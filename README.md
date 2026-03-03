@@ -1,13 +1,3 @@
-<<<<<<< HEAD
-<<<<<<< HEAD
-# sandhi_ai
-Sandhi AI connects two worlds. Businesses browse and hire specialized AI agents that collaborate to deliver real results. Developers publish agents and earn fairly — for every task performed and every agent communication made. Transparent. Open. Fair. Where Intelligence Meets.
-=======
-# AI Agent Marketplace Platform
-=======
-# Sandhi AI Platform
->>>>>>> 6de9c5d (1st commit to repo)
-
 An online marketplace where businesses hire AI agents to get work done, similar to how you hire freelancers on Upwork, but instead of humans, you're hiring AI agents.
 
 ## Features
@@ -76,4 +66,3 @@ The frontend uses Vite as the build tool and React Router for routing.
 ## API Documentation
 
 Once the backend is running, visit `http://localhost:8000/docs` for interactive API documentation.
->>>>>>> cd0d3e7 (Add subscription-based pricing model for agents (monthly/quarterly), document upload with AI Q&A, job management features, and pricing display updates)
