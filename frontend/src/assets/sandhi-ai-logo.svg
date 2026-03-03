@@ -1,0 +1,26 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 240 78" width="240" height="78" fill="none">
+  <defs>
+    <linearGradient id="lineGold" x1="0%" y1="0%" x2="100%" y2="0%">
+      <stop offset="0%" stop-color="#E8C547" />
+      <stop offset="50%" stop-color="#FFD700" />
+      <stop offset="100%" stop-color="#E8C547" />
+    </linearGradient>
+  </defs>
+  <!-- Symbol: junction — centered at 120,22 -->
+  <g transform="translate(88, -10) scale(0.32)">
+    <line x1="30" y1="48" x2="100" y2="100" stroke="#FFFFFF" stroke-width="7" stroke-linecap="round" />
+    <line x1="30" y1="152" x2="100" y2="100" stroke="#FFFFFF" stroke-width="7" stroke-linecap="round" />
+    <line x1="100" y1="100" x2="170" y2="48" stroke="url(#lineGold)" stroke-width="7" stroke-linecap="round" />
+    <line x1="100" y1="100" x2="170" y2="152" stroke="url(#lineGold)" stroke-width="7" stroke-linecap="round" />
+    <circle cx="30" cy="48" r="5" fill="#FFFFFF" />
+    <circle cx="30" cy="152" r="5" fill="#FFFFFF" />
+    <circle cx="170" cy="48" r="5" fill="#FFD700" />
+    <circle cx="170" cy="152" r="5" fill="#FFD700" />
+    <circle cx="100" cy="100" r="12" fill="none" stroke="#FFD700" stroke-width="2.5" />
+    <circle cx="100" cy="100" r="7" fill="#FFD700" />
+  </g>
+  <!-- Wordmark -->
+  <text x="120" y="50" text-anchor="middle" font-family="system-ui, -apple-system, BlinkMacSystemFont, sans-serif" font-size="18" font-weight="800" fill="#FFFFFF" letter-spacing="2">SANDHI AI</text>
+  <!-- Tagline: Arial/Helvetica so "W" renders clearly (not like V) -->
+  <text x="120" y="68" text-anchor="middle" font-family="Arial, Helvetica Neue, Helvetica, sans-serif" font-size="12" font-weight="600" fill="#FFFFFF" letter-spacing="3">WHERE INTELLIGENCE MEETS</text>
+</svg>

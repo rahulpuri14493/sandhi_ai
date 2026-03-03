@@ -1,0 +1,57 @@
+from sqlalchemy import Column, Integer, String, Float, DateTime, ForeignKey, Enum, Text
+from sqlalchemy.orm import relationship
+import enum
+from datetime import datetime
+from db.database import Base
+
+
+class JobStatus(str, enum.Enum):
+    DRAFT = "draft"
+    PENDING_APPROVAL = "pending_approval"
+    APPROVED = "approved"
+    IN_PROGRESS = "in_progress"
+    COMPLETED = "completed"
+    FAILED = "failed"
+    CANCELLED = "cancelled"
+
+
+class Job(Base):
+    __tablename__ = "jobs"
+
+    id = Column(Integer, primary_key=True, index=True)
+    business_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    title = Column(String, nullable=False)
+    description = Column(Text)
+    status = Column(Enum(JobStatus), default=JobStatus.DRAFT)
+    total_cost = Column(Float, default=0.0)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    completed_at = Column(DateTime, nullable=True)
+    files = Column(Text)  # JSON string storing file metadata: [{"name": "...", "path": "...", "type": "..."}]
+    conversation = Column(Text)  # JSON string storing Q&A conversation with AI
+    failure_reason = Column(Text, nullable=True)  # Reason for job failure
+
+    # Relationships
+    business = relationship("User", back_populates="jobs", foreign_keys=[business_id])
+    workflow_steps = relationship("WorkflowStep", back_populates="job", order_by="WorkflowStep.step_order")
+    transaction = relationship("Transaction", back_populates="job", uselist=False)
+
+
+class WorkflowStep(Base):
+    __tablename__ = "workflow_steps"
+
+    id = Column(Integer, primary_key=True, index=True)
+    job_id = Column(Integer, ForeignKey("jobs.id"), nullable=False)
+    agent_id = Column(Integer, ForeignKey("agents.id"), nullable=False)
+    step_order = Column(Integer, nullable=False)
+    input_data = Column(Text)  # JSON string
+    output_data = Column(Text)  # JSON string
+    status = Column(String, default="pending")  # pending, in_progress, completed, failed
+    cost = Column(Float, default=0.0)
+    started_at = Column(DateTime, nullable=True)
+    completed_at = Column(DateTime, nullable=True)
+
+    # Relationships
+    job = relationship("Job", back_populates="workflow_steps")
+    agent = relationship("Agent", back_populates="workflow_steps")
+    communications_from = relationship("AgentCommunication", foreign_keys="AgentCommunication.from_workflow_step_id", back_populates="from_step")
+    communications_to = relationship("AgentCommunication", foreign_keys="AgentCommunication.to_workflow_step_id", back_populates="to_step")
