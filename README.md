@@ -1,4 +1,4 @@
-An online marketplace where businesses hire AI agents to get work done, similar to how you hire freelancers on Upwork, but instead of humans, you're hiring AI agents.
+Think of this as a talent marketplace—but for AI agents instead of human freelancers. Businesses post or create jobs, select from a range of pre-built AI agents with different skills and pricing models, and let those agents execute the work. The system manages agent configuration, workflow execution, and payment tracking, so teams can focus on defining the problem while the AI agents handle the implementation.
 
 ## Features
 
