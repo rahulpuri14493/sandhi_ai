@@ -1,39 +1,47 @@
-version: '3.8'
+version: "3.9"
 
 services:
   db:
     image: postgres:15-alpine
+    container_name: sandhi-db
     environment:
-      POSTGRES_USER: postgres
-      POSTGRES_PASSWORD: postgres
-      POSTGRES_DB: agent_marketplace
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+      POSTGRES_DB: ${POSTGRES_DB:-agent_marketplace}
     ports:
       - "5432:5432"
     volumes:
-      - postgres_data:/var/lib/postgresql/data
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U postgres"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
+      - db_data:/var/lib/postgresql/data
 
-  backend:
-    build:
-      context: ./backend
-      dockerfile: Dockerfile
-    command: uvicorn main:app --host 0.0.0.0 --port 8000 --reload
-    volumes:
-      - ./backend:/app
-    ports:
-      - "8000:8000"
-    environment:
-      - DATABASE_URL=postgresql://postgres:postgres@db:5432/agent_marketplace
-      - SECRET_KEY=your-secret-key-change-in-production
-      - ALGORITHM=HS256
-      - ACCESS_TOKEN_EXPIRE_MINUTES=30
-    depends_on:
-      db:
-        condition: service_healthy
+  # backend:
+  #   build:
+  #     context: ./backend
+  #     dockerfile: Dockerfile
+  #   container_name: sandhi-backend
+  #   restart: always
+  #   command: uvicorn main:app --host 0.0.0.0 --port 8000 --reload
+  #   volumes:
+  #     - ./backend:/app
+  #   ports:
+  #     - "8000:8000"
+  #   environment:
+  #     DATABASE_URL: postgresql+psycopg2://postgres:postgres@db:5432/agent_marketplace
+  #   env_file:
+  #     - .env
+  #   depends_on:
+  #     - db
+
+  # frontend:
+  #   build:
+  #     context: ./frontend
+  #     dockerfile: Dockerfile
+  #   container_name: sandhi-frontend
+  #   environment:
+  #     VITE_API_URL: ${VITE_API_URL:-http://localhost:8000}
+  #   depends_on:
+  #     - backend
+  #   ports:
+  #     - "3000:3000"
 
 volumes:
-  postgres_data:
+  db_data:
