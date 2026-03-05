@@ -164,6 +164,8 @@ class DocumentAnalyzer:
         *,
         agent_api_url: Optional[str] = None,
         agent_api_key: Optional[str] = None,
+        agent_llm_model: Optional[str] = None,
+        agent_temperature: Optional[float] = None,
     ) -> Dict[str, Any]:
         """
         Extract document text and optionally analyze via hired agent (no MLOPS).
@@ -305,10 +307,12 @@ Be thorough, analytical, and solution-oriented. Focus on understanding the compl
                 if len(msg.get("content", "")) > max_content_length:
                     msg["content"] = msg["content"][:max_content_length] + "\n\n[Content truncated due to length...]"
             
+            model = (agent_llm_model or "").strip() or "gpt-4o-mini"
+            temperature = agent_temperature if agent_temperature is not None else 0.7
             payload = {
-                "model": "gpt-4o-mini",
+                "model": model,
                 "messages": messages,
-                "temperature": 0.7,
+                "temperature": temperature,
                 "max_tokens": 2000,
             }
             headers = {"Content-Type": "application/json"}
@@ -376,6 +380,8 @@ Be thorough, analytical, and solution-oriented. Focus on understanding the compl
         *,
         agent_api_url: Optional[str] = None,
         agent_api_key: Optional[str] = None,
+        agent_llm_model: Optional[str] = None,
+        agent_temperature: Optional[float] = None,
     ) -> Dict[str, Any]:
         """Process user's answer and generate follow-up questions or final recommendations via hired agent."""
         last_question = None
@@ -409,6 +415,8 @@ Be thorough, analytical, and solution-oriented. Focus on understanding the compl
             updated_history,
             agent_api_url=agent_api_url,
             agent_api_key=agent_api_key,
+            agent_llm_model=agent_llm_model,
+            agent_temperature=agent_temperature,
         )
     
     def _format_conversation(self, history: List[Dict[str, Any]]) -> str:

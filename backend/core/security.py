@@ -99,9 +99,6 @@ def get_current_user(token: str = Depends(oauth2_scheme), db: Session = Depends(
             detail="Token has expired",
             headers={"WWW-Authenticate": "Bearer"},
         )
-    except jwt.InvalidTokenError as e:
-        print(f"ERROR: Invalid token - {e}")
-        raise credentials_exception
     except JWTError as e:
         print(f"ERROR: JWT decode error - {e}")
         raise credentials_exception

@@ -16,6 +16,8 @@ class TestConnectionRequest(BaseModel):
     api_endpoint: str
     api_key: Optional[str] = None
     test_data: Optional[dict] = None
+    llm_model: Optional[str] = None
+    temperature: Optional[float] = None
 
 
 @router.get("", response_model=List[AgentResponse])
@@ -56,6 +58,8 @@ def list_agents(
             "monthly_price": agent.monthly_price,
             "quarterly_price": agent.quarterly_price,
             "api_endpoint": agent.api_endpoint,
+            "llm_model": getattr(agent, "llm_model", None),
+            "temperature": getattr(agent, "temperature", None),
             "plugin_config": agent.plugin_config,
             "status": agent.status,
             "created_at": agent.created_at,
@@ -95,6 +99,8 @@ def get_agent(
         quarterly_price=agent.quarterly_price,
         api_endpoint=agent.api_endpoint,
         api_key=agent.api_key if is_owner else None,  # Include api_key only for owner
+        llm_model=getattr(agent, "llm_model", None),
+        temperature=getattr(agent, "temperature", None),
         plugin_config=agent.plugin_config,
         status=agent.status,
         created_at=agent.created_at,
@@ -131,6 +137,8 @@ def create_agent(
         monthly_price=new_agent.monthly_price,
         quarterly_price=new_agent.quarterly_price,
         api_endpoint=new_agent.api_endpoint,
+        llm_model=getattr(new_agent, "llm_model", None),
+        temperature=getattr(new_agent, "temperature", None),
         plugin_config=new_agent.plugin_config,
         status=new_agent.status,
         created_at=new_agent.created_at,
@@ -185,6 +193,8 @@ def update_agent(
         quarterly_price=agent.quarterly_price,
         api_endpoint=agent.api_endpoint,
         api_key=agent.api_key,  # Include api_key for owner
+        llm_model=getattr(agent, "llm_model", None),
+        temperature=getattr(agent, "temperature", None),
         plugin_config=agent.plugin_config,
         status=agent.status,
         created_at=agent.created_at,
@@ -268,12 +278,18 @@ async def test_agent_connection(
         
         # OpenAI-style API
         if 'openai' in endpoint_lower or '/v1/chat/completions' in endpoint_lower:
+            model = (test_request.llm_model or "").strip() or "gpt-4o-mini"
             test_payload = {
-                "model": "gpt-3.5-turbo",
+                "model": model,
                 "messages": [
                     {"role": "user", "content": "Hello! This is a connection test."}
                 ],
-                "max_tokens": 10
+                "max_tokens": 10,
+                "temperature": (
+                    test_request.temperature
+                    if test_request.temperature is not None
+                    else 0.7
+                ),
             }
         # Anthropic Claude API
         elif 'anthropic' in endpoint_lower or 'claude' in endpoint_lower:

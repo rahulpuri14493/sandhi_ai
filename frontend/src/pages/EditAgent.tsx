@@ -17,6 +17,8 @@ export default function EditAgentPage() {
     quarterly_price: undefined,
     api_endpoint: '',
     api_key: '',
+    llm_model: 'gpt-4o-mini',
+    temperature: 0.7,
     status: 'pending',
   })
   const [newCapability, setNewCapability] = useState('')
@@ -52,6 +54,8 @@ export default function EditAgentPage() {
         quarterly_price: agent.quarterly_price,
         api_endpoint: agent.api_endpoint || '',
         api_key: agent.api_key || '', // This will be empty if not returned for security
+        llm_model: agent.llm_model || 'gpt-4o-mini',
+        temperature: agent.temperature ?? 0.7,
         status: agent.status || 'pending',
       })
     } catch (err: any) {
@@ -75,7 +79,12 @@ export default function EditAgentPage() {
     try {
       const result = await agentsAPI.testConnection(
         formData.api_endpoint,
-        formData.api_key || undefined
+        formData.api_key || undefined,
+        undefined,
+        {
+          llm_model: formData.llm_model,
+          temperature: formData.temperature,
+        }
       )
       setConnectionTestResult(result)
       if (result.success) {
@@ -351,6 +360,42 @@ export default function EditAgentPage() {
               />
             </div>
           )}
+          <div className="mb-8">
+            <label className="block text-white font-bold mb-3 text-lg" htmlFor="llm_model">
+              Model (optional)
+            </label>
+            <input
+              id="llm_model"
+              type="text"
+              value={formData.llm_model || ''}
+              onChange={(e) => setFormData({ ...formData, llm_model: e.target.value })}
+              placeholder="e.g. gpt-4o-mini"
+              className="w-full px-5 py-4 bg-white border-2 border-gray-300 rounded-xl text-gray-900 placeholder-gray-500 focus:outline-none focus:ring-2 focus:ring-primary-500 focus:border-primary-500 text-lg font-medium mb-6"
+            />
+
+            <label className="block text-white font-bold mb-3 text-lg" htmlFor="temperature">
+              Temperature (optional)
+            </label>
+            <input
+              id="temperature"
+              type="number"
+              min="0"
+              max="2"
+              step="0.1"
+              value={formData.temperature ?? 0.7}
+              onChange={(e) =>
+                setFormData({
+                  ...formData,
+                  temperature: e.target.value === '' ? undefined : parseFloat(e.target.value),
+                })
+              }
+              className="w-full px-5 py-4 bg-white border-2 border-gray-300 rounded-xl text-gray-900 placeholder-gray-500 focus:outline-none focus:ring-2 focus:ring-primary-500 focus:border-primary-500 text-lg font-medium"
+            />
+            <p className="text-sm text-white/80 mt-3 font-medium">
+              Used when calling OpenAI-compatible chat/completions endpoints.
+            </p>
+          </div>
+
           <div className="mb-8">
             <label className="block text-white font-bold mb-3 text-lg" htmlFor="api_endpoint">
               API Endpoint (optional)

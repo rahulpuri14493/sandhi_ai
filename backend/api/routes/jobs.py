@@ -26,7 +26,7 @@ router = APIRouter(prefix="/api/jobs", tags=["jobs"])
 
 
 def _get_first_hired_agent_for_job(db: Session, job_id: int) -> Optional[tuple]:
-    """Return (api_url, api_key) for the first hired agent in the job's workflow, or None."""
+    """Return (api_url, api_key, llm_model, temperature) for the first hired agent, or None."""
     first_step = (
         db.query(WorkflowStep)
         .filter(WorkflowStep.job_id == job_id)
@@ -38,7 +38,12 @@ def _get_first_hired_agent_for_job(db: Session, job_id: int) -> Optional[tuple]:
     agent = db.query(Agent).filter(Agent.id == first_step.agent_id).first()
     if not agent or not (agent.api_endpoint and (agent.api_endpoint or "").strip()):
         return None
-    return (agent.api_endpoint.strip(), (agent.api_key or "").strip() or None)
+    return (
+        agent.api_endpoint.strip(),
+        (agent.api_key or "").strip() or None,
+        (getattr(agent, "llm_model", None) or None),
+        (getattr(agent, "temperature", None)),
+    )
 
 
 # Create uploads directory if it doesn't exist
@@ -233,7 +238,7 @@ async def analyze_documents(
             detail="No valid document paths found in job files"
         )
     hired = _get_first_hired_agent_for_job(db, job.id)
-    agent_url, agent_key = hired if hired else (None, None)
+    agent_url, agent_key, agent_model, agent_temp = hired if hired else (None, None, None, None)
     
     try:
         analyzer = DocumentAnalyzer()
@@ -244,6 +249,8 @@ async def analyze_documents(
             conversation_history=conversation_history,
             agent_api_url=agent_url,
             agent_api_key=agent_key,
+            agent_llm_model=agent_model,
+            agent_temperature=agent_temp,
         )
         
         # Add the new questions to conversation
@@ -350,7 +357,7 @@ async def answer_question(
     files_data = json.loads(job.files)
     documents = [{"path": f["path"], "name": f["name"]} for f in files_data]
     hired = _get_first_hired_agent_for_job(db, job.id)
-    agent_url, agent_key = hired if hired else (None, None)
+    agent_url, agent_key, agent_model, agent_temp = hired if hired else (None, None, None, None)
     
     try:
         analyzer = DocumentAnalyzer()
@@ -362,6 +369,8 @@ async def answer_question(
             conversation_history=conversation_history,
             agent_api_url=agent_url,
             agent_api_key=agent_key,
+            agent_llm_model=agent_model,
+            agent_temperature=agent_temp,
         )
         
         # Add new questions if any

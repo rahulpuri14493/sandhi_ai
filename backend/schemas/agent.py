@@ -17,6 +17,8 @@ class AgentCreate(BaseModel):
     quarterly_price: Optional[float] = None
     api_endpoint: Optional[str] = None
     api_key: Optional[str] = None  # API key for authenticated endpoints
+    llm_model: Optional[str] = None
+    temperature: Optional[float] = None
     plugin_config: Optional[Dict[str, Any]] = None
 
 
@@ -33,6 +35,8 @@ class AgentUpdate(BaseModel):
     quarterly_price: Optional[float] = None
     api_endpoint: Optional[str] = None
     api_key: Optional[str] = None
+    llm_model: Optional[str] = None
+    temperature: Optional[float] = None
     plugin_config: Optional[Dict[str, Any]] = None
     status: Optional[AgentStatus] = None
 
@@ -52,6 +56,8 @@ class AgentResponse(BaseModel):
     quarterly_price: Optional[float] = None
     api_endpoint: Optional[str]
     api_key: Optional[str] = None  # Never return API key in responses for security
+    llm_model: Optional[str] = None
+    temperature: Optional[float] = None
     plugin_config: Optional[Dict[str, Any]]
     status: AgentStatus
     created_at: datetime

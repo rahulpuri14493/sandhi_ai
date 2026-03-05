@@ -68,13 +68,20 @@ AGENTS (each will perform one subtask):
 
     user_content += f"""Split this job into {len(agents)} subtasks. Return JSON array with agent_index and task for each agent."""
 
+    model = (getattr(splitter_agent, "llm_model", None) or "").strip() or "gpt-4o-mini"
+    temperature = (
+        getattr(splitter_agent, "temperature", None)
+        if getattr(splitter_agent, "temperature", None) is not None
+        else 0.3
+    )
+
     payload = {
-        "model": "gpt-4o-mini",
+        "model": model,
         "messages": [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_content},
         ],
-        "temperature": 0.3,
+        "temperature": temperature,
     }
 
     headers = {"Content-Type": "application/json"}

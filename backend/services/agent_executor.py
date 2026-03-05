@@ -448,9 +448,13 @@ END DOCUMENT {i+1}: {doc_name}
         
         # Build OpenAI-compatible payload for hired agent API
         payload = {
-            "model": "gpt-4o-mini",
+            "model": (getattr(agent, "llm_model", None) or "").strip() or "gpt-4o-mini",
             "messages": messages,
-            "temperature": 0.7
+            "temperature": (
+                getattr(agent, "temperature", None)
+                if getattr(agent, "temperature", None) is not None
+                else 0.7
+            ),
         }
         return payload
     

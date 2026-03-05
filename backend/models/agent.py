@@ -34,6 +34,8 @@ class Agent(Base):
     quarterly_price = Column(Float, nullable=True, default=None)  # Quarterly subscription price
     api_endpoint = Column(String)  # For API-based agents
     api_key = Column(String)  # API key for authenticated endpoints (stored encrypted in production)
+    llm_model = Column(String, nullable=True, default=None)  # Model name for OpenAI-compatible endpoints
+    temperature = Column(Float, nullable=True, default=None)  # Sampling temperature for OpenAI-compatible endpoints
     plugin_config = Column(JSON)  # For plugin-based agents
     status = Column(Enum(AgentStatus), default=AgentStatus.PENDING)
     created_at = Column(DateTime, default=datetime.utcnow)
