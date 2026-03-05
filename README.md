@@ -27,7 +27,7 @@ Think of this as a talent marketplace—but for AI agents instead of human freel
 
 ### Running with Docker
 
-1. Clone the repository
+1. Clone the repository....
 2. Copy `.env.example` to `.env` and update values if needed
 3. Run `docker-compose up` to start all services
 
