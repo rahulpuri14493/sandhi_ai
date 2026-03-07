@@ -426,11 +426,16 @@ def list_jobs(
     db: Session = Depends(get_db)
 ):
     if current_user.role == UserRole.BUSINESS:
-        jobs = db.query(Job).filter(Job.business_id == current_user.id).all()
+        # Filter out soft-deleted jobs
+        jobs = db.query(Job).filter(
+            Job.business_id == current_user.id,
+            Job.deleted_at.is_(None)
+        ).all()
     else:
-        # Developers can see jobs where their agents are used
+        # Developers can see jobs where their agents are used (exclude deleted)
         jobs = db.query(Job).join(WorkflowStep).join(Agent).filter(
-            Agent.developer_id == current_user.id
+            Agent.developer_id == current_user.id,
+            Job.deleted_at.is_(None)
         ).distinct().all()
     
     # Parse files for each job
@@ -477,7 +482,8 @@ def get_job(
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
-    job = db.query(Job).filter(Job.id == job_id).first()
+    # Exclude soft-deleted jobs
+    job = db.query(Job).filter(Job.id == job_id, Job.deleted_at.is_(None)).first()
     if not job:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -709,71 +715,76 @@ async def update_job(
     return JobResponse(**job_dict)
 
 
-@router.delete("/{job_id}")
+@router.delete("/{job_id}", status_code=200)
 def delete_job(
     job_id: int,
     current_user: User = Depends(get_current_business_user),
     db: Session = Depends(get_db)
 ):
-    """Delete a job (draft, completed, or failed jobs can be deleted)"""
-    job = db.query(Job).filter(Job.id == job_id).first()
+    """
+    Soft delete a job (marks as deleted but preserves data).
+    
+    - **job_id**: ID of the job to delete
+    
+    Returns success message with deleted job details.
+    
+    **Authorization**: Only the job creator (business owner) can delete their jobs.
+    
+    **Soft Delete Behavior**:
+    - Job is marked as deleted with deleted_at timestamp
+    - Status changed to CANCELLED
+    - Data preserved for audit trail and prevents foreign key issues
+    - Job will not appear in normal listings
+    """
+    # Get the job (exclude already deleted jobs)
+    job = db.query(Job).filter(Job.id == job_id, Job.deleted_at.is_(None)).first()
+    
     if not job:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
-            detail="Job not found"
+            detail=f"Job with id {job_id} not found"
         )
     
+    # Authorization check: Only job creator can delete
     if job.business_id != current_user.id:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
-            detail="Not authorized to delete this job"
+            detail="You don't have permission to delete this job. Only the job creator can delete it."
         )
     
-    # Allow deletion of draft, completed, or failed jobs
-    # Prevent deletion of jobs that are in progress or pending approval
+    # Prevent deletion of jobs that are actively in progress or approved
     if job.status in [JobStatus.IN_PROGRESS, JobStatus.PENDING_APPROVAL, JobStatus.APPROVED]:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Cannot delete a job with status '{job.status}'. Only draft, completed, or failed jobs can be deleted."
+            detail=f"Cannot delete a job with status '{job.status}'. Only draft, completed, failed, or cancelled jobs can be deleted."
         )
     
-    # Delete associated workflow steps first (to avoid foreign key constraint issues)
-    # Also delete any communications related to these workflow steps
-    from models.communication import AgentCommunication
-    workflow_steps = db.query(WorkflowStep).filter(WorkflowStep.job_id == job_id).all()
-    for step in workflow_steps:
-        # Delete communications related to this workflow step
-        db.query(AgentCommunication).filter(
-            (AgentCommunication.from_workflow_step_id == step.id) |
-            (AgentCommunication.to_workflow_step_id == step.id)
-        ).delete()
-        db.delete(step)
-    
-    # Delete associated transaction if exists
-    from models.transaction import Transaction
-    transaction = db.query(Transaction).filter(Transaction.job_id == job_id).first()
-    if transaction:
-        # Delete earnings related to this transaction
-        from models.transaction import Earnings
-        db.query(Earnings).filter(Earnings.transaction_id == transaction.id).delete()
-        db.delete(transaction)
-    
-    # Delete associated files
-    if job.files:
-        try:
-            files_data = json.loads(job.files)
-            for file_info in files_data:
-                file_path = Path(file_info.get("path", ""))
-                if file_path.exists():
-                    file_path.unlink()
-        except (json.JSONDecodeError, TypeError, Exception):
-            pass  # Continue even if file deletion fails
-    
-    # Now delete the job
-    db.delete(job)
-    db.commit()
-    # Return 204 No Content response
-    return Response(status_code=status.HTTP_204_NO_CONTENT)
+    try:
+        # Soft delete the job using the helper method
+        job.soft_delete()
+        db.commit()
+        db.refresh(job)
+        
+        return {
+            "success": True,
+            "message": f"Job '{job.title}' (ID: {job_id}) successfully deleted",
+            "job": {
+                "id": job.id,
+                "title": job.title,
+                "deleted_at": job.deleted_at.isoformat() if job.deleted_at else None,
+                "status": job.status.value if isinstance(job.status, JobStatus) else job.status
+            }
+        }
+        
+    except Exception as e:
+        db.rollback()
+        # Log the error (you can add proper logging here)
+        print(f"Error deleting job {job_id}: {str(e)}")
+        
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"An error occurred while deleting the job: {str(e)}"
+        )
 
 
 @router.post("/{job_id}/workflow/auto-split", response_model=WorkflowPreview)

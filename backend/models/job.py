@@ -26,6 +26,7 @@ class Job(Base):
     total_cost = Column(Float, default=0.0)
     created_at = Column(DateTime, default=datetime.utcnow)
     completed_at = Column(DateTime, nullable=True)
+    deleted_at = Column(DateTime, nullable=True, index=True)  # Soft delete timestamp
     files = Column(Text)  # JSON string storing file metadata: [{"name": "...", "path": "...", "type": "..."}]
     conversation = Column(Text)  # JSON string storing Q&A conversation with AI
     failure_reason = Column(Text, nullable=True)  # Reason for job failure
@@ -34,6 +35,16 @@ class Job(Base):
     business = relationship("User", back_populates="jobs", foreign_keys=[business_id])
     workflow_steps = relationship("WorkflowStep", back_populates="job", order_by="WorkflowStep.step_order")
     transaction = relationship("Transaction", back_populates="job", uselist=False)
+    
+    # Helper methods for soft delete
+    def is_deleted(self):
+        """Check if job is soft-deleted"""
+        return self.deleted_at is not None
+    
+    def soft_delete(self):
+        """Mark job as deleted"""
+        self.deleted_at = datetime.utcnow()
+        self.status = JobStatus.CANCELLED
 
 
 class WorkflowStep(Base):
