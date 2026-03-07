@@ -51,7 +51,14 @@ npm install
 npm run dev
 ```
 
-The frontend uses Vite as the build tool and React Router for routing.
+The frontend uses Vite as the build tool and React Router for routing. The application runs at **http://localhost:3000**.
+
+### Running tests
+
+- **Backend**: `cd backend && pytest`
+- **Frontend**: `cd frontend && npm run test`
+
+On every pull request, GitHub Actions runs both test suites (see [.github/workflows/pr-tests.yml](.github/workflows/pr-tests.yml)).
 
 ## Project Structure
 

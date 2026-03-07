@@ -21,6 +21,10 @@ from services.workflow_builder import WorkflowBuilder
 from services.payment_processor import PaymentProcessor
 from services.agent_executor import AgentExecutor
 from services.document_analyzer import DocumentAnalyzer
+from models.transaction import Transaction, Earnings
+from core.external_token import create_job_token, get_share_url
+from datetime import datetime
+from models.communication import AgentCommunication
 
 router = APIRouter(prefix="/api/jobs", tags=["jobs"])
 
@@ -254,7 +258,7 @@ async def analyze_documents(
         )
         
         # Add the new questions to conversation
-        from datetime import datetime
+        
         new_conversation = conversation_history.copy()
         if result.get("analysis"):
             new_conversation.append({
@@ -310,7 +314,7 @@ async def answer_question(
     db: Session = Depends(get_db)
 ):
     """Submit user's answer and get follow-up questions or recommendations"""
-    from datetime import datetime
+    
     
     job = db.query(Job).filter(Job.id == job_id).first()
     if not job:
@@ -637,7 +641,6 @@ async def update_job(
             agent_url, agent_key = hired if hired else (None, None)
             
             analyzer = DocumentAnalyzer()
-            from datetime import datetime
             result = await analyzer.analyze_documents_and_generate_questions(
                 documents=documents,
                 job_title=job.title,
@@ -737,26 +740,23 @@ def delete_job(
             detail=f"Cannot delete a job with status '{job.status}'. Only draft, completed, or failed jobs can be deleted."
         )
     
-    # Delete associated workflow steps first (to avoid foreign key constraint issues)
-    # Also delete any communications related to these workflow steps
-    from models.communication import AgentCommunication
+    # Delete transaction and earnings FIRST (earnings reference agent_communications,
+    # so they must be removed before we delete workflow steps and communications)
+    
+    transaction = db.query(Transaction).filter(Transaction.job_id == job_id).first()
+    if transaction:
+        db.query(Earnings).filter(Earnings.transaction_id == transaction.id).delete()
+        db.delete(transaction)
+    
+    # Delete associated workflow steps and their communications (no FKs reference these now)
+    
     workflow_steps = db.query(WorkflowStep).filter(WorkflowStep.job_id == job_id).all()
     for step in workflow_steps:
-        # Delete communications related to this workflow step
         db.query(AgentCommunication).filter(
             (AgentCommunication.from_workflow_step_id == step.id) |
             (AgentCommunication.to_workflow_step_id == step.id)
         ).delete()
         db.delete(step)
-    
-    # Delete associated transaction if exists
-    from models.transaction import Transaction
-    transaction = db.query(Transaction).filter(Transaction.job_id == job_id).first()
-    if transaction:
-        # Delete earnings related to this transaction
-        from models.transaction import Earnings
-        db.query(Earnings).filter(Earnings.transaction_id == transaction.id).delete()
-        db.delete(transaction)
     
     # Delete associated files
     if job.files:
@@ -1068,7 +1068,7 @@ def get_job_share_link(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Job not found")
     if current_user.role == UserRole.BUSINESS and job.business_id != current_user.id:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Not authorized")
-    from core.external_token import create_job_token, get_share_url
+    
     return {
         "job_id": job.id,
         "share_url": get_share_url(job.id),
