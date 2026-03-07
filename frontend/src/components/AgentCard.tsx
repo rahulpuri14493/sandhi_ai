@@ -1,6 +1,25 @@
 import { Link } from 'react-router-dom'
 import type { Agent } from '../lib/types'
 
+const STARS = [1, 2, 3, 4, 5]
+
+function StarRating({ value, size = 'sm' }: { value: number; size?: 'sm' | 'md' }) {
+  const scale = size === 'sm' ? 'w-4 h-4' : 'w-5 h-5'
+  return (
+    <span className="inline-flex items-center gap-0.5" role="img" aria-label={`Rating: ${value} out of 5`}>
+      {STARS.map((star) => (
+        <span
+          key={star}
+          className={`${scale} ${value >= star ? 'text-amber-400' : 'text-dark-300'}`}
+          aria-hidden
+        >
+          ★
+        </span>
+      ))}
+    </span>
+  )
+}
+
 interface AgentCardProps {
   agent: Agent
 }
@@ -40,6 +59,22 @@ export function AgentCard({ agent }: AgentCardProps) {
         <p className="text-white/70 text-base mb-5 line-clamp-2 font-medium leading-relaxed">
           {agent.description || 'No description available'}
         </p>
+        {/* Overall rating (marketplace list only) */}
+        <div className="mb-4 flex items-center gap-2">
+          {agent.review_count != null && agent.review_count > 0 && agent.average_rating != null ? (
+            <>
+              <StarRating value={Math.round(agent.average_rating * 2) / 2} size="sm" />
+              <span className="text-white/80 text-sm font-semibold">
+                {agent.average_rating.toFixed(1)}
+              </span>
+              <span className="text-white/50 text-sm">
+                ({agent.review_count} {agent.review_count === 1 ? 'review' : 'reviews'})
+              </span>
+            </>
+          ) : (
+            <span className="text-white/50 text-sm">No reviews yet</span>
+          )}
+        </div>
         <div className="flex items-center justify-between mb-4">
           <div>
             <span className="text-3xl font-black text-primary-400">
