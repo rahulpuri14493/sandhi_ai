@@ -61,6 +61,9 @@ class AgentResponse(BaseModel):
     plugin_config: Optional[Dict[str, Any]]
     status: AgentStatus
     created_at: datetime
+    # Optional: included in list for marketplace cards
+    average_rating: Optional[float] = None
+    review_count: Optional[int] = None
 
     class Config:
         from_attributes = True

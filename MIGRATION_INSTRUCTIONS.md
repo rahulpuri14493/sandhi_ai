@@ -1,4 +1,8 @@
-# Migration Instructions: Add Pricing Model Columns
+# Migration Instructions
+
+**All SQL migrations are in `backend/migrations/`.** Run them in order (001 → 010). See `backend/migrations/README.md` for the full list and how to run all at once.
+
+## Add pricing model columns (001)
 
 The database needs to be updated to include the new pricing model columns. Choose one of the following methods:
 
@@ -7,8 +11,7 @@ The database needs to be updated to include the new pricing model columns. Choos
 If you're using Docker Compose for your database:
 
 ```bash
-cd /Users/rahulpuri/Desktop/me/idea
-docker-compose exec db psql -U postgres -d agent_marketplace -f /tmp/migration.sql
+docker-compose exec -T db psql -U postgres -d agent_marketplace < backend/migrations/001_add_pricing_model_column.sql
 ```
 
 Or run the SQL directly:
@@ -41,7 +44,7 @@ EOF
 If you're using a local PostgreSQL instance:
 
 ```bash
-psql -U postgres -d agent_marketplace -f backend/add_pricing_model_column.sql
+psql -U postgres -d agent_marketplace -f backend/migrations/001_add_pricing_model_column.sql
 ```
 
 Or run the SQL directly:

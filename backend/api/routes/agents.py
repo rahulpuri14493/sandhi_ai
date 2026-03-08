@@ -1,3 +1,4 @@
+from datetime import datetime
 from fastapi import APIRouter, Depends, HTTPException, status, Query
 from sqlalchemy.orm import Session
 from typing import List, Optional
@@ -5,8 +6,16 @@ from pydantic import BaseModel
 import httpx
 from db.database import get_db
 from models.agent import Agent, AgentStatus, PricingModel
+from models.agent_review import AgentReview
 from schemas.agent import AgentCreate, AgentResponse, AgentUpdate
-from core.security import get_current_user, get_current_developer_user
+from schemas.agent_review import (
+    AgentReviewCreate,
+    AgentReviewUpdate,
+    AgentReviewResponse,
+    AgentReviewSummaryResponse,
+    AgentReviewListResponse,
+)
+from core.security import get_current_user, get_current_user_optional, get_current_developer_user
 from models.user import User
 
 router = APIRouter(prefix="/api/agents", tags=["agents"])
@@ -37,13 +46,29 @@ def list_agents(
         query = query.filter(Agent.capabilities.contains([capability]))
     
     agents = query.all()
-    # Exclude api_key from responses for security
+    agent_ids = [a.id for a in agents]
+    # Batch load review counts and averages per agent
+    from sqlalchemy import func
+    review_stats = (
+        db.query(
+            AgentReview.agent_id,
+            func.count(AgentReview.id).label("count"),
+            func.avg(AgentReview.rating).label("avg_rating"),
+        )
+        .filter(AgentReview.agent_id.in_(agent_ids))
+        .group_by(AgentReview.agent_id)
+    )
+    stats_by_agent = {r.agent_id: (r.count, round(float(r.avg_rating), 2)) for r in review_stats}
+
+    # Exclude api_key from responses for security; include overall rating for marketplace
     result = []
     for agent in agents:
         # Handle pricing_model - default to 'pay_per_use' if None (for existing agents)
         from models.agent import PricingModel
         pricing_model = agent.pricing_model if agent.pricing_model else PricingModel.PAY_PER_USE
-        
+
+        count, avg = stats_by_agent.get(agent.id, (0, 0.0))
+
         agent_data = {
             "id": agent.id,
             "developer_id": agent.developer_id,
@@ -63,6 +88,8 @@ def list_agents(
             "plugin_config": agent.plugin_config,
             "status": agent.status,
             "created_at": agent.created_at,
+            "average_rating": avg if count else None,
+            "review_count": count if count else None,
         }
         result.append(AgentResponse(**agent_data))
     return result
@@ -71,17 +98,21 @@ def list_agents(
 @router.get("/{agent_id}", response_model=AgentResponse)
 def get_agent(
     agent_id: int,
-    current_user: User = Depends(get_current_user),
-    db: Session = Depends(get_db)
+    current_user: Optional[User] = Depends(get_current_user_optional),
+    db: Session = Depends(get_db),
 ):
+    """Get agent by id. Public: no auth required. api_endpoint and api_key only for authenticated users (api_key only for owner)."""
     agent = db.query(Agent).filter(Agent.id == agent_id).first()
     if not agent:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Agent not found"
         )
-    # Include api_key only if user is the agent owner
-    is_owner = agent.developer_id == current_user.id
+    # api_endpoint: only for authenticated users (any logged-in user)
+    # api_key: only for the agent owner
+    is_owner = current_user is not None and agent.developer_id == current_user.id
+    api_endpoint = agent.api_endpoint if current_user is not None else None
+    api_key = agent.api_key if is_owner else None
     # Handle None pricing_model for agents created before migration
     pricing_model = agent.pricing_model if agent.pricing_model is not None else PricingModel.PAY_PER_USE
     return AgentResponse(
@@ -97,14 +128,187 @@ def get_agent(
         price_per_communication=agent.price_per_communication,
         monthly_price=agent.monthly_price,
         quarterly_price=agent.quarterly_price,
-        api_endpoint=agent.api_endpoint,
-        api_key=agent.api_key if is_owner else None,  # Include api_key only for owner
+        api_endpoint=api_endpoint,
+        api_key=api_key,
         llm_model=getattr(agent, "llm_model", None),
         temperature=getattr(agent, "temperature", None),
         plugin_config=agent.plugin_config,
         status=agent.status,
         created_at=agent.created_at,
     )
+
+
+# ---------- Agent reviews (public read, authenticated write) ----------
+
+
+def _get_agent_or_404(agent_id: int, db: Session) -> Agent:
+    agent = db.query(Agent).filter(Agent.id == agent_id).first()
+    if not agent:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Agent not found",
+        )
+    return agent
+
+
+@router.get("/{agent_id}/reviews/summary", response_model=AgentReviewSummaryResponse)
+def get_agent_reviews_summary(
+    agent_id: int,
+    db: Session = Depends(get_db),
+):
+    """Public: overall average rating and count for an agent."""
+    _get_agent_or_404(agent_id, db)
+    reviews = db.query(AgentReview).filter(AgentReview.agent_id == agent_id).all()
+    total = len(reviews)
+    if total == 0:
+        return AgentReviewSummaryResponse(
+            agent_id=agent_id,
+            average_rating=0.0,
+            total_count=0,
+            rating_distribution={1: 0, 2: 0, 3: 0, 4: 0, 5: 0},
+        )
+    distribution = {1: 0, 2: 0, 3: 0, 4: 0, 5: 0}
+    for r in reviews:
+        bucket = min(5, max(1, int(round(r.rating))))
+        distribution[bucket] = distribution.get(bucket, 0) + 1
+    avg = sum(r.rating for r in reviews) / total
+    return AgentReviewSummaryResponse(
+        agent_id=agent_id,
+        average_rating=round(avg, 2),
+        total_count=total,
+        rating_distribution=distribution,
+    )
+
+
+@router.get("/{agent_id}/reviews", response_model=AgentReviewListResponse)
+def list_agent_reviews(
+    agent_id: int,
+    limit: int = Query(20, ge=1, le=100),
+    offset: int = Query(0, ge=0),
+    current_user: Optional[User] = Depends(get_current_user_optional),
+    db: Session = Depends(get_db),
+):
+    """Public: paginated list of reviews for an agent."""
+    _get_agent_or_404(agent_id, db)
+    query = db.query(AgentReview).filter(AgentReview.agent_id == agent_id)
+    total = query.count()
+    rows = query.order_by(AgentReview.created_at.desc()).offset(offset).limit(limit).all()
+    items = [
+        AgentReviewResponse(
+            id=r.id,
+            agent_id=r.agent_id,
+            user_id=r.user_id,
+            rating=r.rating,
+            review_text=r.review_text,
+            created_at=r.created_at,
+            updated_at=r.updated_at,
+            is_own=current_user is not None and r.user_id == current_user.id,
+        )
+        for r in rows
+    ]
+    return AgentReviewListResponse(items=items, total=total, limit=limit, offset=offset)
+
+
+def _get_review_or_404(agent_id: int, review_id: int, db: Session) -> AgentReview:
+    review = (
+        db.query(AgentReview)
+        .filter(AgentReview.id == review_id, AgentReview.agent_id == agent_id)
+        .first()
+    )
+    if not review:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Review not found",
+        )
+    return review
+
+
+@router.put("/{agent_id}/reviews/{review_id}", response_model=AgentReviewResponse)
+def update_agent_review(
+    agent_id: int,
+    review_id: int,
+    payload: AgentReviewUpdate,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Update a review. Only the review author can update."""
+    _get_agent_or_404(agent_id, db)
+    review = _get_review_or_404(agent_id, review_id, db)
+    if review.user_id != current_user.id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Not authorized to update this review",
+        )
+    data = payload.model_dump(exclude_unset=True)
+    for k, v in data.items():
+        setattr(review, k, v)
+    review.updated_at = datetime.utcnow()
+    db.commit()
+    db.refresh(review)
+    return AgentReviewResponse(
+        id=review.id,
+        agent_id=review.agent_id,
+        user_id=review.user_id,
+        rating=review.rating,
+        review_text=review.review_text,
+        created_at=review.created_at,
+        updated_at=review.updated_at,
+        is_own=True,
+    )
+
+
+@router.delete("/{agent_id}/reviews/{review_id}", status_code=status.HTTP_204_NO_CONTENT)
+def delete_agent_review(
+    agent_id: int,
+    review_id: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Delete a review. Only the review author can delete."""
+    _get_agent_or_404(agent_id, db)
+    review = _get_review_or_404(agent_id, review_id, db)
+    if review.user_id != current_user.id:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Not authorized to delete this review",
+        )
+    db.delete(review)
+    db.commit()
+    return None
+
+
+@router.post("/{agent_id}/reviews", response_model=AgentReviewResponse, status_code=status.HTTP_201_CREATED)
+def create_agent_review(
+    agent_id: int,
+    payload: AgentReviewCreate,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Create a new review. Users can submit multiple reviews per agent. Review text is optional."""
+    _get_agent_or_404(agent_id, db)
+    review_text = (payload.review_text.strip() or None) if payload.review_text else None
+    review = AgentReview(
+        agent_id=agent_id,
+        user_id=current_user.id,
+        rating=payload.rating,
+        review_text=review_text,
+    )
+    db.add(review)
+    db.commit()
+    db.refresh(review)
+    return AgentReviewResponse(
+        id=review.id,
+        agent_id=review.agent_id,
+        user_id=review.user_id,
+        rating=review.rating,
+        review_text=review.review_text,
+        created_at=review.created_at,
+        updated_at=getattr(review, "updated_at", None),
+        is_own=True,
+    )
+
+
+# ---------- Agent CRUD (authenticated) ----------
 
 
 @router.post("", response_model=AgentResponse, status_code=status.HTTP_201_CREATED)

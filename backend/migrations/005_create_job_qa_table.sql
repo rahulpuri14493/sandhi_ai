@@ -1,5 +1,5 @@
--- Migration script to create job_questions table
--- Run this if you have an existing database
+-- Create job_questions table.
+-- Requires: jobs table.
 
 CREATE TABLE IF NOT EXISTS job_questions (
     id SERIAL PRIMARY KEY,

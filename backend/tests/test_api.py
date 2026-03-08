@@ -28,6 +28,9 @@ def test_protected_endpoints_require_auth(client: TestClient):
     # Jobs list requires auth
     response = client.get("/api/jobs")
     assert response.status_code == 401
-    # Agent detail (by id) requires auth; list is public
+    # Agent detail is public (200 without auth); api_endpoint is hidden for unauthenticated users
     response = client.get("/api/agents/1")
-    assert response.status_code == 401
+    assert response.status_code in (200, 404)  # 200 if agent exists, 404 if no data
+    if response.status_code == 200:
+        data = response.json()
+        assert data.get("api_endpoint") is None  # restricted to logged-in users
