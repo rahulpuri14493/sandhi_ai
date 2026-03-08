@@ -62,6 +62,7 @@ jobs:
         with:
           push: true
           tags: ghcr.io/${{ env.REPO }}:${{ github.sha }}
+          # Same backend image as in docker-compose (backend service)
           context: ./backend
           file: ./backend/Dockerfile
 
