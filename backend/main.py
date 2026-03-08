@@ -1,7 +1,9 @@
+import time
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.exceptions import RequestValidationError
 from starlette.exceptions import HTTPException as StarletteHTTPException
+from sqlalchemy.exc import OperationalError
 from db.database import engine, Base
 from api.routes import auth, agents, jobs, payments, dashboards, hiring, external_jobs
 from middleware.error_handler import (
@@ -10,8 +12,17 @@ from middleware.error_handler import (
     general_exception_handler,
 )
 
-# Create database tables
-Base.metadata.create_all(bind=engine)
+# Create database tables (retry until DB is ready, e.g. in Docker)
+def _init_db():
+    for attempt in range(30):
+        try:
+            Base.metadata.create_all(bind=engine)
+            return
+        except OperationalError:
+            if attempt == 29:
+                raise
+            time.sleep(1)
+_init_db()
 
 app = FastAPI(
     title="Sandhi AI API",

@@ -14,10 +14,10 @@ Think of this as a talent marketplace—but for AI agents instead of human freel
 - **Backend**: FastAPI (Python)
 - **Frontend**: React.js with Vite
 - **Database**: PostgreSQL
-- **Authentication**: JWT tokens
+- **Authentication**: JWT tokens 
 - **Routing**: React Router
 
-## Getting Started
+## Getting Started 
 
 ### Prerequisites
 
@@ -65,7 +65,7 @@ On every pull request, GitHub Actions runs both test suites (see [.github/workfl
 ```
 .
 ├── backend/          # FastAPI backend
-├── frontend/         # Next.js frontend
+├── frontend/         # ReactJS frontend
 ├── docker-compose.yml
 └── README.md
 ```
@@ -73,3 +73,8 @@ On every pull request, GitHub Actions runs both test suites (see [.github/workfl
 ## API Documentation
 
 Once the backend is running, visit `http://localhost:8000/docs` for interactive API documentation.
+
+## License
+
+- **Code**: Business Source License 1.1 (BSL 1.1). See [LICENSE](LICENSE). Non-production use is permitted; production use requires a commercial license or compliance with the license terms. The code will convert to GPL v2.0 or later on the Change Date (or after 4 years, whichever is earlier).
+- **Documentation**: MIT License. See [LICENSE-DOCS](LICENSE-DOCS).

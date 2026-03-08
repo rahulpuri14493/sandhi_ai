@@ -84,4 +84,30 @@ describe('AgentCard', () => {
     render(wrapWithRouter(<AgentCard agent={agentWithoutDesc} />))
     expect(screen.getByText('No description available')).toBeInTheDocument()
   })
+
+  it('shows "No reviews yet" when agent has no reviews', () => {
+    render(wrapWithRouter(<AgentCard agent={baseAgent} />))
+    expect(screen.getByText('No reviews yet')).toBeInTheDocument()
+  })
+
+  it('shows overall rating and review count when present', () => {
+    const agentWithReviews: Agent = {
+      ...baseAgent,
+      average_rating: 4.2,
+      review_count: 12,
+    }
+    render(wrapWithRouter(<AgentCard agent={agentWithReviews} />))
+    expect(screen.getByText('4.2')).toBeInTheDocument()
+    expect(screen.getByText('(12 reviews)')).toBeInTheDocument()
+  })
+
+  it('shows singular "review" when review_count is 1', () => {
+    const agentWithOneReview: Agent = {
+      ...baseAgent,
+      average_rating: 5,
+      review_count: 1,
+    }
+    render(wrapWithRouter(<AgentCard agent={agentWithOneReview} />))
+    expect(screen.getByText('(1 review)')).toBeInTheDocument()
+  })
 })

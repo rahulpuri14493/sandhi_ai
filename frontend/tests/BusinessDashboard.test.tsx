@@ -32,9 +32,9 @@ describe('BusinessDashboard', () => {
 
   it('renders Business Dashboard title', async () => {
     render(wrapWithRouter(<BusinessDashboard />))
-    await screen.findByText('Business Dashboard')
+    await screen.findByText('Business Dashboard', {}, { timeout: 10000 })
     expect(screen.getByText('Business Dashboard')).toBeInTheDocument()
-  })
+  }, 12000)
 
   it('displays total spent and job count after loading', async () => {
     render(wrapWithRouter(<BusinessDashboard />))

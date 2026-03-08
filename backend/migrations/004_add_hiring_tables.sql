@@ -1,21 +1,18 @@
--- Migration script to create hiring_positions and agent_nominations tables
--- Run this if you have an existing database
+-- Create hiring_positions and agent_nominations tables.
+-- Requires: users, agents tables.
 
--- Create hiring_status enum
 DO $$ BEGIN
     CREATE TYPE hiringstatus AS ENUM ('open', 'closed', 'filled');
 EXCEPTION
     WHEN duplicate_object THEN null;
 END $$;
 
--- Create nominationstatus enum
 DO $$ BEGIN
     CREATE TYPE nominationstatus AS ENUM ('pending', 'approved', 'rejected');
 EXCEPTION
     WHEN duplicate_object THEN null;
 END $$;
 
--- Create hiring_positions table
 CREATE TABLE IF NOT EXISTS hiring_positions (
     id SERIAL PRIMARY KEY,
     business_id INTEGER NOT NULL REFERENCES users(id),
@@ -27,7 +24,6 @@ CREATE TABLE IF NOT EXISTS hiring_positions (
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
--- Create agent_nominations table
 CREATE TABLE IF NOT EXISTS agent_nominations (
     id SERIAL PRIMARY KEY,
     hiring_position_id INTEGER NOT NULL REFERENCES hiring_positions(id) ON DELETE CASCADE,
@@ -41,7 +37,6 @@ CREATE TABLE IF NOT EXISTS agent_nominations (
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
--- Create indexes
 CREATE INDEX IF NOT EXISTS idx_hiring_positions_business_id ON hiring_positions(business_id);
 CREATE INDEX IF NOT EXISTS idx_hiring_positions_status ON hiring_positions(status);
 CREATE INDEX IF NOT EXISTS idx_agent_nominations_position_id ON agent_nominations(hiring_position_id);

@@ -17,6 +17,8 @@ ALGORITHM = os.getenv("ALGORITHM", "HS256")
 ACCESS_TOKEN_EXPIRE_MINUTES = int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", "30"))
 
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="api/auth/login")
+# Optional auth: do not raise 401 when token is missing (for public endpoints)
+oauth2_scheme_optional = OAuth2PasswordBearer(tokenUrl="api/auth/login", auto_error=False)
 
 
 def verify_password(plain_password: str, hashed_password: str) -> bool:
@@ -114,6 +116,25 @@ def get_current_user(token: str = Depends(oauth2_scheme), db: Session = Depends(
         print(f"ERROR: User with id {user_id} not found in database")
         raise credentials_exception
     
+    return user
+
+
+def get_current_user_optional(
+    token: Optional[str] = Depends(oauth2_scheme_optional),
+    db: Session = Depends(get_db),
+) -> Optional[User]:
+    """Return current user if valid JWT is present; otherwise return None. Never raises 401."""
+    if not token:
+        return None
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        user_id_str = payload.get("sub")
+        if user_id_str is None:
+            return None
+        user_id = int(user_id_str)
+    except (JWTError, ValueError, TypeError):
+        return None
+    user = db.query(User).filter(User.id == user_id).first()
     return user
 
 
