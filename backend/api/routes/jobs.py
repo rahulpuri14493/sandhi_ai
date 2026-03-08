@@ -30,7 +30,7 @@ router = APIRouter(prefix="/api/jobs", tags=["jobs"])
 
 
 def _get_first_hired_agent_for_job(db: Session, job_id: int) -> Optional[tuple]:
-    """Return (api_url, api_key, llm_model, temperature) for the first hired agent, or None."""
+    """Return (api_url, api_key, llm_model, temperature, a2a_enabled) for the first hired agent, or None."""
     first_step = (
         db.query(WorkflowStep)
         .filter(WorkflowStep.job_id == job_id)
@@ -47,6 +47,7 @@ def _get_first_hired_agent_for_job(db: Session, job_id: int) -> Optional[tuple]:
         (agent.api_key or "").strip() or None,
         (getattr(agent, "llm_model", None) or None),
         (getattr(agent, "temperature", None)),
+        getattr(agent, "a2a_enabled", False),
     )
 
 
@@ -202,7 +203,7 @@ async def analyze_documents(
     current_user: User = Depends(get_current_business_user),
     db: Session = Depends(get_db)
 ):
-    """Analyze uploaded documents and generate questions using MLOps inference endpoints"""
+    """Analyze uploaded documents and generate questions using the hired agent."""
     job = db.query(Job).filter(Job.id == job_id).first()
     if not job:
         raise HTTPException(
@@ -242,7 +243,11 @@ async def analyze_documents(
             detail="No valid document paths found in job files"
         )
     hired = _get_first_hired_agent_for_job(db, job.id)
-    agent_url, agent_key, agent_model, agent_temp = hired if hired else (None, None, None, None)
+    if hired:
+        agent_url, agent_key, agent_model, agent_temp, use_a2a = hired
+    else:
+        agent_url = agent_key = agent_model = agent_temp = None
+        use_a2a = False
     
     try:
         analyzer = DocumentAnalyzer()
@@ -255,6 +260,7 @@ async def analyze_documents(
             agent_api_key=agent_key,
             agent_llm_model=agent_model,
             agent_temperature=agent_temp,
+            use_a2a=use_a2a,
         )
         
         # Add the new questions to conversation
@@ -277,13 +283,15 @@ async def analyze_documents(
                     "timestamp": str(datetime.utcnow())
                 })
         else:
-            # No questions - add completion with solutions
+            # No questions - add completion with solutions and optional workflow hint
             new_conversation.append({
                 "type": "completion",
                 "message": "Requirements understood. Here are the solutions:",
                 "recommendations": result.get("recommendations", []),
                 "solutions": result.get("solutions", []),
                 "next_steps": result.get("next_steps", []),
+                "workflow_collaboration_hint": result.get("workflow_collaboration_hint"),
+                "workflow_collaboration_reason": result.get("workflow_collaboration_reason"),
                 "timestamp": str(datetime.utcnow())
             })
         
@@ -361,8 +369,12 @@ async def answer_question(
     files_data = json.loads(job.files)
     documents = [{"path": f["path"], "name": f["name"]} for f in files_data]
     hired = _get_first_hired_agent_for_job(db, job.id)
-    agent_url, agent_key, agent_model, agent_temp = hired if hired else (None, None, None, None)
-    
+    if hired:
+        agent_url, agent_key, agent_model, agent_temp, use_a2a = hired
+    else:
+        agent_url = agent_key = agent_model = agent_temp = None
+        use_a2a = False
+
     try:
         analyzer = DocumentAnalyzer()
         result = await analyzer.process_user_response(
@@ -375,6 +387,7 @@ async def answer_question(
             agent_api_key=agent_key,
             agent_llm_model=agent_model,
             agent_temperature=agent_temp,
+            use_a2a=use_a2a,
         )
         
         # Add new questions if any
@@ -387,13 +400,15 @@ async def answer_question(
                     "timestamp": str(datetime.utcnow())
                 })
         else:
-            # No more questions - add completion message with solutions
+            # No more questions - add completion message with solutions and optional workflow hint
             completion_item = {
                 "type": "completion",
                 "message": "Requirements understood. Here are the solutions and recommendations:",
                 "recommendations": result.get("recommendations", []),
                 "solutions": result.get("solutions", []),
                 "next_steps": result.get("next_steps", []),
+                "workflow_collaboration_hint": result.get("workflow_collaboration_hint"),
+                "workflow_collaboration_reason": result.get("workflow_collaboration_reason"),
                 "timestamp": str(datetime.utcnow())
             }
             conversation_history.append(completion_item)
@@ -638,8 +653,13 @@ async def update_job(
             files_data = json.loads(job.files)
             documents = [{"path": f["path"], "name": f["name"]} for f in files_data]
             hired = _get_first_hired_agent_for_job(db, job.id)
-            agent_url, agent_key = hired if hired else (None, None)
-            
+            if hired:
+                agent_url, agent_key = hired[0], hired[1]
+                use_a2a = hired[4] if len(hired) > 4 else False
+            else:
+                agent_url = agent_key = None
+                use_a2a = False
+
             analyzer = DocumentAnalyzer()
             result = await analyzer.analyze_documents_and_generate_questions(
                 documents=documents,
@@ -648,6 +668,7 @@ async def update_job(
                 conversation_history=[],
                 agent_api_url=agent_url,
                 agent_api_key=agent_key,
+                use_a2a=use_a2a,
             )
             
             # Add analysis and questions to conversation

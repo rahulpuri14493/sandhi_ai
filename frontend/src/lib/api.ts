@@ -78,7 +78,7 @@ export const agentsAPI = {
   delete(agentId: number) {
     return api.delete('/agents/' + agentId)
   },
-  testConnection(params: { api_endpoint: string; api_key?: string; test_data?: object; llm_model?: string; temperature?: number }) {
+  testConnection(params: { api_endpoint: string; api_key?: string; test_data?: object; llm_model?: string; temperature?: number; a2a_enabled?: boolean }) {
     return api.post('/agents/test-connection', params).then((res) => res.data)
   },
 }

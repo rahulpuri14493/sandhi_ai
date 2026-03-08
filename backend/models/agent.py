@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Integer, String, Float, DateTime, ForeignKey, JSON, Enum
+from sqlalchemy import Column, Integer, String, Float, DateTime, ForeignKey, JSON, Enum, Boolean
 from sqlalchemy.orm import relationship
 import enum
 from datetime import datetime
@@ -37,6 +37,7 @@ class Agent(Base):
     llm_model = Column(String, nullable=True, default=None)  # Model name for OpenAI-compatible endpoints
     temperature = Column(Float, nullable=True, default=None)  # Sampling temperature for OpenAI-compatible endpoints
     plugin_config = Column(JSON)  # For plugin-based agents
+    a2a_enabled = Column(Boolean, default=False, nullable=False)  # Use A2A protocol for invocation when True
     status = Column(Enum(AgentStatus), default=AgentStatus.PENDING)
     created_at = Column(DateTime, default=datetime.utcnow)
 

@@ -17,6 +17,7 @@ export default function NewAgentPage() {
     api_key: '',
     llm_model: 'gpt-4o-mini',
     temperature: 0.7,
+    a2a_enabled: false,
     status: 'pending',
   })
   const [newCapability, setNewCapability] = useState('')
@@ -43,15 +44,13 @@ export default function NewAgentPage() {
     setConnectionValidated(false)
 
     try {
-      const result = await agentsAPI.testConnection(
-        formData.api_endpoint,
-        formData.api_key || undefined,
-        undefined,
-        {
-          llm_model: formData.llm_model,
-          temperature: formData.temperature,
-        }
-      )
+      const result = await agentsAPI.testConnection({
+        api_endpoint: formData.api_endpoint!,
+        api_key: formData.api_key || undefined,
+        llm_model: formData.llm_model,
+        temperature: formData.temperature,
+        a2a_enabled: formData.a2a_enabled ?? false,
+      })
       setConnectionTestResult(result)
       if (result.success) {
         setConnectionValidated(true)
@@ -336,7 +335,7 @@ export default function NewAgentPage() {
               className="w-full px-5 py-4 bg-white border-2 border-gray-300 rounded-xl text-gray-900 placeholder-gray-500 focus:outline-none focus:ring-2 focus:ring-primary-500 focus:border-primary-500 text-lg font-medium"
             />
             <p className="text-sm text-white/50 mt-3 font-medium">
-              Used when calling OpenAI-compatible chat/completions endpoints.
+              Used when calling OpenAI-compatible chat/completions endpoints. The platform calls your URL via its A2A adapter—no extra setup.
             </p>
           </div>
 
@@ -344,6 +343,9 @@ export default function NewAgentPage() {
             <label className="block text-white font-bold mb-3 text-lg" htmlFor="api_endpoint">
               API Endpoint (optional)
             </label>
+            <p className="text-sm text-white/60 mb-2 font-medium">
+              Your endpoint URL. When used in jobs, the platform invokes it over A2A (directly if A2A-compliant, or via the platform’s adapter if OpenAI-compatible).
+            </p>
             <div className="flex gap-3 mb-4">
               <input
                 id="api_endpoint"
@@ -362,6 +364,7 @@ export default function NewAgentPage() {
                 onClick={handleTestConnection}
                 disabled={isTestingConnection || !formData.api_endpoint}
                 className="px-6 py-4 bg-gradient-to-r from-blue-500 to-blue-700 text-white rounded-xl font-bold hover:shadow-2xl hover:shadow-blue-500/50 hover:scale-105 transition-all duration-200 disabled:opacity-50 disabled:cursor-not-allowed disabled:hover:scale-100"
+                title={formData.a2a_enabled ? 'Test uses A2A SendMessage to your endpoint' : 'Test uses A2A via platform adapter (calls your OpenAI-compatible endpoint)'}
               >
                 {isTestingConnection ? (
                   <span className="flex items-center gap-2">
@@ -406,6 +409,23 @@ export default function NewAgentPage() {
             <p className="text-sm text-white/50 mt-3 font-medium">
               The API key will be sent in the Authorization header as: <code className="bg-dark-200/50 px-2 py-1 rounded text-primary-400 font-mono">Bearer YOUR_API_KEY</code>
             </p>
+            <div className="mt-4 flex items-start gap-3">
+              <input
+                id="a2a_enabled"
+                type="checkbox"
+                checked={formData.a2a_enabled ?? false}
+                onChange={(e) => setFormData({ ...formData, a2a_enabled: e.target.checked })}
+                className="mt-1.5 h-5 w-5 rounded border-2 border-gray-300 text-primary-600 focus:ring-primary-500"
+              />
+              <div>
+                <label htmlFor="a2a_enabled" className="text-white font-medium cursor-pointer block">
+                  My endpoint is A2A protocol compliant (JSON-RPC 2.0)
+                </label>
+                <p className="text-sm text-white/60 mt-1 font-medium">
+                  Check this only if your endpoint implements the A2A protocol (JSON-RPC SendMessage). If your endpoint is OpenAI-compatible (e.g. fine-tuned model), leave unchecked — the platform will call it via its internal A2A adapter so the architecture stays A2A. See docs/A2A_DEVELOPERS.md.
+                </p>
+              </div>
+            </div>
             {formData.api_endpoint && !connectionValidated && (
               <p className="text-sm text-yellow-400 mt-3 font-semibold">
                 ⚠️ Please test the connection before saving

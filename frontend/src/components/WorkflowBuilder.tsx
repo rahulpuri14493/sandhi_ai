@@ -30,7 +30,7 @@ export function WorkflowBuilder({ jobId, onWorkflowCreated, initialSelectedAgent
     try {
       const agents = await agentsAPI.list('active')
       if (initialSelectedAgentIds && initialSelectedAgentIds.length > 0) {
-        setAvailableAgents(agents.filter((a) => initialSelectedAgentIds.includes(a.id)))
+        setAvailableAgents(agents.filter((a: Agent) => initialSelectedAgentIds!.includes(a.id)))
       } else {
         setAvailableAgents(agents)
       }
@@ -67,6 +67,16 @@ export function WorkflowBuilder({ jobId, onWorkflowCreated, initialSelectedAgent
 
   return (
     <div className="bg-dark-100/50 backdrop-blur-xl rounded-2xl shadow-2xl p-8 border border-dark-200/50">
+      <div className="mb-6 p-5 bg-primary-500/10 border-2 border-primary-500/30 rounded-xl">
+        <h3 className="font-bold text-primary-400 mb-2 text-base">Workflow mode</h3>
+        <p className="text-sm text-white/70 font-medium mb-2">
+          All agents are called over A2A by the platform. The badge below is about collaboration style, not transport.
+        </p>
+        <p className="text-sm text-white/90 font-medium">
+          <strong>Sequential:</strong> Each agent receives the previous agent’s output (pipeline). Use agents without the A2A badge.
+          <strong className="ml-1"> A2A:</strong> Agents collaborate asynchronously; choose agents with the &quot;A2A&quot; badge when your requirements need peer-to-peer collaboration.
+        </p>
+      </div>
       <div className="mb-8">
         <h2 className="text-4xl font-black text-white tracking-tight mb-6">Build Workflow</h2>
         <div className="flex gap-4 mb-6">
@@ -118,7 +128,14 @@ export function WorkflowBuilder({ jobId, onWorkflowCreated, initialSelectedAgent
                     className="w-5 h-5 text-primary-600 bg-dark-200 border-dark-300 rounded focus:ring-primary-500 focus:ring-2"
                   />
                   <div className="flex-1">
-                    <div className="font-bold text-white text-lg">{agent.name}</div>
+                    <div className="flex items-center gap-2 flex-wrap">
+                      <span className="font-bold text-white text-lg">{agent.name}</span>
+                      {agent.a2a_enabled && (
+                        <span className="px-2 py-0.5 text-xs font-bold bg-primary-500/30 text-primary-300 rounded border border-primary-500/50">
+                          A2A
+                        </span>
+                      )}
+                    </div>
                     <div className="text-sm text-primary-400 font-semibold mt-1">
                       ${agent.price_per_task.toFixed(2)} per task
                     </div>

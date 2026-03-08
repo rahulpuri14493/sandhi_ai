@@ -34,11 +34,24 @@ services:
       - "8000:8000"
     environment:
       DATABASE_URL: postgresql://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@db:5432/${POSTGRES_DB:-agent_marketplace}
+      A2A_ADAPTER_URL: http://a2a-openai-adapter:8080
     env_file:
       - .env
     depends_on:
       db:
         condition: service_healthy
+      a2a-openai-adapter:
+        condition: service_started
+
+  a2a-openai-adapter:
+    build:
+      context: ./tools/a2a_openai_adapter
+      dockerfile: Dockerfile
+    container_name: a2a-openai-adapter
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    # No OPENAI_* env needed: platform sends openai_url/openai_api_key/openai_model per request in metadata
 
   frontend:
     build:

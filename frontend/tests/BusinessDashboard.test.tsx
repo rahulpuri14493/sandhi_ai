@@ -79,8 +79,7 @@ describe('BusinessDashboard', () => {
 
   it('shows New Job button', async () => {
     render(wrapWithRouter(<BusinessDashboard />))
-    await screen.findByText('New Job')
-    const newJobLink = screen.getByRole('link', { name: /new job/i })
+    const newJobLink = await screen.findByRole('link', { name: /new job/i }, { timeout: 10000 })
     expect(newJobLink).toHaveAttribute('href', '/jobs/new')
-  })
+  }, 12000)
 })

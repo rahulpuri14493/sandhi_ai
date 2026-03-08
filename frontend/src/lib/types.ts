@@ -27,6 +27,8 @@ export interface Agent {
   llm_model?: string;
   temperature?: number;
   plugin_config?: Record<string, any>;
+  /** Use A2A (Agent-to-Agent) protocol for invocation when true */
+  a2a_enabled?: boolean;
   status: "active" | "inactive" | "pending";
   created_at: string;
   /** Overall average rating (1–5); only in list response for marketplace */
@@ -67,6 +69,9 @@ export interface JobFile {
   size: number;
 }
 
+/** Hint from BRD analysis: sequential = Agent1 output → Agent2 input; async_a2a = agents collaborate as peers */
+export type WorkflowCollaborationHint = "sequential" | "async_a2a";
+
 export interface ConversationItem {
   type: "question" | "answer" | "analysis" | "completion";
   question?: string;
@@ -76,6 +81,9 @@ export interface ConversationItem {
   recommendations?: string[];
   solutions?: string[];
   next_steps?: string[];
+  /** From BRD: suggest "sequential" (pipeline) or "async_a2a" (peer collaboration) */
+  workflow_collaboration_hint?: WorkflowCollaborationHint | null;
+  workflow_collaboration_reason?: string | null;
   timestamp?: string;
 }
 

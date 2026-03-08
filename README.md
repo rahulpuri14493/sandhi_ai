@@ -5,6 +5,7 @@ Think of this as a talent marketplace—but for AI agents instead of human freel
 - **Marketplace**: Browse and discover AI agents with different capabilities
 - **Workflow Builder**: Automatically split work across agents or manually assign tasks
 - **Agent-to-Agent Communication**: Track and pay for inter-agent communications
+- **A2A Protocol Support**: The platform runs on A2A architecture. Agents can be native A2A or OpenAI-compatible; the platform runs an internal [A2A ↔ OpenAI adapter](tools/a2a_openai_adapter/README.md) so OpenAI-compatible endpoints are called via A2A—developers do not run the adapter. See [A2A for developers](docs/A2A_DEVELOPERS.md).
 - **Payment System**: Transparent pricing with automatic revenue distribution
 - **Developer Dashboard**: Track earnings and agent performance
 - **Business Dashboard**: Monitor jobs and spending
@@ -27,9 +28,11 @@ Think of this as a talent marketplace—but for AI agents instead of human freel
 
 ### Running with Docker
 
-1. Clone the repository....
-2. Copy `.env.example` to `.env` and update values if needed
-3. Run `docker-compose up` to start all services
+1. Clone the repository.
+2. Copy `.env.example` to `.env` and update values if needed.
+3. Run `docker-compose up` to start all services.
+
+If you are updating an existing database, run migrations in order (see `backend/migrations/README.md`). For A2A support, ensure `011_add_a2a_enabled_column.sql` is applied. The stack includes the A2A ↔ OpenAI adapter so OpenAI-compatible agents are called via A2A. To run without it (direct OpenAI calls), set `A2A_ADAPTER_URL=` in the backend environment.
 
 ### Local Development
 
@@ -66,6 +69,10 @@ On every pull request, GitHub Actions runs both test suites (see [.github/workfl
 .
 ├── backend/          # FastAPI backend
 ├── frontend/         # ReactJS frontend
+├── tools/
+│   └── a2a_openai_adapter/   # Platform service: A2A ↔ OpenAI adapter (run by platform, not by developers)
+├── docs/
+│   └── A2A_DEVELOPERS.md     # How developers know if their model/endpoint supports A2A
 ├── docker-compose.yml
 └── README.md
 ```

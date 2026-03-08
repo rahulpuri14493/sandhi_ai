@@ -1,6 +1,6 @@
 import { useState, useEffect } from 'react'
 import { jobsAPI } from '../lib/api'
-import type { ConversationItem } from '../lib/types'
+import type { ConversationItem, WorkflowCollaborationHint } from '../lib/types'
 
 interface DocumentConversationProps {
   jobId: number
@@ -61,10 +61,10 @@ export function DocumentConversation({ jobId, files, initialConversation = [], o
       }
       
       // Check if all questions are answered or completion message exists
-      const hasUnanswered = updatedConversation.some(item => 
+      const hasUnanswered = updatedConversation.some((item: ConversationItem) =>
         item.type === 'question' && (!item.answer || item.answer.trim() === '')
       )
-      const hasCompletion = updatedConversation.some(item => item.type === 'completion')
+      const hasCompletion = updatedConversation.some((item: ConversationItem) => item.type === 'completion')
       
       if (!hasUnanswered || hasCompletion) {
         // All questions answered or completion received
@@ -94,6 +94,10 @@ export function DocumentConversation({ jobId, files, initialConversation = [], o
   const hasQuestions = conversation.some(item => item.type === 'question')
   const hasAnalysis = conversation.some(item => item.type === 'analysis')
   const hasCompletion = conversation.some(item => item.type === 'completion')
+  const completionWithHint = conversation.find(
+    (item): item is ConversationItem & { workflow_collaboration_hint: WorkflowCollaborationHint; workflow_collaboration_reason?: string | null } =>
+      item.type === 'completion' && !!item.workflow_collaboration_hint
+  )
 
   return (
     <div className="bg-dark-100/50 backdrop-blur-xl rounded-2xl shadow-2xl p-8 border border-dark-200/50">
@@ -120,6 +124,33 @@ export function DocumentConversation({ jobId, files, initialConversation = [], o
       {error && (
         <div className="mb-6 p-4 bg-red-500/20 border-2 border-red-500/50 text-red-400 rounded-xl font-semibold">
           {error}
+        </div>
+      )}
+
+      {(hasAnalysis || hasCompletion) && (
+        <div className="mb-6 p-5 bg-primary-500/10 border-2 border-primary-500/30 rounded-xl">
+          <h3 className="font-bold text-primary-400 mb-2 text-base">Understanding workflow modes</h3>
+          <p className="text-sm text-white/70 font-medium mb-2">
+            All agents are invoked over the A2A protocol by the platform (OpenAI-compatible endpoints go through the platform’s adapter).
+          </p>
+          <p className="text-sm text-white/90 font-medium mb-2">
+            <strong>Sequential (Agent 1 → Agent 2):</strong> One agent’s output is the next agent’s input. Use agents without the A2A badge. Best for pipelines and step-by-step tasks.
+          </p>
+          <p className="text-sm text-white/90 font-medium">
+            <strong>A2A (async, peer collaboration):</strong> Agents work asynchronously and communicate as peers. Use agents with the &quot;A2A&quot; badge when your requirements need peer-to-peer collaboration instead of a simple handoff.
+          </p>
+          {completionWithHint && completionWithHint.workflow_collaboration_reason && (
+            <div className="mt-4 pt-4 border-t border-primary-500/30">
+              <p className="text-sm font-semibold text-white">
+                Based on your requirements: {completionWithHint.workflow_collaboration_reason}
+              </p>
+              <p className="text-sm text-primary-300 mt-1">
+                {completionWithHint.workflow_collaboration_hint === 'async_a2a'
+                  ? 'Consider selecting A2A-enabled agents when you build the workflow.'
+                  : 'Standard (sequential) agents are suitable for this workflow.'}
+              </p>
+            </div>
+          )}
         </div>
       )}
 

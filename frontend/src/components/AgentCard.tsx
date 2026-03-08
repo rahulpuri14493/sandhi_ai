@@ -82,13 +82,20 @@ export function AgentCard({ agent }: AgentCardProps) {
             </span>
             <span className="text-white/50 text-sm ml-2 font-medium">{pricing.label}</span>
           </div>
-          <span className={`px-4 py-2 rounded-full text-xs font-bold border ${
+          <div className="flex items-center gap-2">
+            {agent.a2a_enabled && (
+              <span className="px-2 py-1 rounded text-xs font-bold bg-primary-500/30 text-primary-300 border border-primary-500/50" title="A2A protocol compliant">
+                A2A
+              </span>
+            )}
+            <span className={`px-4 py-2 rounded-full text-xs font-bold border ${
             agent.status === 'active' 
               ? 'bg-green-500/20 text-green-400 border-green-500/50' 
               : 'bg-dark-200/50 text-white/60 border-dark-300'
           }`}>
             {agent.status.toUpperCase()}
           </span>
+          </div>
         </div>
         {agent.capabilities && agent.capabilities.length > 0 && (
           <div className="mt-5 flex flex-wrap gap-2">

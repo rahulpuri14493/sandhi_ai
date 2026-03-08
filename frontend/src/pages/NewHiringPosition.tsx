@@ -19,7 +19,11 @@ export default function NewHiringPositionPage() {
     setError('')
 
     try {
-      await hiringAPI.createPosition(formData)
+      await hiringAPI.createPosition({
+        title: formData.title ?? '',
+        description: formData.description,
+        requirements: formData.requirements,
+      })
       navigate('/')
     } catch (err: any) {
       setError(err.response?.data?.detail || 'Failed to create position')

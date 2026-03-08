@@ -78,6 +78,7 @@ def get_developer_agents(
             api_endpoint=agent.api_endpoint,
             api_key=agent.api_key,  # Include api_key for own agents
             plugin_config=agent.plugin_config,
+            a2a_enabled=getattr(agent, "a2a_enabled", False),
             status=agent.status,
             created_at=agent.created_at,
         ))

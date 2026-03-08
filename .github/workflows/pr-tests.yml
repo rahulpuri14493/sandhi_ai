@@ -84,6 +84,9 @@ jobs:
       - name: Run pytest
         run: pytest -v
 
+      - name: Run integration tests
+        run: pytest tests/integration/ -v
+
   frontend-tests:
     name: Frontend tests
     runs-on: ubuntu-latest
@@ -106,5 +109,10 @@ jobs:
 
       - name: Run tests
         run: npm run test -- --run
+        env:
+          CI: true
+
+      - name: Run integration tests
+        run: npm run test -- --run tests/integration
         env:
           CI: true
