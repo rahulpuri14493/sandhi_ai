@@ -2,9 +2,8 @@
 
 BRD files are expected in uploads/jobs (project root) or backend/uploads/jobs.
 When running tests in Docker, mount project uploads so the backend sees them:
-  docker compose run --rm --no-deps -v ./uploads:/app/uploads backend pytest tests/test_job_flow_brd.py -v
+  docker compose run --rm --no-deps -v ./uploads:/app/uploads backend pytest tests/integration/test_job_flow_brd.py -v
 """
-import json
 import uuid
 from pathlib import Path
 
@@ -18,7 +17,8 @@ from core.security import get_password_hash, create_access_token
 
 
 # Possible locations for BRD docs: backend root (e.g. /app/uploads/jobs in Docker) or project root uploads/jobs.
-_BACKEND_ROOT = Path(__file__).resolve().parent.parent
+# __file__ is tests/integration/test_job_flow_brd.py -> parent.parent.parent = backend
+_BACKEND_ROOT = Path(__file__).resolve().parent.parent.parent
 _PROJECT_ROOT = _BACKEND_ROOT.parent
 _CANDIDATE_UPLOADS = [
     _BACKEND_ROOT / "uploads" / "jobs",
