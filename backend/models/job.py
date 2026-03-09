@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Integer, String, Float, DateTime, ForeignKey, Enum, Text
+from sqlalchemy import Column, Integer, String, Float, DateTime, ForeignKey, Enum, Text, Boolean
 from sqlalchemy.orm import relationship
 import enum
 from datetime import datetime
@@ -46,6 +46,7 @@ class WorkflowStep(Base):
     input_data = Column(Text)  # JSON string
     output_data = Column(Text)  # JSON string
     status = Column(String, default="pending")  # pending, in_progress, completed, failed
+    depends_on_previous = Column(Boolean, default=True, nullable=False)  # False = independent (no previous output)
     cost = Column(Float, default=0.0)
     started_at = Column(DateTime, nullable=True)
     completed_at = Column(DateTime, nullable=True)

@@ -7,39 +7,20 @@ interface DocumentConversationProps {
   files?: Array<{ id: string; name: string }>
   initialConversation?: ConversationItem[]
   onConversationUpdate?: (conversation: ConversationItem[]) => void
+  /** When present (workflow already built), show "Generate clarification questions from workflow & BRD" */
+  workflowSteps?: Array<{ step_order: number; agent_name?: string }>
 }
 
-export function DocumentConversation({ jobId, files, initialConversation = [], onConversationUpdate }: DocumentConversationProps) {
+export function DocumentConversation({ jobId, files, initialConversation = [], onConversationUpdate, workflowSteps }: DocumentConversationProps) {
   const [conversation, setConversation] = useState<ConversationItem[]>(initialConversation)
   const [currentAnswer, setCurrentAnswer] = useState('')
-  const [isAnalyzing, setIsAnalyzing] = useState(false)
   const [isSubmitting, setIsSubmitting] = useState(false)
+  const [isGeneratingWorkflowQuestions, setIsGeneratingWorkflowQuestions] = useState(false)
   const [error, setError] = useState('')
 
   useEffect(() => {
     setConversation(initialConversation)
   }, [initialConversation])
-
-  const handleAnalyze = async () => {
-    if (!files || files.length === 0) {
-      setError('No documents uploaded')
-      return
-    }
-
-    setIsAnalyzing(true)
-    setError('')
-    try {
-      const result = await jobsAPI.analyzeDocuments(jobId)
-      setConversation(result.conversation || [])
-      if (onConversationUpdate) {
-        onConversationUpdate(result.conversation || [])
-      }
-    } catch (err: any) {
-      setError(err.response?.data?.detail || 'Failed to analyze documents')
-    } finally {
-      setIsAnalyzing(false)
-    }
-  }
 
   const handleSubmitAnswer = async () => {
     if (!currentAnswer.trim()) {
@@ -82,12 +63,35 @@ export function DocumentConversation({ jobId, files, initialConversation = [], o
     }
   }
 
+  const handleGenerateWorkflowQuestions = async () => {
+    setIsGeneratingWorkflowQuestions(true)
+    setError('')
+    try {
+      const result = await jobsAPI.generateWorkflowQuestions(jobId)
+      const updated = result.conversation || []
+      setConversation(updated)
+      if (onConversationUpdate) onConversationUpdate(updated)
+    } catch (err: any) {
+      setError(err.response?.data?.detail || 'Failed to generate workflow questions')
+    } finally {
+      setIsGeneratingWorkflowQuestions(false)
+    }
+  }
+
   const getUnansweredQuestion = (): ConversationItem | null => {
-    // Find questions that don't have an answer (checking for null, undefined, or empty string)
-    return conversation.find(item => 
-      item.type === 'question' && 
-      (!item.answer || item.answer.trim() === '')
-    ) || null
+    // Question texts we've already seen answered (so we skip duplicate question items)
+    const answeredTexts = new Set(
+      conversation
+        .filter(item => item.type === 'question' && item.answer && String(item.answer).trim())
+        .map(item => String(item.question || '').trim())
+    )
+    // First unanswered question whose text we haven't already answered elsewhere
+    return conversation.find(item => {
+      if (item.type !== 'question' || !item.question) return false
+      if (item.answer && String(item.answer).trim()) return false
+      const text = String(item.question).trim()
+      return !answeredTexts.has(text)
+    }) as ConversationItem | null || null
   }
 
   const unansweredQuestion = getUnansweredQuestion()
@@ -101,21 +105,26 @@ export function DocumentConversation({ jobId, files, initialConversation = [], o
 
   return (
     <div className="bg-dark-100/50 backdrop-blur-xl rounded-2xl shadow-2xl p-8 border border-dark-200/50">
-      <div className="flex justify-between items-center mb-6">
+      <div className="mb-4">
         <h2 className="text-4xl font-black text-white tracking-tight">Document Analysis & Q&A</h2>
-        {!hasAnalysis && files && files.length > 0 && (
+        <p className="mt-2 text-sm text-white/70 font-medium">
+          Order: Use <strong className="text-white/90">Analyze Documents</strong> on the Job screen (above) (optional) → <strong className="text-white/90">Build Workflow</strong> → then use the button below to <strong className="text-white/90">Generate clarification questions</strong> (optional) → answer questions below → Preview Cost → Execute.
+        </p>
+      </div>
+      <div className="flex flex-wrap items-center gap-3 mb-6">
+        {workflowSteps && workflowSteps.length > 0 && (
           <button
-            onClick={handleAnalyze}
-            disabled={isAnalyzing}
-            className="px-6 py-3 bg-gradient-to-r from-blue-500 to-blue-700 text-white rounded-xl font-bold hover:shadow-2xl hover:shadow-blue-500/50 hover:scale-105 transition-all duration-200 disabled:opacity-50 disabled:cursor-not-allowed disabled:hover:scale-100"
+            onClick={handleGenerateWorkflowQuestions}
+            disabled={isGeneratingWorkflowQuestions}
+            className="px-6 py-3 bg-gradient-to-r from-primary-500 to-primary-700 text-white rounded-xl font-bold hover:shadow-2xl hover:shadow-primary-500/50 hover:scale-105 transition-all duration-200 disabled:opacity-50 disabled:cursor-not-allowed disabled:hover:scale-100"
           >
-            {isAnalyzing ? (
+            {isGeneratingWorkflowQuestions ? (
               <span className="flex items-center gap-2">
                 <div className="animate-spin rounded-full h-4 w-4 border-2 border-white border-t-transparent"></div>
-                Analyzing...
+                Generating...
               </span>
             ) : (
-              'Analyze Documents'
+              'Generate clarification questions (workflow + BRD) (optional)'
             )}
           </button>
         )}
@@ -157,9 +166,11 @@ export function DocumentConversation({ jobId, files, initialConversation = [], o
       {conversation.length === 0 && !hasAnalysis && (
         <div className="text-center py-12">
           {files && files.length > 0 ? (
-            <p className="text-white/60 text-lg font-medium">Click "Analyze Documents" to have AI Assistant review your documents and ask clarifying questions.</p>
+            <p className="text-white/60 text-lg font-medium">
+              Use <strong className="text-white/80">Analyze Documents</strong> on the Job screen (above) to have the AI review your BRD. After building a workflow, click <strong className="text-white/80">Generate clarification questions</strong> above to get questions based on the workflow and BRD. Answer any questions here, then go to Preview Cost → Execute.
+            </p>
           ) : (
-            <p className="text-white/60 text-lg font-medium">Upload documents to enable document analysis and Q&A.</p>
+            <p className="text-white/60 text-lg font-medium">Upload documents on the Job screen, then follow the order above.</p>
           )}
         </div>
       )}

@@ -25,48 +25,61 @@ async def split_job_for_agents(
     if not url:
         return _fallback_tasks(agents, job_title, job_description, documents_content)
 
-    # Build context for the splitter
+    # Build context for the splitter (BRD = documents; use larger excerpt so division is based on full requirements)
     agents_desc = "\n".join(
         f"- Agent {i} ({a.name}): {a.description or 'No description'}"
         for i, a in enumerate(agents)
     )
     docs_text = ""
     if documents_content:
+        # Include more BRD content so work division is driven by requirements (up to ~5000 chars per doc)
         docs_text = "\n\n".join(
-            f"Document: {d.get('name', 'Unknown')}\n{d.get('content', '')[:2000]}"
+            f"Document: {d.get('name', 'Unknown')}\n{d.get('content', '')[:5000]}"
             for d in documents_content
         )
     conv_text = ""
     if conversation_data:
-        conv_text = json.dumps(conversation_data, indent=2)[:1500]
+        # Q&A from analyze-documents (BRD-driven); use for refining how work is divided
+        conv_text = json.dumps(conversation_data, indent=2)[:3000]
 
-    system_prompt = """You are a task planner for a multi-agent platform. Your job is to split a single job into N distinct subtasks, one per agent.
+    system_prompt = """You are a task planner for a multi-agent platform. Your job is to divide work among N agents.
+
+WORK DIVISION MUST BE DRIVEN BY:
+1. The BRD (Business Requirements Documents) – requirements, scope, and criteria from the uploaded documents.
+2. The job prompt – job title and description provided by the user.
+3. The Q&A conversation (when present) – questions asked by the AI based on the BRD and the user's answers. Use these to refine requirements before splitting.
 
 RULES:
 - Return ONLY valid JSON. No markdown, no explanation.
 - Format: [{"agent_index": 0, "task": "..."}, {"agent_index": 1, "task": "..."}, ...]
 - agent_index must be 0-based (0, 1, 2, ...) for each of the N agents.
+- Derive each subtask directly from the BRD and the job prompt. Each task must reference the specific requirement or scope it fulfils.
 - Each task must be SELF-CONTAINED and SCOPE-BOUND: each agent does ONLY its part, nothing else.
 - CRITICAL: Each task must explicitly state what the agent must NOT do (e.g. "Do NOT perform subtraction" for an addition-only agent).
 - For sequential workflows: Agent 0 does the first step; Agent 1 receives "the result from the previous agent" and does the next step; etc.
 - Each task must say "Return ONLY [specific output]" so the agent does not over-execute.
-- Split the work fairly; each agent gets one clear, bounded subtask."""
+- Split the work fairly; each agent gets one clear, bounded subtask based on the BRD and prompt."""
 
-    user_content = f"""JOB TITLE: {job_title}
+    user_content = f"""JOB TITLE (user prompt): {job_title}
 
-JOB DESCRIPTION:
-{job_description or '(none)'}
+JOB DESCRIPTION (user prompt): {job_description or '(none)'}
 
 AGENTS (each will perform one subtask):
 {agents_desc}
 
 """
     if docs_text:
-        user_content += f"DOCUMENTS (excerpt):\n{docs_text}\n\n"
-    if conv_text:
-        user_content += f"Q&A CONTEXT:\n{conv_text}\n\n"
+        user_content += f"""BRD / REQUIREMENT DOCUMENTS (use these to divide work; requirements here drive the split):
+{docs_text}
 
-    user_content += f"""Split this job into {len(agents)} subtasks. Return JSON array with agent_index and task for each agent."""
+"""
+    if conv_text:
+        user_content += f"""Q&A FROM BRD (questions asked by AI based on documents; user answers – use to refine requirements when splitting):
+{conv_text}
+
+"""
+
+    user_content += f"""Using the BRD, job prompt, and Q&A above, split this job into {len(agents)} subtasks. Return JSON array with agent_index and task for each agent."""
 
     model = (getattr(splitter_agent, "llm_model", None) or "").strip() or "gpt-4o-mini"
     temperature = (

@@ -160,7 +160,8 @@ def get_business_jobs(
                 status=step.status,
                 cost=step.cost or 0.0,
                 started_at=step.started_at,
-                completed_at=step.completed_at
+                completed_at=step.completed_at,
+                depends_on_previous=getattr(step, "depends_on_previous", True),
             ))
         
         job_dict = {

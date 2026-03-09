@@ -114,6 +114,8 @@ export interface WorkflowStep {
   cost: number;
   started_at?: string;
   completed_at?: string;
+  /** When false, step does not receive previous agent output (independent workflow). */
+  depends_on_previous?: boolean;
 }
 
 export interface WorkflowPreview {

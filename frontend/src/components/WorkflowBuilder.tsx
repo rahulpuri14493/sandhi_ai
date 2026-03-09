@@ -8,10 +8,13 @@ interface WorkflowBuilderProps {
   initialSelectedAgentIds?: number[]
 }
 
+export type WorkflowCollaborationMode = 'from_brd' | 'independent' | 'sequential'
+
 export function WorkflowBuilder({ jobId, onWorkflowCreated, initialSelectedAgentIds }: WorkflowBuilderProps) {
   const [selectedAgents, setSelectedAgents] = useState<number[]>(initialSelectedAgentIds ?? [])
   const [availableAgents, setAvailableAgents] = useState<Agent[]>([])
   const [mode, setMode] = useState<'auto' | 'manual'>('auto')
+  const [workflowCollaboration, setWorkflowCollaboration] = useState<WorkflowCollaborationMode>('from_brd')
   const [isLoading, setIsLoading] = useState(false)
   const [error, setError] = useState('')
 
@@ -48,7 +51,13 @@ export function WorkflowBuilder({ jobId, onWorkflowCreated, initialSelectedAgent
     setIsLoading(true)
     setError('')
     try {
-      await jobsAPI.autoSplitWorkflow(jobId, selectedAgents)
+      const workflowMode =
+        workflowCollaboration === 'from_brd'
+          ? undefined
+          : workflowCollaboration === 'independent'
+            ? 'independent'
+            : 'sequential'
+      await jobsAPI.autoSplitWorkflow(jobId, selectedAgents, workflowMode)
       onWorkflowCreated()
     } catch (err: any) {
       setError(err.response?.data?.detail || 'Failed to create workflow')
@@ -75,6 +84,12 @@ export function WorkflowBuilder({ jobId, onWorkflowCreated, initialSelectedAgent
         <p className="text-sm text-white/90 font-medium">
           <strong>Sequential:</strong> Each agent receives the previous agent’s output (pipeline). Use agents without the A2A badge.
           <strong className="ml-1"> A2A:</strong> Agents collaborate asynchronously; choose agents with the &quot;A2A&quot; badge when your requirements need peer-to-peer collaboration.
+        </p>
+      </div>
+      <div className="mb-6 p-5 bg-emerald-500/10 border-2 border-emerald-500/30 rounded-xl">
+        <h3 className="font-bold text-emerald-400 mb-2 text-base">BRD &amp; Q&A → Auto-Split</h3>
+        <p className="text-sm text-white/90 font-medium">
+          Work is divided among agents based on your <strong>job prompt</strong> and <strong>BRD documents</strong>. Run <strong>Analyze Documents</strong> first so the AI can ask questions from your BRD; your answers are then used when splitting work. Each agent receives only its assigned subtask derived from the BRD and prompt.
         </p>
       </div>
       <div className="mb-8">
@@ -112,6 +127,23 @@ export function WorkflowBuilder({ jobId, onWorkflowCreated, initialSelectedAgent
       {mode === 'auto' && (
         <div>
           <h3 className="font-black text-white mb-5 text-xl">Select Agents for Auto-Split</h3>
+          <div className="mb-6">
+            <label className="block text-sm font-bold text-white/90 mb-2">Agents work</label>
+            <select
+              value={workflowCollaboration}
+              onChange={(e) => setWorkflowCollaboration(e.target.value as WorkflowCollaborationMode)}
+              className="px-4 py-2.5 bg-dark-200/80 border-2 border-dark-300 rounded-xl text-white font-medium focus:ring-2 focus:ring-primary-500 focus:border-primary-500"
+            >
+              <option value="from_brd">From BRD / document (default)</option>
+              <option value="independent">Independently (each agent gets only its task)</option>
+              <option value="sequential">Sequentially (each agent receives previous agent output)</option>
+            </select>
+            <p className="text-xs text-white/50 mt-1.5">
+              {workflowCollaboration === 'independent' && 'Best when tasks are separate (e.g. 2+5 and 9-1).'}
+              {workflowCollaboration === 'sequential' && 'Best when agent 2 needs agent 1’s result (pipeline).'}
+              {workflowCollaboration === 'from_brd' && 'Uses analyze-documents hint from your BRD when available.'}
+            </p>
+          </div>
           <div className="space-y-3 max-h-80 overflow-y-auto border-2 border-dark-300 rounded-xl p-5 mb-6 bg-dark-200/30">
             {availableAgents.length === 0 ? (
               <p className="text-white/50 text-center py-8 font-medium">No agents available</p>

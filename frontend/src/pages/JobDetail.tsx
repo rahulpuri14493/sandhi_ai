@@ -17,6 +17,7 @@ export default function JobDetailPage() {
   const [job, setJob] = useState<Job | null>(null)
   const [workflowPreview, setWorkflowPreview] = useState<WorkflowPreview | null>(null)
   const [isLoading, setIsLoading] = useState(true)
+  const [isAnalyzingDocuments, setIsAnalyzingDocuments] = useState(false)
   const [mode, setMode] = useState<'workflow' | 'preview' | 'status' | 'qa'>('workflow')
 
   useEffect(() => {
@@ -85,6 +86,21 @@ export default function JobDetailPage() {
       setMode('status')
     } catch (error) {
       console.error('Failed to execute job:', error)
+    }
+  }
+
+  const handleAnalyzeDocuments = async () => {
+    if (!job?.files?.length) return
+    setIsAnalyzingDocuments(true)
+    try {
+      const result = await jobsAPI.analyzeDocuments(jobId)
+      await loadJob()
+      if (result.conversation?.length) setMode('qa')
+    } catch (error) {
+      console.error('Failed to analyze documents:', error)
+      alert((error as any)?.response?.data?.detail || 'Failed to analyze documents')
+    } finally {
+      setIsAnalyzingDocuments(false)
     }
   }
 
@@ -221,12 +237,35 @@ export default function JobDetailPage() {
           </div>
           {job.files && job.files.length > 0 && (
             <div className="mt-8 pt-8 border-t border-dark-200/50">
-              <h3 className="text-2xl font-black text-white mb-6 flex items-center gap-3">
-                <svg className="w-6 h-6 text-primary-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
-                </svg>
-                Uploaded Documents
-              </h3>
+              <div className="flex flex-wrap items-center justify-between gap-4 mb-6">
+                <h3 className="text-2xl font-black text-white flex items-center gap-3">
+                  <svg className="w-6 h-6 text-primary-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
+                  </svg>
+                  Uploaded Documents
+                </h3>
+                {job.status === 'draft' && (
+                  <button
+                    onClick={handleAnalyzeDocuments}
+                    disabled={isAnalyzingDocuments}
+                    className="px-6 py-3 bg-gradient-to-r from-blue-500 to-blue-700 text-white rounded-xl font-bold hover:shadow-2xl hover:shadow-blue-500/50 hover:scale-105 transition-all duration-200 disabled:opacity-50 disabled:cursor-not-allowed disabled:hover:scale-100 flex items-center gap-2"
+                  >
+                    {isAnalyzingDocuments ? (
+                      <>
+                        <div className="animate-spin rounded-full h-4 w-4 border-2 border-white border-t-transparent" />
+                        Analyzing...
+                      </>
+                    ) : (
+                      <>
+                        <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2m-6 9l2 2 4-4" />
+                        </svg>
+                        Analyze Documents (optional)
+                      </>
+                    )}
+                  </button>
+                )}
+              </div>
               <div className="grid gap-4">
                 {job.files.map((file) => (
                   <div
@@ -331,11 +370,9 @@ export default function JobDetailPage() {
             files={job.files}
             initialConversation={job.conversation || []}
             onConversationUpdate={(conversation) => {
-              // Update job state with new conversation
-              if (job) {
-                setJob({ ...job, conversation })
-              }
+              if (job) setJob({ ...job, conversation })
             }}
+            workflowSteps={job.workflow_steps}
           />
         )}
 

@@ -130,11 +130,20 @@ export const jobsAPI = {
   analyzeDocuments(jobId: number) {
     return api.post('/jobs/' + jobId + '/analyze-documents').then((res) => res.data)
   },
-  answerQuestion(jobId: number, question: string) {
-    return api.post('/jobs/' + jobId + '/answer-question', { question }).then((res) => res.data)
+  answerQuestion(jobId: number, answer: string) {
+    return api.post('/jobs/' + jobId + '/answer-question', { answer }).then((res) => res.data)
   },
-  autoSplitWorkflow(jobId: number, agentIds: number[]) {
-    return api.post('/jobs/' + jobId + '/workflow/auto-split', { agent_ids: agentIds }).then((res) => res.data)
+  generateWorkflowQuestions(jobId: number) {
+    return api.post('/jobs/' + jobId + '/generate-workflow-questions').then((res) => res.data)
+  },
+  autoSplitWorkflow(
+    jobId: number,
+    agentIds: number[],
+    workflowMode?: 'independent' | 'sequential'
+  ) {
+    const body: { agent_ids: number[]; workflow_mode?: string } = { agent_ids: agentIds }
+    if (workflowMode) body.workflow_mode = workflowMode
+    return api.post('/jobs/' + jobId + '/workflow/auto-split', body).then((res) => res.data)
   },
 }
 export const dashboardsAPI = {

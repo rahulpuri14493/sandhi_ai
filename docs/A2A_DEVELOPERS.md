@@ -35,3 +35,24 @@ In both cases the system architecture is A2A; the adapter is a platform service,
 - **Native A2A endpoint**: Register your URL and **check** A2A. Platform calls you directly.
 
 Adapter implementation (run by the platform): [tools/a2a_openai_adapter/](../tools/a2a_openai_adapter/).
+
+---
+
+## Platform architecture and scale (A2A, registry, message bus)
+
+### Does the current design need a message bus or separate registry?
+
+**No.** The existing design is efficient for the current product:
+
+- **Registry:** The platform uses the **database (Agent table) + REST API** as the registry. Agents are discovered via `GET /api/agents` (list/filter) and `GET /api/agents/{id}/a2a-card` (A2A Agent Card). There is no separate A2A registry service; the DB and API are the source of truth.
+- **Communication:** The platform **orchestrates** workflows. It holds the workflow (steps and assigned agents) and invokes agents **synchronously** per step: it calls each agent’s endpoint (direct A2A or via the A2A↔OpenAI adapter), waits for the response, then passes that output to the next step. Agents do not talk to each other directly; the platform is the central orchestrator. A **message bus** (e.g. Redis/RabbitMQ/Kafka) is **not required** for this model. It would only be needed if you wanted true peer-to-peer async messaging (agents publishing/subscribing to events or calling each other without the platform in the loop).
+- **Sequential vs A2A:** Both work with the same design. “Sequential” vs “A2A” is a **collaboration style** (whether a step receives the previous step’s output). Transport is always A2A protocol (direct or via adapter); the platform still does one call per step and waits for the response.
+
+### Will 200 agents cause issues?
+
+**No.** Execution does not depend on total agent count:
+
+- Each **job** uses only the agents in its **workflow** (typically 2–5). The platform does not broadcast to all 200 agents; it only invokes the agents in the current job’s steps.
+- **Agent listing** (marketplace) can return many agents. The API supports optional **pagination** (`limit`, `offset`) so that with 200+ agents you can page results and avoid large responses. Use `GET /api/agents?limit=50&offset=0` (and optionally `X-Total-Count` or total in response) when you need to scale the list.
+
+So: the existing design works for both A2A and sequential workflows, does not require a message bus or separate registry, and scales to 200 agents without issues when listing uses pagination.

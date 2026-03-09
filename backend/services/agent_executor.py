@@ -58,9 +58,10 @@ class AgentExecutor:
                     raise ValueError(f"Agent {step.agent_id} not found")
                 
                 # Prepare input data
-                # If there's previous output, merge it with the step's base input data
-                # Otherwise, use the step's input data (which includes job context and conversation)
-                if previous_output:
+                # Independent steps (depends_on_previous=False) do not receive previous agent output.
+                # Sequential steps receive previous_step_output for handoff.
+                depends_on_previous = getattr(step, "depends_on_previous", True)
+                if previous_output and depends_on_previous:
                     # Merge previous output with base input data from step
                     base_input = json.loads(step.input_data) if step.input_data else {}
                     input_data = {
@@ -68,7 +69,7 @@ class AgentExecutor:
                         "previous_step_output": previous_output  # Output from previous agent
                     }
                 else:
-                    # First step - use step's input data (includes job context, conversation, and documents)
+                    # First step or independent step - use step's input data only (no previous output)
                     input_data = json.loads(step.input_data) if step.input_data else {}
                 
                 # Uploaded documents are requirement documents: agent must understand them, ask questions if any, else execute and answer.
@@ -224,6 +225,8 @@ class AgentExecutor:
         """
         Execute OpenAI-compatible agent via platform A2A adapter. Adapter receives A2A
         and forwards to agent.api_endpoint with OpenAI payload; returns A2A response.
+        Sends formatted OpenAI-style messages so the model gets a proper prompt and
+        returns the actual answer instead of echoing the context.
         """
         url = (agent.api_endpoint or "").strip()
         if not url:
@@ -234,6 +237,9 @@ class AgentExecutor:
         api_key = (agent.api_key or "").strip() or None
         model = (getattr(agent, "llm_model", None) or "").strip() or "gpt-4o-mini"
         print(f"[DEBUG] Executing agent '{agent.name}' via A2A adapter -> {url}")
+        # Build the same formatted messages we use for direct OpenAI API so the model
+        # gets system + user messages and returns a real answer, not the context echo.
+        payload = self._format_for_openai(agent, input_data)
         result = await execute_via_a2a(
             adapter_url,
             input_data,
@@ -244,6 +250,7 @@ class AgentExecutor:
                 "openai_url": url,
                 "openai_api_key": api_key or "",
                 "openai_model": model,
+                "openai_messages": payload.get("messages", []),
             },
         )
         return result

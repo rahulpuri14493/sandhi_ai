@@ -1,6 +1,7 @@
 from datetime import datetime
-from fastapi import APIRouter, Depends, HTTPException, status, Query
+from fastapi import APIRouter, Depends, HTTPException, status, Query, Response
 from sqlalchemy.orm import Session
+from sqlalchemy import func
 from typing import List, Optional
 from pydantic import BaseModel
 import httpx
@@ -33,24 +34,31 @@ class TestConnectionRequest(BaseModel):
 
 @router.get("", response_model=List[AgentResponse])
 def list_agents(
+    response: Response,
     status: Optional[AgentStatus] = Query(None, description="Filter by status"),
     capability: Optional[str] = Query(None, description="Filter by capability"),
+    limit: Optional[int] = Query(None, ge=1, le=500, description="Max agents to return (pagination); omit for all"),
+    offset: int = Query(0, ge=0, description="Pagination offset"),
     db: Session = Depends(get_db)
 ):
+    """List agents (marketplace). Optional limit/offset for scale (e.g. 200+ agents). X-Total-Count header set with total matching count."""
     query = db.query(Agent)
-    
+
     if status:
         query = query.filter(Agent.status == status)
     else:
         query = query.filter(Agent.status == AgentStatus.ACTIVE)
-    
+
     if capability:
         query = query.filter(Agent.capabilities.contains([capability]))
-    
+
+    total = query.count()
+    if limit is not None:
+        query = query.offset(offset).limit(limit)
     agents = query.all()
     agent_ids = [a.id for a in agents]
+
     # Batch load review counts and averages per agent
-    from sqlalchemy import func
     review_stats = (
         db.query(
             AgentReview.agent_id,
@@ -95,6 +103,7 @@ def list_agents(
             "review_count": count if count else None,
         }
         result.append(AgentResponse(**agent_data))
+    response.headers["X-Total-Count"] = str(total)
     return result
 
 
@@ -433,17 +442,25 @@ def delete_agent(
     # Delete related workflow steps first (to avoid foreign key constraint issues)
     from models.job import WorkflowStep
     from models.communication import AgentCommunication
-    
+    from models.transaction import Earnings
+
     # Get all workflow steps that use this agent
     workflow_steps = db.query(WorkflowStep).filter(WorkflowStep.agent_id == agent_id).all()
-    
+    step_ids = [s.id for s in workflow_steps]
+
+    # Unlink earnings from these steps so we can delete the steps
+    if step_ids:
+        db.query(Earnings).filter(Earnings.workflow_step_id.in_(step_ids)).update(
+            {Earnings.workflow_step_id: None}, synchronize_session=False
+        )
+
     # Delete communications related to these workflow steps
     for step in workflow_steps:
         db.query(AgentCommunication).filter(
             (AgentCommunication.from_workflow_step_id == step.id) |
             (AgentCommunication.to_workflow_step_id == step.id)
         ).delete(synchronize_session=False)
-    
+
     # Delete the workflow steps
     db.query(WorkflowStep).filter(WorkflowStep.agent_id == agent_id).delete(synchronize_session=False)
     

@@ -118,6 +118,7 @@ async def a2a_endpoint(request: Request):
 
     metadata = params.get("metadata") or {}
     openai_url, openai_api_key, openai_model = _resolve_target(metadata)
+    openai_messages = metadata.get("openai_messages")
 
     if not openai_url:
         return JSONResponse(
@@ -139,9 +140,16 @@ async def a2a_endpoint(request: Request):
     elif openai_api_key:
         headers["Authorization"] = f"Bearer {openai_api_key}"
 
+    # Use pre-formatted messages from platform when present so the model gets
+    # system + user structure and returns the actual answer instead of echoing context.
+    if isinstance(openai_messages, list) and len(openai_messages) > 0:
+        messages = openai_messages
+    else:
+        messages = [{"role": "user", "content": user_text}]
+
     payload = {
         "model": openai_model,
-        "messages": [{"role": "user", "content": user_text}],
+        "messages": messages,
         "temperature": 0.7,
     }
 
