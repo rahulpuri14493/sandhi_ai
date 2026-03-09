@@ -18,12 +18,18 @@ Configure via environment (optional when platform sends metadata):
   OPENAI_MODEL          - default model name
   ADAPTER_PORT          - default 8080
 """
+import ipaddress
+import logging
 import os
+import socket
 from typing import Any, Dict, List
+from urllib.parse import urlparse
 
 import httpx
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
+
+logger = logging.getLogger(__name__)
 
 app = FastAPI(
     title="A2A ↔ OpenAI Adapter",
@@ -66,6 +72,52 @@ def health():
     return {"status": "ok", "openai_configured": bool(OPENAI_URL_DEFAULT)}
 
 
+def _validate_openai_url(url: str) -> str:
+    """
+    Basic SSRF mitigation: ensure URL has http/https scheme and does not resolve to
+    a private, loopback, or link-local address.
+    """
+    url = (url or "").strip()
+    if not url:
+        raise ValueError("Missing OpenAI URL.")
+
+    parsed = urlparse(url)
+    if not parsed.scheme or not parsed.netloc:
+        raise ValueError("Invalid OpenAI URL.")
+
+    if parsed.scheme not in ("http", "https"):
+        raise ValueError("OpenAI URL must use http or https.")
+
+    hostname = parsed.hostname
+    if not hostname:
+        raise ValueError("Invalid OpenAI URL hostname.")
+
+    try:
+        addrinfo = socket.getaddrinfo(hostname, None)
+    except socket.gaierror:
+        raise ValueError("Unable to resolve OpenAI URL hostname.")
+
+    for family, _, _, _, sockaddr in addrinfo:
+        ip_str = None
+        if family == socket.AF_INET:
+            ip_str = sockaddr[0]
+        elif family == socket.AF_INET6:
+            ip_str = sockaddr[0]
+        if ip_str is None:
+            continue
+        ip_obj = ipaddress.ip_address(ip_str)
+        if (
+            ip_obj.is_private
+            or ip_obj.is_loopback
+            or ip_obj.is_link_local
+            or ip_obj.is_reserved
+            or ip_obj.is_multicast
+        ):
+            raise ValueError("OpenAI URL points to a disallowed IP address.")
+
+    return url
+
+
 def _resolve_target(metadata: Dict[str, Any]) -> tuple:
     """Return (url, api_key, model) for upstream OpenAI call. Per-request metadata overrides env."""
     url = (metadata.get("openai_url") or "").strip() or OPENAI_URL_DEFAULT
@@ -83,13 +135,14 @@ async def a2a_endpoint(request: Request):
     """
     try:
         body = await request.json()
-    except Exception as e:
+    except Exception:
+        logger.exception("A2A adapter: parse error reading request body")
         return JSONResponse(
             status_code=400,
             content={
                 "jsonrpc": JSONRPC_VERSION,
                 "id": None,
-                "error": {"code": -32700, "message": f"Parse error: {e}"},
+                "error": {"code": -32700, "message": "Parse error"},
             },
         )
 
@@ -170,7 +223,8 @@ async def a2a_endpoint(request: Request):
                 },
             },
         )
-    except Exception as e:
+    except Exception:
+        logger.exception("Upstream request failed for request id %s", req_id)
         return JSONResponse(
             status_code=200,
             content={
@@ -178,7 +232,7 @@ async def a2a_endpoint(request: Request):
                 "id": req_id,
                 "error": {
                     "code": -32603,
-                    "message": f"Upstream request failed: {str(e)[:500]}",
+                    "message": "Upstream request failed",
                 },
             },
         )

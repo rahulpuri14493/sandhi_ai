@@ -19,6 +19,9 @@ from schemas.agent_review import (
 from core.security import get_current_user, get_current_user_optional, get_current_developer_user
 from core.config import settings
 from models.user import User
+import logging
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/agents", tags=["agents"])
 
@@ -547,10 +550,13 @@ async def test_agent_connection(
                 "status_code": 200,
                 "response_preview": None,
             }
-        except Exception as e:
+        except Exception:
+            logger.exception(
+                "A2A connection test failed for endpoint %s", test_request.api_endpoint
+            )
             return {
                 "success": False,
-                "message": f"A2A connection failed: {str(e)[:200]}",
+                "message": "A2A connection failed",
                 "status_code": 500,
                 "response_preview": None,
             }
@@ -578,10 +584,14 @@ async def test_agent_connection(
                 "status_code": 200,
                 "response_preview": None,
             }
-        except Exception as e:
+        except Exception:
+            logger.exception(
+                "Connection test via adapter failed for endpoint %s",
+                test_request.api_endpoint,
+            )
             return {
                 "success": False,
-                "message": f"Connection failed (via adapter): {str(e)[:200]}",
+                "message": "Connection failed (via adapter)",
                 "status_code": 500,
                 "response_preview": None,
             }

@@ -4,8 +4,12 @@ Uses JSON-RPC 2.0 over HTTP to call SendMessage and optionally GetTask.
 See: https://a2a-protocol.org/latest/specification/
 """
 from typing import Dict, Any, List, Optional
+import ipaddress
 import json
+import socket
 import uuid
+from urllib.parse import urlparse
+
 import httpx
 
 
@@ -110,6 +114,43 @@ def _extract_result_from_send_message_response(response_body: Dict[str, Any]) ->
     return {"content": "", "task_id": task.get("id"), "state": state}
 
 
+def _validate_public_http_url(url: str) -> str:
+    """
+    Basic SSRF protection: ensure the URL uses http/https and resolves to a public IP.
+    Raises ValueError if the URL is invalid or points to a private/internal address.
+    """
+    parsed = urlparse(url)
+    if parsed.scheme not in ("http", "https"):
+        raise ValueError("Only http and https schemes are allowed for agent endpoints")
+    if not parsed.hostname:
+        raise ValueError("Agent endpoint must include a hostname")
+
+    try:
+        addr_info = socket.getaddrinfo(parsed.hostname, None)
+    except OSError as exc:
+        raise ValueError(f"Could not resolve agent endpoint host: {parsed.hostname}") from exc
+
+    for family, _, _, _, sockaddr in addr_info:
+        ip_str = None
+        if family == socket.AF_INET:
+            ip_str = sockaddr[0]
+        elif family == socket.AF_INET6:
+            ip_str = sockaddr[0]
+        if not ip_str:
+            continue
+        ip_obj = ipaddress.ip_address(ip_str)
+        if (
+            ip_obj.is_private
+            or ip_obj.is_loopback
+            or ip_obj.is_link_local
+            or ip_obj.is_reserved
+            or ip_obj.is_multicast
+        ):
+            raise ValueError("Agent endpoint host must resolve to a public IP address")
+
+    return url
+
+
 async def send_message(
     url: str,
     message_parts: List[Dict[str, Any]],
@@ -147,8 +188,11 @@ async def send_message(
     if api_key and (api_key or "").strip():
         headers["Authorization"] = f"Bearer {(api_key or '').strip()}"
 
+    normalized_url = (url or "").strip()
+    safe_url = _validate_public_http_url(normalized_url)
+
     async with httpx.AsyncClient(timeout=timeout, verify=False) as client:
-        response = await client.post(url.strip(), json=payload, headers=headers)
+        response = await client.post(safe_url, json=payload, headers=headers)
 
     try:
         response_body = response.json()
