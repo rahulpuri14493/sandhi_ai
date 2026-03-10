@@ -127,11 +127,15 @@ def _validate_openai_url(url: str) -> str:
 
 
 def _resolve_target(metadata: Dict[str, Any]) -> tuple:
-    """Return (url, api_key, model) for upstream OpenAI call. Per-request metadata overrides env."""
-    url = (metadata.get("openai_url") or "").strip() or OPENAI_URL_DEFAULT
+    """Return (validated_url, api_key, model). All URLs pass _validate_openai_url before use (SSRF)."""
+    raw_url = (metadata.get("openai_url") or "").strip() or OPENAI_URL_DEFAULT
+    if not raw_url:
+        validated_url = ""
+    else:
+        validated_url = _validate_openai_url(raw_url)
     key = (metadata.get("openai_api_key") or "").strip() or OPENAI_API_KEY_DEFAULT
     model = (metadata.get("openai_model") or metadata.get("model") or "").strip() or OPENAI_MODEL_DEFAULT
-    return url, key, model
+    return validated_url, key, model
 
 
 @app.post("/")
@@ -178,7 +182,22 @@ async def a2a_endpoint(request: Request):
         user_text = "(empty message)"
 
     metadata = params.get("metadata") or {}
-    openai_url, openai_api_key, openai_model = _resolve_target(metadata)
+    try:
+        openai_url, openai_api_key, openai_model = _resolve_target(metadata)
+    except ValueError:
+        logger.warning("Invalid openai_url provided", exc_info=True)
+        return JSONResponse(
+            status_code=400,
+            content={
+                "jsonrpc": JSONRPC_VERSION,
+                "id": req_id,
+                "error": {
+                    "code": -32602,
+                    "message": "Invalid openai_url",
+                },
+            },
+        )
+
     openai_messages = metadata.get("openai_messages")
 
     if not openai_url:
@@ -190,22 +209,6 @@ async def a2a_endpoint(request: Request):
                 "error": {
                     "code": -32603,
                     "message": "Adapter not configured: set OPENAI_COMPATIBLE_URL or pass openai_url in metadata",
-                },
-            },
-        )
-
-    try:
-        validated_openai_url = _validate_openai_url(openai_url)
-    except ValueError:
-        logger.warning("Invalid openai_url provided", exc_info=True)
-        return JSONResponse(
-            status_code=400,
-            content={
-                "jsonrpc": JSONRPC_VERSION,
-                "id": req_id,
-                "error": {
-                    "code": -32602,
-                    "message": "Invalid openai_url",
                 },
             },
         )
@@ -232,8 +235,8 @@ async def a2a_endpoint(request: Request):
 
     try:
         async with httpx.AsyncClient(timeout=120.0) as client:
-            # codeql[py/full-ssrf] URL validated by _validate_openai_url (scheme, hostname/domain, public IP)
-            response = await client.post(validated_openai_url, json=payload, headers=headers)
+            # codeql[py/full-ssrf] URL validated in _resolve_target → _validate_openai_url (scheme, hostname/domain, public IP)
+            response = await client.post(openai_url, json=payload, headers=headers)
             response.raise_for_status()
             data = response.json()
     except httpx.HTTPStatusError as e:
