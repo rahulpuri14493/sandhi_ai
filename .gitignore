@@ -41,7 +41,9 @@ coverage.xml
 *.cover
 *.py.cover
 .hypothesis/
+# Pytest cache (any directory)
 .pytest_cache/
+**/.pytest_cache/
 cover/
 
 # Translations
@@ -120,8 +122,9 @@ ipython_config.py
 # PEP 582; used by e.g. github.com/David-OConnor/pyflow and github.com/pdm-project/pdm
 __pypackages__/
 
-# Python bytecode caches
+# Python bytecode caches (any directory)
 __pycache__/
+**/__pycache__/
 *.py[cod]
 
 # Celery stuff
