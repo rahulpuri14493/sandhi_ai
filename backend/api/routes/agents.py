@@ -533,7 +533,7 @@ async def test_agent_connection(
         )
     
     # A2A path: send minimal SendMessage (direct to agent or via platform adapter)
-    from services.a2a_client import send_message
+    from services.a2a_client import send_message, _validate_public_http_url
 
     if test_request.a2a_enabled:
         try:
@@ -595,6 +595,15 @@ async def test_agent_connection(
                 "status_code": 500,
                 "response_preview": None,
             }
+
+    # SSRF protection: validate URL before direct request (fallback path)
+    try:
+        _validate_public_http_url(test_request.api_endpoint.strip())
+    except ValueError as e:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid API endpoint URL",
+        ) from e
 
     headers = {"Content-Type": "application/json"}
     if test_request.api_key:
@@ -674,13 +683,15 @@ async def test_agent_connection(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="Connection failed - unable to reach the API endpoint. Please check the URL."
         )
-    except httpx.RequestError as e:
+    except httpx.RequestError:
+        logger.exception("Connection test request error for endpoint %s", test_request.api_endpoint)
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Connection error: {str(e)}"
+            detail="Connection error",
         )
-    except Exception as e:
+    except Exception:
+        logger.exception("Unexpected error testing connection for endpoint %s", test_request.api_endpoint)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Unexpected error testing connection: {str(e)}"
+            detail="Unexpected error testing connection",
         )

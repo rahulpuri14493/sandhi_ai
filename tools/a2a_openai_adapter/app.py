@@ -186,6 +186,21 @@ async def a2a_endpoint(request: Request):
             },
         )
 
+    try:
+        validated_openai_url = _validate_openai_url(openai_url)
+    except ValueError as e:
+        return JSONResponse(
+            status_code=400,
+            content={
+                "jsonrpc": JSONRPC_VERSION,
+                "id": req_id,
+                "error": {
+                    "code": -32602,
+                    "message": f"Invalid openai_url: {e}",
+                },
+            },
+        )
+
     headers = {"Content-Type": "application/json"}
     auth = request.headers.get("Authorization")
     if auth:
@@ -208,7 +223,8 @@ async def a2a_endpoint(request: Request):
 
     try:
         async with httpx.AsyncClient(timeout=120.0) as client:
-            response = await client.post(openai_url, json=payload, headers=headers)
+            # codeql[py/full-ssrf] URL validated by _validate_openai_url (scheme + hostname + public IP)
+            response = await client.post(validated_openai_url, json=payload, headers=headers)
             response.raise_for_status()
             data = response.json()
     except httpx.HTTPStatusError as e:

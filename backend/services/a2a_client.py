@@ -192,6 +192,7 @@ async def send_message(
     safe_url = _validate_public_http_url(normalized_url)
 
     async with httpx.AsyncClient(timeout=timeout, verify=False) as client:
+        # codeql[py/full-ssrf] URL validated by _validate_public_http_url (scheme + hostname + public IP)
         response = await client.post(safe_url, json=payload, headers=headers)
 
     try:

@@ -81,7 +81,10 @@ def test_extract_result_from_jsonrpc_error_raises():
 
 @pytest.mark.asyncio
 async def test_send_message_calls_httpx():
-    with patch("services.a2a_client.httpx.AsyncClient") as mock_client:
+    # Mock URL validation so agent.example.com doesn't need to resolve (CI has no DNS for it)
+    with patch("services.a2a_client._validate_public_http_url", side_effect=lambda u: u), patch(
+        "services.a2a_client.httpx.AsyncClient"
+    ) as mock_client:
         mock_response = MagicMock()
         mock_response.status_code = 200
         mock_response.json.return_value = {
