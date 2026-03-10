@@ -7,9 +7,30 @@ from models.job import Job, JobStatus, WorkflowStep
 from models.agent import Agent
 from models.communication import AgentCommunication
 from models.audit_log import AuditLog
+from models.mcp_server import MCPToolConfig, MCPServerConnection
 from services.payment_processor import PaymentProcessor
 from services.a2a_client import execute_via_a2a
 from core.config import settings
+
+
+def _safe_slug(name: str) -> str:
+    """Slug for tool name (alphanumeric and underscore)."""
+    if not name:
+        return ""
+    return "".join(c if c.isalnum() or c in "_-" else "_" for c in (name or "").strip())[:50]
+
+
+def _parse_allowed_ids(value: Optional[str]) -> Optional[list]:
+    """Parse JSON array string from job/step allowed_* columns to list of ints."""
+    if value is None or (isinstance(value, str) and not value.strip()):
+        return None
+    if isinstance(value, list):
+        return value
+    try:
+        out = json.loads(value)
+        return [int(x) for x in out] if isinstance(out, list) else None
+    except (json.JSONDecodeError, TypeError, ValueError):
+        return None
 
 
 class AgentExecutor:
@@ -40,6 +61,7 @@ class AgentExecutor:
         previous_output = None
         
         try:
+            # Strict sequential execution: steps run in step_order; each step gets previous_output only when depends_on_previous is True
             for step in workflow_steps:
                 # Update step status
                 step.status = "in_progress"
@@ -71,6 +93,34 @@ class AgentExecutor:
                 else:
                     # First step or independent step - use step's input data only (no previous output)
                     input_data = json.loads(step.input_data) if step.input_data else {}
+
+                # Resolve which tools this step (agent) can use: step-level overrides; else job-level; else all business tools
+                job_platform_ids = _parse_allowed_ids(getattr(job, "allowed_platform_tool_ids", None))
+                job_conn_ids = _parse_allowed_ids(getattr(job, "allowed_connection_ids", None))
+                step_platform_ids = _parse_allowed_ids(getattr(step, "allowed_platform_tool_ids", None))
+                step_conn_ids = _parse_allowed_ids(getattr(step, "allowed_connection_ids", None))
+                # Step explicit list (including []) overrides job; else use job list; else None = all business tools
+                effective_platform = step_platform_ids if step_platform_ids is not None else job_platform_ids
+                effective_conn = step_conn_ids if step_conn_ids is not None else job_conn_ids
+                # Step can only use tools that are in job scope
+                if job_platform_ids is not None and effective_platform is not None:
+                    effective_platform = [x for x in effective_platform if x in job_platform_ids]
+                if job_conn_ids is not None and effective_conn is not None:
+                    effective_conn = [x for x in effective_conn if x in job_conn_ids]
+
+                available_mcp_tools = self._get_available_mcp_tools(
+                    job.business_id,
+                    platform_tool_ids=effective_platform if effective_platform else None,
+                    connection_ids=effective_conn if effective_conn else None,
+                )
+                if available_mcp_tools:
+                    input_data["available_mcp_tools"] = available_mcp_tools
+                    if step.step_order == 1:
+                        self._log_action("job", job_id, "mcp_tool_discovery", {
+                            "business_id": job.business_id,
+                            "tool_count": len(available_mcp_tools),
+                            "tool_names": [t.get("name") for t in available_mcp_tools[:20]],
+                        })
                 
                 # Uploaded documents are requirement documents: agent must understand them, ask questions if any, else execute and answer.
                 documents = input_data.get('documents', [])
@@ -202,6 +252,7 @@ class AgentExecutor:
         """
         Execute agent via A2A protocol (JSON-RPC 2.0 SendMessage).
         Used when agent.a2a_enabled is True.
+        input_data includes available_mcp_tools and previous_step_output for MCP/sequential collaboration.
         """
         url = (agent.api_endpoint or "").strip()
         if not url:
@@ -394,17 +445,34 @@ class AgentExecutor:
         assigned_task = input_data.get('assigned_task', '')
         step_order = input_data.get('step_order')
         total_steps = input_data.get('total_steps')
+        has_previous_output = input_data.get('previous_step_output') is not None
         if assigned_task and assigned_task.strip():
             system_content += "═══════════════════════════════════════════════════════\n"
             system_content += "CRITICAL: YOUR ASSIGNED TASK (multi-agent workflow)\n"
             system_content += "═══════════════════════════════════════════════════════\n\n"
             if step_order is not None and total_steps is not None and total_steps > 1:
                 system_content += f"You are Agent {step_order} of {total_steps}. "
+                if has_previous_output:
+                    system_content += "This is a sequential workflow: you will receive the previous agent's output below. Use it as your input.\n"
             system_content += "Perform ONLY your assigned subtask below. Do NOT perform work assigned to other agents.\n"
             system_content += "If the documents describe the full workflow, IGNORE the parts that are not your assignment.\n\n"
             system_content += f"YOUR TASK:\n{assigned_task.strip()}\n\n"
         else:
+            if has_previous_output and step_order is not None and total_steps is not None and total_steps > 1:
+                system_content += "SEQUENTIAL WORKFLOW: You receive the previous agent's output below. Use it as your input and continue the pipeline.\n\n"
             system_content += "TASK: Execute the job from the requirements above and provide your complete, correct answer. Do not ask questions unless something is strictly required and impossible to infer.\n"
+        # MCP tool discovery: inform agent of available tools (platform + external) for collaboration
+        available_mcp_tools = input_data.get("available_mcp_tools") or []
+        if available_mcp_tools:
+            system_content += "\n═══════════════════════════════════════════════════════\n"
+            system_content += "AVAILABLE MCP TOOLS (data sources / APIs for this job)\n"
+            system_content += "═══════════════════════════════════════════════════════\n\n"
+            system_content += "The following tools are available. Use them in your reasoning when the task requires data or actions they provide. "
+            system_content += "Platform tools are invoked by name (e.g. platform_1_my_db for PostgreSQL). "
+            system_content += "Reference tool names in your response when you need the platform to run a query or operation.\n\n"
+            for t in available_mcp_tools:
+                system_content += f"  - {t.get('name', '')}: {t.get('description', '')}\n"
+            system_content += "\n"
         messages.append({"role": "system", "content": system_content})
         
         # Add document content to messages with clear formatting (if documents exist)
@@ -568,6 +636,67 @@ END DOCUMENT {i+1}: {doc_name}
         self.db.add(communication)
         self.db.commit()
     
+    def _get_available_mcp_tools(
+        self,
+        business_id: int,
+        platform_tool_ids: Optional[list] = None,
+        connection_ids: Optional[list] = None,
+    ) -> list:
+        """
+        Return list of MCP tool descriptors for the business (tenant) for agent context.
+        If platform_tool_ids/connection_ids are provided, only those tools are returned
+        (per-step or per-job allowlist). Otherwise all active business tools are returned.
+        """
+        TOOL_TYPE_DESC = {
+            "vector_db": "Vector database (semantic search)",
+            "pinecone": "Pinecone vector store",
+            "weaviate": "Weaviate vector store",
+            "qdrant": "Qdrant vector store",
+            "chroma": "Chroma vector store",
+            "postgres": "PostgreSQL database",
+            "mysql": "MySQL database",
+            "elasticsearch": "Elasticsearch search",
+            "filesystem": "File system access",
+            "s3": "AWS S3 storage",
+            "slack": "Slack integration",
+            "github": "GitHub API",
+            "notion": "Notion API",
+            "rest_api": "REST API client",
+        }
+        tools = []
+        platform_query = self.db.query(MCPToolConfig).filter(
+            MCPToolConfig.user_id == business_id,
+            MCPToolConfig.is_active == True,
+        )
+        if platform_tool_ids:
+            platform_query = platform_query.filter(MCPToolConfig.id.in_(platform_tool_ids))
+        platform = platform_query.order_by(MCPToolConfig.name).all()
+        for t in platform:
+            name = f"platform_{t.id}_{_safe_slug(t.name)}" if _safe_slug(t.name) else f"platform_{t.id}"
+            desc = TOOL_TYPE_DESC.get(t.tool_type.value, t.tool_type.value)
+            tools.append({
+                "name": name,
+                "description": f"{desc}: {t.name}",
+                "source": "platform",
+                "platform_tool_id": t.id,
+                "tool_type": t.tool_type.value,
+            })
+        conn_query = self.db.query(MCPServerConnection).filter(
+            MCPServerConnection.user_id == business_id,
+            MCPServerConnection.is_active == True,
+        )
+        if connection_ids:
+            conn_query = conn_query.filter(MCPServerConnection.id.in_(connection_ids))
+        conns = conn_query.all()
+        for c in conns:
+            tools.append({
+                "name": c.name,
+                "description": f"External MCP server: {c.base_url}",
+                "source": "external",
+                "connection_id": c.id,
+            })
+        return tools
+
     def _log_action(self, entity_type: str, entity_id: int, action: str, details: Dict[str, Any]):
         """Log an action to the audit log"""
         log_entry = AuditLog(

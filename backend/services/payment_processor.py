@@ -45,6 +45,17 @@ class PaymentProcessor:
             # Use agent.price_per_task for preview (step.cost is only set after execution)
             step_cost = (agent.price_per_task if agent else 0.0) if (step.cost is None or step.cost == 0) else step.cost
             
+            step_platform = step_conn = None
+            if getattr(step, "allowed_platform_tool_ids", None):
+                try:
+                    step_platform = json.loads(step.allowed_platform_tool_ids)
+                except (json.JSONDecodeError, TypeError):
+                    pass
+            if getattr(step, "allowed_connection_ids", None):
+                try:
+                    step_conn = json.loads(step.allowed_connection_ids)
+                except (json.JSONDecodeError, TypeError):
+                    pass
             step_responses.append(WorkflowStepResponse(
                 id=step.id,
                 job_id=step.job_id,
@@ -58,6 +69,8 @@ class PaymentProcessor:
                 started_at=step.started_at,
                 completed_at=step.completed_at,
                 depends_on_previous=getattr(step, "depends_on_previous", True),
+                allowed_platform_tool_ids=step_platform,
+                allowed_connection_ids=step_conn,
             ))
         
         # Estimate communication costs (between consecutive steps)

@@ -83,12 +83,24 @@ export const agentsAPI = {
   },
 }
 export const jobsAPI = {
-  create(payload: { title: string; description?: string; files?: File[] }) {
+  create(payload: {
+    title: string
+    description?: string
+    files?: File[]
+    allowed_platform_tool_ids?: number[]
+    allowed_connection_ids?: number[]
+  }) {
     const form = new FormData()
     form.append('title', payload.title)
     if (payload.description) form.append('description', payload.description)
     if (payload.files?.length) {
       payload.files.forEach((f) => form.append('files', f))
+    }
+    if (payload.allowed_platform_tool_ids?.length) {
+      form.append('allowed_platform_tool_ids', JSON.stringify(payload.allowed_platform_tool_ids))
+    }
+    if (payload.allowed_connection_ids?.length) {
+      form.append('allowed_connection_ids', JSON.stringify(payload.allowed_connection_ids))
     }
     return api.post('/jobs', form, { headers: { 'Content-Type': 'multipart/form-data' } }).then((res) => res.data)
   },
@@ -139,11 +151,24 @@ export const jobsAPI = {
   autoSplitWorkflow(
     jobId: number,
     agentIds: number[],
-    workflowMode?: 'independent' | 'sequential'
+    workflowMode?: 'independent' | 'sequential',
+    stepTools?: Array<{ agent_index: number; allowed_platform_tool_ids?: number[]; allowed_connection_ids?: number[] }>
   ) {
-    const body: { agent_ids: number[]; workflow_mode?: string } = { agent_ids: agentIds }
+    const body: {
+      agent_ids: number[]
+      workflow_mode?: string
+      step_tools?: Array<{ agent_index: number; allowed_platform_tool_ids?: number[]; allowed_connection_ids?: number[] }>
+    } = { agent_ids: agentIds }
     if (workflowMode) body.workflow_mode = workflowMode
+    if (stepTools?.length) body.step_tools = stepTools
     return api.post('/jobs/' + jobId + '/workflow/auto-split', body).then((res) => res.data)
+  },
+  updateStepTools(
+    jobId: number,
+    stepId: number,
+    payload: { allowed_platform_tool_ids?: number[]; allowed_connection_ids?: number[] }
+  ) {
+    return api.patch('/jobs/' + jobId + '/workflow/steps/' + stepId, payload).then((res) => res.data)
   },
 }
 export const dashboardsAPI = {
@@ -192,6 +217,71 @@ export const paymentsAPI = {
   },
   getTransactions() {
     return api.get('/payments/transactions').then((res) => res.data)
+  },
+}
+
+export interface MCPServerConnectionRes {
+  id: number
+  user_id: number
+  name: string
+  base_url: string
+  endpoint_path: string
+  auth_type: string
+  is_platform_configured: boolean
+  is_active: boolean
+  created_at: string
+  updated_at: string
+}
+
+export interface MCPToolConfigRes {
+  id: number
+  user_id: number
+  tool_type: string
+  name: string
+  is_active: boolean
+  created_at: string
+  updated_at: string
+}
+
+export const mcpAPI = {
+  listConnections() {
+    return api.get<MCPServerConnectionRes[]>('/mcp/connections').then((res) => res.data)
+  },
+  createConnection(data: { name: string; base_url: string; endpoint_path?: string; auth_type?: string; credentials?: Record<string, string> }) {
+    return api.post<MCPServerConnectionRes>('/mcp/connections', data).then((res) => res.data)
+  },
+  updateConnection(id: number, data: Partial<{ name: string; base_url: string; endpoint_path: string; auth_type: string; credentials: Record<string, string>; is_active: boolean }>) {
+    return api.patch<MCPServerConnectionRes>('/mcp/connections/' + id, data).then((res) => res.data)
+  },
+  deleteConnection(id: number) {
+    return api.delete('/mcp/connections/' + id)
+  },
+  validateConnection(data: { name: string; base_url: string; endpoint_path?: string; auth_type?: string; credentials?: Record<string, string> }) {
+    return api.post<{ valid: boolean; message: string }>('/mcp/connections/validate', data).then((res) => res.data)
+  },
+  listTools() {
+    return api.get<MCPToolConfigRes[]>('/mcp/tools').then((res) => res.data)
+  },
+  createTool(data: { tool_type: string; name: string; config: Record<string, unknown> }) {
+    return api.post<MCPToolConfigRes>('/mcp/tools', data).then((res) => res.data)
+  },
+  updateTool(id: number, data: Partial<{ name: string; config: Record<string, unknown>; is_active: boolean }>) {
+    return api.patch<MCPToolConfigRes>('/mcp/tools/' + id, data).then((res) => res.data)
+  },
+  deleteTool(id: number) {
+    return api.delete('/mcp/tools/' + id)
+  },
+  proxy(connectionId: number, method: string, params?: Record<string, unknown>) {
+    return api.post('/mcp/proxy', { connection_id: connectionId, method, params }).then((res) => res.data)
+  },
+  getRegistry() {
+    return api.get<{ tools: Array<{ source: string; name: string; tool_type?: string; description?: string }>; platform_tool_count: number }>('/mcp/registry').then((res) => res.data)
+  },
+  validateToolConfig(tool_type: string, config: Record<string, unknown>) {
+    return api.post<{ valid: boolean; message: string }>('/mcp/tools/validate', { tool_type, config }).then((res) => res.data)
+  },
+  getTool(toolId: number) {
+    return api.get<MCPToolConfigRes>('/mcp/tools/' + toolId).then((res) => res.data)
   },
 }
 

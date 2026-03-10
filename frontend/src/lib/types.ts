@@ -99,7 +99,11 @@ export interface Job {
   workflow_steps?: WorkflowStep[];
   files?: JobFile[];
   conversation?: ConversationItem[];
-  failure_reason?: string; // Reason for job failure
+  failure_reason?: string;
+  /** Platform tool IDs in scope for this job (empty/undefined = all business tools). */
+  allowed_platform_tool_ids?: number[] | null;
+  /** MCP connection IDs in scope for this job (empty/undefined = all). */
+  allowed_connection_ids?: number[] | null;
 }
 
 export interface WorkflowStep {
@@ -114,8 +118,10 @@ export interface WorkflowStep {
   cost: number;
   started_at?: string;
   completed_at?: string;
-  /** When false, step does not receive previous agent output (independent workflow). */
   depends_on_previous?: boolean;
+  /** Tools this step (agent) can use; empty/undefined = use job-level tools. */
+  allowed_platform_tool_ids?: number[] | null;
+  allowed_connection_ids?: number[] | null;
 }
 
 export interface WorkflowPreview {

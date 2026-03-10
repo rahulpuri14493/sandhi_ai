@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react'
 import { useParams, useSearchParams, useNavigate, useLocation } from 'react-router-dom'
-import { jobsAPI } from '../lib/api'
-import type { Job, WorkflowPreview } from '../lib/types'
+import { jobsAPI, mcpAPI } from '../lib/api'
+import type { Job, WorkflowPreview, WorkflowStep } from '../lib/types'
 import { WorkflowBuilder } from '../components/WorkflowBuilder'
 import { CostCalculator } from '../components/CostCalculator'
 import { JobStatusTracker } from '../components/JobStatusTracker'
@@ -19,6 +19,11 @@ export default function JobDetailPage() {
   const [isLoading, setIsLoading] = useState(true)
   const [isAnalyzingDocuments, setIsAnalyzingDocuments] = useState(false)
   const [mode, setMode] = useState<'workflow' | 'preview' | 'status' | 'qa'>('workflow')
+  const [editingStepTools, setEditingStepTools] = useState<WorkflowStep | null>(null)
+  const [stepToolsModalPlatform, setStepToolsModalPlatform] = useState<{ id: number; name: string; tool_type: string }[]>([])
+  const [stepToolsModalConnections, setStepToolsModalConnections] = useState<{ id: number; name: string }[]>([])
+  const [stepToolsSelection, setStepToolsSelection] = useState<{ platformIds: number[]; connectionIds: number[] }>({ platformIds: [], connectionIds: [] })
+  const [savingStepTools, setSavingStepTools] = useState(false)
 
   useEffect(() => {
     if (jobId) {
@@ -101,6 +106,42 @@ export default function JobDetailPage() {
       alert((error as any)?.response?.data?.detail || 'Failed to analyze documents')
     } finally {
       setIsAnalyzingDocuments(false)
+    }
+  }
+
+  const openStepToolsModal = async (step: WorkflowStep) => {
+    setEditingStepTools(step)
+    setStepToolsSelection({
+      platformIds: step.allowed_platform_tool_ids ?? [],
+      connectionIds: step.allowed_connection_ids ?? [],
+    })
+    try {
+      const [tools, conns] = await Promise.all([mcpAPI.listTools(), mcpAPI.listConnections()])
+      const allowedPlatform = job?.allowed_platform_tool_ids
+      const allowedConn = job?.allowed_connection_ids
+      setStepToolsModalPlatform(allowedPlatform?.length ? tools.filter((t: { id: number }) => allowedPlatform.includes(t.id)) : tools)
+      setStepToolsModalConnections(allowedConn?.length ? conns.filter((c: { id: number }) => allowedConn.includes(c.id)) : conns)
+    } catch (e) {
+      console.error(e)
+    }
+  }
+
+  const saveStepTools = async () => {
+    if (!editingStepTools) return
+    setSavingStepTools(true)
+    try {
+      await jobsAPI.updateStepTools(jobId, editingStepTools.id, {
+        allowed_platform_tool_ids: stepToolsSelection.platformIds,
+        allowed_connection_ids: stepToolsSelection.connectionIds,
+      })
+      await loadJob()
+      await loadWorkflowPreview()
+      setEditingStepTools(null)
+    } catch (e) {
+      console.error(e)
+      alert((e as any)?.response?.data?.detail || 'Failed to update step tools')
+    } finally {
+      setSavingStepTools(false)
     }
   }
 
@@ -377,11 +418,100 @@ export default function JobDetailPage() {
         )}
 
         {mode === 'workflow' && job.status === 'draft' && (
-          <WorkflowBuilder
-            jobId={jobId}
-            onWorkflowCreated={loadWorkflowPreview}
-            initialSelectedAgentIds={selectedAgentsFromCreate}
-          />
+          <>
+            <WorkflowBuilder
+              jobId={jobId}
+              job={job}
+              onWorkflowCreated={() => { loadJob(); loadWorkflowPreview(); }}
+              initialSelectedAgentIds={selectedAgentsFromCreate}
+            />
+            {job.workflow_steps && job.workflow_steps.length > 0 && (
+              <div className="mt-6 p-6 bg-dark-100/50 rounded-2xl border border-dark-200/50">
+                <h3 className="font-bold text-white mb-3">Tools per step</h3>
+                <p className="text-sm text-white/60 mb-4">Assign which tools each agent can use. Other agents are restricted from these tools.</p>
+                <div className="space-y-2">
+                  {job.workflow_steps.map((step) => (
+                    <div key={step.id} className="flex items-center justify-between py-2 px-4 bg-dark-200/30 rounded-xl border border-dark-300">
+                      <span className="text-white/90 font-medium">Step {step.step_order}: {step.agent_name ?? `Agent ${step.agent_id}`}</span>
+                      <div className="flex items-center gap-3">
+                        <span className="text-sm text-white/50">
+                          {(step.allowed_platform_tool_ids?.length ?? 0) + (step.allowed_connection_ids?.length ?? 0) > 0
+                            ? `${step.allowed_platform_tool_ids?.length ?? 0} platform, ${step.allowed_connection_ids?.length ?? 0} connection(s)`
+                            : 'All job tools'}
+                        </span>
+                        <button
+                          type="button"
+                          onClick={() => openStepToolsModal(step)}
+                          className="text-primary-400 hover:text-primary-300 text-sm font-semibold"
+                        >
+                          Edit tools
+                        </button>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+          </>
+        )}
+
+        {editingStepTools && (
+          <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4" onClick={() => setEditingStepTools(null)}>
+            <div className="bg-dark-100 border-2 border-dark-300 rounded-2xl shadow-2xl max-w-lg w-full max-h-[80vh] overflow-hidden flex flex-col" onClick={(e) => e.stopPropagation()}>
+              <div className="p-6 border-b border-dark-300">
+                <h3 className="text-xl font-bold text-white">Tools for Step {editingStepTools.step_order}: {editingStepTools.agent_name}</h3>
+              </div>
+              <div className="p-6 overflow-y-auto flex-1">
+                {stepToolsModalPlatform.length > 0 && (
+                  <div className="mb-4">
+                    <h4 className="text-white font-semibold mb-2">Platform tools</h4>
+                    <div className="space-y-2">
+                      {stepToolsModalPlatform.map((t) => (
+                        <label key={t.id} className="flex items-center gap-2 cursor-pointer text-white/90">
+                          <input
+                            type="checkbox"
+                            checked={stepToolsSelection.platformIds.includes(t.id)}
+                            onChange={() => setStepToolsSelection((prev) => ({
+                              ...prev,
+                              platformIds: prev.platformIds.includes(t.id) ? prev.platformIds.filter((id) => id !== t.id) : [...prev.platformIds, t.id],
+                            }))}
+                            className="w-4 h-4 text-primary-600 rounded"
+                          />
+                          <span>{t.name}</span>
+                          <span className="text-white/50 text-xs">({t.tool_type})</span>
+                        </label>
+                      ))}
+                    </div>
+                  </div>
+                )}
+                {stepToolsModalConnections.length > 0 && (
+                  <div>
+                    <h4 className="text-white font-semibold mb-2">MCP connections</h4>
+                    <div className="space-y-2">
+                      {stepToolsModalConnections.map((c) => (
+                        <label key={c.id} className="flex items-center gap-2 cursor-pointer text-white/90">
+                          <input
+                            type="checkbox"
+                            checked={stepToolsSelection.connectionIds.includes(c.id)}
+                            onChange={() => setStepToolsSelection((prev) => ({
+                              ...prev,
+                              connectionIds: prev.connectionIds.includes(c.id) ? prev.connectionIds.filter((id) => id !== c.id) : [...prev.connectionIds, c.id],
+                            }))}
+                            className="w-4 h-4 text-primary-600 rounded"
+                          />
+                          <span>{c.name}</span>
+                        </label>
+                      ))}
+                    </div>
+                  </div>
+                )}
+              </div>
+              <div className="p-6 border-t border-dark-300 flex gap-3 justify-end">
+                <button type="button" onClick={() => setEditingStepTools(null)} className="px-4 py-2 rounded-xl font-semibold text-white/80 hover:text-white border border-dark-300">Cancel</button>
+                <button type="button" onClick={saveStepTools} disabled={savingStepTools} className="px-4 py-2 rounded-xl font-semibold bg-primary-500 text-white hover:bg-primary-600 disabled:opacity-50">{savingStepTools ? 'Saving...' : 'Save'}</button>
+              </div>
+            </div>
+          </div>
         )}
 
         {mode === 'preview' && workflowPreview && (

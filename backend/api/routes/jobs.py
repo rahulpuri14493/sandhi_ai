@@ -25,8 +25,38 @@ from models.transaction import Transaction, Earnings
 from core.external_token import create_job_token, get_share_url
 from datetime import datetime
 from models.communication import AgentCommunication
+from models.mcp_server import MCPToolConfig, MCPServerConnection
 
 router = APIRouter(prefix="/api/jobs", tags=["jobs"])
+
+
+def _validate_allowed_tools(db: Session, business_id: int, platform_ids: Optional[List[int]], connection_ids: Optional[List[int]]):
+    """Validate that platform_tool_ids and connection_ids belong to business_id. Returns (platform_ids, connection_ids) as JSON-serializable lists or None."""
+    out_platform = None
+    if platform_ids:
+        valid = db.query(MCPToolConfig.id).filter(
+            MCPToolConfig.user_id == business_id,
+            MCPToolConfig.id.in_(platform_ids),
+            MCPToolConfig.is_active == True,
+        ).all()
+        valid_set = {r[0] for r in valid}
+        invalid = set(platform_ids) - valid_set
+        if invalid:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Invalid or unauthorized platform tool ids: {sorted(invalid)}")
+        out_platform = list(valid_set)
+    out_conn = None
+    if connection_ids:
+        valid = db.query(MCPServerConnection.id).filter(
+            MCPServerConnection.user_id == business_id,
+            MCPServerConnection.id.in_(connection_ids),
+            MCPServerConnection.is_active == True,
+        ).all()
+        valid_set = {r[0] for r in valid}
+        invalid = set(connection_ids) - valid_set
+        if invalid:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Invalid or unauthorized connection ids: {sorted(invalid)}")
+        out_conn = list(valid_set)
+    return (out_platform, out_conn)
 
 
 def _get_first_hired_agent_for_job(db: Session, job_id: int) -> Optional[tuple]:
@@ -134,17 +164,35 @@ class UserResponseRequest(BaseModel):
     answer: str
 
 
+def _parse_int_list_form(value: Optional[str]) -> Optional[List[int]]:
+    """Parse Form JSON string to list of ints."""
+    if not value or not value.strip():
+        return None
+    try:
+        out = json.loads(value)
+        return [int(x) for x in out] if isinstance(out, list) else None
+    except (json.JSONDecodeError, TypeError, ValueError):
+        return None
+
+
 @router.post("", response_model=JobResponse, status_code=status.HTTP_201_CREATED)
 async def create_job(
     title: str = Form(...),
     description: Optional[str] = Form(None),
     files: Optional[List[UploadFile]] = File(None),
+    allowed_platform_tool_ids: Optional[str] = Form(None),
+    allowed_connection_ids: Optional[str] = Form(None),
     current_user: User = Depends(get_current_business_user),
     db: Session = Depends(get_db)
 ):
-    """Create a new job with optional file uploads"""
+    """Create a new job with optional file uploads and optional tool scope."""
     file_metadata = []
-    
+
+    platform_ids = _parse_int_list_form(allowed_platform_tool_ids)
+    connection_ids = _parse_int_list_form(allowed_connection_ids)
+    if (platform_ids and len(platform_ids)) or (connection_ids and len(connection_ids)):
+        platform_ids, connection_ids = _validate_allowed_tools(db, current_user.id, platform_ids, connection_ids)
+
     # Process uploaded files (zips are extracted; their contents become individual files)
     if files:
         for file in files:
@@ -162,14 +210,15 @@ async def create_job(
         description=description,
         status=JobStatus.DRAFT,
         files=json.dumps(file_metadata) if file_metadata else None,
-        conversation=json.dumps([])  # Initialize empty conversation
+        conversation=json.dumps([]),  # Initialize empty conversation
+        allowed_platform_tool_ids=json.dumps(platform_ids) if platform_ids else None,
+        allowed_connection_ids=json.dumps(connection_ids) if connection_ids else None,
     )
     db.add(new_job)
     db.commit()
     db.refresh(new_job)
-    
+
     # Build response with parsed files (remove paths for security)
-    # Files are optional - always return a response
     files_for_response = []
     if file_metadata:
         for file_info in file_metadata:
@@ -179,8 +228,7 @@ async def create_job(
                 "type": file_info["type"],
                 "size": file_info["size"]
             })
-    
-    # Always return a response, whether files were uploaded or not
+
     response_data = {
         "id": new_job.id,
         "business_id": new_job.business_id,
@@ -192,7 +240,9 @@ async def create_job(
         "completed_at": new_job.completed_at,
         "workflow_steps": [],
         "files": files_for_response if files_for_response else None,
-        "failure_reason": new_job.failure_reason
+        "failure_reason": new_job.failure_reason,
+        "allowed_platform_tool_ids": platform_ids,
+        "allowed_connection_ids": connection_ids,
     }
     return JobResponse(**response_data)
 
@@ -627,6 +677,17 @@ def list_jobs(
             except (json.JSONDecodeError, TypeError):
                 pass
         
+        job_platform = job_conn = None
+        if getattr(job, "allowed_platform_tool_ids", None):
+            try:
+                job_platform = json.loads(job.allowed_platform_tool_ids)
+            except (json.JSONDecodeError, TypeError):
+                pass
+        if getattr(job, "allowed_connection_ids", None):
+            try:
+                job_conn = json.loads(job.allowed_connection_ids)
+            except (json.JSONDecodeError, TypeError):
+                pass
         job_dict = {
             "id": job.id,
             "business_id": job.business_id,
@@ -639,7 +700,9 @@ def list_jobs(
             "workflow_steps": [],
             "files": files_data,
             "conversation": conversation_data,
-            "failure_reason": job.failure_reason
+            "failure_reason": job.failure_reason,
+            "allowed_platform_tool_ids": job_platform,
+            "allowed_connection_ids": job_conn,
         }
         result.append(JobResponse(**job_dict))
     return result
@@ -689,6 +752,18 @@ def get_job(
     for step in workflow_steps:
         agent = db.query(Agent).filter(Agent.id == step.agent_id).first()
         agent_name = agent.name if agent else None
+        step_platform = None
+        step_conn = None
+        if getattr(step, "allowed_platform_tool_ids", None):
+            try:
+                step_platform = json.loads(step.allowed_platform_tool_ids)
+            except (json.JSONDecodeError, TypeError):
+                pass
+        if getattr(step, "allowed_connection_ids", None):
+            try:
+                step_conn = json.loads(step.allowed_connection_ids)
+            except (json.JSONDecodeError, TypeError):
+                pass
         workflow_steps_data.append(WorkflowStepResponse(
             id=step.id,
             job_id=step.job_id,
@@ -696,14 +771,28 @@ def get_job(
             agent_name=agent_name,
             step_order=step.step_order,
             input_data=step.input_data,
-            output_data=step.output_data,  # Keep as string for frontend to parse
+            output_data=step.output_data,
             status=step.status,
             cost=step.cost or 0.0,
             started_at=step.started_at,
             completed_at=step.completed_at,
             depends_on_previous=getattr(step, "depends_on_previous", True),
+            allowed_platform_tool_ids=step_platform,
+            allowed_connection_ids=step_conn,
         ))
-    
+
+    job_platform = None
+    job_conn = None
+    if getattr(job, "allowed_platform_tool_ids", None):
+        try:
+            job_platform = json.loads(job.allowed_platform_tool_ids)
+        except (json.JSONDecodeError, TypeError):
+            pass
+    if getattr(job, "allowed_connection_ids", None):
+        try:
+            job_conn = json.loads(job.allowed_connection_ids)
+        except (json.JSONDecodeError, TypeError):
+            pass
     job_dict = {
         "id": job.id,
         "business_id": job.business_id,
@@ -716,7 +805,9 @@ def get_job(
         "workflow_steps": workflow_steps_data,
         "files": files_data,
         "conversation": conversation_data,
-        "failure_reason": job.failure_reason
+        "failure_reason": job.failure_reason,
+        "allowed_platform_tool_ids": job_platform,
+        "allowed_connection_ids": job_conn,
     }
     return JobResponse(**job_dict)
 
@@ -728,23 +819,25 @@ async def update_job(
     description: Optional[str] = Form(None),
     status: Optional[str] = Form(None),
     files: Optional[List[UploadFile]] = File(None),
+    allowed_platform_tool_ids: Optional[str] = Form(None),
+    allowed_connection_ids: Optional[str] = Form(None),
     current_user: User = Depends(get_current_business_user),
     db: Session = Depends(get_db)
 ):
-    """Update a job with optional file uploads"""
+    """Update a job with optional file uploads and optional tool scope."""
     job = db.query(Job).filter(Job.id == job_id).first()
     if not job:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Job not found"
         )
-    
+
     if job.business_id != current_user.id:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Not authorized to update this job"
         )
-    
+
     # Only allow updates to draft jobs or status changes
     if job.status != JobStatus.DRAFT and status is None:
         if title is not None or description is not None:
@@ -752,7 +845,19 @@ async def update_job(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail="Can only update title and description for draft jobs. Use status update for other jobs."
             )
-    
+
+    # Update allowed tools if provided (each key updates only that field)
+    if allowed_platform_tool_ids is not None:
+        pids = _parse_int_list_form(allowed_platform_tool_ids)
+        if pids:
+            pids, _ = _validate_allowed_tools(db, current_user.id, pids, None)
+        job.allowed_platform_tool_ids = json.dumps(pids) if pids else None
+    if allowed_connection_ids is not None:
+        cids = _parse_int_list_form(allowed_connection_ids)
+        if cids:
+            _, cids = _validate_allowed_tools(db, current_user.id, None, cids)
+        job.allowed_connection_ids = json.dumps(cids) if cids else None
+
     # Update basic fields
     if title is not None:
         job.title = title
@@ -872,6 +977,18 @@ async def update_job(
         except (json.JSONDecodeError, TypeError):
             pass
     
+    job_platform = None
+    job_conn = None
+    if getattr(job, "allowed_platform_tool_ids", None):
+        try:
+            job_platform = json.loads(job.allowed_platform_tool_ids)
+        except (json.JSONDecodeError, TypeError):
+            pass
+    if getattr(job, "allowed_connection_ids", None):
+        try:
+            job_conn = json.loads(job.allowed_connection_ids)
+        except (json.JSONDecodeError, TypeError):
+            pass
     job_dict = {
         "id": job.id,
         "business_id": job.business_id,
@@ -883,9 +1000,12 @@ async def update_job(
         "completed_at": job.completed_at,
         "workflow_steps": [],
         "files": files_data,
-        "conversation": conversation_data
+        "conversation": conversation_data,
+        "failure_reason": getattr(job, "failure_reason", None),
+        "allowed_platform_tool_ids": job_platform,
+        "allowed_connection_ids": job_conn,
     }
-    
+
     return JobResponse(**job_dict)
 
 
@@ -979,8 +1099,14 @@ def auto_split_workflow(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="workflow_mode must be 'independent' or 'sequential' when provided",
         )
+    step_tools = None
+    if body.step_tools:
+        step_tools = [
+            {"agent_index": st.agent_index, "allowed_platform_tool_ids": st.allowed_platform_tool_ids, "allowed_connection_ids": st.allowed_connection_ids}
+            for st in body.step_tools
+        ]
     workflow_builder = WorkflowBuilder(db)
-    preview = workflow_builder.auto_split_workflow(job_id, body.agent_ids, workflow_mode=workflow_mode)
+    preview = workflow_builder.auto_split_workflow(job_id, body.agent_ids, workflow_mode=workflow_mode, step_tools=step_tools)
     return preview
 
 
@@ -1007,6 +1133,66 @@ def manual_workflow(
     workflow_builder = WorkflowBuilder(db)
     preview = workflow_builder.create_manual_workflow(job_id, workflow_steps)
     return preview
+
+
+class StepToolsUpdateBody(BaseModel):
+    allowed_platform_tool_ids: Optional[List[int]] = None
+    allowed_connection_ids: Optional[List[int]] = None
+
+
+@router.patch("/{job_id}/workflow/steps/{step_id}", response_model=WorkflowStepResponse)
+def update_workflow_step_tools(
+    job_id: int,
+    step_id: int,
+    body: StepToolsUpdateBody,
+    current_user: User = Depends(get_current_business_user),
+    db: Session = Depends(get_db)
+):
+    """Update which tools a workflow step (agent) can use."""
+    job = db.query(Job).filter(Job.id == job_id).first()
+    if not job:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Job not found")
+    if job.business_id != current_user.id:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Not authorized")
+    step = db.query(WorkflowStep).filter(WorkflowStep.id == step_id, WorkflowStep.job_id == job_id).first()
+    if not step:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Step not found")
+    if body.allowed_platform_tool_ids is not None or body.allowed_connection_ids is not None:
+        pids, cids = body.allowed_platform_tool_ids, body.allowed_connection_ids
+        if (pids and len(pids)) or (cids and len(cids)):
+            pids, cids = _validate_allowed_tools(db, current_user.id, pids, cids)
+        step.allowed_platform_tool_ids = json.dumps(pids) if pids is not None else None
+        step.allowed_connection_ids = json.dumps(cids) if cids is not None else None
+    db.commit()
+    db.refresh(step)
+    agent = db.query(Agent).filter(Agent.id == step.agent_id).first()
+    step_platform = step_conn = None
+    if getattr(step, "allowed_platform_tool_ids", None):
+        try:
+            step_platform = json.loads(step.allowed_platform_tool_ids)
+        except (json.JSONDecodeError, TypeError):
+            pass
+    if getattr(step, "allowed_connection_ids", None):
+        try:
+            step_conn = json.loads(step.allowed_connection_ids)
+        except (json.JSONDecodeError, TypeError):
+            pass
+    return WorkflowStepResponse(
+        id=step.id,
+        job_id=step.job_id,
+        agent_id=step.agent_id,
+        agent_name=agent.name if agent else None,
+        step_order=step.step_order,
+        input_data=step.input_data,
+        output_data=step.output_data,
+        status=step.status,
+        cost=step.cost or 0.0,
+        started_at=step.started_at,
+        completed_at=step.completed_at,
+        depends_on_previous=getattr(step, "depends_on_previous", True),
+        allowed_platform_tool_ids=step_platform,
+        allowed_connection_ids=step_conn,
+    )
 
 
 @router.get("/{job_id}/workflow/preview", response_model=WorkflowPreview)

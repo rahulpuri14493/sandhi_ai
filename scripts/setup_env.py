@@ -1,0 +1,68 @@
+#!/usr/bin/env python3
+"""
+Ensure .env exists and MCP secrets are set so the stack can run with the platform MCP server.
+
+- If .env does not exist: copy from .env.example and set MCP_INTERNAL_SECRET (and optionally MCP_ENCRYPTION_KEY).
+- If .env exists but MCP_INTERNAL_SECRET is empty: set it to a generated value.
+
+Run from project root: python scripts/setup_env.py
+"""
+import os
+import re
+import secrets
+import sys
+
+PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+ENV_EXAMPLE = os.path.join(PROJECT_ROOT, ".env.example")
+ENV_FILE = os.path.join(PROJECT_ROOT, ".env")
+
+
+def generate_secret() -> str:
+    return secrets.token_urlsafe(32)
+
+
+def ensure_env():
+    os.chdir(PROJECT_ROOT)
+    if not os.path.isfile(ENV_EXAMPLE):
+        print("Missing .env.example; nothing to do.", file=sys.stderr)
+        sys.exit(1)
+
+    created = False
+    if not os.path.isfile(ENV_FILE):
+        with open(ENV_EXAMPLE, "r", encoding="utf-8") as f:
+            content = f.read()
+        with open(ENV_FILE, "w", encoding="utf-8") as f:
+            f.write(content)
+        print("Created .env from .env.example")
+        created = True
+
+    with open(ENV_FILE, "r", encoding="utf-8") as f:
+        lines = f.readlines()
+
+    modified = False
+    out = []
+    for line in lines:
+        if re.match(r"^MCP_INTERNAL_SECRET=\s*$", line):
+            secret = generate_secret()
+            out.append(f"MCP_INTERNAL_SECRET={secret}\n")
+            modified = True
+            print("Set MCP_INTERNAL_SECRET in .env")
+        elif re.match(r"^MCP_ENCRYPTION_KEY=\s*$", line) and created:
+            secret = generate_secret()
+            out.append(f"MCP_ENCRYPTION_KEY={secret}\n")
+            modified = True
+            print("Set MCP_ENCRYPTION_KEY in .env")
+        else:
+            out.append(line)
+
+    if modified:
+        with open(ENV_FILE, "w", encoding="utf-8") as f:
+            f.writelines(out)
+
+    if not modified and not created:
+        print(".env already exists; MCP_INTERNAL_SECRET already set or not present.")
+    print("Done. Start the stack with: docker-compose up")
+
+
+if __name__ == "__main__":
+    ensure_env()

@@ -1,8 +1,23 @@
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator
 from typing import Optional, List, Dict, Any
 from datetime import datetime
 import json
 from models.job import JobStatus
+
+
+def _parse_int_list(v):
+    """Parse optional JSON array string or list to list of ints."""
+    if v is None:
+        return None
+    if isinstance(v, list):
+        return [int(x) for x in v if x is not None]
+    if isinstance(v, str) and v.strip():
+        try:
+            out = json.loads(v)
+            return [int(x) for x in out] if isinstance(out, list) else None
+        except (json.JSONDecodeError, TypeError, ValueError):
+            return None
+    return None
 
 
 class JobCreate(BaseModel):
@@ -10,18 +25,30 @@ class JobCreate(BaseModel):
     description: Optional[str] = None
     agent_ids: Optional[List[int]] = []  # For auto-split
     workflow_steps: Optional[List["WorkflowStepCreate"]] = []  # For manual assignment
+    allowed_platform_tool_ids: Optional[List[int]] = None  # Tools in scope for this job (empty = all)
+    allowed_connection_ids: Optional[List[int]] = None  # MCP connections in scope (empty = all)
 
 
 class JobUpdate(BaseModel):
     title: Optional[str] = None
     description: Optional[str] = None
     status: Optional[JobStatus] = None
+    allowed_platform_tool_ids: Optional[List[int]] = None
+    allowed_connection_ids: Optional[List[int]] = None
+
+
+class StepToolsAssignment(BaseModel):
+    """Per-step tool allowlist for auto-split (by agent index)."""
+    agent_index: int  # 0-based index into agent_ids
+    allowed_platform_tool_ids: Optional[List[int]] = None
+    allowed_connection_ids: Optional[List[int]] = None
 
 
 class AutoSplitBody(BaseModel):
     """Request body for POST /jobs/{job_id}/workflow/auto-split."""
     agent_ids: List[int] = []
     workflow_mode: Optional[str] = None  # "independent" | "sequential" | None (infer from BRD/conversation)
+    step_tools: Optional[List[StepToolsAssignment]] = None  # Which tools each agent (step) can use
 
 
 class AnswerQuestionBody(BaseModel):
@@ -38,6 +65,8 @@ class WorkflowStepCreate(BaseModel):
     agent_id: int
     step_order: int
     input_data: Optional[Dict[str, Any]] = None
+    allowed_platform_tool_ids: Optional[List[int]] = None  # Tools this step can use (empty = job-level)
+    allowed_connection_ids: Optional[List[int]] = None
 
 
 class JobResponse(BaseModel):
@@ -52,10 +81,17 @@ class JobResponse(BaseModel):
     workflow_steps: Optional[List["WorkflowStepResponse"]] = []
     files: Optional[List[Dict[str, Any]]] = None  # File metadata
     failure_reason: Optional[str] = None  # Reason for job failure
+    allowed_platform_tool_ids: Optional[List[int]] = None
+    allowed_connection_ids: Optional[List[int]] = None
 
     class Config:
         from_attributes = True
-    
+
+    @field_validator("allowed_platform_tool_ids", "allowed_connection_ids", mode="before")
+    @classmethod
+    def _coerce_int_list(cls, v):
+        return _parse_int_list(v)
+
     @classmethod
     def model_validate(cls, obj, **kwargs):
         # Parse files JSON string if it exists
@@ -86,9 +122,16 @@ class WorkflowStepResponse(BaseModel):
     started_at: Optional[datetime]
     completed_at: Optional[datetime]
     depends_on_previous: Optional[bool] = True  # False = step works independently (no previous output)
+    allowed_platform_tool_ids: Optional[List[int]] = None
+    allowed_connection_ids: Optional[List[int]] = None
 
     class Config:
         from_attributes = True
+
+    @field_validator("allowed_platform_tool_ids", "allowed_connection_ids", mode="before")
+    @classmethod
+    def _coerce_int_list(cls, v):
+        return _parse_int_list(v)
 
 
 class WorkflowPreview(BaseModel):

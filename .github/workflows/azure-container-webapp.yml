@@ -11,6 +11,10 @@
 # 2. Create a secret in your repository named AZURE_WEBAPP_PUBLISH_PROFILE, paste the publish profile contents as the value of the secret.
 #    For instructions on obtaining the publish profile see: https://docs.microsoft.com/azure/app-service/deploy-github-actions#configure-the-github-secret
 #
+# 2b. Add Azure login credentials: create a secret AZURE_CREDENTIALS with the output of:
+#     az ad sp create-for-rbac --name "github-actions" --role contributor --scopes /subscriptions/<subscription-id>/resourceGroups/<resource-group>/providers/Microsoft.Web/sites/<app-name> --sdk-auth
+#     Or use a JSON object: {"clientId":"<app-id>","clientSecret":"<password>","subscriptionId":"<subscription-id>","tenantId":"<tenant-id>"}
+#
 # 3. (Optional) If you see "installation not allowed to Create organization package":
 #    - For a user repo: ensure this workflow has packages: write (see permissions below).
 #    - For an org repo: org admin must allow "GitHub Actions to create packages" (Settings → Actions → General),
@@ -82,6 +86,11 @@ jobs:
     steps:
       - name: Lowercase the repo name and username
         run: echo "REPO=${GITHUB_REPOSITORY,,}" >>${GITHUB_ENV}
+
+      - name: Login to Azure
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
 
       - name: Deploy to Azure Web App
         id: deploy-to-webapp

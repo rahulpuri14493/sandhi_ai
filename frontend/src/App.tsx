@@ -12,6 +12,7 @@ import NewAgent from './pages/NewAgent'
 import EditAgent from './pages/EditAgent'
 import EditJob from './pages/EditJob'
 import NewHiringPosition from './pages/NewHiringPosition'
+import MCP from './pages/MCP'
 
 function App() {
   return (
@@ -23,6 +24,7 @@ function App() {
           <Route path="/auth/login" element={<Login />} />
           <Route path="/auth/register" element={<Register />} />
           <Route path="/marketplace" element={<Marketplace />} />
+          <Route path="/mcp" element={<MCP />} />
           <Route path="/marketplace/agent/:id" element={<AgentDetail />} />
           <Route path="/jobs/new" element={<NewJob />} />
           <Route path="/jobs/:id" element={<JobDetail />} />

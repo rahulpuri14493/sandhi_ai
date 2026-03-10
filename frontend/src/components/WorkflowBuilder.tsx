@@ -1,18 +1,28 @@
 import { useState, useEffect } from 'react'
-import { jobsAPI, agentsAPI } from '../lib/api'
+import { jobsAPI, agentsAPI, mcpAPI } from '../lib/api'
 import type { Agent } from '../lib/types'
+import type { Job } from '../lib/types'
+import type { MCPToolConfigRes, MCPServerConnectionRes } from '../lib/api'
 
 interface WorkflowBuilderProps {
   jobId: number
   onWorkflowCreated: () => void
   initialSelectedAgentIds?: number[]
+  /** Job data (optional); if provided, used for job-level allowed tools and step tool pool */
+  job?: Job | null
 }
 
 export type WorkflowCollaborationMode = 'from_brd' | 'independent' | 'sequential'
 
-export function WorkflowBuilder({ jobId, onWorkflowCreated, initialSelectedAgentIds }: WorkflowBuilderProps) {
+/** Per-step tool assignment: agent_index -> { platformIds, connectionIds } */
+type StepToolSelection = Record<number, { platformIds: number[]; connectionIds: number[] }>
+
+export function WorkflowBuilder({ jobId, onWorkflowCreated, initialSelectedAgentIds, job }: WorkflowBuilderProps) {
   const [selectedAgents, setSelectedAgents] = useState<number[]>(initialSelectedAgentIds ?? [])
   const [availableAgents, setAvailableAgents] = useState<Agent[]>([])
+  const [platformTools, setPlatformTools] = useState<MCPToolConfigRes[]>([])
+  const [connections, setConnections] = useState<MCPServerConnectionRes[]>([])
+  const [stepToolSelections, setStepToolSelections] = useState<StepToolSelection>({})
   const [mode, setMode] = useState<'auto' | 'manual'>('auto')
   const [workflowCollaboration, setWorkflowCollaboration] = useState<WorkflowCollaborationMode>('from_brd')
   const [isLoading, setIsLoading] = useState(false)
@@ -22,6 +32,11 @@ export function WorkflowBuilder({ jobId, onWorkflowCreated, initialSelectedAgent
     loadAgents()
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [initialSelectedAgentIds])
+
+  useEffect(() => {
+    loadTools()
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [jobId, job?.id, job?.allowed_platform_tool_ids, job?.allowed_connection_ids])
 
   useEffect(() => {
     if (initialSelectedAgentIds && initialSelectedAgentIds.length > 0) {
@@ -42,6 +57,47 @@ export function WorkflowBuilder({ jobId, onWorkflowCreated, initialSelectedAgent
     }
   }
 
+  const loadTools = async () => {
+    try {
+      const [tools, conns] = await Promise.all([mcpAPI.listTools(), mcpAPI.listConnections()])
+      const jobData = job ?? (jobId ? await jobsAPI.get(jobId).catch(() => null) : null)
+      const allowedPlatform = jobData?.allowed_platform_tool_ids
+      const allowedConn = jobData?.allowed_connection_ids
+      setPlatformTools(
+        allowedPlatform?.length
+          ? tools.filter((t: MCPToolConfigRes) => allowedPlatform.includes(t.id))
+          : tools
+      )
+      setConnections(
+        allowedConn?.length
+          ? conns.filter((c: MCPServerConnectionRes) => allowedConn.includes(c.id))
+          : conns
+      )
+    } catch (error) {
+      console.error('Failed to load tools:', error)
+    }
+  }
+
+  const setStepTools = (agentIndex: number, platformIds: number[], connectionIds: number[]) => {
+    setStepToolSelections((prev) => ({ ...prev, [agentIndex]: { platformIds, connectionIds } }))
+  }
+
+  const toggleStepPlatformTool = (agentIndex: number, toolId: number) => {
+    const cur = stepToolSelections[agentIndex] ?? { platformIds: [], connectionIds: [] }
+    const platformIds = cur.platformIds.includes(toolId)
+      ? cur.platformIds.filter((id) => id !== toolId)
+      : [...cur.platformIds, toolId]
+    setStepTools(agentIndex, platformIds, cur.connectionIds)
+  }
+
+  const toggleStepConnection = (agentIndex: number, connId: number) => {
+    const cur = stepToolSelections[agentIndex] ?? { platformIds: [], connectionIds: [] }
+    const connectionIds = cur.connectionIds.includes(connId)
+      ? cur.connectionIds.filter((id) => id !== connId)
+      : [...cur.connectionIds, connId]
+    setStepTools(agentIndex, cur.platformIds, connectionIds)
+  }
+
   const handleAutoSplit = async () => {
     if (selectedAgents.length === 0) {
       setError('Please select at least one agent')
@@ -57,7 +113,15 @@ export function WorkflowBuilder({ jobId, onWorkflowCreated, initialSelectedAgent
           : workflowCollaboration === 'independent'
             ? 'independent'
             : 'sequential'
-      await jobsAPI.autoSplitWorkflow(jobId, selectedAgents, workflowMode)
+      const stepTools = selectedAgents.map((_, idx) => {
+        const sel = stepToolSelections[idx]
+        return {
+          agent_index: idx,
+          allowed_platform_tool_ids: sel?.platformIds?.length ? sel.platformIds : undefined,
+          allowed_connection_ids: sel?.connectionIds?.length ? sel.connectionIds : undefined,
+        }
+      }).filter((s) => (s.allowed_platform_tool_ids?.length ?? 0) > 0 || (s.allowed_connection_ids?.length ?? 0) > 0)
+      await jobsAPI.autoSplitWorkflow(jobId, selectedAgents, workflowMode, stepTools.length ? stepTools : undefined)
       onWorkflowCreated()
     } catch (err: any) {
       setError(err.response?.data?.detail || 'Failed to create workflow')
@@ -176,6 +240,55 @@ export function WorkflowBuilder({ jobId, onWorkflowCreated, initialSelectedAgent
               ))
             )}
           </div>
+          {(platformTools.length > 0 || connections.length > 0) && selectedAgents.length > 0 && (
+            <div className="mb-6 p-5 bg-emerald-500/10 border-2 border-emerald-500/30 rounded-xl">
+              <h4 className="font-bold text-emerald-400 mb-3">Assign tools per agent (optional)</h4>
+              <p className="text-sm text-white/70 mb-4">Restrict which tools each agent can use. E.g. Agent 1 = Postgres only, Agent 2 = arithmetic.</p>
+              <div className="space-y-4">
+                {selectedAgents.map((agentId, idx) => {
+                  const agent = availableAgents.find((a) => a.id === agentId)
+                  const sel = stepToolSelections[idx] ?? { platformIds: [], connectionIds: [] }
+                  return (
+                    <div key={agentId} className="border border-dark-300 rounded-lg p-4 bg-dark-200/30">
+                      <div className="font-bold text-white mb-2">Step {idx + 1}: {agent?.name ?? `Agent ${agentId}`}</div>
+                      <div className="flex flex-wrap gap-4">
+                        {platformTools.length > 0 && (
+                          <div className="flex flex-wrap gap-2">
+                            {platformTools.map((t) => (
+                              <label key={t.id} className="inline-flex items-center gap-1.5 text-sm text-white/90 cursor-pointer">
+                                <input
+                                  type="checkbox"
+                                  checked={sel.platformIds.includes(t.id)}
+                                  onChange={() => toggleStepPlatformTool(idx, t.id)}
+                                  className="w-3.5 h-3.5 text-primary-600 rounded"
+                                />
+                                <span>{t.name}</span>
+                              </label>
+                            ))}
+                          </div>
+                        )}
+                        {connections.length > 0 && (
+                          <div className="flex flex-wrap gap-2">
+                            {connections.map((c) => (
+                              <label key={c.id} className="inline-flex items-center gap-1.5 text-sm text-white/90 cursor-pointer">
+                                <input
+                                  type="checkbox"
+                                  checked={sel.connectionIds.includes(c.id)}
+                                  onChange={() => toggleStepConnection(idx, c.id)}
+                                  className="w-3.5 h-3.5 text-primary-600 rounded"
+                                />
+                                <span className="truncate max-w-[120px]">{c.name}</span>
+                              </label>
+                            ))}
+                          </div>
+                        )}
+                      </div>
+                    </div>
+                  )
+                })}
+              </div>
+            </div>
+          )}
           <button
             onClick={handleAutoSplit}
             disabled={isLoading || selectedAgents.length === 0}

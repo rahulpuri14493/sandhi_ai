@@ -34,9 +34,14 @@ class WorkflowBuilder:
         return None
 
     def auto_split_workflow(
-        self, job_id: int, agent_ids: List[int], workflow_mode: Optional[str] = None
+        self,
+        job_id: int,
+        agent_ids: List[int],
+        workflow_mode: Optional[str] = None,
+        step_tools: Optional[List[Dict[str, Any]]] = None,
     ) -> WorkflowPreview:
-        """Automatically split a job across selected agents. workflow_mode: 'independent' | 'sequential' | None (infer from BRD)."""
+        """Automatically split a job across selected agents. workflow_mode: 'independent' | 'sequential' | None.
+        step_tools: optional list of {agent_index, allowed_platform_tool_ids, allowed_connection_ids} per step."""
         import json
         import asyncio
         
@@ -170,8 +175,8 @@ class WorkflowBuilder:
             if not assigned_task:
                 assigned_task = f"Execute the job. You are agent {idx+1} of {len(agents)}. {job.description or job.title}"
             
-            # Step 1 has no previous; step 2+ are independent only when steps_independent
-            depends_on_previous = not steps_independent if idx >= 1 else True
+            # Step 1 never receives previous output; step 2+ depend on previous only in sequential mode
+            depends_on_previous = False if idx == 0 else (not steps_independent)
             
             # Each agent gets base context + their specific task assignment
             step_input_data = {
@@ -191,6 +196,13 @@ class WorkflowBuilder:
             print(f"[DEBUG]   - Documents: {len(step_docs)}")
             print(f"[DEBUG]   - Conversation items: {len(step_conv)}")
             
+            step_platform = step_conn = None
+            if step_tools:
+                for st in step_tools:
+                    if st.get("agent_index") == idx:
+                        step_platform = st.get("allowed_platform_tool_ids")
+                        step_conn = st.get("allowed_connection_ids")
+                        break
             step = WorkflowStep(
                 job_id=job_id,
                 agent_id=agent.id,
@@ -198,6 +210,8 @@ class WorkflowBuilder:
                 input_data=json.dumps(step_input_data),
                 status="pending",
                 depends_on_previous=depends_on_previous,
+                allowed_platform_tool_ids=json.dumps(step_platform) if step_platform else None,
+                allowed_connection_ids=json.dumps(step_conn) if step_conn else None,
             )
             self.db.add(step)
             steps.append(step)
@@ -349,9 +363,12 @@ class WorkflowBuilder:
                     except (json.JSONDecodeError, TypeError):
                         step_input_data["custom_input"] = custom_input_data
             
-            depends_on_previous = step_data.get("depends_on_previous", True)
+            # Step 1 never receives previous output; default step 2+ to True (sequential) unless overridden
+            depends_on_previous = step_data.get("depends_on_previous")
             if not isinstance(depends_on_previous, bool):
-                depends_on_previous = True
+                depends_on_previous = step_order != 1
+            step_platform = step_data.get("allowed_platform_tool_ids")
+            step_conn = step_data.get("allowed_connection_ids")
             step = WorkflowStep(
                 job_id=job_id,
                 agent_id=agent_id,
@@ -359,6 +376,8 @@ class WorkflowBuilder:
                 input_data=json.dumps(step_input_data),
                 status="pending",
                 depends_on_previous=depends_on_previous,
+                allowed_platform_tool_ids=json.dumps(step_platform) if step_platform else None,
+                allowed_connection_ids=json.dumps(step_conn) if step_conn else None,
             )
             self.db.add(step)
         

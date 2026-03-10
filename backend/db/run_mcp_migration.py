@@ -1,0 +1,66 @@
+"""
+Run MCP migration (013) if MCP tables do not exist.
+
+Called after Base.metadata.create_all() so existing databases get
+mcp_server_connections and mcp_tool_configs without manual psql.
+Idempotent: uses CREATE TABLE IF NOT EXISTS and CREATE INDEX IF NOT EXISTS.
+"""
+import os
+from sqlalchemy import text
+from db.database import engine
+
+
+def _migration_dir():
+    return os.path.join(os.path.dirname(__file__), "..", "migrations")
+
+
+def _table_exists(conn, table_name: str) -> bool:
+    r = conn.execute(
+        text(
+            "SELECT 1 FROM information_schema.tables "
+            "WHERE table_schema = 'public' AND table_name = :name"
+        ),
+        {"name": table_name},
+    )
+    return r.scalar() is not None
+
+
+def run_mcp_migration_if_needed():
+    """Run 013 if MCP tables do not exist; run 014 to add tool types; run 015 to add endpoint_path; run 016 for job/step allowed tools."""
+    path_013 = os.path.join(_migration_dir(), "013_add_mcp_tables.sql")
+    path_014 = os.path.join(_migration_dir(), "014_add_mcp_tool_types.sql")
+    path_015 = os.path.join(_migration_dir(), "015_add_mcp_endpoint_path.sql")
+    path_016 = os.path.join(_migration_dir(), "016_add_job_and_step_allowed_tools.sql")
+    with engine.connect() as conn:
+        if os.path.isfile(path_013) and not _table_exists(conn, "mcp_server_connections"):
+            with open(path_013, "r", encoding="utf-8") as f:
+                conn.execute(text(f.read()))
+            conn.commit()
+        if os.path.isfile(path_014):
+            with open(path_014, "r", encoding="utf-8") as f:
+                sql = f.read()
+            for line in sql.strip().split("\n"):
+                line = line.strip()
+                if not line or line.startswith("--"):
+                    continue
+                try:
+                    conn.execute(text(line))
+                except Exception:
+                    pass
+            conn.commit()
+        if os.path.isfile(path_015) and _table_exists(conn, "mcp_server_connections"):
+            with open(path_015, "r", encoding="utf-8") as f:
+                conn.execute(text(f.read()))
+            conn.commit()
+        if os.path.isfile(path_016) and _table_exists(conn, "jobs"):
+            with open(path_016, "r", encoding="utf-8") as f:
+                sql = f.read()
+            for line in sql.strip().split("\n"):
+                line = line.strip()
+                if not line or line.startswith("--"):
+                    continue
+                try:
+                    conn.execute(text(line))
+                except Exception:
+                    pass
+            conn.commit()
