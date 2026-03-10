@@ -40,6 +40,8 @@ app = FastAPI(
 OPENAI_URL_DEFAULT = os.environ.get("OPENAI_COMPATIBLE_URL", "").strip()
 OPENAI_API_KEY_DEFAULT = os.environ.get("OPENAI_API_KEY", "").strip() or None
 OPENAI_MODEL_DEFAULT = os.environ.get("OPENAI_MODEL", "").strip() or "gpt-4o-mini"
+# When set, per-request openai_url must match or be subdomain of this host (SSRF mitigation)
+_default_hostname = (urlparse(OPENAI_URL_DEFAULT).hostname or "").strip().lower() if OPENAI_URL_DEFAULT else ""
 JSONRPC_VERSION = "2.0"
 METHOD_SEND_MESSAGE = "SendMessage"
 ROLE_AGENT = "ROLE_AGENT"
@@ -74,8 +76,8 @@ def health():
 
 def _validate_openai_url(url: str) -> str:
     """
-    Basic SSRF mitigation: ensure URL has http/https scheme and does not resolve to
-    a private, loopback, or link-local address.
+    SSRF mitigation: http/https only; when OPENAI_COMPATIBLE_URL is set, hostname must
+    match or be a subdomain of it; resolved IP must not be private/loopback/link-local.
     """
     url = (url or "").strip()
     if not url:
@@ -91,6 +93,12 @@ def _validate_openai_url(url: str) -> str:
     hostname = parsed.hostname
     if not hostname:
         raise ValueError("Invalid OpenAI URL hostname.")
+
+    # When a default upstream is configured, allow only that host or its subdomains
+    if _default_hostname:
+        h = hostname.lower()
+        if h != _default_hostname and not (h.endswith("." + _default_hostname)):
+            raise ValueError("OpenAI URL hostname is not allowed")
 
     try:
         addrinfo = socket.getaddrinfo(hostname, None)
@@ -188,7 +196,8 @@ async def a2a_endpoint(request: Request):
 
     try:
         validated_openai_url = _validate_openai_url(openai_url)
-    except ValueError as e:
+    except ValueError:
+        logger.warning("Invalid openai_url provided", exc_info=True)
         return JSONResponse(
             status_code=400,
             content={
@@ -196,7 +205,7 @@ async def a2a_endpoint(request: Request):
                 "id": req_id,
                 "error": {
                     "code": -32602,
-                    "message": f"Invalid openai_url: {e}",
+                    "message": "Invalid openai_url",
                 },
             },
         )
@@ -223,7 +232,7 @@ async def a2a_endpoint(request: Request):
 
     try:
         async with httpx.AsyncClient(timeout=120.0) as client:
-            # codeql[py/full-ssrf] URL validated by _validate_openai_url (scheme + hostname + public IP)
+            # codeql[py/full-ssrf] URL validated by _validate_openai_url (scheme, hostname/domain, public IP)
             response = await client.post(validated_openai_url, json=payload, headers=headers)
             response.raise_for_status()
             data = response.json()

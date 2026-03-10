@@ -8,8 +8,6 @@ import ipaddress
 import json
 import socket
 import uuid
-from urllib.parse import urlparse
-
 import httpx
 
 
@@ -116,19 +114,35 @@ def _extract_result_from_send_message_response(response_body: Dict[str, Any]) ->
 
 def _validate_public_http_url(url: str) -> str:
     """
-    Basic SSRF protection: ensure the URL uses http/https and resolves to a public IP.
-    Raises ValueError if the URL is invalid or points to a private/internal address.
+    SSRF protection: ensure the URL uses http/https, uses an allowed port,
+    and resolves to a public IP. Raises ValueError if invalid or private/internal.
     """
-    parsed = urlparse(url)
-    if parsed.scheme not in ("http", "https"):
-        raise ValueError("Only http and https schemes are allowed for agent endpoints")
-    if not parsed.hostname:
-        raise ValueError("Agent endpoint must include a hostname")
+    if not (url or "").strip():
+        raise ValueError("Agent endpoint URL is required")
 
     try:
-        addr_info = socket.getaddrinfo(parsed.hostname, None)
+        normalized = httpx.URL((url or "").strip())
+    except Exception as exc:
+        raise ValueError("Invalid agent endpoint URL") from exc
+
+    scheme = normalized.scheme
+    hostname = normalized.host
+    port = normalized.port
+
+    if scheme not in ("http", "https"):
+        raise ValueError("Only http and https schemes are allowed for agent endpoints")
+    if not hostname:
+        raise ValueError("Agent endpoint must include a hostname")
+
+    # Block sensitive ports to reduce SSRF risk
+    blocked_ports = {22, 23, 25, 53, 110, 143, 3306, 5432, 6379, 11211}
+    if port is not None and port in blocked_ports:
+        raise ValueError(f"Agent endpoint port {port} is not allowed")
+
+    try:
+        addr_info = socket.getaddrinfo(hostname, None)
     except OSError as exc:
-        raise ValueError(f"Could not resolve agent endpoint host: {parsed.hostname}") from exc
+        raise ValueError(f"Could not resolve agent endpoint host: {hostname}") from exc
 
     for family, _, _, _, sockaddr in addr_info:
         ip_str = None
@@ -148,7 +162,7 @@ def _validate_public_http_url(url: str) -> str:
         ):
             raise ValueError("Agent endpoint host must resolve to a public IP address")
 
-    return url
+    return str(normalized)
 
 
 async def send_message(
@@ -192,7 +206,7 @@ async def send_message(
     safe_url = _validate_public_http_url(normalized_url)
 
     async with httpx.AsyncClient(timeout=timeout, verify=False) as client:
-        # codeql[py/full-ssrf] URL validated by _validate_public_http_url (scheme + hostname + public IP)
+        # codeql[py/full-ssrf] URL validated by _validate_public_http_url (scheme, hostname, port, public IP)
         response = await client.post(safe_url, json=payload, headers=headers)
 
     try:
