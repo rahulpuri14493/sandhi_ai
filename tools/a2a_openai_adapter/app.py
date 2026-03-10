@@ -126,6 +126,51 @@ def _validate_openai_url(url: str) -> str:
     return url
 
 
+def _validate_outbound_url(url: str) -> str:
+    """
+    Per-request SSRF check immediately before outgoing request: require HTTPS,
+    resolve hostname and reject private/loopback/link-local/multicast/reserved/unspecified IPs.
+    Guards against DNS rebinding; use the returned URL for client.post.
+    """
+    url = (url or "").strip()
+    if not url:
+        raise ValueError("URL is required")
+
+    parsed = urlparse(url)
+    if parsed.scheme != "https":
+        raise ValueError("Outbound URL must use https")
+    if not parsed.hostname:
+        raise ValueError("Outbound URL must include a hostname")
+
+    try:
+        addrinfo = socket.getaddrinfo(parsed.hostname, None)
+    except socket.gaierror:
+        raise ValueError("Unable to resolve outbound URL hostname")
+
+    for family, _, _, _, sockaddr in addrinfo:
+        ip_str = None
+        if family == socket.AF_INET:
+            ip_str = sockaddr[0]
+        elif family == socket.AF_INET6:
+            ip_str = sockaddr[0]
+        if ip_str is None:
+            continue
+        ip_obj = ipaddress.ip_address(ip_str)
+        if (
+            ip_obj.is_private
+            or ip_obj.is_loopback
+            or ip_obj.is_link_local
+            or ip_obj.is_reserved
+            or ip_obj.is_multicast
+        ):
+            raise ValueError("Outbound URL host resolves to a disallowed IP address")
+        # IPv6 unspecified (::)
+        if getattr(ip_obj, "is_unspecified", False):
+            raise ValueError("Outbound URL host resolves to a disallowed IP address")
+
+    return url
+
+
 def _resolve_target(metadata: Dict[str, Any]) -> tuple:
     """Return (validated_url, api_key, model). All URLs pass _validate_openai_url before use (SSRF)."""
     raw_url = (metadata.get("openai_url") or "").strip() or OPENAI_URL_DEFAULT
@@ -213,6 +258,22 @@ async def a2a_endpoint(request: Request):
             },
         )
 
+    try:
+        outbound_url = _validate_outbound_url(openai_url)
+    except ValueError:
+        logger.warning("Outbound URL validation failed", exc_info=True)
+        return JSONResponse(
+            status_code=400,
+            content={
+                "jsonrpc": JSONRPC_VERSION,
+                "id": req_id,
+                "error": {
+                    "code": -32602,
+                    "message": "Invalid openai_url",
+                },
+            },
+        )
+
     headers = {"Content-Type": "application/json"}
     auth = request.headers.get("Authorization")
     if auth:
@@ -235,8 +296,8 @@ async def a2a_endpoint(request: Request):
 
     try:
         async with httpx.AsyncClient(timeout=120.0) as client:
-            # codeql[py/full-ssrf] URL validated in _resolve_target → _validate_openai_url (scheme, hostname/domain, public IP)
-            response = await client.post(openai_url, json=payload, headers=headers)
+            # codeql[py/full-ssrf] URL validated by _validate_outbound_url (https + fresh DNS + public IP) immediately before request
+            response = await client.post(outbound_url, json=payload, headers=headers)
             response.raise_for_status()
             data = response.json()
     except httpx.HTTPStatusError as e:
