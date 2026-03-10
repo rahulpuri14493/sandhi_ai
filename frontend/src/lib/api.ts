@@ -78,7 +78,7 @@ export const agentsAPI = {
   delete(agentId: number) {
     return api.delete('/agents/' + agentId)
   },
-  testConnection(params: { api_endpoint: string; api_key?: string; test_data?: object; llm_model?: string; temperature?: number }) {
+  testConnection(params: { api_endpoint: string; api_key?: string; test_data?: object; llm_model?: string; temperature?: number; a2a_enabled?: boolean }) {
     return api.post('/agents/test-connection', params).then((res) => res.data)
   },
 }
@@ -130,11 +130,20 @@ export const jobsAPI = {
   analyzeDocuments(jobId: number) {
     return api.post('/jobs/' + jobId + '/analyze-documents').then((res) => res.data)
   },
-  answerQuestion(jobId: number, question: string) {
-    return api.post('/jobs/' + jobId + '/answer-question', { question }).then((res) => res.data)
+  answerQuestion(jobId: number, answer: string) {
+    return api.post('/jobs/' + jobId + '/answer-question', { answer }).then((res) => res.data)
   },
-  autoSplitWorkflow(jobId: number, agentIds: number[]) {
-    return api.post('/jobs/' + jobId + '/workflow/auto-split', { agent_ids: agentIds }).then((res) => res.data)
+  generateWorkflowQuestions(jobId: number) {
+    return api.post('/jobs/' + jobId + '/generate-workflow-questions').then((res) => res.data)
+  },
+  autoSplitWorkflow(
+    jobId: number,
+    agentIds: number[],
+    workflowMode?: 'independent' | 'sequential'
+  ) {
+    const body: { agent_ids: number[]; workflow_mode?: string } = { agent_ids: agentIds }
+    if (workflowMode) body.workflow_mode = workflowMode
+    return api.post('/jobs/' + jobId + '/workflow/auto-split', body).then((res) => res.data)
   },
 }
 export const dashboardsAPI = {

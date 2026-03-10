@@ -18,6 +18,22 @@ class JobUpdate(BaseModel):
     status: Optional[JobStatus] = None
 
 
+class AutoSplitBody(BaseModel):
+    """Request body for POST /jobs/{job_id}/workflow/auto-split."""
+    agent_ids: List[int] = []
+    workflow_mode: Optional[str] = None  # "independent" | "sequential" | None (infer from BRD/conversation)
+
+
+class AnswerQuestionBody(BaseModel):
+    """Request body for POST /jobs/{job_id}/answer-question. Accepts 'answer' (preferred) or legacy 'question'."""
+    answer: Optional[str] = None
+    question: Optional[str] = None  # Legacy: frontend used to send user's answer under this key
+
+    def get_answer(self) -> str:
+        """Return the user's answer from either 'answer' or legacy 'question'."""
+        return (self.answer or self.question or "").strip()
+
+
 class WorkflowStepCreate(BaseModel):
     agent_id: int
     step_order: int
@@ -69,6 +85,7 @@ class WorkflowStepResponse(BaseModel):
     cost: float
     started_at: Optional[datetime]
     completed_at: Optional[datetime]
+    depends_on_previous: Optional[bool] = True  # False = step works independently (no previous output)
 
     class Config:
         from_attributes = True

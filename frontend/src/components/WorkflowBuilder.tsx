@@ -8,10 +8,13 @@ interface WorkflowBuilderProps {
   initialSelectedAgentIds?: number[]
 }
 
+export type WorkflowCollaborationMode = 'from_brd' | 'independent' | 'sequential'
+
 export function WorkflowBuilder({ jobId, onWorkflowCreated, initialSelectedAgentIds }: WorkflowBuilderProps) {
   const [selectedAgents, setSelectedAgents] = useState<number[]>(initialSelectedAgentIds ?? [])
   const [availableAgents, setAvailableAgents] = useState<Agent[]>([])
   const [mode, setMode] = useState<'auto' | 'manual'>('auto')
+  const [workflowCollaboration, setWorkflowCollaboration] = useState<WorkflowCollaborationMode>('from_brd')
   const [isLoading, setIsLoading] = useState(false)
   const [error, setError] = useState('')
 
@@ -30,7 +33,7 @@ export function WorkflowBuilder({ jobId, onWorkflowCreated, initialSelectedAgent
     try {
       const agents = await agentsAPI.list('active')
       if (initialSelectedAgentIds && initialSelectedAgentIds.length > 0) {
-        setAvailableAgents(agents.filter((a) => initialSelectedAgentIds.includes(a.id)))
+        setAvailableAgents(agents.filter((a: Agent) => initialSelectedAgentIds!.includes(a.id)))
       } else {
         setAvailableAgents(agents)
       }
@@ -48,7 +51,13 @@ export function WorkflowBuilder({ jobId, onWorkflowCreated, initialSelectedAgent
     setIsLoading(true)
     setError('')
     try {
-      await jobsAPI.autoSplitWorkflow(jobId, selectedAgents)
+      const workflowMode =
+        workflowCollaboration === 'from_brd'
+          ? undefined
+          : workflowCollaboration === 'independent'
+            ? 'independent'
+            : 'sequential'
+      await jobsAPI.autoSplitWorkflow(jobId, selectedAgents, workflowMode)
       onWorkflowCreated()
     } catch (err: any) {
       setError(err.response?.data?.detail || 'Failed to create workflow')
@@ -67,6 +76,22 @@ export function WorkflowBuilder({ jobId, onWorkflowCreated, initialSelectedAgent
 
   return (
     <div className="bg-dark-100/50 backdrop-blur-xl rounded-2xl shadow-2xl p-8 border border-dark-200/50">
+      <div className="mb-6 p-5 bg-primary-500/10 border-2 border-primary-500/30 rounded-xl">
+        <h3 className="font-bold text-primary-400 mb-2 text-base">Workflow mode</h3>
+        <p className="text-sm text-white/70 font-medium mb-2">
+          All agents are called over A2A by the platform. The badge below is about collaboration style, not transport.
+        </p>
+        <p className="text-sm text-white/90 font-medium">
+          <strong>Sequential:</strong> Each agent receives the previous agent’s output (pipeline). Use agents without the A2A badge.
+          <strong className="ml-1"> A2A:</strong> Agents collaborate asynchronously; choose agents with the &quot;A2A&quot; badge when your requirements need peer-to-peer collaboration.
+        </p>
+      </div>
+      <div className="mb-6 p-5 bg-emerald-500/10 border-2 border-emerald-500/30 rounded-xl">
+        <h3 className="font-bold text-emerald-400 mb-2 text-base">BRD &amp; Q&A → Auto-Split</h3>
+        <p className="text-sm text-white/90 font-medium">
+          Work is divided among agents based on your <strong>job prompt</strong> and <strong>BRD documents</strong>. Run <strong>Analyze Documents</strong> first so the AI can ask questions from your BRD; your answers are then used when splitting work. Each agent receives only its assigned subtask derived from the BRD and prompt.
+        </p>
+      </div>
       <div className="mb-8">
         <h2 className="text-4xl font-black text-white tracking-tight mb-6">Build Workflow</h2>
         <div className="flex gap-4 mb-6">
@@ -102,6 +127,23 @@ export function WorkflowBuilder({ jobId, onWorkflowCreated, initialSelectedAgent
       {mode === 'auto' && (
         <div>
           <h3 className="font-black text-white mb-5 text-xl">Select Agents for Auto-Split</h3>
+          <div className="mb-6">
+            <label className="block text-sm font-bold text-white/90 mb-2">Agents work</label>
+            <select
+              value={workflowCollaboration}
+              onChange={(e) => setWorkflowCollaboration(e.target.value as WorkflowCollaborationMode)}
+              className="px-4 py-2.5 bg-dark-200/80 border-2 border-dark-300 rounded-xl text-white font-medium focus:ring-2 focus:ring-primary-500 focus:border-primary-500"
+            >
+              <option value="from_brd">From BRD / document (default)</option>
+              <option value="independent">Independently (each agent gets only its task)</option>
+              <option value="sequential">Sequentially (each agent receives previous agent output)</option>
+            </select>
+            <p className="text-xs text-white/50 mt-1.5">
+              {workflowCollaboration === 'independent' && 'Best when tasks are separate (e.g. 2+5 and 9-1).'}
+              {workflowCollaboration === 'sequential' && 'Best when agent 2 needs agent 1’s result (pipeline).'}
+              {workflowCollaboration === 'from_brd' && 'Uses analyze-documents hint from your BRD when available.'}
+            </p>
+          </div>
           <div className="space-y-3 max-h-80 overflow-y-auto border-2 border-dark-300 rounded-xl p-5 mb-6 bg-dark-200/30">
             {availableAgents.length === 0 ? (
               <p className="text-white/50 text-center py-8 font-medium">No agents available</p>
@@ -118,7 +160,14 @@ export function WorkflowBuilder({ jobId, onWorkflowCreated, initialSelectedAgent
                     className="w-5 h-5 text-primary-600 bg-dark-200 border-dark-300 rounded focus:ring-primary-500 focus:ring-2"
                   />
                   <div className="flex-1">
-                    <div className="font-bold text-white text-lg">{agent.name}</div>
+                    <div className="flex items-center gap-2 flex-wrap">
+                      <span className="font-bold text-white text-lg">{agent.name}</span>
+                      {agent.a2a_enabled && (
+                        <span className="px-2 py-0.5 text-xs font-bold bg-primary-500/30 text-primary-300 rounded border border-primary-500/50">
+                          A2A
+                        </span>
+                      )}
+                    </div>
                     <div className="text-sm text-primary-400 font-semibold mt-1">
                       ${agent.price_per_task.toFixed(2)} per task
                     </div>

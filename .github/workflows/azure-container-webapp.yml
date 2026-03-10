@@ -11,7 +11,10 @@
 # 2. Create a secret in your repository named AZURE_WEBAPP_PUBLISH_PROFILE, paste the publish profile contents as the value of the secret.
 #    For instructions on obtaining the publish profile see: https://docs.microsoft.com/azure/app-service/deploy-github-actions#configure-the-github-secret
 #
-# 3. Create a GitHub Personal access token with "repo" and "read:packages" permissions.
+# 3. (Optional) If you see "installation not allowed to Create organization package":
+#    - For a user repo: ensure this workflow has packages: write (see permissions below).
+#    - For an org repo: org admin must allow "GitHub Actions to create packages" (Settings → Actions → General),
+#      OR add a secret CR_PAT (PAT with write:packages, read:packages) and set USE_CR_PAT: true in env below.
 #
 # 4. Create three app settings on your Azure Web app:
 #       DOCKER_REGISTRY_SERVER_URL: Set this to "https://ghcr.io"
@@ -27,7 +30,7 @@
 name: Build and deploy a container to an Azure Web App
 
 env:
-  AZURE_WEBAPP_NAME: your-app-name  # set this to the name of your Azure Web App
+  AZURE_WEBAPP_NAME: sandhi_ai_platform  # set this to the name of your Azure Web App
 
 on:
   push:
@@ -36,6 +39,7 @@ on:
 
 permissions:
   contents: read
+  packages: write   # required to push image to ghcr.io
 
 jobs:
   build:
@@ -52,7 +56,7 @@ jobs:
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
-          password: ${{ github.token }}
+          password: ${{ secrets.CR_PAT || github.token }}
 
       - name: Lowercase the repo name and username
         run: echo "REPO=${GITHUB_REPOSITORY,,}" >>${GITHUB_ENV}

@@ -1,7 +1,7 @@
 import { useState, useEffect } from 'react'
 import { useNavigate, useParams, useLocation } from 'react-router-dom'
 import { jobsAPI, agentsAPI } from '../lib/api'
-import type { Job, Agent } from '../lib/types'
+import type { Job, Agent, WorkflowStep } from '../lib/types'
 
 export default function EditJobPage() {
   const { id } = useParams<{ id: string }>()
@@ -49,7 +49,7 @@ export default function EditJobPage() {
         job.workflow_steps &&
         job.workflow_steps.length > 0
       ) {
-        setSelectedAgents([...new Set(job.workflow_steps.map((s) => s.agent_id))])
+        setSelectedAgents(Array.from(new Set(job.workflow_steps.map((s: WorkflowStep) => s.agent_id))))
       }
     } catch (err: any) {
       setError(err.response?.data?.detail || 'Failed to load job')

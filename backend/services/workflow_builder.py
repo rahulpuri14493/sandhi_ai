@@ -1,8 +1,12 @@
 from sqlalchemy.orm import Session
-from typing import List, Dict, Any
+from sqlalchemy import or_
+from typing import List, Dict, Any, Optional
 import asyncio
+import json
 from models.job import Job, WorkflowStep
 from models.agent import Agent
+from models.transaction import Earnings
+from models.communication import AgentCommunication
 from schemas.job import WorkflowPreview, WorkflowStepResponse
 from services.payment_processor import PaymentProcessor
 from services.task_splitter import split_job_for_agents
@@ -13,8 +17,26 @@ class WorkflowBuilder:
         self.db = db
         self.payment_processor = PaymentProcessor(db)
     
-    def auto_split_workflow(self, job_id: int, agent_ids: List[int]) -> WorkflowPreview:
-        """Automatically split a job across selected agents"""
+    def _get_workflow_collaboration_hint(self, job: Job) -> Optional[str]:
+        """Get workflow_collaboration_hint from job conversation (BRD/analyze-documents). Returns 'sequential', 'async_a2a', or None."""
+        if not job.conversation:
+            return None
+        try:
+            conv = json.loads(job.conversation)
+            if not isinstance(conv, list):
+                return None
+            for item in reversed(conv):
+                hint = item.get("workflow_collaboration_hint") if isinstance(item, dict) else None
+                if hint in ("sequential", "async_a2a"):
+                    return hint
+        except (json.JSONDecodeError, TypeError):
+            pass
+        return None
+
+    def auto_split_workflow(
+        self, job_id: int, agent_ids: List[int], workflow_mode: Optional[str] = None
+    ) -> WorkflowPreview:
+        """Automatically split a job across selected agents. workflow_mode: 'independent' | 'sequential' | None (infer from BRD)."""
         import json
         import asyncio
         
@@ -109,8 +131,33 @@ class WorkflowBuilder:
                     for i in range(len(agents))
                 ]
         
-        # Clear existing workflow steps
-        self.db.query(WorkflowStep).filter(WorkflowStep.job_id == job_id).delete()
+        # Independent vs sequential: from request override or BRD/conversation hint
+        if workflow_mode == "independent":
+            steps_independent = True
+        elif workflow_mode == "sequential":
+            steps_independent = False
+        else:
+            hint = self._get_workflow_collaboration_hint(job)
+            steps_independent = hint == "async_a2a"
+        print(f"[DEBUG] Workflow mode: {'independent' if steps_independent else 'sequential'} (workflow_mode={workflow_mode!r}, BRD hint used when None)")
+        
+        # Unlink earnings and delete dependent rows, then clear existing workflow steps
+        step_ids = [s.id for s in self.db.query(WorkflowStep.id).filter(WorkflowStep.job_id == job_id).all()]
+        if step_ids:
+            self.db.query(Earnings).filter(Earnings.workflow_step_id.in_(step_ids)).update(
+                {Earnings.workflow_step_id: None}, synchronize_session=False
+            )
+            comm_filter = or_(
+                AgentCommunication.from_workflow_step_id.in_(step_ids),
+                AgentCommunication.to_workflow_step_id.in_(step_ids),
+            )
+            comm_ids = [r.id for r in self.db.query(AgentCommunication.id).filter(comm_filter).all()]
+            if comm_ids:
+                self.db.query(Earnings).filter(Earnings.communication_id.in_(comm_ids)).update(
+                    {Earnings.communication_id: None}, synchronize_session=False
+                )
+                self.db.query(AgentCommunication).filter(comm_filter).delete(synchronize_session=False)
+        self.db.query(WorkflowStep).filter(WorkflowStep.job_id == job_id).delete(synchronize_session=False)
         
         # Create workflow steps - each agent gets assigned task + base context
         steps = []
@@ -122,6 +169,9 @@ class WorkflowBuilder:
                     break
             if not assigned_task:
                 assigned_task = f"Execute the job. You are agent {idx+1} of {len(agents)}. {job.description or job.title}"
+            
+            # Step 1 has no previous; step 2+ are independent only when steps_independent
+            depends_on_previous = not steps_independent if idx >= 1 else True
             
             # Each agent gets base context + their specific task assignment
             step_input_data = {
@@ -137,7 +187,7 @@ class WorkflowBuilder:
             # Validate step input data includes documents and conversation
             step_docs = step_input_data.get('documents', [])
             step_conv = step_input_data.get('conversation', [])
-            print(f"[DEBUG] Step {idx + 1} for agent '{agent.name}':")
+            print(f"[DEBUG] Step {idx + 1} for agent '{agent.name}': depends_on_previous={depends_on_previous}")
             print(f"[DEBUG]   - Documents: {len(step_docs)}")
             print(f"[DEBUG]   - Conversation items: {len(step_conv)}")
             
@@ -146,7 +196,8 @@ class WorkflowBuilder:
                 agent_id=agent.id,
                 step_order=idx + 1,
                 input_data=json.dumps(step_input_data),
-                status="pending"
+                status="pending",
+                depends_on_previous=depends_on_previous,
             )
             self.db.add(step)
             steps.append(step)
@@ -242,8 +293,23 @@ class WorkflowBuilder:
             print(f"[DEBUG] Conversation includes {len([item for item in conversation_data if item.get('type') == 'question'])} questions")
             print(f"[DEBUG] Conversation includes {len([item for item in conversation_data if item.get('type') == 'completion'])} completion messages")
         
-        # Clear existing workflow steps
-        self.db.query(WorkflowStep).filter(WorkflowStep.job_id == job_id).delete()
+        # Unlink earnings and delete dependent rows, then clear existing workflow steps
+        step_ids = [s.id for s in self.db.query(WorkflowStep.id).filter(WorkflowStep.job_id == job_id).all()]
+        if step_ids:
+            self.db.query(Earnings).filter(Earnings.workflow_step_id.in_(step_ids)).update(
+                {Earnings.workflow_step_id: None}, synchronize_session=False
+            )
+            comm_filter = or_(
+                AgentCommunication.from_workflow_step_id.in_(step_ids),
+                AgentCommunication.to_workflow_step_id.in_(step_ids),
+            )
+            comm_ids = [r.id for r in self.db.query(AgentCommunication.id).filter(comm_filter).all()]
+            if comm_ids:
+                self.db.query(Earnings).filter(Earnings.communication_id.in_(comm_ids)).update(
+                    {Earnings.communication_id: None}, synchronize_session=False
+                )
+                self.db.query(AgentCommunication).filter(comm_filter).delete(synchronize_session=False)
+        self.db.query(WorkflowStep).filter(WorkflowStep.job_id == job_id).delete(synchronize_session=False)
         
         # Create workflow steps
         for step_data in workflow_steps:
@@ -283,12 +349,16 @@ class WorkflowBuilder:
                     except (json.JSONDecodeError, TypeError):
                         step_input_data["custom_input"] = custom_input_data
             
+            depends_on_previous = step_data.get("depends_on_previous", True)
+            if not isinstance(depends_on_previous, bool):
+                depends_on_previous = True
             step = WorkflowStep(
                 job_id=job_id,
                 agent_id=agent_id,
                 step_order=step_order,
                 input_data=json.dumps(step_input_data),
-                status="pending"
+                status="pending",
+                depends_on_previous=depends_on_previous,
             )
             self.db.add(step)
         

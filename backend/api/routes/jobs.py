@@ -14,7 +14,7 @@ from db.database import get_db
 from models.job import Job, JobStatus, WorkflowStep
 from models.agent import Agent
 from models.user import User, UserRole
-from schemas.job import JobCreate, JobUpdate, JobResponse, WorkflowStepResponse, WorkflowPreview
+from schemas.job import JobCreate, JobUpdate, JobResponse, WorkflowStepResponse, WorkflowPreview, AutoSplitBody, AnswerQuestionBody
 from core.security import get_current_user, get_current_business_user
 from core.config import settings
 from services.workflow_builder import WorkflowBuilder
@@ -30,7 +30,7 @@ router = APIRouter(prefix="/api/jobs", tags=["jobs"])
 
 
 def _get_first_hired_agent_for_job(db: Session, job_id: int) -> Optional[tuple]:
-    """Return (api_url, api_key, llm_model, temperature) for the first hired agent, or None."""
+    """Return (api_url, api_key, llm_model, temperature, a2a_enabled) for the first hired agent, or None."""
     first_step = (
         db.query(WorkflowStep)
         .filter(WorkflowStep.job_id == job_id)
@@ -47,6 +47,7 @@ def _get_first_hired_agent_for_job(db: Session, job_id: int) -> Optional[tuple]:
         (agent.api_key or "").strip() or None,
         (getattr(agent, "llm_model", None) or None),
         (getattr(agent, "temperature", None)),
+        getattr(agent, "a2a_enabled", False),
     )
 
 
@@ -202,7 +203,7 @@ async def analyze_documents(
     current_user: User = Depends(get_current_business_user),
     db: Session = Depends(get_db)
 ):
-    """Analyze uploaded documents and generate questions using MLOps inference endpoints"""
+    """Analyze uploaded documents and generate questions using the hired agent."""
     job = db.query(Job).filter(Job.id == job_id).first()
     if not job:
         raise HTTPException(
@@ -242,7 +243,11 @@ async def analyze_documents(
             detail="No valid document paths found in job files"
         )
     hired = _get_first_hired_agent_for_job(db, job.id)
-    agent_url, agent_key, agent_model, agent_temp = hired if hired else (None, None, None, None)
+    if hired:
+        agent_url, agent_key, agent_model, agent_temp, use_a2a = hired
+    else:
+        agent_url = agent_key = agent_model = agent_temp = None
+        use_a2a = False
     
     try:
         analyzer = DocumentAnalyzer()
@@ -255,6 +260,7 @@ async def analyze_documents(
             agent_api_key=agent_key,
             agent_llm_model=agent_model,
             agent_temperature=agent_temp,
+            use_a2a=use_a2a,
         )
         
         # Add the new questions to conversation
@@ -267,23 +273,32 @@ async def analyze_documents(
                 "timestamp": str(datetime.utcnow())
             })
         
-        # Add questions if any
+        # Add questions if any (dedupe by text so we don't repeat the same question)
+        existing_questions = {str(item.get("question", "")).strip() for item in new_conversation if item.get("type") == "question" and item.get("question")}
         if result.get("questions"):
+            seen_in_batch = set()
             for question in result["questions"]:
+                q = str(question).strip() if question else ""
+                if not q or q in existing_questions or q in seen_in_batch:
+                    continue
+                seen_in_batch.add(q)
+                existing_questions.add(q)
                 new_conversation.append({
                     "type": "question",
-                    "question": question,
+                    "question": q,
                     "answer": None,
                     "timestamp": str(datetime.utcnow())
                 })
         else:
-            # No questions - add completion with solutions
+            # No questions - add completion with solutions and optional workflow hint
             new_conversation.append({
                 "type": "completion",
                 "message": "Requirements understood. Here are the solutions:",
                 "recommendations": result.get("recommendations", []),
                 "solutions": result.get("solutions", []),
                 "next_steps": result.get("next_steps", []),
+                "workflow_collaboration_hint": result.get("workflow_collaboration_hint"),
+                "workflow_collaboration_reason": result.get("workflow_collaboration_reason"),
                 "timestamp": str(datetime.utcnow())
             })
         
@@ -309,13 +324,17 @@ async def analyze_documents(
 @router.post("/{job_id}/answer-question", status_code=status.HTTP_200_OK)
 async def answer_question(
     job_id: int,
-    answer: str = Form(...),
+    body: AnswerQuestionBody,
     current_user: User = Depends(get_current_business_user),
     db: Session = Depends(get_db)
 ):
-    """Submit user's answer and get follow-up questions or recommendations"""
-    
-    
+    """Submit user's answer and get follow-up questions or recommendations."""
+    answer = body.get_answer()
+    if not answer:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="Missing 'answer' in request body (or legacy 'question' with the user's answer text)",
+        )
     job = db.query(Job).filter(Job.id == job_id).first()
     if not job:
         raise HTTPException(
@@ -338,31 +357,42 @@ async def answer_question(
     # Parse conversation
     conversation_history = json.loads(job.conversation) if job.conversation else []
     
-    # Find the last unanswered question
-    last_question_idx = None
-    for i in range(len(conversation_history) - 1, -1, -1):
+    # Question texts already answered (so we skip duplicate question items, same as frontend)
+    answered_texts = {
+        str(item.get("question", "")).strip()
+        for item in conversation_history
+        if item.get("type") == "question" and item.get("answer") and str(item.get("answer", "")).strip()
+    }
+    # Find the FIRST unanswered question whose text we haven't already answered (matches UI)
+    first_question_idx = None
+    for i in range(len(conversation_history)):
         item = conversation_history[i]
-        if item.get("type") == "question" and not item.get("answer"):
-            # Ensure question field exists and is not None
-            if item.get("question"):
-                last_question_idx = i
-                break
-    
-    if last_question_idx is None:
+        if item.get("type") != "question" or item.get("answer"):
+            continue
+        qtext = str(item.get("question", "")).strip()
+        if qtext and qtext not in answered_texts:
+            first_question_idx = i
+            break
+
+    if first_question_idx is None:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="No unanswered question found"
         )
-    
+
     # Update conversation with answer
-    conversation_history[last_question_idx]["answer"] = answer
-    conversation_history[last_question_idx]["answered_at"] = str(datetime.utcnow())
+    conversation_history[first_question_idx]["answer"] = answer
+    conversation_history[first_question_idx]["answered_at"] = str(datetime.utcnow())
     
     files_data = json.loads(job.files)
     documents = [{"path": f["path"], "name": f["name"]} for f in files_data]
     hired = _get_first_hired_agent_for_job(db, job.id)
-    agent_url, agent_key, agent_model, agent_temp = hired if hired else (None, None, None, None)
-    
+    if hired:
+        agent_url, agent_key, agent_model, agent_temp, use_a2a = hired
+    else:
+        agent_url = agent_key = agent_model = agent_temp = None
+        use_a2a = False
+
     try:
         analyzer = DocumentAnalyzer()
         result = await analyzer.process_user_response(
@@ -375,36 +405,53 @@ async def answer_question(
             agent_api_key=agent_key,
             agent_llm_model=agent_model,
             agent_temperature=agent_temp,
+            use_a2a=use_a2a,
         )
         
-        # Add new questions if any
+        # Add new questions if any (dedupe: skip if already in conversation or already in this batch)
+        existing_questions = {str(item.get("question", "")).strip() for item in conversation_history if item.get("type") == "question" and item.get("question")}
         if result.get("questions"):
+            seen_in_batch = set()
             for question in result["questions"]:
+                q = str(question).strip() if question else ""
+                if not q or q in existing_questions or q in seen_in_batch:
+                    continue
+                seen_in_batch.add(q)
+                existing_questions.add(q)
                 conversation_history.append({
                     "type": "question",
-                    "question": question,
+                    "question": q,
                     "answer": None,
                     "timestamp": str(datetime.utcnow())
                 })
         else:
-            # No more questions - add completion message with solutions
+            # No more questions - add completion message with solutions and optional workflow hint
             completion_item = {
                 "type": "completion",
                 "message": "Requirements understood. Here are the solutions and recommendations:",
                 "recommendations": result.get("recommendations", []),
                 "solutions": result.get("solutions", []),
                 "next_steps": result.get("next_steps", []),
+                "workflow_collaboration_hint": result.get("workflow_collaboration_hint"),
+                "workflow_collaboration_reason": result.get("workflow_collaboration_reason"),
                 "timestamp": str(datetime.utcnow())
             }
             conversation_history.append(completion_item)
         
-        # Always add analysis if provided
+        # Add analysis only if not duplicate (avoid same analysis block repeated after every answer)
         if result.get("analysis"):
-            conversation_history.append({
-                "type": "analysis",
-                "content": result["analysis"],
-                "timestamp": str(datetime.utcnow())
-            })
+            new_analysis = (result["analysis"] or "").strip()
+            last_analysis = None
+            for item in reversed(conversation_history):
+                if item.get("type") == "analysis" and item.get("content"):
+                    last_analysis = (item.get("content") or "").strip()
+                    break
+            if new_analysis and new_analysis != last_analysis:
+                conversation_history.append({
+                    "type": "analysis",
+                    "content": result["analysis"],
+                    "timestamp": str(datetime.utcnow())
+                })
         
         # Update job conversation
         job.conversation = json.dumps(conversation_history)
@@ -422,6 +469,129 @@ async def answer_question(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to process answer: {str(e)}"
         )
+
+
+@router.post("/{job_id}/generate-workflow-questions", status_code=status.HTTP_200_OK)
+async def generate_workflow_questions(
+    job_id: int,
+    current_user: User = Depends(get_current_business_user),
+    db: Session = Depends(get_db)
+):
+    """
+    Generate clarifying questions for the end user based on the workflow (assigned tasks),
+    BRD documents, and job prompt. Use this in the Q&A step after Build Workflow so
+    AI agents can get requirements clarified before execution. Appends new questions
+    to the job conversation.
+    """
+    job = db.query(Job).filter(Job.id == job_id).first()
+    if not job:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Job not found")
+    if job.business_id != current_user.id:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Not authorized")
+
+    steps = (
+        db.query(WorkflowStep)
+        .filter(WorkflowStep.job_id == job_id)
+        .order_by(WorkflowStep.step_order)
+        .all()
+    )
+    if not steps:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Job has no workflow. Build a workflow first, then generate clarification questions.",
+        )
+
+    # Build workflow_tasks from steps (assigned_task, agent_name)
+    workflow_tasks = []
+    for step in steps:
+        agent = db.query(Agent).filter(Agent.id == step.agent_id).first()
+        agent_name = agent.name if agent else "Agent"
+        input_data = {}
+        if step.input_data:
+            try:
+                input_data = json.loads(step.input_data)
+            except (json.JSONDecodeError, TypeError):
+                pass
+        workflow_tasks.append({
+            "step_order": step.step_order,
+            "agent_name": agent_name,
+            "assigned_task": input_data.get("assigned_task", ""),
+        })
+
+    # Document content for BRD (read from storage)
+    documents_content = []
+    if job.files:
+        try:
+            files_data = json.loads(job.files)
+        except (json.JSONDecodeError, TypeError):
+            files_data = []
+        analyzer = DocumentAnalyzer()
+        for f in files_data:
+            path = f.get("path")
+            name = f.get("name", "Unknown")
+            if not path:
+                continue
+            try:
+                content = await analyzer.read_document(path)
+                documents_content.append({"name": name, "content": content})
+            except Exception:
+                documents_content.append({"name": name, "content": f"[Could not read {name}]"})
+
+    conversation_history = []
+    if job.conversation:
+        try:
+            conversation_history = json.loads(job.conversation)
+        except (json.JSONDecodeError, TypeError):
+            pass
+
+    hired = _get_first_hired_agent_for_job(db, job.id)
+    if hired:
+        agent_url, agent_key, agent_model, agent_temp, use_a2a = hired
+    else:
+        agent_url = agent_key = agent_model = agent_temp = None
+        use_a2a = False
+
+    try:
+        analyzer = DocumentAnalyzer()
+        result = await analyzer.generate_workflow_clarification_questions(
+            job_title=job.title or "",
+            job_description=job.description,
+            documents_content=documents_content,
+            workflow_tasks=workflow_tasks,
+            conversation_history=conversation_history,
+            agent_api_url=agent_url,
+            agent_api_key=agent_key,
+            agent_llm_model=agent_model,
+            agent_temperature=agent_temp,
+            use_a2a=use_a2a,
+        )
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to generate workflow questions: {str(e)}",
+        )
+
+    questions = result.get("questions") or []
+    new_conversation = conversation_history.copy()
+    existing_questions = {str(item.get("question", "")).strip() for item in new_conversation if item.get("type") == "question" and item.get("question")}
+    seen_in_batch = set()
+    for q in questions:
+        qs = str(q).strip() if q else ""
+        if not qs or qs in existing_questions or qs in seen_in_batch:
+            continue
+        seen_in_batch.add(qs)
+        existing_questions.add(qs)
+        new_conversation.append({
+            "type": "question",
+            "question": qs,
+            "answer": None,
+            "timestamp": str(datetime.utcnow()),
+        })
+
+    job.conversation = json.dumps(new_conversation)
+    db.commit()
+
+    return {"questions": questions, "conversation": new_conversation}
 
 
 @router.get("", response_model=List[JobResponse])
@@ -530,7 +700,8 @@ def get_job(
             status=step.status,
             cost=step.cost or 0.0,
             started_at=step.started_at,
-            completed_at=step.completed_at
+            completed_at=step.completed_at,
+            depends_on_previous=getattr(step, "depends_on_previous", True),
         ))
     
     job_dict = {
@@ -638,8 +809,13 @@ async def update_job(
             files_data = json.loads(job.files)
             documents = [{"path": f["path"], "name": f["name"]} for f in files_data]
             hired = _get_first_hired_agent_for_job(db, job.id)
-            agent_url, agent_key = hired if hired else (None, None)
-            
+            if hired:
+                agent_url, agent_key = hired[0], hired[1]
+                use_a2a = hired[4] if len(hired) > 4 else False
+            else:
+                agent_url = agent_key = None
+                use_a2a = False
+
             analyzer = DocumentAnalyzer()
             result = await analyzer.analyze_documents_and_generate_questions(
                 documents=documents,
@@ -648,6 +824,7 @@ async def update_job(
                 conversation_history=[],
                 agent_api_url=agent_url,
                 agent_api_key=agent_key,
+                use_a2a=use_a2a,
             )
             
             # Add analysis and questions to conversation
@@ -779,7 +956,7 @@ def delete_job(
 @router.post("/{job_id}/workflow/auto-split", response_model=WorkflowPreview)
 def auto_split_workflow(
     job_id: int,
-    agent_ids: List[int],
+    body: AutoSplitBody,
     current_user: User = Depends(get_current_business_user),
     db: Session = Depends(get_db)
 ):
@@ -796,8 +973,14 @@ def auto_split_workflow(
             detail="Not authorized"
         )
     
+    workflow_mode = (body.workflow_mode or "").strip() or None
+    if workflow_mode and workflow_mode not in ("independent", "sequential"):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="workflow_mode must be 'independent' or 'sequential' when provided",
+        )
     workflow_builder = WorkflowBuilder(db)
-    preview = workflow_builder.auto_split_workflow(job_id, agent_ids)
+    preview = workflow_builder.auto_split_workflow(job_id, body.agent_ids, workflow_mode=workflow_mode)
     return preview
 
 
@@ -1123,7 +1306,8 @@ def get_job_status(
             status=step.status,
             cost=step.cost or 0.0,
             started_at=step.started_at,
-            completed_at=step.completed_at
+            completed_at=step.completed_at,
+            depends_on_previous=getattr(step, "depends_on_previous", True),
         ))
     
     job_dict = {

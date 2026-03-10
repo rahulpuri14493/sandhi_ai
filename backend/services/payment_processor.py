@@ -56,7 +56,8 @@ class PaymentProcessor:
                 status=step.status,
                 cost=step_cost,
                 started_at=step.started_at,
-                completed_at=step.completed_at
+                completed_at=step.completed_at,
+                depends_on_previous=getattr(step, "depends_on_previous", True),
             ))
         
         # Estimate communication costs (between consecutive steps)

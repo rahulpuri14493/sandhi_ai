@@ -1,6 +1,6 @@
 # Database migrations
 
-All SQL migrations live here. **Run in order** (001 → 010) when setting up or updating the database. Each file is idempotent where possible (`IF NOT EXISTS`, `IF EXISTS`).
+All SQL migrations live here. **Run in order** (001 → 011) when setting up or updating the database. Each file is idempotent where possible (`IF NOT EXISTS`, `IF EXISTS`).
 
 ## Order
 
@@ -16,6 +16,7 @@ All SQL migrations live here. **Run in order** (001 → 010) when setting up or 
 | `008_add_failure_reason_column.sql` | Jobs: failure_reason column |
 | `009_add_agent_reviews_table.sql` | agent_reviews table (ratings/reviews) |
 | `010_drop_agent_review_unique_constraint.sql` | Allow multiple reviews per user per agent |
+| `011_add_a2a_enabled_column.sql` | Agents: a2a_enabled (A2A protocol support) |
 
 **Prerequisites:** Core tables (`users`, `agents`, `jobs`, etc.) must exist. The app creates them via `Base.metadata.create_all()` on startup; if you use a blank DB, start the app once so core tables exist, then run migrations.
 

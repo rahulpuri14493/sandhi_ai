@@ -1,6 +1,7 @@
 from datetime import datetime
-from fastapi import APIRouter, Depends, HTTPException, status, Query
+from fastapi import APIRouter, Depends, HTTPException, status, Query, Response
 from sqlalchemy.orm import Session
+from sqlalchemy import func
 from typing import List, Optional
 from pydantic import BaseModel
 import httpx
@@ -16,7 +17,11 @@ from schemas.agent_review import (
     AgentReviewListResponse,
 )
 from core.security import get_current_user, get_current_user_optional, get_current_developer_user
+from core.config import settings
 from models.user import User
+import logging
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/agents", tags=["agents"])
 
@@ -27,28 +32,36 @@ class TestConnectionRequest(BaseModel):
     test_data: Optional[dict] = None
     llm_model: Optional[str] = None
     temperature: Optional[float] = None
+    a2a_enabled: Optional[bool] = False
 
 
 @router.get("", response_model=List[AgentResponse])
 def list_agents(
+    response: Response,
     status: Optional[AgentStatus] = Query(None, description="Filter by status"),
     capability: Optional[str] = Query(None, description="Filter by capability"),
+    limit: Optional[int] = Query(None, ge=1, le=500, description="Max agents to return (pagination); omit for all"),
+    offset: int = Query(0, ge=0, description="Pagination offset"),
     db: Session = Depends(get_db)
 ):
+    """List agents (marketplace). Optional limit/offset for scale (e.g. 200+ agents). X-Total-Count header set with total matching count."""
     query = db.query(Agent)
-    
+
     if status:
         query = query.filter(Agent.status == status)
     else:
         query = query.filter(Agent.status == AgentStatus.ACTIVE)
-    
+
     if capability:
         query = query.filter(Agent.capabilities.contains([capability]))
-    
+
+    total = query.count()
+    if limit is not None:
+        query = query.offset(offset).limit(limit)
     agents = query.all()
     agent_ids = [a.id for a in agents]
+
     # Batch load review counts and averages per agent
-    from sqlalchemy import func
     review_stats = (
         db.query(
             AgentReview.agent_id,
@@ -86,12 +99,14 @@ def list_agents(
             "llm_model": getattr(agent, "llm_model", None),
             "temperature": getattr(agent, "temperature", None),
             "plugin_config": agent.plugin_config,
+            "a2a_enabled": getattr(agent, "a2a_enabled", False),
             "status": agent.status,
             "created_at": agent.created_at,
             "average_rating": avg if count else None,
             "review_count": count if count else None,
         }
         result.append(AgentResponse(**agent_data))
+    response.headers["X-Total-Count"] = str(total)
     return result
 
 
@@ -133,6 +148,7 @@ def get_agent(
         llm_model=getattr(agent, "llm_model", None),
         temperature=getattr(agent, "temperature", None),
         plugin_config=agent.plugin_config,
+        a2a_enabled=getattr(agent, "a2a_enabled", False),
         status=agent.status,
         created_at=agent.created_at,
     )
@@ -344,6 +360,7 @@ def create_agent(
         llm_model=getattr(new_agent, "llm_model", None),
         temperature=getattr(new_agent, "temperature", None),
         plugin_config=new_agent.plugin_config,
+        a2a_enabled=getattr(new_agent, "a2a_enabled", False),
         status=new_agent.status,
         created_at=new_agent.created_at,
     )
@@ -400,6 +417,7 @@ def update_agent(
         llm_model=getattr(agent, "llm_model", None),
         temperature=getattr(agent, "temperature", None),
         plugin_config=agent.plugin_config,
+        a2a_enabled=getattr(agent, "a2a_enabled", False),
         status=agent.status,
         created_at=agent.created_at,
     )
@@ -427,17 +445,25 @@ def delete_agent(
     # Delete related workflow steps first (to avoid foreign key constraint issues)
     from models.job import WorkflowStep
     from models.communication import AgentCommunication
-    
+    from models.transaction import Earnings
+
     # Get all workflow steps that use this agent
     workflow_steps = db.query(WorkflowStep).filter(WorkflowStep.agent_id == agent_id).all()
-    
+    step_ids = [s.id for s in workflow_steps]
+
+    # Unlink earnings from these steps so we can delete the steps
+    if step_ids:
+        db.query(Earnings).filter(Earnings.workflow_step_id.in_(step_ids)).update(
+            {Earnings.workflow_step_id: None}, synchronize_session=False
+        )
+
     # Delete communications related to these workflow steps
     for step in workflow_steps:
         db.query(AgentCommunication).filter(
             (AgentCommunication.from_workflow_step_id == step.id) |
             (AgentCommunication.to_workflow_step_id == step.id)
         ).delete(synchronize_session=False)
-    
+
     # Delete the workflow steps
     db.query(WorkflowStep).filter(WorkflowStep.agent_id == agent_id).delete(synchronize_session=False)
     
@@ -457,18 +483,128 @@ def delete_agent(
     return None
 
 
+@router.get("/{agent_id}/a2a-card", response_model=dict)
+def get_agent_a2a_card(
+    agent_id: int,
+    db: Session = Depends(get_db),
+):
+    """
+    Return an A2A-compliant Agent Card for the agent (discovery).
+    See: https://a2a-protocol.org/latest/specification/
+    """
+    agent = db.query(Agent).filter(Agent.id == agent_id).first()
+    if not agent:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Agent not found",
+        )
+    # Only expose card for agents with an endpoint (can be invoked)
+    if not (agent.api_endpoint and (agent.api_endpoint or "").strip()):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Agent has no API endpoint; cannot produce A2A card",
+        )
+    # A2A Agent Card (camelCase per spec): identity, capabilities, endpoint, auth requirements
+    card = {
+        "name": agent.name or f"Agent {agent.id}",
+        "description": agent.description or "",
+        "capabilities": agent.capabilities if isinstance(agent.capabilities, list) else [],
+        "url": agent.api_endpoint.strip(),
+        "protocolVersion": "1.0",
+        "authentication": {
+            "type": "bearer",
+            "required": bool(agent.api_key and (agent.api_key or "").strip()),
+        },
+        "a2aEnabled": getattr(agent, "a2a_enabled", False),
+    }
+    return card
+
+
 @router.post("/test-connection", status_code=status.HTTP_200_OK)
 async def test_agent_connection(
     test_request: TestConnectionRequest,
     current_user: User = Depends(get_current_developer_user)
 ):
-    """Test connectivity to an agent API endpoint"""
+    """Test connectivity to an agent API endpoint (OpenAI-style or A2A)."""
     if not test_request.api_endpoint:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="API endpoint is required"
         )
     
+    # A2A path: send minimal SendMessage (direct to agent or via platform adapter)
+    from services.a2a_client import send_message, _validate_public_http_url
+
+    if test_request.a2a_enabled:
+        try:
+            await send_message(
+                test_request.api_endpoint.strip(),
+                [{"text": "Connection test from Sandhi AI"}],
+                api_key=test_request.api_key,
+                blocking=True,
+                timeout=10.0,
+            )
+            return {
+                "success": True,
+                "message": "A2A connection successful",
+                "status_code": 200,
+                "response_preview": None,
+            }
+        except Exception:
+            logger.exception(
+                "A2A connection test failed for endpoint %s", test_request.api_endpoint
+            )
+            return {
+                "success": False,
+                "message": "A2A connection failed",
+                "status_code": 500,
+                "response_preview": None,
+            }
+
+    # OpenAI-compatible: route through platform adapter so test uses same A2A path as execution
+    adapter_url = (getattr(settings, "A2A_ADAPTER_URL", None) or "").strip()
+    if adapter_url:
+        try:
+            model = (test_request.llm_model or "").strip() or "gpt-4o-mini"
+            await send_message(
+                adapter_url,
+                [{"text": "Connection test from Sandhi AI"}],
+                api_key=None,
+                blocking=True,
+                timeout=10.0,
+                metadata={
+                    "openai_url": test_request.api_endpoint.strip(),
+                    "openai_api_key": (test_request.api_key or "").strip() or "",
+                    "openai_model": model,
+                },
+            )
+            return {
+                "success": True,
+                "message": "Connection successful (via A2A adapter)",
+                "status_code": 200,
+                "response_preview": None,
+            }
+        except Exception:
+            logger.exception(
+                "Connection test via adapter failed for endpoint %s",
+                test_request.api_endpoint,
+            )
+            return {
+                "success": False,
+                "message": "Connection failed (via adapter)",
+                "status_code": 500,
+                "response_preview": None,
+            }
+
+    # SSRF protection: validate URL before direct request (fallback path)
+    try:
+        _validate_public_http_url(test_request.api_endpoint.strip())
+    except ValueError as e:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid API endpoint URL",
+        ) from e
+
     headers = {"Content-Type": "application/json"}
     if test_request.api_key:
         headers["Authorization"] = f"Bearer {test_request.api_key}"
@@ -547,13 +683,15 @@ async def test_agent_connection(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="Connection failed - unable to reach the API endpoint. Please check the URL."
         )
-    except httpx.RequestError as e:
+    except httpx.RequestError:
+        logger.exception("Connection test request error for endpoint %s", test_request.api_endpoint)
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Connection error: {str(e)}"
+            detail="Connection error",
         )
-    except Exception as e:
+    except Exception:
+        logger.exception("Unexpected error testing connection for endpoint %s", test_request.api_endpoint)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Unexpected error testing connection: {str(e)}"
+            detail="Unexpected error testing connection",
         )

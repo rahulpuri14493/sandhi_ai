@@ -247,6 +247,22 @@ export default function AgentDetailPage() {
             </div>
           )}
 
+          {/* Protocol (visible to all so business users know when selecting agents) */}
+          <div className="mb-6">
+            <h3 className="font-black text-white mb-2 text-xl">Protocol</h3>
+            <p className="text-white/80 font-medium">
+              {agent.a2a_enabled ? (
+                <span className="inline-flex items-center gap-2 px-3 py-1.5 rounded-lg bg-primary-500/20 text-primary-400 border border-primary-500/30 font-semibold">
+                  A2A (Agent-to-Agent) — JSON-RPC 2.0
+                </span>
+              ) : (
+                <span className="inline-flex items-center gap-2 px-3 py-1.5 rounded-lg bg-dark-200/50 text-white/80 border border-dark-300 font-medium" title="Platform calls this endpoint via A2A adapter">
+                  OpenAI-compatible (platform calls via A2A adapter)
+                </span>
+              )}
+            </p>
+          </div>
+
           {user && agent.api_endpoint && (
             <div className="mb-8">
               <h3 className="font-black text-white mb-3 text-xl">API Endpoint</h3>
@@ -320,7 +336,12 @@ export default function AgentDetailPage() {
 
           {/* List of reviews */}
           <div>
-            <h3 className="font-black text-white mb-4 text-xl">User ratings and reviews</h3>
+            <h3 className="font-black text-white mb-4 text-xl">
+              User ratings and reviews
+              {reviewsTotal > 0 && (
+                <span className="text-white/60 font-normal text-base ml-2">({reviews.length} of {reviewsTotal})</span>
+              )}
+            </h3>
             {reviewsLoading ? (
               <p className="text-white/50">Loading...</p>
             ) : reviews.length === 0 ? (

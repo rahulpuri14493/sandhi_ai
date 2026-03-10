@@ -415,3 +415,39 @@ def test_delete_review_forbidden_not_owner(client_with_agents, db_session):
     )
     assert response.status_code == 403
     assert "Not authorized" in response.json().get("detail", "")
+
+
+def test_a2a_card_not_found(client_with_agents):
+    """GET /api/agents/{id}/a2a-card returns 404 when agent does not exist."""
+    client, _, _, _ = client_with_agents
+    r = client.get("/api/agents/99999/a2a-card")
+    assert r.status_code == 404
+
+
+def test_a2a_card_no_endpoint_returns_400(client_with_agents):
+    """GET /api/agents/{id}/a2a-card returns 400 when agent has no API endpoint."""
+    client, _, agent1, _ = client_with_agents
+    assert agent1.api_endpoint is None
+    r = client.get(f"/api/agents/{agent1.id}/a2a-card")
+    assert r.status_code == 400
+    assert "api endpoint" in r.json().get("detail", "").lower()
+
+
+def test_a2a_card_success(client_with_agents):
+    """GET /api/agents/{id}/a2a-card returns A2A Agent Card when agent has endpoint."""
+    client, dev, agent1, _ = client_with_agents
+    token = create_access_token(data={"sub": dev.id})
+    # Update agent to have an endpoint (via API)
+    client.put(
+        f"/api/agents/{agent1.id}",
+        json={"api_endpoint": "https://agent.example.com/a2a", "capabilities": ["nlp", "code"]},
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    r = client.get(f"/api/agents/{agent1.id}/a2a-card")
+    assert r.status_code == 200
+    data = r.json()
+    assert data["name"] == agent1.name
+    assert data["url"] == "https://agent.example.com/a2a"
+    assert "capabilities" in data
+    assert "protocolVersion" in data
+    assert "authentication" in data
