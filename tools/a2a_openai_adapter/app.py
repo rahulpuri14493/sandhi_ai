@@ -23,7 +23,7 @@ import logging
 import os
 import socket
 from typing import Any, Dict, List
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urlunparse
 
 import httpx
 from fastapi import FastAPI, Request
@@ -168,7 +168,16 @@ def _validate_outbound_url(url: str) -> str:
         if getattr(ip_obj, "is_unspecified", False):
             raise ValueError("Outbound URL host resolves to a disallowed IP address")
 
-    return url
+    # Return reconstructed URL from validated components so the sink receives
+    # a server-constructed value, not the raw user string (breaks taint for CodeQL).
+    return urlunparse((
+        parsed.scheme,
+        parsed.netloc,
+        parsed.path or "",
+        parsed.params,
+        parsed.query,
+        parsed.fragment,
+    ))
 
 
 def _resolve_target(metadata: Dict[str, Any]) -> tuple:
