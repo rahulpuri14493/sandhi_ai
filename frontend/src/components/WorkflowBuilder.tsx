@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useRef } from 'react'
 import { jobsAPI, agentsAPI, mcpAPI } from '../lib/api'
 import type { Agent } from '../lib/types'
 import type { Job } from '../lib/types'
@@ -23,10 +23,15 @@ export function WorkflowBuilder({ jobId, onWorkflowCreated, initialSelectedAgent
   const [platformTools, setPlatformTools] = useState<MCPToolConfigRes[]>([])
   const [connections, setConnections] = useState<MCPServerConnectionRes[]>([])
   const [stepToolSelections, setStepToolSelections] = useState<StepToolSelection>({})
+  const stepToolSelectionsRef = useRef<StepToolSelection>({})
   const [mode, setMode] = useState<'auto' | 'manual'>('auto')
   const [workflowCollaboration, setWorkflowCollaboration] = useState<WorkflowCollaborationMode>('from_brd')
   const [isLoading, setIsLoading] = useState(false)
   const [error, setError] = useState('')
+
+  useEffect(() => {
+    stepToolSelectionsRef.current = stepToolSelections
+  }, [stepToolSelections])
 
   useEffect(() => {
     loadAgents()
@@ -43,6 +48,25 @@ export function WorkflowBuilder({ jobId, onWorkflowCreated, initialSelectedAgent
       setSelectedAgents(initialSelectedAgentIds)
     }
   }, [initialSelectedAgentIds])
+
+  // When job has workflow steps and we have no local selections yet, pre-fill so checkboxes reflect saved state
+  useEffect(() => {
+    const jobData = job ?? null
+    const steps = jobData?.workflow_steps
+    if (!steps?.length || selectedAgents.length === 0) return
+    const next: StepToolSelection = {}
+    steps.forEach((step, i) => {
+      const platformIds = step.allowed_platform_tool_ids ?? []
+      const connectionIds = step.allowed_connection_ids ?? []
+      if (platformIds.length > 0 || connectionIds.length > 0) {
+        next[i] = { platformIds, connectionIds }
+      }
+    })
+    if (Object.keys(next).length > 0) {
+      setStepToolSelections((prev) => (Object.keys(prev).length === 0 ? next : prev))
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [job?.id, job?.workflow_steps?.length, selectedAgents.length])
 
   const loadAgents = async () => {
     try {
@@ -79,7 +103,11 @@ export function WorkflowBuilder({ jobId, onWorkflowCreated, initialSelectedAgent
   }
 
   const setStepTools = (agentIndex: number, platformIds: number[], connectionIds: number[]) => {
-    setStepToolSelections((prev) => ({ ...prev, [agentIndex]: { platformIds, connectionIds } }))
+    setStepToolSelections((prev) => {
+      const next = { ...prev, [agentIndex]: { platformIds, connectionIds } }
+      stepToolSelectionsRef.current = next
+      return next
+    })
   }
 
   const toggleStepPlatformTool = (agentIndex: number, toolId: number) => {
@@ -113,15 +141,17 @@ export function WorkflowBuilder({ jobId, onWorkflowCreated, initialSelectedAgent
           : workflowCollaboration === 'independent'
             ? 'independent'
             : 'sequential'
+      // Read from ref so we always use the latest tool selections (avoids stale state when user clicks Create right after checking a box)
+      const current = stepToolSelectionsRef.current
       const stepTools = selectedAgents.map((_, idx) => {
-        const sel = stepToolSelections[idx]
+        const sel = current[idx]
         return {
           agent_index: idx,
           allowed_platform_tool_ids: sel?.platformIds?.length ? sel.platformIds : undefined,
           allowed_connection_ids: sel?.connectionIds?.length ? sel.connectionIds : undefined,
         }
       }).filter((s) => (s.allowed_platform_tool_ids?.length ?? 0) > 0 || (s.allowed_connection_ids?.length ?? 0) > 0)
-      await jobsAPI.autoSplitWorkflow(jobId, selectedAgents, workflowMode, stepTools.length ? stepTools : undefined)
+      await jobsAPI.autoSplitWorkflow(jobId, selectedAgents, workflowMode, stepTools.length > 0 ? stepTools : undefined)
       onWorkflowCreated()
     } catch (err: any) {
       setError(err.response?.data?.detail || 'Failed to create workflow')
@@ -242,8 +272,8 @@ export function WorkflowBuilder({ jobId, onWorkflowCreated, initialSelectedAgent
           </div>
           {(platformTools.length > 0 || connections.length > 0) && selectedAgents.length > 0 && (
             <div className="mb-6 p-5 bg-emerald-500/10 border-2 border-emerald-500/30 rounded-xl">
-              <h4 className="font-bold text-emerald-400 mb-3">Assign tools per agent (optional)</h4>
-              <p className="text-sm text-white/70 mb-4">Restrict which tools each agent can use. E.g. Agent 1 = Postgres only, Agent 2 = arithmetic.</p>
+              <h4 className="font-bold text-emerald-400 mb-3">Tools per agent (optional)</h4>
+              <p className="text-sm text-white/70 mb-4">Select which tools each agent can use in this workflow. Leave unchecked to allow all job tools for that agent.</p>
               <div className="space-y-4">
                 {selectedAgents.map((agentId, idx) => {
                   const agent = availableAgents.find((a) => a.id === agentId)

@@ -1,7 +1,4 @@
-from fastapi import APIRouter, Depends, HTTPException, status, BackgroundTasks, UploadFile, File, Form
-from fastapi.responses import FileResponse, Response
-from sqlalchemy.orm import Session
-from typing import List, Optional
+import logging
 import asyncio
 import io
 import json
@@ -9,6 +6,10 @@ import os
 import uuid
 import zipfile
 from pathlib import Path
+from typing import List, Optional
+from fastapi import APIRouter, Depends, HTTPException, status, BackgroundTasks, UploadFile, File, Form
+from fastapi.responses import FileResponse, Response
+from sqlalchemy.orm import Session
 from pydantic import BaseModel
 from db.database import get_db
 from models.job import Job, JobStatus, WorkflowStep
@@ -27,6 +28,7 @@ from datetime import datetime
 from models.communication import AgentCommunication
 from models.mcp_server import MCPToolConfig, MCPServerConnection
 
+logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/jobs", tags=["jobs"])
 
 
@@ -959,7 +961,7 @@ async def update_job(
             }
         except Exception as e:
             # Don't fail the update if analysis fails, just log it
-            print(f"Failed to auto-analyze documents: {str(e)}")
+            logger.warning("Failed to auto-analyze documents: %s", e)
     
     # Parse files and conversation for response
     files_data = None
@@ -1310,7 +1312,7 @@ def execute_job(
             loop.run_until_complete(executor.execute_job(job_id))
         except Exception as e:
             # Job status will be updated to failed by executor
-            print(f"Job execution failed: {e}")
+            logger.exception("Job execution failed: %s", e)
         finally:
             loop.close()
     

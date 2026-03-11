@@ -21,6 +21,8 @@ class Settings(BaseSettings):
         PLATFORM_MCP_SERVER_URL: str = os.getenv("PLATFORM_MCP_SERVER_URL", "http://platform-mcp-server:8081")
         # Internal secret for platform MCP server and backend-to-MCP-server calls (same secret in both)
         MCP_INTERNAL_SECRET: str = os.getenv("MCP_INTERNAL_SECRET", "")
+        # When True, allow agent endpoints that resolve to private/loopback IPs (dev, Docker, same host). Default False in production.
+        ALLOW_PRIVATE_AGENT_ENDPOINTS: bool = True
 
         class Config:
             env_file = ".env"

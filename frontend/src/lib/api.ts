@@ -239,6 +239,9 @@ export interface MCPToolConfigRes {
   tool_type: string
   name: string
   is_active: boolean
+  business_description?: string | null
+  schema_metadata?: string | null
+  schema_table_count?: number | null
   created_at: string
   updated_at: string
 }
@@ -262,11 +265,14 @@ export const mcpAPI = {
   listTools() {
     return api.get<MCPToolConfigRes[]>('/mcp/tools').then((res) => res.data)
   },
-  createTool(data: { tool_type: string; name: string; config: Record<string, unknown> }) {
+  createTool(data: { tool_type: string; name: string; config: Record<string, unknown>; business_description?: string | null }) {
     return api.post<MCPToolConfigRes>('/mcp/tools', data).then((res) => res.data)
   },
-  updateTool(id: number, data: Partial<{ name: string; config: Record<string, unknown>; is_active: boolean }>) {
+  updateTool(id: number, data: Partial<{ name: string; config: Record<string, unknown>; business_description?: string | null; is_active: boolean }>) {
     return api.patch<MCPToolConfigRes>('/mcp/tools/' + id, data).then((res) => res.data)
+  },
+  refreshToolSchema(id: number) {
+    return api.post<{ success: boolean; message: string; table_count: number }>('/mcp/tools/' + id + '/refresh-schema').then((res) => res.data)
   },
   deleteTool(id: number) {
     return api.delete('/mcp/tools/' + id)

@@ -1,8 +1,9 @@
-from sqlalchemy.orm import Session
-from sqlalchemy import or_
-from typing import List, Dict, Any, Optional
+import logging
 import asyncio
 import json
+from typing import List, Dict, Any, Optional
+from sqlalchemy.orm import Session
+from sqlalchemy import or_
 from models.job import Job, WorkflowStep
 from models.agent import Agent
 from models.transaction import Earnings
@@ -10,6 +11,8 @@ from models.communication import AgentCommunication
 from schemas.job import WorkflowPreview, WorkflowStepResponse
 from services.payment_processor import PaymentProcessor
 from services.task_splitter import split_job_for_agents
+
+logger = logging.getLogger(__name__)
 
 
 class WorkflowBuilder:
@@ -79,10 +82,10 @@ class WorkflowBuilder:
                             content = asyncio.run(analyzer.read_document(file_path))
                             # Validate content was extracted - skip empty documents (they're optional)
                             if not content or not content.strip():
-                                print(f"[WARNING] Document {file_info.get('name')} has empty content - skipping (documents are optional)")
+                                logger.warning("Document %s has empty content - skipping (documents are optional)", file_info.get('name'))
                                 continue
                             
-                            print(f"[DEBUG] Successfully read document: {file_info.get('name')} - Content length: {len(content)} chars")
+                            logger.debug("Successfully read document: %s - Content length: %s chars", file_info.get('name'), len(content))
                             documents_content.append({
                                 "name": file_info.get("name", "Unknown"),
                                 "type": file_info.get("type", "unknown"),
@@ -90,19 +93,19 @@ class WorkflowBuilder:
                             })
                         except Exception as e:
                             # If document reading fails, skip it (documents are optional)
-                            print(f"[WARNING] Failed to read document {file_info.get('name')}: {str(e)} - skipping (documents are optional)")
+                            logger.warning("Failed to read document %s: %s - skipping (documents are optional)", file_info.get('name'), e)
                             continue
                     else:
-                        print(f"[WARNING] Document {file_info.get('name')} has no file path")
+                        logger.warning("Document %s has no file path", file_info.get('name'))
             except (json.JSONDecodeError, TypeError, Exception) as e:
                 # If document parsing fails, continue without document content (documents are optional)
-                print(f"[WARNING] Failed to parse job.files: {str(e)} - Continuing without documents (they are optional)")
+                logger.warning("Failed to parse job.files: %s - Continuing without documents (they are optional)", e)
         
         # Log document status
         if documents_content:
-            print(f"[DEBUG] {len(documents_content)} document(s) will be included as additional information")
+            logger.debug("%s document(s) will be included as additional information", len(documents_content))
         else:
-            print(f"[DEBUG] No documents provided - agent will work with job title and description only")
+            logger.debug("No documents provided - agent will work with job title and description only")
         
         # Prepare base input data with job context, Q&A conversation, and documents
         base_input_data = {
@@ -129,7 +132,7 @@ class WorkflowBuilder:
                         )
                     )
             except Exception as e:
-                print(f"[WARNING] Task split failed: {e}, using fallback")
+                logger.warning("Task split failed: %s, using fallback", e)
             if not task_assignments:
                 task_assignments = [
                     {"agent_index": i, "task": f"Execute the job. You are agent {i+1} of {len(agents)}. {job.description or job.title}"}
@@ -144,7 +147,7 @@ class WorkflowBuilder:
         else:
             hint = self._get_workflow_collaboration_hint(job)
             steps_independent = hint == "async_a2a"
-        print(f"[DEBUG] Workflow mode: {'independent' if steps_independent else 'sequential'} (workflow_mode={workflow_mode!r}, BRD hint used when None)")
+        logger.debug("Workflow mode: %s (workflow_mode=%r, BRD hint used when None)", 'independent' if steps_independent else 'sequential', workflow_mode)
         
         # Unlink earnings and delete dependent rows, then clear existing workflow steps
         step_ids = [s.id for s in self.db.query(WorkflowStep.id).filter(WorkflowStep.job_id == job_id).all()]
@@ -192,9 +195,7 @@ class WorkflowBuilder:
             # Validate step input data includes documents and conversation
             step_docs = step_input_data.get('documents', [])
             step_conv = step_input_data.get('conversation', [])
-            print(f"[DEBUG] Step {idx + 1} for agent '{agent.name}': depends_on_previous={depends_on_previous}")
-            print(f"[DEBUG]   - Documents: {len(step_docs)}")
-            print(f"[DEBUG]   - Conversation items: {len(step_conv)}")
+            logger.debug("Step %s for agent '%s': depends_on_previous=%s documents=%s conversation_items=%s", idx + 1, agent.name, depends_on_previous, len(step_docs), len(step_conv))
             
             step_platform = step_conn = None
             if step_tools:
@@ -256,10 +257,10 @@ class WorkflowBuilder:
                             content = asyncio.run(analyzer.read_document(file_path))
                             # Validate content was extracted - skip empty documents (they're optional)
                             if not content or not content.strip():
-                                print(f"[WARNING] Document {file_info.get('name')} has empty content - skipping (documents are optional)")
+                                logger.warning("Document %s has empty content - skipping (documents are optional)", file_info.get('name'))
                                 continue
                             
-                            print(f"[DEBUG] Successfully read document: {file_info.get('name')} - Content length: {len(content)} chars")
+                            logger.debug("Successfully read document: %s - Content length: %s chars", file_info.get('name'), len(content))
                             documents_content.append({
                                 "name": file_info.get("name", "Unknown"),
                                 "type": file_info.get("type", "unknown"),
@@ -267,25 +268,22 @@ class WorkflowBuilder:
                             })
                         except Exception as e:
                             # If document reading fails, skip it (documents are optional)
-                            print(f"[WARNING] Failed to read document {file_info.get('name')}: {str(e)} - skipping (documents are optional)")
+                            logger.warning("Failed to read document %s: %s - skipping (documents are optional)", file_info.get('name'), e)
                             continue
                     else:
-                        print(f"[WARNING] Document {file_info.get('name')} has no file path")
+                        logger.warning("Document %s has no file path", file_info.get('name'))
             except (json.JSONDecodeError, TypeError, Exception) as e:
                 # If document parsing fails, continue without document content (documents are optional)
-                print(f"[WARNING] Failed to parse job.files: {str(e)} - Continuing without documents (they are optional)")
+                logger.warning("Failed to parse job.files: %s - Continuing without documents (they are optional)", e)
         
         # Log document status
         if documents_content:
-            print(f"[DEBUG] {len(documents_content)} document(s) will be included as additional information")
+            logger.debug("%s document(s) will be included as additional information", len(documents_content))
         else:
-            print(f"[DEBUG] No documents provided - agent will work with job title and description only")
+            logger.debug("No documents provided - agent will work with job title and description only")
         
         # Prepare base input data with job context, Q&A conversation, and documents
-        print(f"[DEBUG] Building manual workflow for job {job_id}")
-        print(f"[DEBUG] Job title: {job.title}")
-        print(f"[DEBUG] Conversation items: {len(conversation_data) if conversation_data else 0}")
-        print(f"[DEBUG] Documents to include: {len(documents_content)}")
+        logger.debug("Building manual workflow for job %s title=%s conversation_items=%s documents=%s", job_id, job.title, len(conversation_data) if conversation_data else 0, len(documents_content))
         
         base_input_data = {
             "job_title": job.title,
@@ -296,16 +294,15 @@ class WorkflowBuilder:
         
         # Validate that documents and conversation are included
         if not documents_content:
-            print(f"[WARNING] No document content found for job {job_id}")
+            logger.warning("No document content found for job %s", job_id)
         else:
             total_content_length = sum(len(doc.get('content', '')) for doc in documents_content)
-            print(f"[DEBUG] Total document content length: {total_content_length} characters")
+            logger.debug("Total document content length: %s characters", total_content_length)
         
         if not conversation_data:
-            print(f"[WARNING] No conversation data found for job {job_id}")
+            logger.warning("No conversation data found for job %s", job_id)
         else:
-            print(f"[DEBUG] Conversation includes {len([item for item in conversation_data if item.get('type') == 'question'])} questions")
-            print(f"[DEBUG] Conversation includes {len([item for item in conversation_data if item.get('type') == 'completion'])} completion messages")
+            logger.debug("Conversation includes %s questions and %s completion messages", len([item for item in conversation_data if item.get('type') == 'question']), len([item for item in conversation_data if item.get('type') == 'completion']))
         
         # Unlink earnings and delete dependent rows, then clear existing workflow steps
         step_ids = [s.id for s in self.db.query(WorkflowStep.id).filter(WorkflowStep.job_id == job_id).all()]
@@ -347,9 +344,7 @@ class WorkflowBuilder:
             # Validate step input data includes documents and conversation
             step_docs = step_input_data.get('documents', [])
             step_conv = step_input_data.get('conversation', [])
-            print(f"[DEBUG] Manual workflow step {step_order} for agent '{agent.name}':")
-            print(f"[DEBUG]   - Documents: {len(step_docs)}")
-            print(f"[DEBUG]   - Conversation items: {len(step_conv)}")
+            logger.debug("Manual workflow step %s for agent '%s': documents=%s conversation_items=%s", step_order, agent.name, len(step_docs), len(step_conv))
             
             # If custom input data is provided, merge it
             if custom_input_data:

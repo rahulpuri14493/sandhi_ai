@@ -1,4 +1,5 @@
 import time
+import logging
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.exceptions import RequestValidationError
@@ -13,6 +14,9 @@ from middleware.error_handler import (
     general_exception_handler,
 )
 from core.encryption import ensure_encryption_key_for_production
+from core.logging_config import configure_logging
+
+configure_logging()
 
 # Create database tables (retry until DB is ready, e.g. in Docker)
 def _init_db():

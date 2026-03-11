@@ -50,12 +50,17 @@ def internal_list_tools(
     for t in rows:
         # MCP tool descriptor (no credentials)
         schema = _input_schema_for_type(t.tool_type)
-        tools.append({
+        entry = {
             "id": t.id,
             "name": _tool_name(t.id, t.name),
             "description": _description_for_type(t.tool_type, t.name),
             "inputSchema": schema,
-        })
+        }
+        if getattr(t, "schema_metadata", None):
+            entry["schemaMetadata"] = t.schema_metadata
+        if getattr(t, "business_description", None):
+            entry["businessDescription"] = t.business_description
+        tools.append(entry)
     return {"tools": tools}
 
 

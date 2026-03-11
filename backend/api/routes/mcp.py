@@ -44,12 +44,22 @@ def _connection_to_response(c: MCPServerConnection) -> MCPServerConnectionRespon
 
 
 def _tool_to_response(t: MCPToolConfig) -> MCPToolConfigResponse:
+    schema_table_count = None
+    if t.schema_metadata:
+        try:
+            data = json.loads(t.schema_metadata)
+            schema_table_count = len(data.get("tables", []))
+        except (TypeError, json.JSONDecodeError):
+            pass
     return MCPToolConfigResponse(
         id=t.id,
         user_id=t.user_id,
         tool_type=t.tool_type.value,
         name=t.name,
         is_active=t.is_active,
+        business_description=getattr(t, "business_description", None) or None,
+        schema_metadata=t.schema_metadata,
+        schema_table_count=schema_table_count,
         created_at=t.created_at,
         updated_at=t.updated_at,
     )
@@ -242,11 +252,15 @@ def create_tool(
             detail="tool_type must be one of: vector_db, pinecone, weaviate, qdrant, chroma, postgres, mysql, elasticsearch, filesystem, s3, slack, github, notion, rest_api",
         )
     encrypted = encrypt_json(body.config)
+    business_description = (body.business_description or "").strip() or None
+    if business_description and len(business_description) > 2000:
+        business_description = business_description[:2000]
     tool = MCPToolConfig(
         user_id=current_user.id,
         tool_type=tool_type,
         name=body.name,
         encrypted_config=encrypted,
+        business_description=business_description,
     )
     db.add(tool)
     db.commit()
@@ -286,11 +300,49 @@ def update_tool(
         t.name = body.name
     if body.config is not None:
         t.encrypted_config = encrypt_json(body.config)
+    if body.business_description is not None:
+        bd = (body.business_description or "").strip() or None
+        t.business_description = bd[:2000] if bd and len(bd) > 2000 else bd
     if body.is_active is not None:
         t.is_active = body.is_active
     db.commit()
     db.refresh(t)
     return _tool_to_response(t)
+
+
+@router.post("/tools/{tool_id}/refresh-schema")
+def refresh_tool_schema(
+    tool_id: int,
+    current_user: User = Depends(get_current_business_user),
+    db: Session = Depends(get_db),
+):
+    """
+    Introspect the database for this tool (Postgres/MySQL only) and store schema metadata.
+    Does not overwrite existing schema on connection failure.
+    """
+    from services.db_schema_introspection import introspect_sql_tool
+    from core.encryption import decrypt_json
+
+    t = db.query(MCPToolConfig).filter(
+        MCPToolConfig.id == tool_id,
+        MCPToolConfig.user_id == current_user.id,
+    ).first()
+    if not t:
+        raise HTTPException(status_code=404, detail="Tool config not found")
+    if t.tool_type not in (MCPToolType.POSTGRES, MCPToolType.MYSQL):
+        raise HTTPException(
+            status_code=400,
+            detail="Schema refresh is only available for PostgreSQL and MySQL tools",
+        )
+    config = decrypt_json(t.encrypted_config)
+    schema_dict, error = introspect_sql_tool(t.tool_type.value, config)
+    if error:
+        raise HTTPException(status_code=400, detail=error)
+    t.schema_metadata = json.dumps(schema_dict)
+    db.commit()
+    db.refresh(t)
+    table_count = len(schema_dict.get("tables", []))
+    return {"success": True, "message": f"Schema refreshed: {table_count} table(s)", "table_count": table_count}
 
 
 @router.delete("/tools/{tool_id}", status_code=status.HTTP_204_NO_CONTENT)

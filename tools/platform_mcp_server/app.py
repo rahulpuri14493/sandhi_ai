@@ -9,13 +9,21 @@ import json
 import logging
 import os
 import re
+import sys
 from typing import Any, Dict, List, Optional
 
 import httpx
 from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import JSONResponse
 
-logging.basicConfig(level=logging.INFO)
+# Log to stdout: <datetime>.<type>.<message>
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s.%(levelname)s.%(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+    stream=sys.stdout,
+    force=True,
+)
 logger = logging.getLogger(__name__)
 
 app = FastAPI(
@@ -23,6 +31,11 @@ app = FastAPI(
     description="MCP server exposing platform-configured tools (Vector DB, Postgres, File system) per tenant.",
     version="1.0.0",
 )
+
+
+@app.on_event("startup")
+def startup():
+    logger.info("Platform MCP server started; BACKEND_INTERNAL_URL=%s", BACKEND_BASE)
 
 # Backend internal API (same network as platform)
 BACKEND_BASE = os.environ.get("BACKEND_INTERNAL_URL", "http://backend:8000").strip().rstrip("/")
@@ -261,6 +274,7 @@ async def jsonrpc(request: Request, x_mcp_business_id: Optional[str] = Header(No
     try:
         body = await request.json()
     except Exception:
+        logger.warning("Invalid JSON body")
         raise HTTPException(status_code=400, detail="Invalid JSON")
     req_id = body.get("id")
     method = (body.get("method") or "").strip()
@@ -268,8 +282,10 @@ async def jsonrpc(request: Request, x_mcp_business_id: Optional[str] = Header(No
     if not method:
         return JSONResponse({"jsonrpc": JSONRPC_VERSION, "id": req_id, "error": {"code": -32600, "message": "Invalid method"}})
     business_id = _get_business_id(request)
+    logger.info("MCP request method=%s business_id=%s id=%s", method, business_id, req_id)
 
     if method == "initialize":
+        logger.info("MCP initialize OK business_id=%s", business_id)
         return JSONResponse({
             "jsonrpc": JSONRPC_VERSION,
             "id": req_id,
@@ -283,13 +299,14 @@ async def jsonrpc(request: Request, x_mcp_business_id: Optional[str] = Header(No
     if method == "tools/list":
         try:
             tools = _fetch_platform_tools(business_id)
+            logger.info("MCP tools/list business_id=%s tool_count=%s", business_id, len(tools))
             return JSONResponse({
                 "jsonrpc": JSONRPC_VERSION,
                 "id": req_id,
                 "result": {"tools": tools, "nextCursor": None},
             })
         except httpx.HTTPStatusError as e:
-            logger.exception("Backend tools/list failed")
+            logger.exception("Backend tools/list failed business_id=%s", business_id)
             return JSONResponse({
                 "jsonrpc": JSONRPC_VERSION,
                 "id": req_id,
@@ -324,29 +341,36 @@ async def jsonrpc(request: Request, x_mcp_business_id: Optional[str] = Header(No
             config = data.get("config") or {}
             tool_type = data.get("tool_type") or "vector_db"
             result_text = execute_platform_tool(tool_type, config, arguments)
+            is_err = result_text.startswith("Error:")
+            preview = (result_text[:80] + "…") if len(result_text) > 80 else result_text
+            logger.info(
+                "MCP tools/call business_id=%s tool=%s tool_type=%s is_error=%s result_preview=%s",
+                business_id, name, tool_type, is_err, preview.replace("\n", " "),
+            )
             return JSONResponse({
                 "jsonrpc": JSONRPC_VERSION,
                 "id": req_id,
                 "result": {
                     "content": [{"type": "text", "text": result_text}],
-                    "isError": result_text.startswith("Error:"),
+                    "isError": is_err,
                 },
             })
         except httpx.HTTPStatusError as e:
-            logger.exception("Backend config fetch failed")
+            logger.exception("Backend config fetch failed business_id=%s tool_id=%s", business_id, tool_id)
             return JSONResponse({
                 "jsonrpc": JSONRPC_VERSION,
                 "id": req_id,
                 "error": {"code": -32000, "message": e.response.text or str(e)},
             })
         except Exception as e:
-            logger.exception("tools/call error")
+            logger.exception("tools/call error business_id=%s tool=%s err=%s", business_id, name, e)
             return JSONResponse({
                 "jsonrpc": JSONRPC_VERSION,
                 "id": req_id,
                 "error": {"code": -32603, "message": str(e)},
             })
 
+    logger.warning("MCP method not found method=%s business_id=%s", method, business_id)
     return JSONResponse({
         "jsonrpc": JSONRPC_VERSION,
         "id": req_id,

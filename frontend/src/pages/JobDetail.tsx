@@ -428,7 +428,7 @@ export default function JobDetailPage() {
             {job.workflow_steps && job.workflow_steps.length > 0 && (
               <div className="mt-6 p-6 bg-dark-100/50 rounded-2xl border border-dark-200/50">
                 <h3 className="font-bold text-white mb-3">Tools per step</h3>
-                <p className="text-sm text-white/60 mb-4">Assign which tools each agent can use. Other agents are restricted from these tools.</p>
+                <p className="text-sm text-white/60 mb-4">Choose which tools each agent can use. You can limit an agent to specific tools (e.g. only Postgres) or leave it to use all job tools.</p>
                 <div className="space-y-2">
                   {job.workflow_steps.map((step) => (
                     <div key={step.id} className="flex items-center justify-between py-2 px-4 bg-dark-200/30 rounded-xl border border-dark-300">

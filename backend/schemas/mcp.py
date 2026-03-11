@@ -44,11 +44,13 @@ class MCPToolConfigCreate(BaseModel):
     tool_type: str  # vector_db, postgres, filesystem
     name: str
     config: dict  # Tool-specific; will be encrypted. e.g. { "connection_string": "...", "api_key": "..." }
+    business_description: Optional[str] = None  # Optional short context for the agent (e.g. "Sales DB: orders, customers")
 
 
 class MCPToolConfigUpdate(BaseModel):
     name: Optional[str] = None
     config: Optional[dict] = None
+    business_description: Optional[str] = None
     is_active: Optional[bool] = None
 
 
@@ -63,6 +65,9 @@ class MCPToolConfigResponse(BaseModel):
     tool_type: str
     name: str
     is_active: bool
+    business_description: Optional[str] = None
+    schema_metadata: Optional[str] = None  # JSON string; for list view prefer schema_table_count
+    schema_table_count: Optional[int] = None  # Number of tables when schema_metadata is set (for UI)
     created_at: datetime
     updated_at: datetime
 

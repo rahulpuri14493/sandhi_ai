@@ -261,6 +261,12 @@ export default function MCPPage() {
           onBack={() => { setView('tools'); setEditTool(null); }}
           onSaved={() => { setView('tools'); setEditTool(null); loadTools(); setError(null); }}
           onError={setError}
+          onSchemaRefreshed={async (id) => {
+            const list = await mcpAPI.listTools()
+            setTools(list)
+            const updated = list.find((t) => t.id === id)
+            if (updated) setEditTool(updated)
+          }}
         />
       )}
 
@@ -638,17 +644,21 @@ function ConfigureFlow({
   onBack,
   onSaved,
   onError,
+  onSchemaRefreshed,
 }: {
   editTool: MCPToolConfigRes | null
   onBack: () => void
   onSaved: () => void
   onError: (e: string | null) => void
+  onSchemaRefreshed?: (toolId: number) => Promise<void>
 }) {
   const [toolType, setToolType] = useState(editTool?.tool_type ?? 'vector_db')
   const [name, setName] = useState(editTool?.name ?? '')
+  const [businessDescription, setBusinessDescription] = useState(editTool?.business_description ?? '')
   const [config, setConfig] = useState<Record<string, string>>({})
   const [submitting, setSubmitting] = useState(false)
   const [validating, setValidating] = useState(false)
+  const [refreshingSchema, setRefreshingSchema] = useState(false)
   const [validateMessage, setValidateMessage] = useState<{ success: boolean; text: string } | null>(null)
   const [toolTypeOpen, setToolTypeOpen] = useState(false)
   const [toolTypeSearch, setToolTypeSearch] = useState('')
@@ -670,9 +680,11 @@ function ConfigureFlow({
     if (editTool) {
       setName(editTool.name)
       setToolType(editTool.tool_type)
+      setBusinessDescription(editTool.business_description ?? '')
       setConfig({})
     } else {
       setName('')
+      setBusinessDescription('')
       setToolType('vector_db')
       setConfig({})
     }
@@ -798,10 +810,11 @@ function ConfigureFlow({
     const configPayload = buildConfigPayload()
     setSubmitting(true)
     try {
+      const businessDesc = businessDescription.trim() || undefined
       if (editTool) {
-        await mcpAPI.updateTool(editTool.id, { name, ...(Object.keys(configPayload).length > 0 ? { config: configPayload } : {}) })
+        await mcpAPI.updateTool(editTool.id, { name, business_description: businessDesc ?? null, ...(Object.keys(configPayload).length > 0 ? { config: configPayload } : {}) })
       } else {
-        await mcpAPI.createTool({ tool_type: toolType, name, config: configPayload })
+        await mcpAPI.createTool({ tool_type: toolType, name, config: configPayload, business_description: businessDesc ?? undefined })
       }
       onSaved()
     } catch (err: unknown) {
@@ -896,6 +909,18 @@ function ConfigureFlow({
               placeholder="e.g. My Pinecone index"
             />
           </div>
+          <div>
+            <label className="block text-sm font-medium text-white/80 mb-1">Business description (optional)</label>
+            <textarea
+              value={businessDescription}
+              onChange={(e) => setBusinessDescription(e.target.value)}
+              maxLength={2000}
+              rows={2}
+              className="w-full px-4 py-2.5 rounded-xl bg-dark-50 border border-dark-200 text-white placeholder-white/40 focus:ring-2 focus:ring-primary-500 resize-y"
+              placeholder="e.g. Sales DB: orders, customers, products. Helps the agent write correct SQL."
+            />
+            <p className="mt-1 text-xs text-white/50">Short context for the agent (e.g. what tables mean). Shown with schema so the agent can write correct queries.</p>
+          </div>
           {fields.map((f) => (
             <div key={f.key}>
               <label className="block text-sm font-medium text-white/80 mb-1">{f.label}</label>
@@ -914,6 +939,34 @@ function ConfigureFlow({
           {validateMessage && (
             <div className={`p-3 rounded-xl text-sm ${validateMessage.success ? 'bg-green-500/20 border border-green-500/50 text-green-200' : 'bg-amber-500/20 border border-amber-500/50 text-amber-200'}`}>
               {validateMessage.text}
+            </div>
+          )}
+          {(editTool && (toolType === 'postgres' || toolType === 'mysql')) && (
+            <div className="p-3 rounded-xl bg-dark-50 border border-dark-200">
+              <p className="text-sm text-white/80 mb-2">Load database schema so the agent can write correct SQL. Refresh after changing the connection.</p>
+              <button
+                type="button"
+                onClick={async () => {
+                  if (!editTool) return
+                  setValidateMessage(null)
+                  setRefreshingSchema(true)
+                  onError(null)
+                  try {
+                    const res = await mcpAPI.refreshToolSchema(editTool.id)
+                    setValidateMessage({ success: true, text: res.message })
+                    await onSchemaRefreshed?.(editTool.id)
+                  } catch (err: unknown) {
+                    const detail = (err as { response?: { data?: { detail?: string } } })?.response?.data?.detail
+                    setValidateMessage({ success: false, text: detail ?? 'Failed to refresh schema' })
+                  } finally {
+                    setRefreshingSchema(false)
+                  }
+                }}
+                disabled={refreshingSchema}
+                className="px-4 py-2 rounded-lg border border-primary-500/70 text-primary-400 hover:bg-primary-500/20 disabled:opacity-50 text-sm font-medium"
+              >
+                {refreshingSchema ? 'Refreshing schema...' : 'Refresh schema'}
+              </button>
             </div>
           )}
           <div className="flex flex-wrap gap-3 pt-2">
@@ -1038,6 +1091,11 @@ function ToolsList({
                       {TOOL_LABELS[t.tool_type] ?? t.tool_type}
                     </span>
                     <span className="font-semibold text-white truncate">{t.name}</span>
+                    {(t.tool_type === 'postgres' || t.tool_type === 'mysql') && (
+                      <span className="inline-flex items-center px-2 py-0.5 rounded text-xs font-medium bg-dark-200/80 text-white/70 border border-dark-200">
+                        {t.schema_table_count != null ? `Schema: ${t.schema_table_count} table${t.schema_table_count !== 1 ? 's' : ''}` : 'Schema: not loaded'}
+                      </span>
+                    )}
                   </div>
                   <div className="flex items-center gap-2 text-sm">
                     {t.is_active ? (

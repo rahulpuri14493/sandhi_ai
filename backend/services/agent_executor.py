@@ -1,8 +1,9 @@
-from sqlalchemy.orm import Session
+import logging
+import json
 from datetime import datetime
 from typing import Dict, Any, Optional
 import httpx
-import json
+from sqlalchemy.orm import Session
 from models.job import Job, JobStatus, WorkflowStep
 from models.agent import Agent
 from models.communication import AgentCommunication
@@ -10,7 +11,11 @@ from models.audit_log import AuditLog
 from models.mcp_server import MCPToolConfig, MCPServerConnection
 from services.payment_processor import PaymentProcessor
 from services.a2a_client import execute_via_a2a
+from services.mcp_client import call_tool as mcp_call_tool
+from services.db_schema_introspection import format_schema_for_prompt
 from core.config import settings
+
+logger = logging.getLogger(__name__)
 
 
 def _safe_slug(name: str) -> str:
@@ -31,6 +36,113 @@ def _parse_allowed_ids(value: Optional[str]) -> Optional[list]:
         return [int(x) for x in out] if isinstance(out, list) else None
     except (json.JSONDecodeError, TypeError, ValueError):
         return None
+
+
+# OpenAI-style tool parameter schemas for MCP tool types (must match platform MCP server expectations)
+def _input_schema_for_tool_type(tool_type: str) -> dict:
+    sql_schema = {
+        "type": "object",
+        "properties": {"query": {"type": "string", "description": "SQL SELECT query (read-only)"}},
+        "required": ["query"],
+    }
+    vector_schema = {
+        "type": "object",
+        "properties": {
+            "query": {"type": "string", "description": "Search query or embedding query"},
+            "top_k": {"type": "integer", "description": "Max results", "default": 5},
+        },
+        "required": ["query"],
+    }
+    schemas = {
+        "postgres": sql_schema,
+        "mysql": sql_schema,
+        "vector_db": vector_schema,
+        "pinecone": vector_schema,
+        "weaviate": vector_schema,
+        "qdrant": vector_schema,
+        "chroma": vector_schema,
+        "elasticsearch": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "Search query"},
+                "index": {"type": "string", "description": "Index name"},
+                "size": {"type": "integer", "default": 10},
+            },
+            "required": ["query"],
+        },
+        "filesystem": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "Relative path under base_path"},
+                "action": {"type": "string", "enum": ["read", "list"], "default": "read"},
+            },
+            "required": ["path"],
+        },
+        "s3": {
+            "type": "object",
+            "properties": {
+                "key": {"type": "string", "description": "Object key or prefix"},
+                "action": {"type": "string", "enum": ["get", "list"], "default": "get"},
+            },
+            "required": ["key"],
+        },
+        "slack": {
+            "type": "object",
+            "properties": {
+                "channel": {"type": "string", "description": "Channel ID or name"},
+                "message": {"type": "string", "description": "Message text"},
+                "action": {"type": "string", "enum": ["list_channels", "send"], "default": "send"},
+            },
+        },
+        "github": {
+            "type": "object",
+            "properties": {
+                "repo": {"type": "string", "description": "owner/repo"},
+                "path": {"type": "string", "description": "File path or 'issues'"},
+                "action": {"type": "string", "enum": ["get_file", "list_issues", "search"], "default": "get_file"},
+            },
+        },
+        "notion": {
+            "type": "object",
+            "properties": {
+                "action": {"type": "string", "enum": ["search", "get_page", "get_database"], "default": "search"},
+                "query": {"type": "string", "description": "Search query or page/database ID"},
+            },
+        },
+        "rest_api": {
+            "type": "object",
+            "properties": {
+                "method": {"type": "string", "enum": ["GET", "POST", "PUT", "PATCH", "DELETE"], "default": "GET"},
+                "path": {"type": "string", "description": "Path or full URL"},
+                "body": {"type": "object", "description": "JSON body for POST/PUT/PATCH"},
+            },
+            "required": ["path"],
+        },
+    }
+    return schemas.get((tool_type or "").lower(), {"type": "object", "properties": {}})
+
+
+def _openai_tools_from_mcp(available_mcp_tools: list) -> list:
+    """Build OpenAI tools array from available_mcp_tools for function calling."""
+    tools = []
+    for t in available_mcp_tools or []:
+        name = t.get("name") or ""
+        if not name:
+            continue
+        description = t.get("description") or name
+        if t.get("schema_metadata") or t.get("business_description"):
+            description = description.rstrip(". ") + ". Database schema and business context are in the system message—use them to write correct SQL."
+        tool_type = t.get("tool_type")
+        schema = _input_schema_for_tool_type(tool_type) if tool_type else {"type": "object", "properties": {}}
+        tools.append({
+            "type": "function",
+            "function": {
+                "name": name,
+                "description": description,
+                "parameters": schema,
+            },
+        })
+    return tools
 
 
 class AgentExecutor:
@@ -115,6 +227,7 @@ class AgentExecutor:
                 )
                 if available_mcp_tools:
                     input_data["available_mcp_tools"] = available_mcp_tools
+                    input_data["business_id"] = job.business_id
                     if step.step_order == 1:
                         self._log_action("job", job_id, "mcp_tool_discovery", {
                             "business_id": job.business_id,
@@ -134,40 +247,34 @@ class AgentExecutor:
                         f"Only hired agents with an API endpoint are supported. "
                         f"Agent '{agent.name}' (id={agent.id}) has no api_endpoint configured."
                     )
-                print(f"[DEBUG] ========== Executing Step {step.step_order} ==========")
-                print(f"[DEBUG] Agent: {agent.name} (hired endpoint)")
-                print(f"[DEBUG] Agent endpoint: {agent.api_endpoint}")
-                print(f"[DEBUG] Job Title: {input_data.get('job_title', 'N/A')}")
-                print(f"[DEBUG] Job Description: {input_data.get('job_description', 'N/A')[:100]}...")
+                logger.debug("========== Executing Step %s ==========", step.step_order)
+                logger.debug("Agent: %s (hired endpoint)", agent.name)
+                logger.debug("Agent endpoint: %s", agent.api_endpoint)
+                logger.debug("Job Title: %s", input_data.get('job_title', 'N/A'))
+                logger.debug("Job Description: %s...", (input_data.get('job_description') or 'N/A')[:100])
                 
                 # Log documents
                 if documents:
-                    print(f"[DEBUG] ✓ Found {len(documents)} document(s) to send to agent:")
+                    logger.debug("Found %s document(s) to send to agent", len(documents))
                     for i, doc in enumerate(documents):
                         content_length = len(doc.get('content', '')) if doc.get('content') else 0
                         content_preview = doc.get('content', '')[:150] if doc.get('content') else 'EMPTY'
-                        print(f"[DEBUG]   Document {i+1}: {doc.get('name', 'Unknown')}")
-                        print(f"[DEBUG]     - Type: {doc.get('type', 'unknown')}")
-                        print(f"[DEBUG]     - Content length: {content_length} chars")
-                        print(f"[DEBUG]     - Content preview: {content_preview}...")
+                        logger.debug("Document %s: %s type=%s content_length=%s preview=%s...", i + 1, doc.get('name', 'Unknown'), doc.get('type', 'unknown'), content_length, content_preview)
                 else:
-                    print(f"[DEBUG] ✗ WARNING: No documents found in input_data!")
+                    logger.warning("No documents found in input_data")
                 
                 # Log conversation
                 if conversation:
-                    print(f"[DEBUG] ✓ Found {len(conversation)} conversation item(s):")
                     questions = [item for item in conversation if item.get('type') == 'question']
                     answers = [item for item in conversation if item.get('type') == 'question' and item.get('answer')]
                     completions = [item for item in conversation if item.get('type') == 'completion']
-                    print(f"[DEBUG]   - Questions: {len(questions)}")
-                    print(f"[DEBUG]   - Answered: {len(answers)}")
-                    print(f"[DEBUG]   - Completions: {len(completions)}")
+                    logger.debug("Found %s conversation item(s) questions=%s answered=%s completions=%s", len(conversation), len(questions), len(answers), len(completions))
                     if completions:
-                        print(f"[DEBUG]   - Latest completion: {completions[-1].get('message', 'N/A')[:100]}...")
+                        logger.debug("Latest completion: %s...", (completions[-1].get('message') or 'N/A')[:100])
                 else:
-                    print(f"[DEBUG] ✗ WARNING: No conversation found in input_data!")
+                    logger.warning("No conversation found in input_data")
                 
-                print(f"[DEBUG] =================================================")
+                logger.debug("=================================================")
                 
                 # Execute agent (API or plugin)
                 try:
@@ -261,7 +368,7 @@ class AgentExecutor:
                 f"Agent '{agent.name}' (id={agent.id}) has no api_endpoint."
             )
         api_key = (agent.api_key or "").strip() or None
-        print(f"[DEBUG] Executing agent '{agent.name}' via A2A: {url}")
+        logger.debug("Executing agent '%s' via A2A: %s", agent.name, url)
         result = await execute_via_a2a(
             url,
             input_data,
@@ -276,8 +383,9 @@ class AgentExecutor:
         """
         Execute OpenAI-compatible agent via platform A2A adapter. Adapter receives A2A
         and forwards to agent.api_endpoint with OpenAI payload; returns A2A response.
-        Sends formatted OpenAI-style messages so the model gets a proper prompt and
-        returns the actual answer instead of echoing the context.
+        When MCP tools are available, runs an agentic loop: send tools to the model,
+        on tool_calls invoke the platform MCP server and append results, then call again
+        until the model returns a final answer (no tool_calls).
         """
         url = (agent.api_endpoint or "").strip()
         if not url:
@@ -287,24 +395,52 @@ class AgentExecutor:
             )
         api_key = (agent.api_key or "").strip() or None
         model = (getattr(agent, "llm_model", None) or "").strip() or "gpt-4o-mini"
-        print(f"[DEBUG] Executing agent '{agent.name}' via A2A adapter -> {url}")
-        # Build the same formatted messages we use for direct OpenAI API so the model
-        # gets system + user messages and returns a real answer, not the context echo.
+        logger.debug("Executing agent '%s' via A2A adapter -> %s", agent.name, url)
         payload = self._format_for_openai(agent, input_data)
-        result = await execute_via_a2a(
-            adapter_url,
-            input_data,
-            api_key=None,
-            blocking=True,
-            timeout=120.0,
-            adapter_metadata={
+        messages = payload.get("messages", [])
+        available_mcp_tools = input_data.get("available_mcp_tools") or []
+        openai_tools = _openai_tools_from_mcp(available_mcp_tools) if available_mcp_tools else []
+        business_id = input_data.get("business_id")
+        max_tool_iterations = 5
+        content = ""
+
+        for iteration in range(max_tool_iterations):
+            metadata = {
                 "openai_url": url,
                 "openai_api_key": api_key or "",
                 "openai_model": model,
-                "openai_messages": payload.get("messages", []),
-            },
-        )
-        return result
+                "openai_messages": messages,
+            }
+            if openai_tools:
+                metadata["openai_tools"] = openai_tools
+            result = await execute_via_a2a(
+                adapter_url,
+                input_data,
+                api_key=None,
+                blocking=True,
+                timeout=120.0,
+                adapter_metadata=metadata,
+            )
+            content = result.get("content") or ""
+            tool_calls = result.get("tool_calls")
+            if not tool_calls or not business_id:
+                break
+            # Append assistant message with tool_calls
+            messages.append({"role": "assistant", "content": content or None, "tool_calls": tool_calls})
+            for tc in tool_calls:
+                tc_id = tc.get("id")
+                fn = tc.get("function") or {}
+                tool_name = fn.get("name")
+                args_raw = fn.get("arguments") or "{}"
+                try:
+                    args = json.loads(args_raw) if isinstance(args_raw, str) else args_raw
+                except (json.JSONDecodeError, TypeError):
+                    args = {}
+                tool_result = await self._call_platform_mcp_tool(business_id, tool_name, args)
+                messages.append({"role": "tool", "tool_call_id": tc_id, "content": tool_result})
+            logger.info("MCP tool round %s: %s tool call(s), continuing agent loop", iteration + 1, len(tool_calls))
+
+        return {"content": content}
 
     async def _execute_api_agent(self, agent: Agent, input_data: Dict[str, Any]) -> Dict[str, Any]:
         """
@@ -325,10 +461,10 @@ class AgentExecutor:
         if isinstance(payload, dict):
             payload["model"] = payload.get("model") or "gpt-4o-mini"
         client_kwargs = {"timeout": 120.0, "verify": False}
-        print(f"[DEBUG] Executing agent '{agent.name}' via hired endpoint: {url}")
+        logger.debug("Executing agent '%s' via hired endpoint: %s", agent.name, url)
 
         payload_for_log = self._truncate_payload_for_log(payload, max_content_len=1500)
-        print(f"[LOG] Request payload: {json.dumps(payload_for_log, indent=2, default=str)}")
+        logger.info("Request payload: %s", json.dumps(payload_for_log, indent=2, default=str))
 
         async with httpx.AsyncClient(**client_kwargs) as client:
             response = await client.post(url, json=payload, headers=headers)
@@ -338,12 +474,12 @@ class AgentExecutor:
             except Exception:
                 response_body = "(unable to read response body)"
             response_for_log = response_body if len(response_body) <= 2000 else response_body[:2000] + "\n... (truncated)"
-            print(f"[LOG] Response status: {response.status_code} {response.reason_phrase}")
-            print(f"[LOG] Response body: {response_for_log}")
+            logger.info("Response status: %s %s", response.status_code, response.reason_phrase)
+            logger.info("Response body: %s", response_for_log)
 
             if response.status_code >= 400:
                 body = response_body if len(response_body) <= 800 else response_body[:800] + "..."
-                print(f"[ERROR] Agent API returned {response.status_code}: {body}")
+                logger.error("Agent API returned %s: %s", response.status_code, body)
                 raise Exception(
                     f"Agent inference returned {response.status_code} {response.reason_phrase}. Response: {body}"
                 )
@@ -467,12 +603,34 @@ class AgentExecutor:
             system_content += "\n═══════════════════════════════════════════════════════\n"
             system_content += "AVAILABLE MCP TOOLS (data sources / APIs for this job)\n"
             system_content += "═══════════════════════════════════════════════════════\n\n"
-            system_content += "The following tools are available. Use them in your reasoning when the task requires data or actions they provide. "
-            system_content += "Platform tools are invoked by name (e.g. platform_1_my_db for PostgreSQL). "
-            system_content += "Reference tool names in your response when you need the platform to run a query or operation.\n\n"
+            system_content += "The following tools are available. When the task requires running a query or fetching data, you MUST invoke the corresponding tool (use a function/tool call). "
+            system_content += "Do NOT only describe or write the query in text—the platform runs the query only when you call the tool. "
+            system_content += "Call the tool with the appropriate arguments (e.g. the SQL query); then use the tool result in your final answer.\n\n"
             for t in available_mcp_tools:
                 system_content += f"  - {t.get('name', '')}: {t.get('description', '')}\n"
             system_content += "\n"
+            # Database schema and business context for SQL tools (so the agent can write correct queries)
+            schema_tools = [t for t in available_mcp_tools if t.get("schema_metadata") or t.get("business_description")]
+            if schema_tools:
+                system_content += "═══════════════════════════════════════════════════════\n"
+                system_content += "DATABASE SCHEMA AND CONTEXT (use this to write correct SQL)\n"
+                system_content += "═══════════════════════════════════════════════════════\n\n"
+                for t in schema_tools:
+                    tool_name = t.get("name", "")
+                    system_content += f"--- Database context for tool: {tool_name} ---\n"
+                    if t.get("business_description"):
+                        system_content += f"Business context: {t.get('business_description')}\n"
+                    if t.get("schema_metadata"):
+                        try:
+                            schema_dict = json.loads(t["schema_metadata"])
+                            formatted = format_schema_for_prompt(schema_dict, max_chars=8000)
+                            if formatted:
+                                system_content += "Schema:\n" + formatted + "\n"
+                        except (TypeError, json.JSONDecodeError):
+                            pass
+                    system_content += "\n"
+                system_content += "Use the schema above to write valid SQL for the corresponding tool. Do not guess table or column names. "
+                system_content += "Then invoke that tool with your SQL so the platform executes it and returns results; do not only show the SQL in your message.\n\n"
         messages.append({"role": "system", "content": system_content})
         
         # Add document content to messages with clear formatting (if documents exist)
@@ -498,7 +656,7 @@ class AgentExecutor:
                     return False
                 return True
 
-            print(f"[DEBUG] Formatting {len(documents)} requirement documents for API (content is inline below)")
+            logger.debug("Formatting %s requirement documents for API (content is inline below)", len(documents))
             messages.append({
                 "role": "user",
                 "content": "═══════════════════════════════════════════════════════\n📋 REQUIREMENT DOCUMENTS (text below):\n═══════════════════════════════════════════════════════\n\nThe requirement document text is in the next message(s). Use it to execute the job and provide your correct answer. Do not ask unnecessary questions.\n\nDocument(s) follow:"
@@ -509,7 +667,7 @@ class AgentExecutor:
                 doc_type = doc.get('type', 'unknown')
                 doc_content = (doc.get('content') or '').strip()
 
-                print(f"[DEBUG] Document {i+1}: {doc_name} - Content length: {len(doc_content)} chars")
+                logger.debug("Document %s: %s - Content length: %s chars", i + 1, doc_name, len(doc_content))
 
                 if _is_extracted_content(doc_content):
                     doc_message = f"""═══════════════════════════════════════════════════════
@@ -532,14 +690,14 @@ END DOCUMENT {i+1}: {doc_name}
                         f"Execute the task based on that and provide your complete answer. Do not refuse; infer from the job context if needed.]"
                     )
                     messages.append({"role": "user", "content": fallback})
-                    print(f"[DEBUG] Document {doc_name}: no extractable content – sent fallback (use job title/description)")
+                    logger.debug("Document %s: no extractable content – sent fallback (use job title/description)", doc_name)
 
             messages.append({
                 "role": "user",
                 "content": "═══════════════════════════════════════════════════════\nEND OF REQUIREMENT DOCUMENTS\n═══════════════════════════════════════════════════════\n\nExecute the job based on the requirement documents above and provide your complete, correct answer."
             })
         else:
-            print("[DEBUG] No documents provided - agent will work with job title and description only")
+            logger.debug("No documents provided - agent will work with job title and description only")
         
         # Convert conversation Q&A to messages (if any)
         if conversation:
@@ -674,13 +832,18 @@ END DOCUMENT {i+1}: {doc_name}
         for t in platform:
             name = f"platform_{t.id}_{_safe_slug(t.name)}" if _safe_slug(t.name) else f"platform_{t.id}"
             desc = TOOL_TYPE_DESC.get(t.tool_type.value, t.tool_type.value)
-            tools.append({
+            entry = {
                 "name": name,
                 "description": f"{desc}: {t.name}",
                 "source": "platform",
                 "platform_tool_id": t.id,
                 "tool_type": t.tool_type.value,
-            })
+            }
+            if getattr(t, "schema_metadata", None):
+                entry["schema_metadata"] = t.schema_metadata
+            if getattr(t, "business_description", None):
+                entry["business_description"] = t.business_description
+            tools.append(entry)
         conn_query = self.db.query(MCPServerConnection).filter(
             MCPServerConnection.user_id == business_id,
             MCPServerConnection.is_active == True,
@@ -696,6 +859,32 @@ END DOCUMENT {i+1}: {doc_name}
                 "connection_id": c.id,
             })
         return tools
+
+    async def _call_platform_mcp_tool(
+        self, business_id: int, tool_name: str, arguments: Dict[str, Any]
+    ) -> str:
+        """Invoke a platform MCP tool by name; returns result content as string for tool result message."""
+        base = (getattr(settings, "PLATFORM_MCP_SERVER_URL", None) or "").strip().rstrip("/")
+        if not base:
+            return json.dumps({"error": "Platform MCP server not configured"})
+        extra_headers = {"X-MCP-Business-Id": str(business_id)}
+        try:
+            result = await mcp_call_tool(
+                base_url=base,
+                tool_name=tool_name,
+                arguments=arguments,
+                endpoint_path="/mcp",
+                timeout=60.0,
+                extra_headers=extra_headers,
+            )
+        except Exception as e:
+            return json.dumps({"error": str(e)})
+        content_list = result.get("content") or []
+        texts = []
+        for part in content_list:
+            if isinstance(part, dict) and part.get("type") == "text":
+                texts.append(part.get("text", ""))
+        return "\n".join(texts) if texts else json.dumps(result)
 
     def _log_action(self, entity_type: str, entity_id: int, action: str, details: Dict[str, Any]):
         """Log an action to the audit log"""

@@ -10,6 +10,8 @@ import socket
 import uuid
 import httpx
 
+from core.config import settings
+
 
 # JSON-RPC 2.0 and A2A constants
 JSONRPC_VERSION = "2.0"
@@ -66,7 +68,10 @@ def _extract_result_from_send_message_response(response_body: Dict[str, Any]) ->
         msg = result["message"]
         parts = msg.get("parts") or []
         content = _extract_text_from_parts(parts)
-        return {"content": content, "raw_message": msg}
+        out = {"content": content, "raw_message": msg}
+        if "tool_calls" in result:
+            out["tool_calls"] = result["tool_calls"]
+        return out
 
     # Task response
     task = result.get("task")
@@ -144,23 +149,27 @@ def _validate_public_http_url(url: str) -> str:
     except OSError as exc:
         raise ValueError(f"Could not resolve agent endpoint host: {hostname}") from exc
 
-    for family, _, _, _, sockaddr in addr_info:
-        ip_str = None
-        if family == socket.AF_INET:
-            ip_str = sockaddr[0]
-        elif family == socket.AF_INET6:
-            ip_str = sockaddr[0]
-        if not ip_str:
-            continue
-        ip_obj = ipaddress.ip_address(ip_str)
-        if (
-            ip_obj.is_private
-            or ip_obj.is_loopback
-            or ip_obj.is_link_local
-            or ip_obj.is_reserved
-            or ip_obj.is_multicast
-        ):
-            raise ValueError("Agent endpoint host must resolve to a public IP address")
+    if not settings.ALLOW_PRIVATE_AGENT_ENDPOINTS:
+        for family, _, _, _, sockaddr in addr_info:
+            ip_str = None
+            if family == socket.AF_INET:
+                ip_str = sockaddr[0]
+            elif family == socket.AF_INET6:
+                ip_str = sockaddr[0]
+            if not ip_str:
+                continue
+            ip_obj = ipaddress.ip_address(ip_str)
+            if (
+                ip_obj.is_private
+                or ip_obj.is_loopback
+                or ip_obj.is_link_local
+                or ip_obj.is_reserved
+                or ip_obj.is_multicast
+            ):
+                raise ValueError(
+                    "Agent endpoint host must resolve to a public IP address. "
+                    "For local/Docker agents set ALLOW_PRIVATE_AGENT_ENDPOINTS=true."
+                )
 
     return str(normalized)
 

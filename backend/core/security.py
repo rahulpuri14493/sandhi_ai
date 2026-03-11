@@ -1,16 +1,18 @@
+import logging
+import os
 from datetime import datetime, timedelta
 from typing import Optional
+import bcrypt
+from dotenv import load_dotenv
 from jose import JWTError, jwt
 from fastapi import Depends, HTTPException, status
 from fastapi.security import OAuth2PasswordBearer
 from sqlalchemy.orm import Session
 from db.database import get_db
 from models.user import User
-import os
-import bcrypt
-from dotenv import load_dotenv
 
 load_dotenv()
+logger = logging.getLogger(__name__)
 
 SECRET_KEY = os.getenv("SECRET_KEY", "your-secret-key-change-in-production")
 ALGORITHM = os.getenv("ALGORITHM", "HS256")
@@ -29,17 +31,15 @@ def verify_password(plain_password: str, hashed_password: str) -> bool:
         
         # Check if hash starts with bcrypt identifier ($2a$, $2b$, $2x$, $2y$)
         if not hashed_password.startswith('$2'):
-            print(f"Warning: Password hash doesn't appear to be bcrypt format: {hashed_password[:20]}...")
+            logger.warning("Password hash doesn't appear to be bcrypt format: %s...", hashed_password[:20])
             return False
         
         result = bcrypt.checkpw(password_bytes, hashed_bytes)
         if not result:
-            print(f"Password verification failed for hash: {hashed_password[:20]}...")
+            logger.debug("Password verification failed for hash: %s...", hashed_password[:20])
         return result
     except Exception as e:
-        print(f"Password verification error: {e}")
-        import traceback
-        traceback.print_exc()
+        logger.exception("Password verification error: %s", e)
         return False
 
 
@@ -75,7 +75,7 @@ def get_current_user(token: str = Depends(oauth2_scheme), db: Session = Depends(
     )
     
     if not token:
-        print("ERROR: No token provided")
+        logger.error("No token provided")
         raise credentials_exception
     
     try:
@@ -84,36 +84,34 @@ def get_current_user(token: str = Depends(oauth2_scheme), db: Session = Depends(
         user_id_str = payload.get("sub")
         
         if user_id_str is None:
-            print(f"ERROR: Token payload missing 'sub' field. Payload: {payload}")
+            logger.error("Token payload missing 'sub' field. Payload: %s", payload)
             raise credentials_exception
         
         # Convert string user_id back to int
         try:
             user_id: int = int(user_id_str)
         except (ValueError, TypeError):
-            print(f"ERROR: Invalid user_id format in token: {user_id_str}")
+            logger.error("Invalid user_id format in token: %s", user_id_str)
             raise credentials_exception
             
     except jwt.ExpiredSignatureError:
-        print("ERROR: Token has expired")
+        logger.warning("Token has expired")
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Token has expired",
             headers={"WWW-Authenticate": "Bearer"},
         )
     except JWTError as e:
-        print(f"ERROR: JWT decode error - {e}")
+        logger.warning("JWT decode error: %s", e)
         raise credentials_exception
     except Exception as e:
-        print(f"ERROR: Unexpected token validation error - {e}")
-        import traceback
-        traceback.print_exc()
+        logger.exception("Unexpected token validation error: %s", e)
         raise credentials_exception
     
     # Get user from database
     user = db.query(User).filter(User.id == user_id).first()
     if user is None:
-        print(f"ERROR: User with id {user_id} not found in database")
+        logger.error("User with id %s not found in database", user_id)
         raise credentials_exception
     
     return user

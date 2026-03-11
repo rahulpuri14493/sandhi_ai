@@ -65,6 +65,10 @@ class MCPToolConfig(Base):
     name = Column(String(255), nullable=False)  # e.g. "My Pinecone", "Prod DB"
     # Encrypted JSON: tool-specific config (connection strings, API keys, paths)
     encrypted_config = Column(Text, nullable=False)
+    # Read-only schema from introspection (tables, columns, PK, FK); no credentials
+    schema_metadata = Column(Text, nullable=True)
+    # Optional short business context for the agent (e.g. "Sales DB: orders, customers")
+    business_description = Column(String(2000), nullable=True)
     is_active = Column(Boolean, default=True, nullable=False)
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
