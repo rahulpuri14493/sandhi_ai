@@ -64,8 +64,9 @@ services:
       - "8081:8081"
     environment:
       BACKEND_INTERNAL_URL: http://backend:8000
-      # Must match backend; dev default allows stack to run without .env
       MCP_INTERNAL_SECRET: ${MCP_INTERNAL_SECRET:-dev-mcp-internal-secret}
+    env_file:
+      - .env
     depends_on:
       - backend
 

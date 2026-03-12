@@ -78,6 +78,24 @@ def _fetch_tool_config(business_id: int, tool_id: int) -> Dict[str, Any]:
         return r.json()
 
 
+def _to_json_safe(obj: Any) -> Any:
+    """Convert object to JSON-serializable form (e.g. Chroma SparseVector in metadata)."""
+    if obj is None or isinstance(obj, (bool, int, float, str)):
+        return obj
+    if isinstance(obj, dict):
+        return {k: _to_json_safe(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_to_json_safe(x) for x in obj]
+    # Chroma SparseVector and similar types
+    if hasattr(obj, "to_dict") and callable(getattr(obj, "to_dict")):
+        return _to_json_safe(obj.to_dict())
+    try:
+        json.dumps(obj)
+        return obj
+    except (TypeError, ValueError):
+        return str(obj)
+
+
 def _parse_platform_tool_id(name: str) -> Optional[int]:
     """Parse platform_<id>_* to get tool id."""
     if not name or not name.startswith("platform_"):
@@ -154,9 +172,372 @@ def _execute_filesystem(config: Dict[str, Any], arguments: Dict[str, Any]) -> st
         return f"Read error: {e}"
 
 
+def _embed_with_user_key(
+    query_text: str, config: Dict[str, Any], dimensions: Optional[int] = None
+) -> Optional[List[float]]:
+    """Embed query text using the end-user's OpenAI API key from tool config. Platform does not provide a key.
+    dimensions: optional output size for text-embedding-3-* (e.g. 1024 to match Chroma collection)."""
+    api_key = (config.get("openai_api_key") or config.get("embedding_api_key") or "").strip()
+    if not api_key:
+        return None
+    model = (config.get("embedding_model") or "text-embedding-3-small").strip()
+    try:
+        from openai import OpenAI
+        client = OpenAI(api_key=api_key)
+        kwargs: Dict[str, Any] = {"model": model, "input": query_text}
+        if dimensions is not None and "text-embedding-3" in model:
+            kwargs["dimensions"] = dimensions
+        r = client.embeddings.create(**kwargs)
+        if r.data and len(r.data) > 0:
+            return r.data[0].embedding
+    except Exception as e:
+        logger.warning("OpenAI embedding (user key) failed: %s", e)
+    return None
+
+
+# Message when embedding is required but user has not provided a key in tool config
+_MSG_ADD_OPENAI_IN_CONFIG = (
+    "Query-by-text requires embedding. Add your own **OpenAI API key** in this tool's configuration "
+    "(optional field 'OpenAI API key for embedding'). The platform does not provide an API key."
+)
+
+
+def _execute_pinecone(config: Dict[str, Any], arguments: Dict[str, Any]) -> str:
+    """Query Pinecone index. Prefer integrated text search (no OpenAI). Fall back to OpenAI embed + vector query if needed."""
+    api_key = (config.get("api_key") or "").strip()
+    host = (config.get("url") or config.get("host") or "").strip().rstrip("/")
+    query_text = (arguments.get("query") or "").strip()
+    top_k = min(max(int(arguments.get("top_k") or 5), 1), 10000)
+    # Pinecone default namespace: API uses "__default__"; UI often shows "_default_"
+    namespace = (arguments.get("namespace") or config.get("namespace") or "").strip() or "__default__"
+    if namespace == "_default_":
+        namespace = "__default__"
+
+    if not query_text:
+        return "Error: query is required"
+    if not api_key:
+        return "Error: Pinecone API key is not configured"
+    if not host:
+        return "Error: Pinecone host (URL) is not configured. Use the index host from Pinecone console."
+
+    index_host = host.replace("https://", "").replace("http://", "").split("/")[0].strip()
+
+    def _normalize_result(result: Any, ns: Optional[str]) -> str:
+        """Build a consistent JSON response from Pinecone search/query result.
+        search() returns result.result.hits with _id, _score, fields; query() returns matches with id, score, metadata."""
+        matches = getattr(result, "matches", None) or getattr(result, "hits", None)
+        if matches is None:
+            inner = getattr(result, "result", None) or (result.get("result") if isinstance(result, dict) else None)
+            if inner is not None:
+                matches = getattr(inner, "hits", None) or (inner.get("hits") if isinstance(inner, dict) else None)
+        if matches is None and isinstance(result, dict):
+            matches = result.get("matches") or result.get("hits") or []
+        matches = matches or []
+        namespace_out = getattr(result, "namespace", None) or (getattr(result, "namespace", None) if hasattr(result, "namespace") else None) or ns
+        out = {"matches": [], "namespace": namespace_out}
+        for m in matches:
+            mid = getattr(m, "id", None) or getattr(m, "_id", None)
+            if mid is None and isinstance(m, dict):
+                mid = m.get("id") or m.get("_id")
+            score = getattr(m, "score", None) or getattr(m, "_score", None)
+            if score is None and isinstance(m, dict):
+                score = m.get("score") or m.get("_score")
+            meta = getattr(m, "metadata", None) or getattr(m, "fields", None)
+            if meta is None and isinstance(m, dict):
+                meta = m.get("metadata") or m.get("fields") or {k: v for k, v in m.items() if k not in ("id", "_id", "score", "_score")}
+            entry = {"id": mid, "score": score}
+            if meta:
+                entry["metadata"] = dict(meta) if hasattr(meta, "items") else meta
+            out["matches"].append(entry)
+        return json.dumps(out, indent=2)
+
+    try:
+        from pinecone import Pinecone
+        pc = Pinecone(api_key=api_key)
+        index = pc.Index(host=index_host)
+
+        # 1) Try integrated text search first (no OpenAI key required)
+        try:
+            search_result = index.search(
+                namespace=namespace,
+                query={"inputs": {"text": query_text}, "top_k": top_k},
+            )
+            return _normalize_result(search_result, namespace)
+        except Exception as text_err:
+            err_msg = str(text_err).lower()
+            fallback = (
+                "integrated" in err_msg or "inputs" in err_msg or "not supported" in err_msg
+                or "text search" in err_msg or "400" in err_msg or "invalid" in err_msg
+                or isinstance(text_err, AttributeError)  # e.g. .search() not in this SDK
+            )
+            if fallback:
+                logger.info("Pinecone integrated text search not available, falling back to vector query: %s", text_err)
+            else:
+                raise
+
+        # 2) Fall back: embed with user's OpenAI key from config then vector query
+        vector = _embed_with_user_key(query_text, config)
+        if not vector:
+            return (
+                "This Pinecone index does not support query-by-text (integrated embedding). "
+                + _MSG_ADD_OPENAI_IN_CONFIG
+            )
+        payload = {"vector": vector, "topK": top_k, "includeMetadata": True, "namespace": namespace}
+        result = index.query(**payload)
+        return _normalize_result(result, namespace)
+    except Exception as e:
+        if "OPENAI" not in str(e) and "embed" not in str(e).lower():
+            logger.exception("Pinecone query error")
+        return f"Pinecone query error: {e}"
+
+
+def _parse_url(url_str: str) -> tuple:
+    """Return (host, port, secure) from URL."""
+    from urllib.parse import urlparse
+    u = urlparse(url_str.strip() or "http://localhost")
+    host = u.hostname or "localhost"
+    port = u.port or (443 if u.scheme == "https" else 8080)
+    secure = u.scheme == "https"
+    return host, port, secure
+
+
+def _execute_weaviate(config: Dict[str, Any], arguments: Dict[str, Any]) -> str:
+    """Query Weaviate. Try near_text first (no key). If that fails, use user's OpenAI key from config + near_vector."""
+    url = (config.get("url") or "").strip()
+    api_key = (config.get("api_key") or "").strip() or None
+    class_name = (config.get("index_name") or config.get("class_name") or "Document").strip()
+    query_text = (arguments.get("query") or "").strip()
+    top_k = min(max(int(arguments.get("top_k") or 5), 1), 100)
+
+    if not query_text:
+        return "Error: query is required"
+    if not url:
+        return "Error: Weaviate URL is not configured"
+
+    try:
+        import weaviate
+        from weaviate.classes.init import Auth
+        auth = Auth.api_key(api_key) if api_key else None
+        if "weaviate.cloud" in url or ".weaviate.io" in url:
+            client = weaviate.connect_to_weaviate_cloud(
+                cluster_url=url.rstrip("/"),
+                auth_credentials=auth,
+            )
+        else:
+            host, port, secure = _parse_url(url)
+            client = weaviate.connect_to_custom(
+                http_host=host,
+                http_port=port,
+                http_secure=secure,
+                grpc_host=host,
+                grpc_port=50051 if not secure else 443,
+                grpc_secure=secure,
+                auth_credentials=auth,
+            )
+        try:
+            collection = client.collections.get(class_name)
+            # 1) Try near_text first (Weaviate server vectorizer; no key from us)
+            try:
+                response = collection.query.near_text(query=query_text, limit=top_k)
+                out = {"matches": []}
+                for obj in response.objects:
+                    entry = {"id": str(obj.uuid), "properties": dict(obj.properties) if obj.properties else {}}
+                    if hasattr(obj, "metadata") and obj.metadata and getattr(obj.metadata, "distance", None) is not None:
+                        entry["score"] = 1 - (obj.metadata.distance or 0)
+                    out["matches"].append(entry)
+                return json.dumps(out, indent=2)
+            except Exception as text_err:
+                logger.info("Weaviate near_text not available, trying embed + near_vector: %s", text_err)
+            # 2) Fall back: user's OpenAI key from config + near_vector
+            vector = _embed_with_user_key(query_text, config)
+            if not vector:
+                return "Weaviate collection has no vectorizer for query-by-text. " + _MSG_ADD_OPENAI_IN_CONFIG
+            response = collection.query.near_vector(near_vector=vector, limit=top_k)
+            out = {"matches": []}
+            for obj in response.objects:
+                entry = {"id": str(obj.uuid), "properties": dict(obj.properties) if obj.properties else {}}
+                if hasattr(obj, "metadata") and obj.metadata and getattr(obj.metadata, "distance", None) is not None:
+                    entry["score"] = 1 - (obj.metadata.distance or 0)
+                out["matches"].append(entry)
+            return json.dumps(out, indent=2)
+        finally:
+            client.close()
+    except Exception as e:
+        logger.exception("Weaviate query error")
+        return f"Weaviate query error: {e}"
+
+
+def _execute_qdrant(config: Dict[str, Any], arguments: Dict[str, Any]) -> str:
+    """Query Qdrant collection. Prefer Qdrant Cloud inference (Document text+model) when available; else user's OpenAI key + vector."""
+    url = (config.get("url") or "").strip() or "http://localhost:6333"
+    api_key = (config.get("api_key") or "").strip() or None
+    collection_name = (config.get("index_name") or "my_collection").strip()
+    query_text = (arguments.get("query") or "").strip()
+    top_k = min(max(int(arguments.get("top_k") or 5), 1), 100)
+    # Model for Qdrant Cloud inference; must match collection. Map common display names to official IDs.
+    _qdrant_model_aliases = {
+        "all minilm l6 v2": "sentence-transformers/all-minilm-l6-v2",
+        "all-minilm-l6-v2": "sentence-transformers/all-minilm-l6-v2",
+        "minilm l6 v2": "sentence-transformers/all-minilm-l6-v2",
+        "multilingual e5 small": "intfloat/multilingual-e5-small",
+        "multilingual-e5-small": "intfloat/multilingual-e5-small",
+    }
+    raw_model = (config.get("embedding_model") or config.get("qdrant_model") or "sentence-transformers/all-minilm-l6-v2").strip()
+    qdrant_model = _qdrant_model_aliases.get(raw_model.lower()) or raw_model
+
+    if not query_text:
+        return "Error: query is required"
+
+    def _parse_points_result(result: Any) -> str:
+        points = result.points if hasattr(result, "points") else []
+        out = {"matches": []}
+        for p in points:
+            pid = p.id if hasattr(p, "id") else (p.get("id") if isinstance(p, dict) else None)
+            score = getattr(p, "score", None) if not isinstance(p, dict) else p.get("score")
+            payload = getattr(p, "payload", None) if not isinstance(p, dict) else p.get("payload")
+            entry = {"id": str(pid), "score": score}
+            if payload:
+                entry["metadata"] = dict(payload) if hasattr(payload, "items") else payload
+            out["matches"].append(entry)
+        return json.dumps(out, indent=2)
+
+    try:
+        from qdrant_client import QdrantClient
+        is_cloud = "cloud.qdrant.io" in url
+        # 1) Qdrant Cloud: use Document(text=..., model=...) so Qdrant embeds server-side (no OpenAI key)
+        if is_cloud and api_key:
+            try:
+                from qdrant_client.http.models import Document
+                client = QdrantClient(url=url, api_key=api_key, cloud_inference=True)
+                result = client.query_points(
+                    collection_name=collection_name,
+                    query=Document(text=query_text, model=qdrant_model),
+                    limit=top_k,
+                    with_payload=True,
+                )
+                return _parse_points_result(result)
+            except Exception as doc_err:
+                err_str = str(doc_err).lower()
+                if "404" in err_str or "doesn't exist" in err_str or "not found" in err_str:
+                    return (
+                        f"Qdrant collection '{collection_name}' was not found. "
+                        "Cluster name is not the same as collection name: in the tool config, set **Collection name** to the exact name of your collection. "
+                        "List collections in Qdrant Cloud (Cluster UI → Collections) to see the correct name."
+                    )
+                logger.info("Qdrant Cloud Document query failed, falling back to vector query: %s", doc_err)
+        # 2) Self-hosted or fallback: embed with user's OpenAI key then query by vector
+        vector = _embed_with_user_key(query_text, config)
+        if not vector:
+            if is_cloud:
+                return (
+                    "Qdrant Cloud Document query failed (check embedding_model matches your collection). "
+                    "Or add your OpenAI API key in this tool's config to use vector search."
+                )
+            return "Qdrant query-by-text requires embedding. " + _MSG_ADD_OPENAI_IN_CONFIG
+        client = QdrantClient(url=url, api_key=api_key)
+        result = client.query_points(
+            collection_name=collection_name,
+            query=vector,
+            limit=top_k,
+            with_payload=True,
+        )
+        return _parse_points_result(result)
+    except Exception as e:
+        logger.exception("Qdrant query error")
+        return f"Qdrant query error: {e}"
+
+
+def _execute_chroma(config: Dict[str, Any], arguments: Dict[str, Any]) -> str:
+    """Query Chroma collection. Uses Chroma Cloud (api_key + tenant + database) or HttpClient for self-hosted."""
+    url = (config.get("url") or "").strip() or "http://localhost:8000"
+    collection_name = (config.get("index_name") or "default").strip()
+    query_text = (arguments.get("query") or "").strip()
+    top_k = min(max(int(arguments.get("top_k") or 5), 1), 100)
+    api_key = (config.get("api_key") or "").strip() or None
+    tenant = (config.get("tenant") or "").strip() or None
+    database = (config.get("database") or "").strip() or None
+
+    if not query_text:
+        return "Error: query is required"
+
+    try:
+        import chromadb
+        is_cloud = "trychroma.com" in url.lower()
+        if is_cloud and api_key:
+            client = chromadb.CloudClient(
+                tenant=tenant,
+                database=database,
+                api_key=api_key,
+            )
+        else:
+            if is_cloud and not api_key:
+                return (
+                    "Chroma Cloud requires an API key. Set **Chroma API key** in this tool's config "
+                    "(create one in Chroma Cloud → Settings → Create API key). Optionally set Tenant ID and Database name."
+                )
+            host, port, _ = _parse_url(url)
+            client = chromadb.HttpClient(host=host, port=port)
+        coll = client.get_or_create_collection(name=collection_name or "default")
+        # Prefer query_texts (Chroma's embedding); fallback to user's OpenAI key from config
+        try:
+            result = coll.query(query_texts=[query_text], n_results=top_k)
+        except Exception as text_err:
+            # Use config embedding_dimension if set (e.g. 1024) to match collection
+            want_dim = None
+            try:
+                raw = config.get("embedding_dimension")
+                if raw is not None and str(raw).strip():
+                    want_dim = int(str(raw).strip())
+            except (TypeError, ValueError):
+                pass
+            vector = _embed_with_user_key(query_text, config, dimensions=want_dim)
+            if not vector:
+                reason = str(text_err).strip() or "collection may have no embedding function"
+                return (
+                    f"Chroma query by text failed ({reason}). "
+                    "Add your **OpenAI API key** in this tool's config (field 'OpenAI API key (optional, for embedding)') so the query can be embedded and searched. "
+                    "The platform does not provide an API key."
+                )
+            try:
+                result = coll.query(query_embeddings=[vector], n_results=top_k)
+            except Exception as dim_err:  # e.g. InvalidArgumentError: dimension 1024 vs 1536
+                err_str = str(dim_err)
+                match = re.search(r"dimension\s+of\s+(\d+)", err_str, re.IGNORECASE) or re.search(
+                    r"expecting\s+embedding\s+with\s+dimension\s+of\s+(\d+)", err_str, re.IGNORECASE
+                )
+                if match:
+                    want_dim = int(match.group(1))
+                    vector = _embed_with_user_key(query_text, config, dimensions=want_dim)
+                    if vector and len(vector) == want_dim:
+                        result = coll.query(query_embeddings=[vector], n_results=top_k)
+                    else:
+                        return (
+                            f"Chroma dimension mismatch: collection expects {want_dim}-dim embeddings. "
+                            f"Set **embedding_model** to a model that supports dimensions (e.g. text-embedding-3-small) and optionally **embedding_dimension** to {want_dim} in this tool's config."
+                        )
+                else:
+                    raise
+        out = {"ids": result.get("ids", [[]])[0], "metadatas": result.get("metadatas", [[]])[0], "documents": result.get("documents", [[]])[0]}
+        # Normalize to matches list for consistency
+        matches = []
+        ids = out["ids"] or []
+        metas = out["metadatas"] or []
+        docs = out["documents"] or []
+        for i, id_ in enumerate(ids):
+            m = {"id": id_}
+            if i < len(metas) and metas[i]:
+                m["metadata"] = _to_json_safe(metas[i])
+            if i < len(docs) and docs[i]:
+                m["document"] = _to_json_safe(docs[i])
+            matches.append(m)
+        return json.dumps({"matches": matches}, indent=2)
+    except Exception as e:
+        logger.exception("Chroma query error")
+        return f"Chroma query error: {e}"
+
+
 def _execute_vector_db(config: Dict[str, Any], arguments: Dict[str, Any]) -> str:
-    """Query vector DB (generic: try Pinecone-style or return placeholder)."""
-    # Optional: add pinecone-client / weaviate-client and implement
+    """Query vector DB (generic fallback: try POST /query or return placeholder)."""
     api_key = config.get("api_key")
     url = config.get("url") or ""
     query = (arguments.get("query") or "").strip()
@@ -165,7 +546,6 @@ def _execute_vector_db(config: Dict[str, Any], arguments: Dict[str, Any]) -> str
         return "Error: query is required"
     if url and api_key:
         try:
-            # Generic HTTP vector API: POST with query and top_k
             with httpx.Client(timeout=10.0) as client:
                 r = client.post(
                     url.rstrip("/") + "/query",
@@ -176,7 +556,7 @@ def _execute_vector_db(config: Dict[str, Any], arguments: Dict[str, Any]) -> str
                     return json.dumps(r.json(), indent=2)
         except Exception as e:
             return f"Vector query error: {e}"
-    return "Vector DB tool is configured; add a compatible endpoint (e.g. Pinecone/Weaviate) for live queries."
+    return "Vector DB tool is configured; add a compatible endpoint (e.g. Pinecone/Weaviate/Qdrant/Chroma) for live queries."
 
 
 def _execute_mysql(config: Dict[str, Any], arguments: Dict[str, Any]) -> str:
@@ -220,7 +600,15 @@ def execute_platform_tool(tool_type: str, config: Dict[str, Any], arguments: Dic
         return _execute_mysql(config, arguments)
     if tool_type == "filesystem":
         return _execute_filesystem(config, arguments)
-    if tool_type in ("vector_db", "pinecone", "weaviate", "qdrant", "chroma"):
+    if tool_type == "pinecone":
+        return _execute_pinecone(config, arguments)
+    if tool_type == "weaviate":
+        return _execute_weaviate(config, arguments)
+    if tool_type == "qdrant":
+        return _execute_qdrant(config, arguments)
+    if tool_type == "chroma":
+        return _execute_chroma(config, arguments)
+    if tool_type == "vector_db":
         return _execute_vector_db(config, arguments)
     # Stub implementations for integrations (extend with real SDKs as needed)
     if tool_type == "elasticsearch":

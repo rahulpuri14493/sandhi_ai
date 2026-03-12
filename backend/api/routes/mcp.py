@@ -229,11 +229,12 @@ def validate_tool_config(
 ):
     """Validate tool config (test connection) before save. Does not store anything."""
     from services.mcp_validate import validate_tool_config as do_validate
+    tool_type_str = (body.tool_type or "").strip().lower()
     try:
-        MCPToolType(body.tool_type)
+        MCPToolType(tool_type_str)
     except ValueError:
         raise HTTPException(status_code=400, detail="Invalid tool_type")
-    valid, message = do_validate(body.tool_type, body.config)
+    valid, message = do_validate(tool_type_str, body.config)
     return {"valid": valid, "message": message}
 
 
@@ -245,7 +246,7 @@ def create_tool(
 ):
     """Add a platform tool config. Config (credentials) stored encrypted."""
     try:
-        tool_type = MCPToolType(body.tool_type)
+        tool_type = MCPToolType((body.tool_type or "").strip().lower())
     except ValueError:
         raise HTTPException(
             status_code=400,

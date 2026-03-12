@@ -15,18 +15,29 @@ def _migration_dir():
 
 
 def _table_exists(conn, table_name: str) -> bool:
-    r = conn.execute(
-        text(
-            "SELECT 1 FROM information_schema.tables "
-            "WHERE table_schema = 'public' AND table_name = :name"
-        ),
-        {"name": table_name},
-    )
+    """Return True if the table exists. Works with PostgreSQL and SQLite (e.g. tests)."""
+    dialect = conn.engine.dialect.name
+    if dialect == "sqlite":
+        r = conn.execute(
+            text("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = :name"),
+            {"name": table_name},
+        )
+    else:
+        r = conn.execute(
+            text(
+                "SELECT 1 FROM information_schema.tables "
+                "WHERE table_schema = 'public' AND table_name = :name"
+            ),
+            {"name": table_name},
+        )
     return r.scalar() is not None
 
 
 def run_mcp_migration_if_needed():
-    """Run 013 if MCP tables do not exist; run 014–017 for tool types, endpoint_path, job/step tools, schema/business context."""
+    """Run 013 if MCP tables do not exist; run 014–017 for tool types, endpoint_path, job/step tools, schema/business context.
+    Skipped for SQLite: test DBs use Base.metadata.create_all() and migration SQL is PostgreSQL-specific."""
+    if engine.dialect.name == "sqlite":
+        return
     path_013 = os.path.join(_migration_dir(), "013_add_mcp_tables.sql")
     path_014 = os.path.join(_migration_dir(), "014_add_mcp_tool_types.sql")
     path_015 = os.path.join(_migration_dir(), "015_add_mcp_endpoint_path.sql")

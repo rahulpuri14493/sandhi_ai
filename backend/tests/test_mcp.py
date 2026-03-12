@@ -181,6 +181,43 @@ class TestMCPTools:
         assert r.json()[0]["name"] == "FS1"
         assert r.json()[0]["tool_type"] == "filesystem"
 
+    def test_create_tool_all_vector_types(self, client_mcp: TestClient, business_user):
+        """Create one tool per vector/store type; all accepted by API."""
+        types_and_configs = [
+            ("chroma", {"url": "http://localhost:8000", "index_name": "col"}),
+            ("pinecone", {"api_key": "k", "host": "https://x.pinecone.io"}),
+            ("weaviate", {"url": "http://localhost:8080", "index_name": "X"}),
+            ("qdrant", {"url": "http://localhost:6333", "index_name": "Y"}),
+            ("vector_db", {"url": "https://v.example.com", "api_key": "k"}),
+        ]
+        for tool_type, config in types_and_configs:
+            r = client_mcp.post(
+                "/api/mcp/tools",
+                headers=business_user["headers"],
+                json={"tool_type": tool_type, "name": f"V-{tool_type}", "config": config},
+            )
+            assert r.status_code == 201, f"create {tool_type}: {r.text}"
+            assert r.json()["tool_type"] == tool_type
+
+    def test_create_tool_integration_types(self, client_mcp: TestClient, business_user):
+        """Create tools for s3, slack, github, notion, elasticsearch, mysql."""
+        types_and_configs = [
+            ("s3", {"bucket": "b", "region": "us-east-1"}),
+            ("slack", {"token": "xoxb-x"}),
+            ("github", {"token": "ghp-x"}),
+            ("notion", {"api_key": "secret-x"}),
+            ("elasticsearch", {"url": "http://localhost:9200"}),
+            ("mysql", {"host": "localhost", "user": "u", "password": "p", "database": "d"}),
+        ]
+        for tool_type, config in types_and_configs:
+            r = client_mcp.post(
+                "/api/mcp/tools",
+                headers=business_user["headers"],
+                json={"tool_type": tool_type, "name": f"I-{tool_type}", "config": config},
+            )
+            assert r.status_code == 201, f"create {tool_type}: {r.text}"
+            assert r.json()["tool_type"] == tool_type
+
     def test_update_tool(self, client_mcp: TestClient, business_user):
         cr = client_mcp.post(
             "/api/mcp/tools",
@@ -298,6 +335,90 @@ class TestMCPRegistry:
         if r.status_code == 200:
             data = r.json()
             assert "tools" in data
+            assert "platform_tool_count" in data
+            assert isinstance(data["tools"], list)
+
+    def test_registry_includes_platform_tools(self, client_mcp: TestClient, business_user):
+        client_mcp.post(
+            "/api/mcp/tools",
+            headers=business_user["headers"],
+            json={"tool_type": "chroma", "name": "My Chroma", "config": {"url": "http://localhost:8000"}},
+        )
+        r = client_mcp.get("/api/mcp/registry", headers=business_user["headers"])
+        assert r.status_code == 200
+        data = r.json()
+        assert data["platform_tool_count"] >= 1
+        platform_tools = [t for t in data["tools"] if t.get("source") == "platform"]
+        assert len(platform_tools) >= 1
+        assert any("platform_" in t["name"] for t in platform_tools)
+        assert any(t.get("tool_type") == "chroma" for t in platform_tools)
+
+
+class TestMCPProxy:
+    """POST /api/mcp/proxy - forward JSON-RPC to user's MCP server."""
+
+    def test_proxy_requires_auth(self, client: TestClient):
+        r = client.post("/api/mcp/proxy", json={"connection_id": 1, "method": "initialize", "params": {}})
+        assert r.status_code == 401
+
+    def test_proxy_connection_not_found(self, client_mcp: TestClient, business_user):
+        r = client_mcp.post(
+            "/api/mcp/proxy",
+            headers=business_user["headers"],
+            json={"connection_id": 99999, "method": "initialize", "params": {}},
+        )
+        assert r.status_code == 404
+        assert "not found" in r.json().get("detail", "").lower()
+
+    def test_proxy_connection_inactive_returns_404(self, client_mcp: TestClient, business_user, db_session):
+        from models.mcp_server import MCPServerConnection
+        conn = MCPServerConnection(
+            user_id=business_user["user"].id,
+            name="Inactive",
+            base_url="https://mcp.example.com",
+            endpoint_path="/mcp",
+            auth_type="none",
+            is_active=False,
+        )
+        db_session.add(conn)
+        db_session.commit()
+        db_session.refresh(conn)
+        r = client_mcp.post(
+            "/api/mcp/proxy",
+            headers=business_user["headers"],
+            json={"connection_id": conn.id, "method": "initialize", "params": {}},
+        )
+        assert r.status_code == 404
+
+
+class TestMCPCallPlatformTool:
+    """POST /api/mcp/call-platform-tool - invoke platform MCP tool by name."""
+
+    def test_call_platform_tool_requires_auth(self, client: TestClient):
+        r = client.post(
+            "/api/mcp/call-platform-tool",
+            json={"tool_name": "platform_1_MyDB", "arguments": {"query": "SELECT 1"}},
+        )
+        assert r.status_code == 401
+
+    def test_call_platform_tool_not_configured_returns_503(self, client_mcp: TestClient, business_user):
+        """When PLATFORM_MCP_SERVER_URL or MCP_INTERNAL_SECRET unset, returns 503."""
+        from core import config
+        orig_url = config.settings.PLATFORM_MCP_SERVER_URL
+        orig_secret = config.settings.MCP_INTERNAL_SECRET
+        config.settings.PLATFORM_MCP_SERVER_URL = ""
+        config.settings.MCP_INTERNAL_SECRET = ""
+        try:
+            r = client_mcp.post(
+                "/api/mcp/call-platform-tool",
+                headers=business_user["headers"],
+                json={"tool_name": "platform_1_MyDB", "arguments": {"query": "SELECT 1"}},
+            )
+            assert r.status_code == 503
+            assert "not configured" in r.json().get("detail", "").lower()
+        finally:
+            config.settings.PLATFORM_MCP_SERVER_URL = orig_url
+            config.settings.MCP_INTERNAL_SECRET = orig_secret
 
 
 # ---------- Positive test cases (expected success) ----------

@@ -124,3 +124,54 @@ class TestMCPIntegrationFlow:
         )
         assert r2.status_code == 201
         assert r2.json()["name"] == "E2E FS"
+
+    def test_registry_after_creating_tools(self, integration_client: TestClient, auth_headers, tmp_path):
+        """Create multiple tool types then fetch registry; platform_tool_count and tools shape."""
+        for tool_type, config in [
+            ("chroma", {"url": "http://localhost:8000", "index_name": "c1"}),
+            ("filesystem", {"base_path": str(tmp_path)}),
+        ]:
+            r = integration_client.post(
+                "/api/mcp/tools",
+                headers=auth_headers,
+                json={"tool_type": tool_type, "name": f"E2E {tool_type}", "config": config},
+            )
+            assert r.status_code == 201
+        r = integration_client.get("/api/mcp/registry", headers=auth_headers)
+        assert r.status_code == 200
+        data = r.json()
+        assert "tools" in data
+        assert "platform_tool_count" in data
+        assert data["platform_tool_count"] >= 2
+        assert any(t.get("tool_type") == "chroma" for t in data["tools"])
+        assert any(t.get("tool_type") == "filesystem" for t in data["tools"])
+
+    def test_validate_tool_chroma_accepts_without_live_server(self, integration_client: TestClient, auth_headers):
+        """Chroma validation returns valid=True and message (no live Chroma required)."""
+        r = integration_client.post(
+            "/api/mcp/tools/validate",
+            headers=auth_headers,
+            json={"tool_type": "chroma", "config": {"url": "http://localhost:8000", "index_name": "test"}},
+        )
+        assert r.status_code == 200
+        assert r.json()["valid"] is True
+
+    def test_refresh_schema_postgres_returns_400_when_unreachable(self, integration_client: TestClient, auth_headers):
+        """Create postgres tool then refresh-schema; expect 400 (connection failure) or success."""
+        cr = integration_client.post(
+            "/api/mcp/tools",
+            headers=auth_headers,
+            json={
+                "tool_type": "postgres",
+                "name": "E2E Postgres Schema",
+                "config": {"connection_string": "postgresql://u:p@invalid-host:5432/db"},
+            },
+        )
+        assert cr.status_code == 201
+        tid = cr.json()["id"]
+        r = integration_client.post(
+            f"/api/mcp/tools/{tid}/refresh-schema",
+            headers=auth_headers,
+        )
+        assert r.status_code == 400
+        assert "detail" in r.json()

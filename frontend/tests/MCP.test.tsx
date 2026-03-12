@@ -114,4 +114,46 @@ describe('MCP page', () => {
       expect(screen.getByText('My MCP')).toBeInTheDocument()
     })
   })
+
+  it('displays tool type labels for Chroma and Pinecone', async () => {
+    mockListTools.mockResolvedValue([
+      { id: 1, user_id: 1, tool_type: 'chroma', name: 'My Chroma', is_active: true, created_at: '', updated_at: '' },
+      { id: 2, user_id: 1, tool_type: 'pinecone', name: 'My Pinecone', is_active: true, created_at: '', updated_at: '' },
+    ])
+    mockListConnections.mockResolvedValue([])
+    render(wrap(<MCPPage />))
+    await waitFor(() => {
+      expect(screen.getByText('My Chroma')).toBeInTheDocument()
+      expect(screen.getByText('My Pinecone')).toBeInTheDocument()
+    })
+    expect(screen.getByText('Chroma')).toBeInTheDocument()
+    expect(screen.getByText('Pinecone')).toBeInTheDocument()
+  })
+
+  it('displays filesystem and vector_db tool types', async () => {
+    mockListTools.mockResolvedValue([
+      { id: 1, user_id: 1, tool_type: 'filesystem', name: 'FS', is_active: true, created_at: '', updated_at: '' },
+      { id: 2, user_id: 1, tool_type: 'vector_db', name: 'Vector', is_active: true, created_at: '', updated_at: '' },
+    ])
+    mockListConnections.mockResolvedValue([])
+    render(wrap(<MCPPage />))
+    await waitFor(() => {
+      expect(screen.getByText('FS')).toBeInTheDocument()
+      expect(screen.getByText('Vector')).toBeInTheDocument()
+    })
+    expect(screen.getByText('File system')).toBeInTheDocument()
+  })
+
+  it('shows registry count when tools exist', async () => {
+    mockListTools.mockResolvedValue([
+      { id: 1, user_id: 1, tool_type: 'postgres', name: 'DB', is_active: true, created_at: '', updated_at: '' },
+    ])
+    mockGetRegistry.mockResolvedValue({ tools: [{ name: 'platform_1_DB', source: 'platform', tool_type: 'postgres' }], platform_tool_count: 1 })
+    mockListConnections.mockResolvedValue([])
+    render(wrap(<MCPPage />))
+    await waitFor(() => {
+      expect(screen.getByText('DB')).toBeInTheDocument()
+    })
+    expect(mockGetRegistry).toHaveBeenCalled()
+  })
 })
