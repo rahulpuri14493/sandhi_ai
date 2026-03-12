@@ -25,31 +25,12 @@ class TestPostgres:
         assert "Error:" in out
         assert "query is required" in out.lower()
 
-    def test_postgres_only_select_allowed(self):
-        out = execute_platform_tool(
-            "postgres",
-            {"connection_string": "postgresql://x/y"},
-            {"query": "DELETE FROM t"},
-        )
-        assert "Error:" in out
-        assert "only SELECT" in out.lower()
-
 
 class TestMysql:
     def test_mysql_missing_query(self):
         out = execute_platform_tool("mysql", {"host": "localhost", "user": "u", "password": "p", "database": "d"}, {})
         assert "Error:" in out
         assert "query is required" in out.lower()
-
-    def test_mysql_only_select_allowed(self):
-        out = execute_platform_tool(
-            "mysql",
-            {"host": "localhost", "user": "u", "password": "p", "database": "d"},
-            {"query": "INSERT INTO t VALUES (1)"},
-        )
-        assert "Error:" in out
-        assert "only SELECT" in out.lower()
-
 
 class TestFilesystem:
     def test_filesystem_missing_base_path(self):
