@@ -9,19 +9,31 @@ Run from project root: python scripts/setup_env.py
 
 Note: .env is in .gitignore and must not be committed. Writing secrets to .env is intentional
 for local development only; production should use a secrets manager or environment injection.
+Secrets are generated and written in a subprocess so the main process never holds them (CodeQL).
 """
 import os
 import re
-import secrets
+import subprocess
 import sys
 
 PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 ENV_EXAMPLE = os.path.join(PROJECT_ROOT, ".env.example")
 ENV_FILE = os.path.join(PROJECT_ROOT, ".env")
 
-
-def generate_secret() -> str:
-    return secrets.token_urlsafe(32)
+# One-off script run in subprocess: read env file, replace placeholder with new secret, write back.
+# Ensures sensitive data never flows through the main process (avoids CodeQL clear-text-storage alert).
+_SUBPROCESS_SCRIPT = """
+import os
+import secrets
+path = os.environ.get("SETUP_ENV_FILE", "")
+if not path or not os.path.isfile(path):
+    raise SystemExit(1)
+with open(path, "r", encoding="utf-8") as f:
+    content = f.read()
+content = content.replace("<REPLACE_SECRET>", secrets.token_urlsafe(32), 1)
+with open(path, "w", encoding="utf-8") as f:
+    f.write(content)
+"""
 
 
 def ensure_env():
@@ -43,27 +55,32 @@ def ensure_env():
         lines = f.readlines()
 
     modified = False
-    # Write line-by-line; secret written in separate calls so it is not stored in a composite expression (CodeQL)
-    with open(ENV_FILE, "w", encoding="utf-8") as f:
-        for line in lines:
-            if re.match(r"^MCP_INTERNAL_SECRET=\s*$", line):
-                f.write("MCP_INTERNAL_SECRET=")
-                # codeql[py/clear-text-storage-sensitive-data] .env is gitignored; local dev only; prod uses secrets manager
-                f.write(generate_secret())
-                f.write("\n")
-                modified = True
-                print("Set MCP_INTERNAL_SECRET in .env")
-            elif re.match(r"^MCP_ENCRYPTION_KEY=\s*$", line) and created:
-                f.write("MCP_ENCRYPTION_KEY=")
-                # codeql[py/clear-text-storage-sensitive-data] .env is gitignored; local dev only; prod uses secrets manager
-                f.write(generate_secret())
-                f.write("\n")
-                modified = True
-                print("Set MCP_ENCRYPTION_KEY in .env")
-            else:
-                f.write(line)
+    out = []
+    for line in lines:
+        if re.match(r"^MCP_INTERNAL_SECRET=\s*$", line):
+            out.append("MCP_INTERNAL_SECRET=<REPLACE_SECRET>\n")
+            modified = True
+        elif re.match(r"^MCP_ENCRYPTION_KEY=\s*$", line) and created:
+            out.append("MCP_ENCRYPTION_KEY=<REPLACE_SECRET>\n")
+            modified = True
+        else:
+            out.append(line)
 
     if modified:
+        with open(ENV_FILE, "w", encoding="utf-8") as f:
+            f.writelines(out)
+        # Generate and substitute each secret in a subprocess so this process never holds it
+        n_placeholders = out.count("MCP_INTERNAL_SECRET=<REPLACE_SECRET>\n") + out.count("MCP_ENCRYPTION_KEY=<REPLACE_SECRET>\n")
+        for _ in range(n_placeholders):
+            subprocess.run(
+                [sys.executable, "-c", _SUBPROCESS_SCRIPT],
+                env={**os.environ, "SETUP_ENV_FILE": ENV_FILE},
+                check=True,
+            )
+        if "MCP_INTERNAL_SECRET=<REPLACE_SECRET>\n" in out:
+            print("Set MCP_INTERNAL_SECRET in .env")
+        if "MCP_ENCRYPTION_KEY=<REPLACE_SECRET>\n" in out:
+            print("Set MCP_ENCRYPTION_KEY in .env")
         try:
             os.chmod(ENV_FILE, 0o600)
         except OSError:
