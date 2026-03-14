@@ -150,6 +150,7 @@ def _execute_postgres(config: Dict[str, Any], arguments: Dict[str, Any]) -> str:
 
 def _execute_filesystem(config: Dict[str, Any], arguments: Dict[str, Any]) -> str:
     """Read file or list directory under base_path."""
+    import pathlib
     base = (config.get("base_path") or "").strip()
     if not base:
         return "Error: base_path not configured"
@@ -158,11 +159,13 @@ def _execute_filesystem(config: Dict[str, Any], arguments: Dict[str, Any]) -> st
         return "Error: path is required"
     if ".." in rel or rel.startswith("/"):
         return "Error: path must be relative and not contain .."
-    import pathlib
-    full = pathlib.Path(base) / rel
+    # Build path only from resolved base + sanitized segments (no user string in path expression)
+    base_resolved = pathlib.Path(base).resolve()
+    parts = [p for p in rel.replace("\\", "/").split("/") if p and p not in (".", "..")]
+    # codeql[py/path-injection] path built from allowlisted segments only; resolved path checked under base_resolved
+    full = base_resolved.joinpath(*parts) if parts else base_resolved
     try:
         full = full.resolve()
-        base_resolved = pathlib.Path(base).resolve()
         try:
             if not full.is_relative_to(base_resolved):
                 return "Error: path escapes base_path"
@@ -178,12 +181,12 @@ def _execute_filesystem(config: Dict[str, Any], arguments: Dict[str, Any]) -> st
         try:
             entries = sorted(full.iterdir())
             return "\n".join(e.name for e in entries)
-        except Exception as e:
+        except Exception:
             logger.exception("Filesystem list error")
             return "List error"
     try:
         return full.read_text(encoding="utf-8", errors="replace")
-    except Exception as e:
+    except Exception:
         logger.exception("Filesystem read error")
         return "Read error"
 
@@ -317,6 +320,13 @@ def _parse_url(url_str: str) -> tuple:
     return host, port, secure
 
 
+def _url_host(url_str: str) -> str:
+    """Return lowercase hostname from URL for safe domain checks (avoids substring-in-URL)."""
+    from urllib.parse import urlparse
+    u = urlparse((url_str or "").strip() or "http://localhost")
+    return (u.hostname or "localhost").lower()
+
+
 def _execute_weaviate(config: Dict[str, Any], arguments: Dict[str, Any]) -> str:
     """Query Weaviate. Try near_text first (no key). If that fails, use user's OpenAI key from config + near_vector."""
     url = (config.get("url") or "").strip()
@@ -334,7 +344,9 @@ def _execute_weaviate(config: Dict[str, Any], arguments: Dict[str, Any]) -> str:
         import weaviate
         from weaviate.classes.init import Auth
         auth = Auth.api_key(api_key) if api_key else None
-        if "weaviate.cloud" in url or ".weaviate.io" in url:
+        host = _url_host(url)
+        is_weaviate_cloud = host == "weaviate.cloud" or host.endswith(".weaviate.io")
+        if is_weaviate_cloud:
             client = weaviate.connect_to_weaviate_cloud(
                 cluster_url=url.rstrip("/"),
                 auth_credentials=auth,
@@ -419,7 +431,8 @@ def _execute_qdrant(config: Dict[str, Any], arguments: Dict[str, Any]) -> str:
 
     try:
         from qdrant_client import QdrantClient
-        is_cloud = "cloud.qdrant.io" in url
+        host = _url_host(url)
+        is_cloud = host == "cloud.qdrant.io" or host.endswith(".cloud.qdrant.io")
         # 1) Qdrant Cloud: use Document(text=..., model=...) so Qdrant embeds server-side (no OpenAI key)
         if is_cloud and api_key:
             try:
@@ -478,7 +491,8 @@ def _execute_chroma(config: Dict[str, Any], arguments: Dict[str, Any]) -> str:
 
     try:
         import chromadb
-        is_cloud = "trychroma.com" in url.lower()
+        host = _url_host(url)
+        is_cloud = host == "trychroma.com" or host.endswith(".trychroma.com")
         if is_cloud and api_key:
             client = chromadb.CloudClient(
                 tenant=tenant,
@@ -847,8 +861,8 @@ async def jsonrpc(request: Request, x_mcp_business_id: Optional[str] = Header(No
                 "id": req_id,
                 "error": {"code": -32000, "message": "Failed to fetch tool configuration from backend"},
             })
-        except Exception as e:
-            logger.exception("tools/call error business_id=%s tool=%s err=%s", business_id, name, e)
+        except Exception:
+            logger.error("tools/call error business_id=%s tool=%s", business_id, name)
             return JSONResponse({
                 "jsonrpc": JSONRPC_VERSION,
                 "id": req_id,

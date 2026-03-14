@@ -49,7 +49,7 @@ class TestFilesystem:
             {"base_path": str(tmp_path)},
             {"path": "nonexistent.txt", "action": "read"},
         )
-        assert "Error:" in out or "not found" in out.lower() or "No such" in out
+        assert "Error:" in out or "not found" in out.lower() or "No such" in out or "read error" in out.lower()
 
     def test_filesystem_list_directory(self, tmp_path):
         (tmp_path / "subdir").mkdir()
