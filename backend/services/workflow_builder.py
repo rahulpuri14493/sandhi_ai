@@ -42,16 +42,21 @@ class WorkflowBuilder:
         agent_ids: List[int],
         workflow_mode: Optional[str] = None,
         step_tools: Optional[List[Dict[str, Any]]] = None,
+        tool_visibility: Optional[str] = None,
     ) -> WorkflowPreview:
         """Automatically split a job across selected agents. workflow_mode: 'independent' | 'sequential' | None.
-        step_tools: optional list of {agent_index, allowed_platform_tool_ids, allowed_connection_ids} per step."""
+        step_tools: optional list of {agent_index, allowed_platform_tool_ids, allowed_connection_ids, tool_visibility} per step.
+        tool_visibility: job-level full | names_only | none (restricts what tool info agents see; credentials never shared)."""
         import json
         import asyncio
         
         job = self.db.query(Job).filter(Job.id == job_id).first()
         if not job:
             raise ValueError("Job not found")
-        
+        if tool_visibility is not None:
+            job.tool_visibility = tool_visibility
+            self.db.commit()
+
         # Get agents
         agents = self.db.query(Agent).filter(Agent.id.in_(agent_ids)).all()
         if len(agents) != len(agent_ids):
@@ -167,6 +172,25 @@ class WorkflowBuilder:
                 self.db.query(AgentCommunication).filter(comm_filter).delete(synchronize_session=False)
         self.db.query(WorkflowStep).filter(WorkflowStep.job_id == job_id).delete(synchronize_session=False)
         
+        # When no step_tools provided (e.g. "From BRD/document"): assign job-level tools to every step so selection is saved and visible when job is opened
+        job_platform_ids = None
+        job_conn_ids = None
+        if not step_tools:
+            if getattr(job, "allowed_platform_tool_ids", None):
+                try:
+                    parsed = json.loads(job.allowed_platform_tool_ids)
+                    if isinstance(parsed, list) and len(parsed) > 0:
+                        job_platform_ids = [int(x) for x in parsed if x is not None]
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    pass
+            if getattr(job, "allowed_connection_ids", None):
+                try:
+                    parsed = json.loads(job.allowed_connection_ids)
+                    if isinstance(parsed, list) and len(parsed) > 0:
+                        job_conn_ids = [int(x) for x in parsed if x is not None]
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    pass
+        
         # Create workflow steps - each agent gets assigned task + base context
         steps = []
         for idx, agent in enumerate(agents):
@@ -197,13 +221,21 @@ class WorkflowBuilder:
             step_conv = step_input_data.get('conversation', [])
             logger.debug("Step %s for agent '%s': depends_on_previous=%s documents=%s conversation_items=%s", idx + 1, agent.name, depends_on_previous, len(step_docs), len(step_conv))
             
-            step_platform = step_conn = None
+            step_platform = step_conn = step_tool_visibility = None
             if step_tools:
                 for st in step_tools:
                     if st.get("agent_index") == idx:
                         step_platform = st.get("allowed_platform_tool_ids")
                         step_conn = st.get("allowed_connection_ids")
+                        step_tool_visibility = st.get("tool_visibility")
                         break
+            else:
+                # Auto-assign job-level tools to this step (From BRD/document: tools selection by system, saved for completed job view)
+                if job_platform_ids is not None:
+                    step_platform = job_platform_ids
+                if job_conn_ids is not None:
+                    step_conn = job_conn_ids
+            step_visibility = step_tool_visibility if step_tool_visibility is not None else (tool_visibility or getattr(job, "tool_visibility", None))
             step = WorkflowStep(
                 job_id=job_id,
                 agent_id=agent.id,
@@ -213,6 +245,7 @@ class WorkflowBuilder:
                 depends_on_previous=depends_on_previous,
                 allowed_platform_tool_ids=json.dumps(step_platform) if step_platform else None,
                 allowed_connection_ids=json.dumps(step_conn) if step_conn else None,
+                tool_visibility=step_visibility,
             )
             self.db.add(step)
             steps.append(step)
@@ -364,6 +397,7 @@ class WorkflowBuilder:
                 depends_on_previous = step_order != 1
             step_platform = step_data.get("allowed_platform_tool_ids")
             step_conn = step_data.get("allowed_connection_ids")
+            step_tool_visibility = step_data.get("tool_visibility")
             step = WorkflowStep(
                 job_id=job_id,
                 agent_id=agent_id,
@@ -373,6 +407,7 @@ class WorkflowBuilder:
                 depends_on_previous=depends_on_previous,
                 allowed_platform_tool_ids=json.dumps(step_platform) if step_platform else None,
                 allowed_connection_ids=json.dumps(step_conn) if step_conn else None,
+                tool_visibility=step_tool_visibility,
             )
             self.db.add(step)
         

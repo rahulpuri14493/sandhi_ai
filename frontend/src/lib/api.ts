@@ -89,6 +89,7 @@ export const jobsAPI = {
     files?: File[]
     allowed_platform_tool_ids?: number[]
     allowed_connection_ids?: number[]
+    tool_visibility?: 'full' | 'names_only' | 'none'
   }) {
     const form = new FormData()
     form.append('title', payload.title)
@@ -102,6 +103,7 @@ export const jobsAPI = {
     if (payload.allowed_connection_ids?.length) {
       form.append('allowed_connection_ids', JSON.stringify(payload.allowed_connection_ids))
     }
+    if (payload.tool_visibility) form.append('tool_visibility', payload.tool_visibility)
     return api.post('/jobs', form, { headers: { 'Content-Type': 'multipart/form-data' } }).then((res) => res.data)
   },
   get(jobId: number) {
@@ -152,21 +154,24 @@ export const jobsAPI = {
     jobId: number,
     agentIds: number[],
     workflowMode?: 'independent' | 'sequential',
-    stepTools?: Array<{ agent_index: number; allowed_platform_tool_ids?: number[]; allowed_connection_ids?: number[] }>
+    stepTools?: Array<{ agent_index: number; allowed_platform_tool_ids?: number[]; allowed_connection_ids?: number[]; tool_visibility?: 'full' | 'names_only' | 'none' }>,
+    toolVisibility?: 'full' | 'names_only' | 'none'
   ) {
     const body: {
       agent_ids: number[]
       workflow_mode?: string
-      step_tools?: Array<{ agent_index: number; allowed_platform_tool_ids?: number[]; allowed_connection_ids?: number[] }>
+      step_tools?: Array<{ agent_index: number; allowed_platform_tool_ids?: number[]; allowed_connection_ids?: number[]; tool_visibility?: string }>
+      tool_visibility?: string
     } = { agent_ids: agentIds }
     if (workflowMode) body.workflow_mode = workflowMode
     if (stepTools?.length) body.step_tools = stepTools
+    if (toolVisibility) body.tool_visibility = toolVisibility
     return api.post('/jobs/' + jobId + '/workflow/auto-split', body).then((res) => res.data)
   },
   updateStepTools(
     jobId: number,
     stepId: number,
-    payload: { allowed_platform_tool_ids?: number[]; allowed_connection_ids?: number[] }
+    payload: { allowed_platform_tool_ids?: number[]; allowed_connection_ids?: number[]; tool_visibility?: 'full' | 'names_only' | 'none' }
   ) {
     return api.patch('/jobs/' + jobId + '/workflow/steps/' + stepId, payload).then((res) => res.data)
   },

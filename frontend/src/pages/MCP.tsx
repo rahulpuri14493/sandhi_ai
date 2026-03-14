@@ -19,6 +19,7 @@ export default function MCPPage() {
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
   const [editTool, setEditTool] = useState<MCPToolConfigRes | null>(null)
+  const [editConnection, setEditConnection] = useState<MCPServerConnectionRes | null>(null)
 
   useEffect(() => {
     if (!user) {
@@ -239,8 +240,9 @@ export default function MCPPage() {
 
       {view === 'connect' && (
         <ConnectFlow
-          onBack={() => setView('choose')}
-          onSaved={() => { setView('connections'); loadConnections(); setError(null); }}
+          connection={editConnection}
+          onBack={() => { setView(editConnection ? 'connections' : 'choose'); setEditConnection(null); }}
+          onSaved={() => { setView('connections'); setEditConnection(null); loadConnections(); setError(null); }}
           onError={setError}
         />
       )}
@@ -249,7 +251,8 @@ export default function MCPPage() {
         <ConnectionsList
           connections={connections}
           onBack={() => setView('choose')}
-          onAdd={() => setView('connect')}
+          onAdd={() => { setEditConnection(null); setView('connect'); }}
+          onEdit={(c) => { setEditConnection(c); setView('connect'); setError(null); }}
           onRefresh={loadConnections}
           onError={setError}
         />
@@ -285,18 +288,21 @@ export default function MCPPage() {
 }
 
 function ConnectFlow({
+  connection,
   onBack,
   onSaved,
   onError,
 }: {
+  connection?: MCPServerConnectionRes | null
   onBack: () => void
   onSaved: () => void
   onError: (e: string | null) => void
 }) {
-  const [name, setName] = useState('')
-  const [baseUrl, setBaseUrl] = useState('')
-  const [endpointPath, setEndpointPath] = useState('/mcp')
-  const [authType, setAuthType] = useState('none')
+  const isEdit = !!connection
+  const [name, setName] = useState(connection?.name ?? '')
+  const [baseUrl, setBaseUrl] = useState(connection?.base_url ?? '')
+  const [endpointPath, setEndpointPath] = useState(connection?.endpoint_path ?? '/mcp')
+  const [authType, setAuthType] = useState(connection?.auth_type ?? 'none')
   const [token, setToken] = useState('')
   const [apiKey, setApiKey] = useState('')
   const [username, setUsername] = useState('')
@@ -304,6 +310,15 @@ function ConnectFlow({
   const [submitting, setSubmitting] = useState(false)
   const [validating, setValidating] = useState(false)
   const [validateMessage, setValidateMessage] = useState<{ success: boolean; text: string } | null>(null)
+
+  useEffect(() => {
+    if (connection) {
+      setName(connection.name)
+      setBaseUrl(connection.base_url)
+      setEndpointPath(connection.endpoint_path || '/mcp')
+      setAuthType(connection.auth_type || 'none')
+    }
+  }, [connection])
 
   const getCredentials = () =>
     authType === 'bearer' && token
@@ -346,16 +361,26 @@ function ConnectFlow({
     const credentials = getCredentials()
     setSubmitting(true)
     try {
-      await mcpAPI.createConnection({
-        name,
-        base_url: baseUrl,
-        endpoint_path: endpointPath || '/mcp',
-        auth_type: authType,
-        credentials,
-      })
+      if (connection) {
+        await mcpAPI.updateConnection(connection.id, {
+          name,
+          base_url: baseUrl,
+          endpoint_path: endpointPath || '/mcp',
+          auth_type: authType,
+          ...(credentials && { credentials }),
+        })
+      } else {
+        await mcpAPI.createConnection({
+          name,
+          base_url: baseUrl,
+          endpoint_path: endpointPath || '/mcp',
+          auth_type: authType,
+          credentials,
+        })
+      }
       onSaved()
     } catch (err: unknown) {
-      onError((err as { response?: { data?: { detail?: string } } })?.response?.data?.detail ?? 'Failed to create connection')
+      onError((err as { response?: { data?: { detail?: string } } })?.response?.data?.detail ?? (isEdit ? 'Failed to update connection' : 'Failed to create connection'))
     } finally {
       setSubmitting(false)
     }
@@ -490,7 +515,7 @@ function ConnectFlow({
               disabled={submitting}
               className="px-6 py-2.5 rounded-xl bg-gradient-to-r from-primary-500 to-primary-700 text-white font-semibold hover:shadow-lg hover:shadow-primary-500/30 disabled:opacity-50"
             >
-              {submitting ? 'Connecting...' : 'Connect'}
+              {submitting ? (isEdit ? 'Saving...' : 'Connecting...') : (isEdit ? 'Save changes' : 'Connect')}
             </button>
           </div>
         </form>
@@ -503,12 +528,14 @@ function ConnectionsList({
   connections,
   onBack,
   onAdd,
+  onEdit,
   onRefresh,
   onError,
 }: {
   connections: MCPServerConnectionRes[]
   onBack: () => void
   onAdd: () => void
+  onEdit: (c: MCPServerConnectionRes) => void
   onRefresh: () => void
   onError: (e: string | null) => void
 }) {
@@ -581,9 +608,14 @@ function ConnectionsList({
                       </button>
                     </>
                   ) : (
-                    <button type="button" onClick={() => handleDeleteClick(c.id)} disabled={deletingId !== null} className="px-3 py-1.5 rounded-lg text-red-400 hover:bg-red-500/20 text-sm font-medium disabled:opacity-50">
-                      Delete
-                    </button>
+                    <>
+                      <button type="button" onClick={() => onEdit(c)} disabled={deletingId !== null} className="px-3 py-1.5 rounded-lg border border-dark-200 text-white/80 hover:bg-dark-200/50 text-sm font-medium disabled:opacity-50">
+                        Edit
+                      </button>
+                      <button type="button" onClick={() => handleDeleteClick(c.id)} disabled={deletingId !== null} className="px-3 py-1.5 rounded-lg text-red-400 hover:bg-red-500/20 text-sm font-medium disabled:opacity-50">
+                        Delete
+                      </button>
+                    </>
                   )}
                 </div>
               </li>
@@ -604,6 +636,7 @@ const TOOL_LABELS: Record<string, string> = {
   postgres: 'PostgreSQL',
   mysql: 'MySQL',
   elasticsearch: 'Elasticsearch',
+  pageindex: 'PageIndex',
   filesystem: 'File system',
   s3: 'AWS S3',
   slack: 'Slack',
@@ -741,6 +774,11 @@ function ConfigureFlow({
     elasticsearch: [
       { key: 'url', label: 'Elasticsearch URL', placeholder: 'http://localhost:9200' },
       { key: 'api_key', label: 'API key (optional)', placeholder: '', secret: true },
+    ],
+    pageindex: [
+      { key: 'api_key', label: 'PageIndex API key', placeholder: 'From https://dash.pageindex.ai', secret: true },
+      { key: 'base_url', label: 'API base URL (optional)', placeholder: 'https://api.pageindex.ai' },
+      { key: 'default_doc_id', label: 'Default document ID (optional)', placeholder: 'e.g. pi-abc123' },
     ],
     filesystem: [
       { key: 'base_path', label: 'Base path', placeholder: '/data or C:\\data' },

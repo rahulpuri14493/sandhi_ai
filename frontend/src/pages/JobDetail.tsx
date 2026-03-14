@@ -22,8 +22,10 @@ export default function JobDetailPage() {
   const [editingStepTools, setEditingStepTools] = useState<WorkflowStep | null>(null)
   const [stepToolsModalPlatform, setStepToolsModalPlatform] = useState<{ id: number; name: string; tool_type: string }[]>([])
   const [stepToolsModalConnections, setStepToolsModalConnections] = useState<{ id: number; name: string }[]>([])
-  const [stepToolsSelection, setStepToolsSelection] = useState<{ platformIds: number[]; connectionIds: number[] }>({ platformIds: [], connectionIds: [] })
+  const [stepToolsSelection, setStepToolsSelection] = useState<{ platformIds: number[]; connectionIds: number[]; toolVisibility?: 'full' | 'names_only' | 'none' }>({ platformIds: [], connectionIds: [] })
   const [savingStepTools, setSavingStepTools] = useState(false)
+  /** Loaded for showing tool names on completed job "Tools per step" */
+  const [platformToolsList, setPlatformToolsList] = useState<{ id: number; name: string; tool_type: string }[]>([])
 
   useEffect(() => {
     if (jobId) {
@@ -42,6 +44,17 @@ export default function JobDetailPage() {
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [job])
+
+  useEffect(() => {
+    if (job?.workflow_steps?.length && job.status !== 'draft') {
+      const hasStepTools = job.workflow_steps.some(
+        (s) => (s.allowed_platform_tool_ids?.length ?? 0) > 0 || (s.allowed_connection_ids?.length ?? 0) > 0
+      )
+      if (hasStepTools) {
+        mcpAPI.listTools().then((tools) => setPlatformToolsList(tools)).catch(() => {})
+      }
+    }
+  }, [job?.id, job?.status, job?.workflow_steps?.length])
 
   const loadJob = async () => {
     setIsLoading(true)
@@ -462,6 +475,19 @@ export default function JobDetailPage() {
                 <h3 className="text-xl font-bold text-white">Tools for Step {editingStepTools.step_order}: {editingStepTools.agent_name}</h3>
               </div>
               <div className="p-6 overflow-y-auto flex-1">
+                <div className="mb-4">
+                  <h4 className="text-white font-semibold mb-2">Tool visibility (what this step sees)</h4>
+                  <select
+                    value={stepToolsSelection.toolVisibility ?? 'full'}
+                    onChange={(e) => setStepToolsSelection((prev) => ({ ...prev, toolVisibility: e.target.value as 'full' | 'names_only' | 'none' }))}
+                    className="w-full px-3 py-2 bg-dark-200 border border-dark-300 rounded-lg text-white focus:ring-2 focus:ring-primary-500"
+                  >
+                    <option value="full">Full — Names, descriptions, schema & business context</option>
+                    <option value="names_only">Names only — Tool names and short description; no schema</option>
+                    <option value="none">None — No tool list for this step</option>
+                  </select>
+                  <p className="text-xs text-white/50 mt-1">Credentials are never shared. Full lets agents write correct SQL; names only/none restrict what they see.</p>
+                </div>
                 {stepToolsModalPlatform.length > 0 && (
                   <div className="mb-4">
                     <h4 className="text-white font-semibold mb-2">Platform tools</h4>
@@ -530,6 +556,50 @@ export default function JobDetailPage() {
 
         {mode === 'status' && (
           <JobStatusTracker jobId={jobId} job={job} onJobUpdate={loadJob} />
+        )}
+
+        {mode === 'status' && job.status !== 'draft' && job.workflow_steps && job.workflow_steps.length > 0 && (
+          <div className="mt-6 p-6 bg-dark-100/50 rounded-2xl border border-dark-200/50">
+            <h3 className="font-bold text-white mb-3">Tools per step</h3>
+            <p className="text-sm text-white/60 mb-4">Tools assigned to each agent for this job (saved when the workflow was created).</p>
+            {job.tool_visibility && job.tool_visibility !== 'full' && (
+              <p className="text-sm text-primary-400/90 mb-2 font-medium">
+                Job tool visibility: {job.tool_visibility === 'names_only'
+                  ? 'Names only (no schema or DB context)'
+                  : 'None (no tool list)'}
+              </p>
+            )}
+            <div className="space-y-2">
+              {job.workflow_steps.map((step) => {
+                const platformIds = step.allowed_platform_tool_ids ?? []
+                const connCount = step.allowed_connection_ids?.length ?? 0
+                const names =
+                  platformToolsList.length > 0 && platformIds.length > 0
+                    ? platformIds
+                        .map((id) => platformToolsList.find((t) => t.id === id)?.name)
+                        .filter(Boolean)
+                        .join(', ')
+                    : null
+                const visibilityLabel = step.tool_visibility === 'names_only' ? 'names only (no schema)' : step.tool_visibility === 'none' ? 'none (no tools)' : null
+                return (
+                  <div
+                    key={step.id}
+                    className="flex items-center justify-between py-2 px-4 bg-dark-200/30 rounded-xl border border-dark-300"
+                  >
+                    <span className="text-white/90 font-medium">
+                      Step {step.step_order}: {step.agent_name ?? `Agent ${step.agent_id}`}
+                    </span>
+                    <span className="text-sm text-white/70">
+                      {names || (platformIds.length > 0 || connCount > 0
+                        ? `${platformIds.length} platform, ${connCount} connection(s)`
+                        : 'All job tools')}
+                      {visibilityLabel && <span className="text-white/50 ml-1">(visibility: {visibilityLabel})</span>}
+                    </span>
+                  </div>
+                )
+              })}
+            </div>
+          </div>
         )}
 
         {job.status === 'pending_approval' && (

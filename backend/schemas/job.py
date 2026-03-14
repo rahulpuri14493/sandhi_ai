@@ -20,6 +20,9 @@ def _parse_int_list(v):
     return None
 
 
+# Tool visibility: full | names_only | none (credentials never shared with agents)
+
+
 class JobCreate(BaseModel):
     title: str
     description: Optional[str] = None
@@ -27,6 +30,7 @@ class JobCreate(BaseModel):
     workflow_steps: Optional[List["WorkflowStepCreate"]] = []  # For manual assignment
     allowed_platform_tool_ids: Optional[List[int]] = None  # Tools in scope for this job (empty = all)
     allowed_connection_ids: Optional[List[int]] = None  # MCP connections in scope (empty = all)
+    tool_visibility: Optional[str] = None  # full | names_only | none (default full)
 
 
 class JobUpdate(BaseModel):
@@ -35,6 +39,7 @@ class JobUpdate(BaseModel):
     status: Optional[JobStatus] = None
     allowed_platform_tool_ids: Optional[List[int]] = None
     allowed_connection_ids: Optional[List[int]] = None
+    tool_visibility: Optional[str] = None  # full | names_only | none
 
 
 class StepToolsAssignment(BaseModel):
@@ -42,6 +47,7 @@ class StepToolsAssignment(BaseModel):
     agent_index: int  # 0-based index into agent_ids
     allowed_platform_tool_ids: Optional[List[int]] = None
     allowed_connection_ids: Optional[List[int]] = None
+    tool_visibility: Optional[str] = None  # full | names_only | none (step override)
 
 
 class AutoSplitBody(BaseModel):
@@ -49,6 +55,7 @@ class AutoSplitBody(BaseModel):
     agent_ids: List[int] = []
     workflow_mode: Optional[str] = None  # "independent" | "sequential" | None (infer from BRD/conversation)
     step_tools: Optional[List[StepToolsAssignment]] = None  # Which tools each agent (step) can use
+    tool_visibility: Optional[str] = None  # Job-level: full | names_only | none
 
 
 class AnswerQuestionBody(BaseModel):
@@ -67,6 +74,7 @@ class WorkflowStepCreate(BaseModel):
     input_data: Optional[Dict[str, Any]] = None
     allowed_platform_tool_ids: Optional[List[int]] = None  # Tools this step can use (empty = job-level)
     allowed_connection_ids: Optional[List[int]] = None
+    tool_visibility: Optional[str] = None  # full | names_only | none (step override)
 
 
 class JobResponse(BaseModel):
@@ -83,6 +91,7 @@ class JobResponse(BaseModel):
     failure_reason: Optional[str] = None  # Reason for job failure
     allowed_platform_tool_ids: Optional[List[int]] = None
     allowed_connection_ids: Optional[List[int]] = None
+    tool_visibility: Optional[str] = None  # full | names_only | none
 
     class Config:
         from_attributes = True
@@ -124,6 +133,7 @@ class WorkflowStepResponse(BaseModel):
     depends_on_previous: Optional[bool] = True  # False = step works independently (no previous output)
     allowed_platform_tool_ids: Optional[List[int]] = None
     allowed_connection_ids: Optional[List[int]] = None
+    tool_visibility: Optional[str] = None  # full | names_only | none
 
     class Config:
         from_attributes = True

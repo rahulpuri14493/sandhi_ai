@@ -13,6 +13,7 @@ export default function NewJobPage() {
   const [connections, setConnections] = useState<MCPServerConnectionRes[]>([])
   const [selectedPlatformToolIds, setSelectedPlatformToolIds] = useState<number[]>([])
   const [selectedConnectionIds, setSelectedConnectionIds] = useState<number[]>([])
+  const [toolVisibility, setToolVisibility] = useState<'full' | 'names_only' | 'none'>('full')
   const [selectedFiles, setSelectedFiles] = useState<File[]>([])
   const [isLoading, setIsLoading] = useState(false)
   const [error, setError] = useState('')
@@ -95,7 +96,10 @@ export default function NewJobPage() {
       const job = await jobsAPI.create({ 
         title, 
         description,
-        files: selectedFiles.length > 0 ? selectedFiles : undefined
+        files: selectedFiles.length > 0 ? selectedFiles : undefined,
+        allowed_platform_tool_ids: selectedPlatformToolIds.length > 0 ? selectedPlatformToolIds : undefined,
+        allowed_connection_ids: selectedConnectionIds.length > 0 ? selectedConnectionIds : undefined,
+        tool_visibility: toolVisibility,
       })
       navigate(`/jobs/${job.id}`, { state: { selectedAgents } })
     } catch (err: any) {
@@ -166,6 +170,19 @@ export default function NewJobPage() {
               className="w-full px-5 py-4 bg-white border-2 border-gray-300 rounded-xl text-gray-900 placeholder-gray-500 focus:outline-none focus:ring-2 focus:ring-primary-500 focus:border-primary-500 text-lg font-medium resize-none"
               placeholder="Describe what you need..."
             />
+          </div>
+          <div className="mb-8">
+            <label className="block text-white font-bold mb-2 text-lg">Tool visibility (optional)</label>
+            <p className="text-sm text-white/50 mb-2 font-medium">Control how much tool info agents see. Credentials are never shared.</p>
+            <select
+              value={toolVisibility}
+              onChange={(e) => setToolVisibility(e.target.value as 'full' | 'names_only' | 'none')}
+              className="px-4 py-2.5 bg-white border-2 border-gray-300 rounded-xl text-gray-900 focus:outline-none focus:ring-2 focus:ring-primary-500 w-full max-w-xl"
+            >
+              <option value="full">Full — Names, descriptions, schema & business context</option>
+              <option value="names_only">Names only — Tool names and short description; no schema or DB context</option>
+              <option value="none">None — No tool list; agents cannot use MCP tools for this job</option>
+            </select>
           </div>
           <div className="mb-8">
             <label className="block text-white font-bold mb-3 text-lg" htmlFor="files">

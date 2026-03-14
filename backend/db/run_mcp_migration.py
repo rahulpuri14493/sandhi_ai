@@ -34,7 +34,7 @@ def _table_exists(conn, table_name: str) -> bool:
 
 
 def run_mcp_migration_if_needed():
-    """Run 013 if MCP tables do not exist; run 014–017 for tool types, endpoint_path, job/step tools, schema/business context.
+    """Run 013 if MCP tables do not exist; run 014–019 for tool types, endpoint_path, job/step tools, schema/business context, pageindex, tool_visibility.
     Skipped for SQLite: test DBs use Base.metadata.create_all() and migration SQL is PostgreSQL-specific."""
     if engine.dialect.name == "sqlite":
         return
@@ -43,6 +43,8 @@ def run_mcp_migration_if_needed():
     path_015 = os.path.join(_migration_dir(), "015_add_mcp_endpoint_path.sql")
     path_016 = os.path.join(_migration_dir(), "016_add_job_and_step_allowed_tools.sql")
     path_017 = os.path.join(_migration_dir(), "017_add_tool_schema_and_business_context.sql")
+    path_018 = os.path.join(_migration_dir(), "018_add_pageindex_tool_type.sql")
+    path_019 = os.path.join(_migration_dir(), "019_add_tool_visibility_handoff.sql")
     with engine.connect() as conn:
         if os.path.isfile(path_013) and not _table_exists(conn, "mcp_server_connections"):
             with open(path_013, "r", encoding="utf-8") as f:
@@ -79,4 +81,27 @@ def run_mcp_migration_if_needed():
         if os.path.isfile(path_017) and _table_exists(conn, "mcp_tool_configs"):
             with open(path_017, "r", encoding="utf-8") as f:
                 conn.execute(text(f.read()))
+            conn.commit()
+        if os.path.isfile(path_018) and _table_exists(conn, "mcp_tool_configs"):
+            with open(path_018, "r", encoding="utf-8") as f:
+                sql = f.read()
+            for line in sql.strip().split("\n"):
+                line = line.strip()
+                if not line or line.startswith("--"):
+                    continue
+                try:
+                    conn.execute(text(line))
+                except Exception:
+                    pass
+            conn.commit()
+        if os.path.isfile(path_019) and _table_exists(conn, "jobs"):
+            with open(path_019, "r", encoding="utf-8") as f:
+                sql = f.read()
+            for stmt in sql.strip().split(";"):
+                s = stmt.strip()
+                if s and not s.startswith("--"):
+                    try:
+                        conn.execute(text(s))
+                    except Exception:
+                        pass
             conn.commit()

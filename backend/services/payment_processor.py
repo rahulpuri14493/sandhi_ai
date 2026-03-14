@@ -71,6 +71,7 @@ class PaymentProcessor:
                 depends_on_previous=getattr(step, "depends_on_previous", True),
                 allowed_platform_tool_ids=step_platform,
                 allowed_connection_ids=step_conn,
+                tool_visibility=getattr(step, "tool_visibility", None),
             ))
         
         # Estimate communication costs (between consecutive steps)

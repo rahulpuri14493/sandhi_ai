@@ -177,6 +177,15 @@ def _parse_int_list_form(value: Optional[str]) -> Optional[List[int]]:
         return None
 
 
+def _validate_tool_visibility(v: Optional[str]) -> Optional[str]:
+    if v is None or (isinstance(v, str) and not v.strip()):
+        return None
+    s = (v or "").strip().lower()
+    if s in ("full", "names_only", "none"):
+        return s
+    raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="tool_visibility must be 'full', 'names_only', or 'none'")
+
+
 @router.post("", response_model=JobResponse, status_code=status.HTTP_201_CREATED)
 async def create_job(
     title: str = Form(...),
@@ -184,6 +193,7 @@ async def create_job(
     files: Optional[List[UploadFile]] = File(None),
     allowed_platform_tool_ids: Optional[str] = Form(None),
     allowed_connection_ids: Optional[str] = Form(None),
+    tool_visibility: Optional[str] = Form(None),
     current_user: User = Depends(get_current_business_user),
     db: Session = Depends(get_db)
 ):
@@ -206,6 +216,7 @@ async def create_job(
                 )
             file_metadata.extend(await _process_one_upload(file))
 
+    tv = _validate_tool_visibility(tool_visibility) if tool_visibility else None
     new_job = Job(
         business_id=current_user.id,
         title=title,
@@ -215,6 +226,7 @@ async def create_job(
         conversation=json.dumps([]),  # Initialize empty conversation
         allowed_platform_tool_ids=json.dumps(platform_ids) if platform_ids else None,
         allowed_connection_ids=json.dumps(connection_ids) if connection_ids else None,
+        tool_visibility=tv,
     )
     db.add(new_job)
     db.commit()
@@ -245,6 +257,7 @@ async def create_job(
         "failure_reason": new_job.failure_reason,
         "allowed_platform_tool_ids": platform_ids,
         "allowed_connection_ids": connection_ids,
+        "tool_visibility": new_job.tool_visibility,
     }
     return JobResponse(**response_data)
 
@@ -781,6 +794,7 @@ def get_job(
             depends_on_previous=getattr(step, "depends_on_previous", True),
             allowed_platform_tool_ids=step_platform,
             allowed_connection_ids=step_conn,
+            tool_visibility=getattr(step, "tool_visibility", None),
         ))
 
     job_platform = None
@@ -810,6 +824,7 @@ def get_job(
         "failure_reason": job.failure_reason,
         "allowed_platform_tool_ids": job_platform,
         "allowed_connection_ids": job_conn,
+        "tool_visibility": getattr(job, "tool_visibility", None),
     }
     return JobResponse(**job_dict)
 
@@ -823,6 +838,7 @@ async def update_job(
     files: Optional[List[UploadFile]] = File(None),
     allowed_platform_tool_ids: Optional[str] = Form(None),
     allowed_connection_ids: Optional[str] = Form(None),
+    tool_visibility: Optional[str] = Form(None),
     current_user: User = Depends(get_current_business_user),
     db: Session = Depends(get_db)
 ):
@@ -859,6 +875,8 @@ async def update_job(
         if cids:
             _, cids = _validate_allowed_tools(db, current_user.id, None, cids)
         job.allowed_connection_ids = json.dumps(cids) if cids else None
+    if tool_visibility is not None:
+        job.tool_visibility = _validate_tool_visibility(tool_visibility)
 
     # Update basic fields
     if title is not None:
@@ -1104,11 +1122,19 @@ def auto_split_workflow(
     step_tools = None
     if body.step_tools:
         step_tools = [
-            {"agent_index": st.agent_index, "allowed_platform_tool_ids": st.allowed_platform_tool_ids, "allowed_connection_ids": st.allowed_connection_ids}
+            {
+                "agent_index": st.agent_index,
+                "allowed_platform_tool_ids": st.allowed_platform_tool_ids,
+                "allowed_connection_ids": st.allowed_connection_ids,
+                "tool_visibility": getattr(st, "tool_visibility", None),
+            }
             for st in body.step_tools
         ]
+    tv = body.tool_visibility
+    if tv is not None and tv not in ("full", "names_only", "none"):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="tool_visibility must be 'full', 'names_only', or 'none'")
     workflow_builder = WorkflowBuilder(db)
-    preview = workflow_builder.auto_split_workflow(job_id, body.agent_ids, workflow_mode=workflow_mode, step_tools=step_tools)
+    preview = workflow_builder.auto_split_workflow(job_id, body.agent_ids, workflow_mode=workflow_mode, step_tools=step_tools, tool_visibility=tv)
     return preview
 
 
@@ -1140,6 +1166,7 @@ def manual_workflow(
 class StepToolsUpdateBody(BaseModel):
     allowed_platform_tool_ids: Optional[List[int]] = None
     allowed_connection_ids: Optional[List[int]] = None
+    tool_visibility: Optional[str] = None  # full | names_only | none
 
 
 @router.patch("/{job_id}/workflow/steps/{step_id}", response_model=WorkflowStepResponse)
@@ -1165,6 +1192,8 @@ def update_workflow_step_tools(
             pids, cids = _validate_allowed_tools(db, current_user.id, pids, cids)
         step.allowed_platform_tool_ids = json.dumps(pids) if pids is not None else None
         step.allowed_connection_ids = json.dumps(cids) if cids is not None else None
+    if body.tool_visibility is not None:
+        step.tool_visibility = _validate_tool_visibility(body.tool_visibility)
     db.commit()
     db.refresh(step)
     agent = db.query(Agent).filter(Agent.id == step.agent_id).first()
@@ -1192,6 +1221,7 @@ def update_workflow_step_tools(
         started_at=step.started_at,
         completed_at=step.completed_at,
         depends_on_previous=getattr(step, "depends_on_previous", True),
+        tool_visibility=getattr(step, "tool_visibility", None),
         allowed_platform_tool_ids=step_platform,
         allowed_connection_ids=step_conn,
     )
@@ -1483,6 +1513,17 @@ def get_job_status(
     for step in workflow_steps:
         agent = db.query(Agent).filter(Agent.id == step.agent_id).first()
         agent_name = agent.name if agent else None
+        step_platform = step_conn = None
+        if getattr(step, "allowed_platform_tool_ids", None):
+            try:
+                step_platform = json.loads(step.allowed_platform_tool_ids)
+            except (json.JSONDecodeError, TypeError):
+                pass
+        if getattr(step, "allowed_connection_ids", None):
+            try:
+                step_conn = json.loads(step.allowed_connection_ids)
+            except (json.JSONDecodeError, TypeError):
+                pass
         workflow_steps_data.append(WorkflowStepResponse(
             id=step.id,
             job_id=step.job_id,
@@ -1496,8 +1537,24 @@ def get_job_status(
             started_at=step.started_at,
             completed_at=step.completed_at,
             depends_on_previous=getattr(step, "depends_on_previous", True),
+            allowed_platform_tool_ids=step_platform,
+            allowed_connection_ids=step_conn,
+            tool_visibility=getattr(step, "tool_visibility", None),
         ))
     
+    job_platform = None
+    job_conn = None
+    if getattr(job, "allowed_platform_tool_ids", None):
+        try:
+            job_platform = json.loads(job.allowed_platform_tool_ids)
+        except (json.JSONDecodeError, TypeError):
+            pass
+    if getattr(job, "allowed_connection_ids", None):
+        try:
+            job_conn = json.loads(job.allowed_connection_ids)
+        except (json.JSONDecodeError, TypeError):
+            pass
+
     job_dict = {
         "id": job.id,
         "business_id": job.business_id,
@@ -1510,7 +1567,10 @@ def get_job_status(
         "workflow_steps": workflow_steps_data,
         "files": files_data,
         "conversation": conversation_data,
-        "failure_reason": job.failure_reason
+        "failure_reason": job.failure_reason,
+        "allowed_platform_tool_ids": job_platform,
+        "allowed_connection_ids": job_conn,
+        "tool_visibility": getattr(job, "tool_visibility", None),
     }
     return JobResponse(**job_dict)
 

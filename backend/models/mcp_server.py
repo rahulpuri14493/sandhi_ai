@@ -46,6 +46,7 @@ class MCPToolType(str, enum.Enum):
     MYSQL = "mysql"
     # Search
     ELASTICSEARCH = "elasticsearch"
+    PAGEINDEX = "pageindex"  # Vectorless RAG (keyword/tree retrieval, no vectors)
     # Storage
     FILESYSTEM = "filesystem"
     S3 = "s3"

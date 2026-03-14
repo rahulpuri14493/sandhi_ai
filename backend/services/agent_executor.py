@@ -38,6 +38,45 @@ def _parse_allowed_ids(value: Optional[str]) -> Optional[list]:
         return None
 
 
+def _get_workflow_collaboration_hint_from_job(job: Job) -> Optional[str]:
+    """Get workflow_collaboration_hint from job conversation (BRD). Returns 'sequential', 'async_a2a', or None."""
+    if not getattr(job, "conversation", None):
+        return None
+    try:
+        conv = json.loads(job.conversation)
+        if not isinstance(conv, list):
+            return None
+        for item in reversed(conv):
+            hint = item.get("workflow_collaboration_hint") if isinstance(item, dict) else None
+            if hint in ("sequential", "async_a2a"):
+                return hint
+    except (json.JSONDecodeError, TypeError):
+        pass
+    return None
+
+
+def _apply_tool_visibility(tools: list, visibility: Optional[str]) -> list:
+    """
+    Apply tool_visibility so agents never receive credentials; only allowed tool metadata.
+    full = full descriptors; names_only = name + short description only; none = no tools.
+    """
+    if visibility == "none" or not tools:
+        return []
+    if visibility == "names_only":
+        return [
+            {
+                "name": t.get("name", ""),
+                "description": (t.get("description") or t.get("name", ""))[:200],
+                "source": t.get("source"),
+                "platform_tool_id": t.get("platform_tool_id"),
+                "connection_id": t.get("connection_id"),
+                "tool_type": t.get("tool_type"),
+            }
+            for t in tools
+        ]
+    return tools
+
+
 # OpenAI-style tool parameter schemas for MCP tool types (must match platform MCP server expectations)
 def _input_schema_for_tool_type(tool_type: str) -> dict:
     sql_schema = {
@@ -67,6 +106,15 @@ def _input_schema_for_tool_type(tool_type: str) -> dict:
                 "query": {"type": "string", "description": "Search query"},
                 "index": {"type": "string", "description": "Index name"},
                 "size": {"type": "integer", "default": 10},
+            },
+            "required": ["query"],
+        },
+        "pageindex": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "Natural language or keyword query over documents"},
+                "doc_id": {"type": "string", "description": "PageIndex document ID (optional if default_doc_id in config)"},
+                "thinking": {"type": "boolean", "description": "Use reasoning before retrieval", "default": False},
             },
             "required": ["query"],
         },
@@ -225,6 +273,9 @@ class AgentExecutor:
                     platform_tool_ids=effective_platform if effective_platform else None,
                     connection_ids=effective_conn if effective_conn else None,
                 )
+                # Hybrid A2A: restrict what tool info agents see (credentials never shared)
+                tool_visibility = getattr(step, "tool_visibility", None) or getattr(job, "tool_visibility", None) or "full"
+                available_mcp_tools = _apply_tool_visibility(available_mcp_tools or [], tool_visibility)
                 if available_mcp_tools:
                     input_data["available_mcp_tools"] = available_mcp_tools
                     input_data["business_id"] = job.business_id
@@ -234,6 +285,18 @@ class AgentExecutor:
                             "tool_count": len(available_mcp_tools),
                             "tool_names": [t.get("name") for t in available_mcp_tools[:20]],
                         })
+
+                # Hybrid A2A: peer context for async_a2a — agents can call each other; no tools/credentials shared
+                collaboration_hint = _get_workflow_collaboration_hint_from_job(job)
+                if collaboration_hint == "async_a2a":
+                    peer_agents = self._get_peer_agents_for_step(workflow_steps, step, agent)
+                    if peer_agents:
+                        input_data["peer_agents"] = peer_agents
+                        if step.step_order == 1:
+                            self._log_action("job", job_id, "peer_a2a_context", {
+                                "peer_count": len(peer_agents),
+                                "peer_ids": [p["agent_id"] for p in peer_agents],
+                            })
                 
                 # Uploaded documents are requirement documents: agent must understand them, ask questions if any, else execute and answer.
                 documents = input_data.get('documents', [])
@@ -597,6 +660,17 @@ class AgentExecutor:
             if has_previous_output and step_order is not None and total_steps is not None and total_steps > 1:
                 system_content += "SEQUENTIAL WORKFLOW: You receive the previous agent's output below. Use it as your input and continue the pipeline.\n\n"
             system_content += "TASK: Execute the job from the requirements above and provide your complete, correct answer. Do not ask questions unless something is strictly required and impossible to infer.\n"
+        # Hybrid A2A: peer agents (endpoints only; no credentials or tool lists shared)
+        peer_agents = input_data.get("peer_agents") or []
+        if peer_agents:
+            system_content += "\n═══════════════════════════════════════════════════════\n"
+            system_content += "PEER AGENTS (optional direct A2A)\n"
+            system_content += "═══════════════════════════════════════════════════════\n\n"
+            system_content += "You may call these agents directly via the A2A protocol (SendMessage to their endpoint). "
+            system_content += "Only endpoint URLs are provided; no API keys or tool information are shared.\n\n"
+            for p in peer_agents:
+                system_content += f"  - {p.get('name', '')} (step {p.get('step_order', '')}): {p.get('a2a_endpoint', '')}\n"
+            system_content += "\n"
         # MCP tool discovery: inform agent of available tools (platform + external) for collaboration
         available_mcp_tools = input_data.get("available_mcp_tools") or []
         if available_mcp_tools:
@@ -794,6 +868,31 @@ END DOCUMENT {i+1}: {doc_name}
         self.db.add(communication)
         self.db.commit()
     
+    def _get_peer_agents_for_step(
+        self, workflow_steps: list, current_step: WorkflowStep, current_agent: Agent
+    ) -> list:
+        """
+        For hybrid A2A (async_a2a): return other agents in this workflow that support A2A.
+        Only endpoint URL and identity are shared; no API keys, no tool lists, no credentials.
+        """
+        peer_list = []
+        for s in workflow_steps:
+            if s.id == current_step.id or s.agent_id == current_agent.id:
+                continue
+            peer_agent = self.db.query(Agent).filter(Agent.id == s.agent_id).first()
+            if not peer_agent or not getattr(peer_agent, "a2a_enabled", False):
+                continue
+            endpoint = (getattr(peer_agent, "api_endpoint", None) or "").strip()
+            if not endpoint:
+                continue
+            peer_list.append({
+                "agent_id": peer_agent.id,
+                "name": peer_agent.name or "",
+                "a2a_endpoint": endpoint,
+                "step_order": s.step_order,
+            })
+        return peer_list
+
     def _get_available_mcp_tools(
         self,
         business_id: int,
@@ -814,6 +913,7 @@ END DOCUMENT {i+1}: {doc_name}
             "postgres": "PostgreSQL database",
             "mysql": "MySQL database",
             "elasticsearch": "Elasticsearch search",
+            "pageindex": "PageIndex (vectorless document retrieval)",
             "filesystem": "File system access",
             "s3": "AWS S3 storage",
             "slack": "Slack integration",

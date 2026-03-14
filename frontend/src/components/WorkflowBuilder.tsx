@@ -14,8 +14,10 @@ interface WorkflowBuilderProps {
 
 export type WorkflowCollaborationMode = 'from_brd' | 'independent' | 'sequential'
 
-/** Per-step tool assignment: agent_index -> { platformIds, connectionIds } */
-type StepToolSelection = Record<number, { platformIds: number[]; connectionIds: number[] }>
+export type ToolVisibility = 'full' | 'names_only' | 'none'
+
+/** Per-step tool assignment: agent_index -> { platformIds, connectionIds, toolVisibility? } */
+type StepToolSelection = Record<number, { platformIds: number[]; connectionIds: number[]; toolVisibility?: ToolVisibility }>
 
 export function WorkflowBuilder({ jobId, onWorkflowCreated, initialSelectedAgentIds, job }: WorkflowBuilderProps) {
   const [selectedAgents, setSelectedAgents] = useState<number[]>(initialSelectedAgentIds ?? [])
@@ -24,6 +26,7 @@ export function WorkflowBuilder({ jobId, onWorkflowCreated, initialSelectedAgent
   const [connections, setConnections] = useState<MCPServerConnectionRes[]>([])
   const [stepToolSelections, setStepToolSelections] = useState<StepToolSelection>({})
   const stepToolSelectionsRef = useRef<StepToolSelection>({})
+  const [jobToolVisibility, setJobToolVisibility] = useState<ToolVisibility>('full')
   const [mode, setMode] = useState<'auto' | 'manual'>('auto')
   const [workflowCollaboration, setWorkflowCollaboration] = useState<WorkflowCollaborationMode>('from_brd')
   const [isLoading, setIsLoading] = useState(false)
@@ -49,24 +52,27 @@ export function WorkflowBuilder({ jobId, onWorkflowCreated, initialSelectedAgent
     }
   }, [initialSelectedAgentIds])
 
-  // When job has workflow steps and we have no local selections yet, pre-fill so checkboxes reflect saved state
+  // When job has workflow steps, pre-fill step tool selections from saved state (by step order)
   useEffect(() => {
     const jobData = job ?? null
     const steps = jobData?.workflow_steps
+    if (jobData?.tool_visibility) setJobToolVisibility(jobData.tool_visibility as ToolVisibility)
     if (!steps?.length || selectedAgents.length === 0) return
+    // Steps are ordered by step_order; index i = step_order - 1
     const next: StepToolSelection = {}
     steps.forEach((step, i) => {
       const platformIds = step.allowed_platform_tool_ids ?? []
       const connectionIds = step.allowed_connection_ids ?? []
-      if (platformIds.length > 0 || connectionIds.length > 0) {
-        next[i] = { platformIds, connectionIds }
-      }
+      const toolVisibility = step.tool_visibility as ToolVisibility | undefined
+      next[i] = { platformIds, connectionIds, toolVisibility }
     })
-    if (Object.keys(next).length > 0) {
-      setStepToolSelections((prev) => (Object.keys(prev).length === 0 ? next : prev))
-    }
+    setStepToolSelections((prev) => {
+      // Only overwrite when we have steps and prev is empty or we're initializing from job
+      if (Object.keys(prev).length === 0) return next
+      return prev
+    })
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [job?.id, job?.workflow_steps?.length, selectedAgents.length])
+  }, [job?.id, job?.tool_visibility, job?.workflow_steps, selectedAgents.length])
 
   const loadAgents = async () => {
     try {
@@ -102,9 +108,9 @@ export function WorkflowBuilder({ jobId, onWorkflowCreated, initialSelectedAgent
     }
   }
 
-  const setStepTools = (agentIndex: number, platformIds: number[], connectionIds: number[]) => {
+  const setStepTools = (agentIndex: number, platformIds: number[], connectionIds: number[], toolVisibility?: ToolVisibility) => {
     setStepToolSelections((prev) => {
-      const next = { ...prev, [agentIndex]: { platformIds, connectionIds } }
+      const next = { ...prev, [agentIndex]: { platformIds, connectionIds, toolVisibility } }
       stepToolSelectionsRef.current = next
       return next
     })
@@ -115,7 +121,7 @@ export function WorkflowBuilder({ jobId, onWorkflowCreated, initialSelectedAgent
     const platformIds = cur.platformIds.includes(toolId)
       ? cur.platformIds.filter((id) => id !== toolId)
       : [...cur.platformIds, toolId]
-    setStepTools(agentIndex, platformIds, cur.connectionIds)
+    setStepTools(agentIndex, platformIds, cur.connectionIds, cur.toolVisibility)
   }
 
   const toggleStepConnection = (agentIndex: number, connId: number) => {
@@ -123,7 +129,19 @@ export function WorkflowBuilder({ jobId, onWorkflowCreated, initialSelectedAgent
     const connectionIds = cur.connectionIds.includes(connId)
       ? cur.connectionIds.filter((id) => id !== connId)
       : [...cur.connectionIds, connId]
-    setStepTools(agentIndex, cur.platformIds, connectionIds)
+    setStepTools(agentIndex, cur.platformIds, connectionIds, cur.toolVisibility)
+  }
+
+  const addStepPlatformTool = (agentIndex: number, toolId: number) => {
+    const cur = stepToolSelections[agentIndex] ?? { platformIds: [], connectionIds: [] }
+    if (cur.platformIds.includes(toolId)) return
+    setStepTools(agentIndex, [...cur.platformIds, toolId], cur.connectionIds, cur.toolVisibility)
+  }
+
+  const addStepConnection = (agentIndex: number, connId: number) => {
+    const cur = stepToolSelections[agentIndex] ?? { platformIds: [], connectionIds: [] }
+    if (cur.connectionIds.includes(connId)) return
+    setStepTools(agentIndex, cur.platformIds, [...cur.connectionIds, connId], cur.toolVisibility)
   }
 
   const handleAutoSplit = async () => {
@@ -149,9 +167,11 @@ export function WorkflowBuilder({ jobId, onWorkflowCreated, initialSelectedAgent
           agent_index: idx,
           allowed_platform_tool_ids: sel?.platformIds?.length ? sel.platformIds : undefined,
           allowed_connection_ids: sel?.connectionIds?.length ? sel.connectionIds : undefined,
+          tool_visibility: sel?.toolVisibility,
         }
-      }).filter((s) => (s.allowed_platform_tool_ids?.length ?? 0) > 0 || (s.allowed_connection_ids?.length ?? 0) > 0)
-      await jobsAPI.autoSplitWorkflow(jobId, selectedAgents, workflowMode, stepTools.length > 0 ? stepTools : undefined)
+      })
+      const hasStepTools = stepTools.some((s) => (s.allowed_platform_tool_ids?.length ?? 0) > 0 || (s.allowed_connection_ids?.length ?? 0) > 0 || s.tool_visibility)
+      await jobsAPI.autoSplitWorkflow(jobId, selectedAgents, workflowMode, hasStepTools ? stepTools : undefined, jobToolVisibility !== 'full' ? jobToolVisibility : undefined)
       onWorkflowCreated()
     } catch (err: any) {
       setError(err.response?.data?.detail || 'Failed to create workflow')
@@ -237,6 +257,24 @@ export function WorkflowBuilder({ jobId, onWorkflowCreated, initialSelectedAgent
               {workflowCollaboration === 'sequential' && 'Best when agent 2 needs agent 1’s result (pipeline).'}
               {workflowCollaboration === 'from_brd' && 'Uses analyze-documents hint from your BRD when available.'}
             </p>
+            {workflowCollaboration === 'from_brd' && job?.allowed_platform_tool_ids && job.allowed_platform_tool_ids.length > 0 && (
+              <p className="text-xs text-emerald-400/90 mt-1.5 font-medium">
+                Job tools will be assigned to all agents automatically. You can optionally restrict tools per agent below.
+              </p>
+            )}
+          </div>
+          <div className="mb-6">
+            <label className="block text-sm font-bold text-white/90 mb-2">Tool visibility (what agents see)</label>
+            <select
+              value={jobToolVisibility}
+              onChange={(e) => setJobToolVisibility(e.target.value as ToolVisibility)}
+              className="px-4 py-2.5 bg-dark-200/80 border-2 border-dark-300 rounded-xl text-white font-medium focus:ring-2 focus:ring-primary-500 focus:border-primary-500"
+            >
+              <option value="full">Full — Names, descriptions, schema & business context</option>
+              <option value="names_only">Names only — Tool names and short description; no schema or DB context</option>
+              <option value="none">None — No tool list; agents cannot use MCP tools for this job</option>
+            </select>
+            <p className="text-xs text-white/50 mt-1.5">Credentials are never shared. This only controls how much tool metadata (names, schema, etc.) agents receive.</p>
           </div>
           <div className="space-y-3 max-h-80 overflow-y-auto border-2 border-dark-300 rounded-xl p-5 mb-6 bg-dark-200/30">
             {availableAgents.length === 0 ? (
@@ -273,43 +311,107 @@ export function WorkflowBuilder({ jobId, onWorkflowCreated, initialSelectedAgent
           {(platformTools.length > 0 || connections.length > 0) && selectedAgents.length > 0 && (
             <div className="mb-6 p-5 bg-emerald-500/10 border-2 border-emerald-500/30 rounded-xl">
               <h4 className="font-bold text-emerald-400 mb-3">Tools per agent (optional)</h4>
-              <p className="text-sm text-white/70 mb-4">Select which tools each agent can use in this workflow. Leave unchecked to allow all job tools for that agent.</p>
+              <p className="text-sm text-white/70 mb-4">Add only the tools each agent can use. If none are added, that agent will have access to all job tools.</p>
               <div className="space-y-4">
                 {selectedAgents.map((agentId, idx) => {
                   const agent = availableAgents.find((a) => a.id === agentId)
                   const sel = stepToolSelections[idx] ?? { platformIds: [], connectionIds: [] }
+                  const selectedPlatformTools = platformTools.filter((t) => sel.platformIds.includes(t.id))
+                  const selectedConns = connections.filter((c) => sel.connectionIds.includes(c.id))
+                  const availableToAddPlatform = platformTools.filter((t) => !sel.platformIds.includes(t.id))
+                  const availableToAddConn = connections.filter((c) => !sel.connectionIds.includes(c.id))
+                  const hasAnySelected = selectedPlatformTools.length > 0 || selectedConns.length > 0
                   return (
                     <div key={agentId} className="border border-dark-300 rounded-lg p-4 bg-dark-200/30">
                       <div className="font-bold text-white mb-2">Step {idx + 1}: {agent?.name ?? `Agent ${agentId}`}</div>
-                      <div className="flex flex-wrap gap-4">
-                        {platformTools.length > 0 && (
+                      <div className="mb-3">
+                        <label className="text-xs text-white/70 mr-2">Step tool visibility:</label>
+                        <select
+                          value={sel.toolVisibility ?? jobToolVisibility}
+                          onChange={(e) => setStepTools(idx, sel.platformIds, sel.connectionIds, e.target.value as ToolVisibility)}
+                          className="px-2 py-1 bg-dark-200/80 border border-dark-300 rounded text-white text-sm min-w-[200px]"
+                          title="Full = names, descriptions, schema. Names only = names + short description. None = no tools."
+                        >
+                          <option value="full">Full (schema + context)</option>
+                          <option value="names_only">Names only (no schema)</option>
+                          <option value="none">None (no tools)</option>
+                        </select>
+                      </div>
+                      <div className="space-y-2">
+                        <div className="text-sm font-semibold text-white/90">Selected for this step:</div>
+                        {!hasAnySelected ? (
+                          <p className="text-xs text-white/50 italic">No tools selected — this step will use all job tools.</p>
+                        ) : (
                           <div className="flex flex-wrap gap-2">
-                            {platformTools.map((t) => (
-                              <label key={t.id} className="inline-flex items-center gap-1.5 text-sm text-white/90 cursor-pointer">
-                                <input
-                                  type="checkbox"
-                                  checked={sel.platformIds.includes(t.id)}
-                                  onChange={() => toggleStepPlatformTool(idx, t.id)}
-                                  className="w-3.5 h-3.5 text-primary-600 rounded"
-                                />
+                            {selectedPlatformTools.map((t) => (
+                              <span
+                                key={t.id}
+                                className="inline-flex items-center gap-1.5 px-2.5 py-1 bg-primary-500/20 border border-primary-500/50 rounded-lg text-sm text-white"
+                              >
                                 <span>{t.name}</span>
-                              </label>
+                                <button
+                                  type="button"
+                                  onClick={() => toggleStepPlatformTool(idx, t.id)}
+                                  className="text-white/70 hover:text-white focus:outline-none"
+                                  aria-label={`Remove ${t.name}`}
+                                >
+                                  <span className="sr-only">Remove</span>×
+                                </button>
+                              </span>
+                            ))}
+                            {selectedConns.map((c) => (
+                              <span
+                                key={c.id}
+                                className="inline-flex items-center gap-1.5 px-2.5 py-1 bg-primary-500/20 border border-primary-500/50 rounded-lg text-sm text-white"
+                              >
+                                <span className="truncate max-w-[120px]">{c.name}</span>
+                                <button
+                                  type="button"
+                                  onClick={() => toggleStepConnection(idx, c.id)}
+                                  className="text-white/70 hover:text-white focus:outline-none"
+                                  aria-label={`Remove ${c.name}`}
+                                >
+                                  <span className="sr-only">Remove</span>×
+                                </button>
+                              </span>
                             ))}
                           </div>
                         )}
-                        {connections.length > 0 && (
-                          <div className="flex flex-wrap gap-2">
-                            {connections.map((c) => (
-                              <label key={c.id} className="inline-flex items-center gap-1.5 text-sm text-white/90 cursor-pointer">
-                                <input
-                                  type="checkbox"
-                                  checked={sel.connectionIds.includes(c.id)}
-                                  onChange={() => toggleStepConnection(idx, c.id)}
-                                  className="w-3.5 h-3.5 text-primary-600 rounded"
-                                />
-                                <span className="truncate max-w-[120px]">{c.name}</span>
-                              </label>
-                            ))}
+                        {(availableToAddPlatform.length > 0 || availableToAddConn.length > 0) && (
+                          <div className="flex flex-wrap items-center gap-2 pt-1">
+                            <span className="text-xs text-white/70">Add tool:</span>
+                            {availableToAddPlatform.length > 0 && (
+                              <select
+                                value=""
+                                onChange={(e) => {
+                                  const id = Number(e.target.value)
+                                  if (id) addStepPlatformTool(idx, id)
+                                  e.target.value = ''
+                                }}
+                                className="px-2 py-1 bg-dark-200/80 border border-dark-300 rounded text-white text-sm"
+                              >
+                                <option value="">— Platform tool —</option>
+                                {availableToAddPlatform.map((t) => (
+                                  <option key={t.id} value={t.id}>{t.name}</option>
+                                ))}
+                              </select>
+                            )}
+                            {availableToAddConn.length > 0 && (
+                              <select
+                                value=""
+                                onChange={(e) => {
+                                  const id = Number(e.target.value)
+                                  if (id) addStepConnection(idx, id)
+                                  e.target.value = ''
+                                }}
+                                className="px-2 py-1 bg-dark-200/80 border border-dark-300 rounded text-white text-sm"
+                              >
+                                <option value="">— Connection —</option>
+                                {availableToAddConn.map((c) => (
+                                  <option key={c.id} value={c.id}>{c.name}</option>
+                                ))}
+                              </select>
+                            )}
                           </div>
                         )}
                       </div>

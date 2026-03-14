@@ -250,7 +250,7 @@ def create_tool(
     except ValueError:
         raise HTTPException(
             status_code=400,
-            detail="tool_type must be one of: vector_db, pinecone, weaviate, qdrant, chroma, postgres, mysql, elasticsearch, filesystem, s3, slack, github, notion, rest_api",
+            detail="tool_type must be one of: vector_db, pinecone, weaviate, qdrant, chroma, postgres, mysql, elasticsearch, pageindex, filesystem, s3, slack, github, notion, rest_api",
         )
     encrypted = encrypt_json(body.config)
     business_description = (body.business_description or "").strip() or None
@@ -494,6 +494,7 @@ def _registry_description(tool_type: str, name: str) -> str:
         "postgres": "PostgreSQL",
         "mysql": "MySQL",
         "elasticsearch": "Elasticsearch",
+        "pageindex": "PageIndex",
         "filesystem": "File system",
         "s3": "AWS S3",
         "slack": "Slack",

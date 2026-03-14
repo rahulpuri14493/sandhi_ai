@@ -17,6 +17,8 @@ def validate_tool_config(tool_type: str, config: dict) -> Tuple[bool, str]:
         return _validate_filesystem(config)
     if tool_type in ("elasticsearch", "rest_api"):
         return _validate_http(config, tool_type)
+    if tool_type == "pageindex":
+        return _validate_pageindex(config)
     # Vector DB, Slack, GitHub, Notion, S3: no lightweight validation without SDK
     return True, "Connection validation not available for this tool type; save to store credentials."
 
@@ -70,6 +72,26 @@ def _validate_filesystem(config: dict) -> Tuple[bool, str]:
     if not os.path.isdir(base):
         return False, f"Base path is not a directory or does not exist: {base}"
     return True, "Base path exists and is readable"
+
+
+def _validate_pageindex(config: dict) -> Tuple[bool, str]:
+    """Validate PageIndex: require api_key and optionally hit list-docs API."""
+    import httpx
+    api_key = (config.get("api_key") or "").strip()
+    if not api_key:
+        return False, "API key is required (get one at https://dash.pageindex.ai)"
+    base = (config.get("base_url") or "https://api.pageindex.ai").strip().rstrip("/")
+    if not base.startswith("http"):
+        base = "https://" + base
+    try:
+        r = httpx.get(f"{base}/docs", headers={"api_key": api_key}, params={"limit": 1}, timeout=10.0)
+        if r.status_code == 401:
+            return False, "Invalid PageIndex API key"
+        if r.status_code >= 400:
+            return False, f"PageIndex API returned {r.status_code}: {r.text[:200]}"
+        return True, "PageIndex connection successful"
+    except Exception as e:
+        return False, str(e)
 
 
 def _validate_http(config: dict, tool_type: str) -> Tuple[bool, str]:

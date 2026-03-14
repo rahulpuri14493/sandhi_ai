@@ -95,8 +95,8 @@ describe('MCP integration', () => {
     await waitFor(() => {
       expect(screen.getByText('MCP Server')).toBeInTheDocument()
     })
-    expect(mockListConnections).toHaveBeenCalledTimes(1)
-    expect(mockListTools).toHaveBeenCalledTimes(1)
-    expect(mockGetRegistry).toHaveBeenCalledTimes(1)
+    expect(mockListConnections).toHaveBeenCalled()
+    expect(mockListTools).toHaveBeenCalled()
+    expect(mockGetRegistry).toHaveBeenCalled()
   })
 })

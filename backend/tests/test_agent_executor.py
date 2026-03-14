@@ -4,7 +4,11 @@ from unittest.mock import MagicMock
 
 import pytest
 from models.agent import Agent
-from services.agent_executor import AgentExecutor
+from services.agent_executor import (
+    AgentExecutor,
+    _apply_tool_visibility,
+    _get_workflow_collaboration_hint_from_job,
+)
 
 
 def _get_executor_format_input(agent: Agent, input_data: dict) -> dict:
@@ -233,3 +237,81 @@ def test_negative_format_handles_empty_available_mcp_tools():
     assert "messages" in payload
     # Should not crash; MCP section may be omitted when empty
     assert "Job" in content_str
+
+
+# ---------- Tool visibility and peer A2A ----------
+
+
+def test_apply_tool_visibility_none_returns_empty():
+    """tool_visibility 'none' returns empty list."""
+    tools = [{"name": "t1", "description": "d1", "schema_metadata": "s1"}]
+    assert _apply_tool_visibility(tools, "none") == []
+    assert _apply_tool_visibility([], "full") == []
+
+
+def test_apply_tool_visibility_names_only_strips_schema():
+    """tool_visibility 'names_only' returns name/description only, no schema or business_description."""
+    tools = [
+        {"name": "db1", "description": "PostgreSQL DB", "schema_metadata": "{}", "business_description": "Sales DB"},
+    ]
+    out = _apply_tool_visibility(tools, "names_only")
+    assert len(out) == 1
+    assert out[0]["name"] == "db1"
+    assert "PostgreSQL" in out[0]["description"]
+    assert "schema_metadata" not in out[0]
+    assert "business_description" not in out[0]
+
+
+def test_apply_tool_visibility_full_returns_unchanged():
+    """tool_visibility 'full' returns tools unchanged."""
+    tools = [{"name": "t1", "description": "d1", "schema_metadata": "x"}]
+    assert _apply_tool_visibility(tools, "full") == tools
+    assert _apply_tool_visibility(tools, None) == tools
+
+
+def test_get_workflow_collaboration_hint_from_job_sequential():
+    """Extract workflow_collaboration_hint 'sequential' from job conversation."""
+    job = MagicMock()
+    job.conversation = json.dumps([
+        {"type": "question", "question": "Q1"},
+        {"type": "completion", "workflow_collaboration_hint": "sequential"},
+    ])
+    assert _get_workflow_collaboration_hint_from_job(job) == "sequential"
+
+
+def test_get_workflow_collaboration_hint_from_job_async_a2a():
+    """Extract workflow_collaboration_hint 'async_a2a' from job conversation."""
+    job = MagicMock()
+    job.conversation = json.dumps([
+        {"workflow_collaboration_hint": "async_a2a"},
+    ])
+    assert _get_workflow_collaboration_hint_from_job(job) == "async_a2a"
+
+
+def test_get_workflow_collaboration_hint_from_job_empty_returns_none():
+    """When conversation is empty or missing hint, returns None."""
+    job = MagicMock()
+    job.conversation = None
+    assert _get_workflow_collaboration_hint_from_job(job) is None
+    job.conversation = json.dumps([{"type": "question"}])
+    assert _get_workflow_collaboration_hint_from_job(job) is None
+
+
+def test_format_for_openai_includes_peer_agents_when_present():
+    """When peer_agents in input_data, system message includes PEER AGENTS section."""
+    agent = MagicMock(spec=Agent)
+    agent.name = "Agent 1"
+    input_data = {
+        "job_title": "Job",
+        "job_description": "",
+        "documents": [],
+        "conversation": [],
+        "peer_agents": [
+            {"agent_id": 2, "name": "Agent 2", "a2a_endpoint": "https://a2.example.com", "step_order": 2},
+        ],
+    }
+    payload = _get_executor_format_input(agent, input_data)
+    content_str = json.dumps([m.get("content", "") for m in payload["messages"]])
+    assert "PEER AGENTS" in content_str
+    assert "Agent 2" in content_str
+    assert "a2.example.com" in content_str

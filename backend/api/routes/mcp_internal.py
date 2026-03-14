@@ -80,6 +80,7 @@ def _description_for_type(tool_type: MCPToolType, name: str) -> str:
         MCPToolType.POSTGRES: "Execute read-only PostgreSQL query",
         MCPToolType.MYSQL: "Execute read-only MySQL query",
         MCPToolType.ELASTICSEARCH: "Search Elasticsearch index",
+        MCPToolType.PAGEINDEX: "Query PageIndex (vectorless document retrieval)",
         MCPToolType.FILESYSTEM: "Read or list files in configured base path",
         MCPToolType.S3: "Read or list objects in S3 bucket",
         MCPToolType.SLACK: "Send message or list channels (Slack)",
@@ -118,6 +119,15 @@ def _input_schema_for_type(tool_type: MCPToolType) -> dict:
                 "query": {"type": "string", "description": "Search query"},
                 "index": {"type": "string", "description": "Index name"},
                 "size": {"type": "integer", "default": 10},
+            },
+            "required": ["query"],
+        },
+        MCPToolType.PAGEINDEX: {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "Natural language or keyword query over documents"},
+                "doc_id": {"type": "string", "description": "PageIndex document ID (optional if default_doc_id is set in config)"},
+                "thinking": {"type": "boolean", "description": "Use reasoning before retrieval", "default": False},
             },
             "required": ["query"],
         },
