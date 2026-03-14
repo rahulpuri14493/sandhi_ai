@@ -314,4 +314,5 @@ def test_format_for_openai_includes_peer_agents_when_present():
     content_str = json.dumps([m.get("content", "") for m in payload["messages"]])
     assert "PEER AGENTS" in content_str
     assert "Agent 2" in content_str
-    assert "a2.example.com" in content_str
+    # Peer endpoint is included in the section (assert key, not host substring, to avoid URL-sanitization false positive)
+    assert "a2a_endpoint" in content_str

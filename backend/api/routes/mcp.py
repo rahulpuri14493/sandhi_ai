@@ -3,6 +3,7 @@ MCP (Model Context Protocol) API: connections and tool configs per user.
 Credentials stored encrypted; platform talks to MCP server via API (JSON-RPC proxy).
 """
 import json
+import logging
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
@@ -102,7 +103,11 @@ async def validate_connection(
         )
         return {"valid": True, "message": "MCP server connection successful"}
     except Exception as e:
-        return {"valid": False, "message": str(e)}
+        logging.exception("MCP server connection validation failed for base_url=%s, endpoint_path=%s", base_url, endpoint_path)
+        return {
+            "valid": False,
+            "message": "Failed to connect to MCP server. Please verify the server URL, endpoint, and credentials.",
+        }
 
 
 @router.get("/connections", response_model=List[MCPServerConnectionResponse])

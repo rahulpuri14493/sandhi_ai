@@ -322,8 +322,8 @@ async def a2a_endpoint(request: Request):
 
     num_tools = len(openai_tools) if isinstance(openai_tools, list) else 0
     logger.info(
-        "A2A SendMessage req_id=%s target=%s model=%s messages=%s tools=%s",
-        req_id, outbound_url, openai_model, len(messages), num_tools,
+        "A2A SendMessage req_id=%s target=%s model_specified=%s messages=%s tools=%s",
+        req_id, outbound_url, bool(openai_model), len(messages), num_tools,
     )
 
     try:

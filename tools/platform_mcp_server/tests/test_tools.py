@@ -23,14 +23,14 @@ class TestPostgres:
     def test_postgres_missing_query(self):
         out = execute_platform_tool("postgres", {"connection_string": "postgresql://x/y"}, {})
         assert "Error:" in out
-        assert "query is required" in out.lower()
+        assert "query" in out.lower() and ("not configured" in out.lower() or "required" in out.lower())
 
 
 class TestMysql:
     def test_mysql_missing_query(self):
         out = execute_platform_tool("mysql", {"host": "localhost", "user": "u", "password": "p", "database": "d"}, {})
         assert "Error:" in out
-        assert "query is required" in out.lower()
+        assert "query" in out.lower() and ("not configured" in out.lower() or "required" in out.lower())
 
 class TestFilesystem:
     def test_filesystem_missing_base_path(self):

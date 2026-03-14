@@ -22,7 +22,7 @@ class Settings(BaseSettings):
         # Internal secret for platform MCP server and backend-to-MCP-server calls (same secret in both)
         MCP_INTERNAL_SECRET: str = os.getenv("MCP_INTERNAL_SECRET", "")
         # When True, allow agent endpoints that resolve to private/loopback IPs (dev, Docker, same host). Default False in production.
-        ALLOW_PRIVATE_AGENT_ENDPOINTS: bool = True
+        ALLOW_PRIVATE_AGENT_ENDPOINTS: bool = os.getenv("ALLOW_PRIVATE_AGENT_ENDPOINTS", "false").lower() in ("true", "1", "yes")
 
         class Config:
             env_file = ".env"

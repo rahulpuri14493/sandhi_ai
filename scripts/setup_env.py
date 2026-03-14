@@ -6,6 +6,9 @@ Ensure .env exists and MCP secrets are set so the stack can run with the platfor
 - If .env exists but MCP_INTERNAL_SECRET is empty: set it to a generated value.
 
 Run from project root: python scripts/setup_env.py
+
+Note: .env is in .gitignore and must not be committed. Writing secrets to .env is intentional
+for local development only; production should use a secrets manager or environment injection.
 """
 import os
 import re
@@ -56,8 +59,13 @@ def ensure_env():
             out.append(line)
 
     if modified:
+        # .env is gitignored; restrict permissions when writing secrets (local dev only)
         with open(ENV_FILE, "w", encoding="utf-8") as f:
             f.writelines(out)
+        try:
+            os.chmod(ENV_FILE, 0o600)
+        except OSError:
+            pass
 
     if not modified and not created:
         print(".env already exists; MCP_INTERNAL_SECRET already set or not present.")

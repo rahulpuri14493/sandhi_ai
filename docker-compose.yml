@@ -70,19 +70,19 @@ services:
     depends_on:
       - backend
 
- # frontend:
- #   build:
- #     context: ./frontend
- #     dockerfile: Dockerfile
- #   container_name: sandhi-frontend
- #   env_file:
- #     - .env
- #   environment:
- #     VITE_PROXY_TARGET: http://backend:8000
- #   depends_on:
- #     - backend
- #   ports:
- #     - "3000:3000"
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: sandhi-frontend
+    env_file:
+      - .env
+    environment:
+      VITE_PROXY_TARGET: http://backend:8000
+    depends_on:
+      - backend
+    ports:
+      - "3000:3000"
 
 volumes:
   db_data:

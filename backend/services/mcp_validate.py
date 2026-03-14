@@ -2,7 +2,10 @@
 Validate MCP tool config (connection test) before save.
 Does not store any data; only checks connectivity where possible.
 """
+import logging
 from typing import Tuple
+
+logger = logging.getLogger(__name__)
 
 
 def validate_tool_config(tool_type: str, config: dict) -> Tuple[bool, str]:
@@ -37,11 +40,12 @@ def _validate_postgres(config: dict) -> Tuple[bool, str]:
         conn.close()
         return True, "PostgreSQL connection successful"
     except Exception as e:
-        err_msg = str(e)
-        # When backend runs in Docker, localhost refers to the container, not the host.
-        if "connection refused" in err_msg.lower() and ("localhost" in conn_str or "127.0.0.1" in conn_str):
-            err_msg += " When the app runs in Docker, use host.docker.internal instead of localhost to reach PostgreSQL on your host (e.g. postgresql://postgres:postgres@host.docker.internal:5432/agent_marketplace). To use the Docker Compose Postgres service, use host 'db' (e.g. postgresql://postgres:postgres@db:5432/agent_marketplace)."
-        return False, err_msg
+        logger.exception("PostgreSQL validation failed")
+        err_text = str(e)
+        base_msg = "Unable to connect to PostgreSQL database; please check host, port, and credentials."
+        if "connection refused" in err_text.lower() and ("localhost" in conn_str or "127.0.0.1" in conn_str):
+            base_msg += " When the app runs in Docker, use host.docker.internal instead of localhost to reach PostgreSQL on your host (e.g. postgresql://postgres:postgres@host.docker.internal:5432/agent_marketplace). To use the Docker Compose Postgres service, use host 'db' (e.g. postgresql://postgres:postgres@db:5432/agent_marketplace)."
+        return False, base_msg
 
 
 def _validate_mysql(config: dict) -> Tuple[bool, str]:
@@ -61,7 +65,8 @@ def _validate_mysql(config: dict) -> Tuple[bool, str]:
     except ImportError:
         return False, "MySQL validation requires pymysql (not installed in backend)"
     except Exception as e:
-        return False, str(e)
+        logger.exception("MySQL validation failed")
+        return False, "Unable to connect to MySQL database; please check host, port, and credentials."
 
 
 def _validate_filesystem(config: dict) -> Tuple[bool, str]:
@@ -91,7 +96,8 @@ def _validate_pageindex(config: dict) -> Tuple[bool, str]:
             return False, f"PageIndex API returned {r.status_code}: {r.text[:200]}"
         return True, "PageIndex connection successful"
     except Exception as e:
-        return False, str(e)
+        logger.exception("PageIndex validation failed")
+        return False, "Unable to reach PageIndex API; please verify the base URL and network connectivity."
 
 
 def _validate_http(config: dict, tool_type: str) -> Tuple[bool, str]:
@@ -107,4 +113,5 @@ def _validate_http(config: dict, tool_type: str) -> Tuple[bool, str]:
             return True, "Endpoint reachable"
         return False, f"Endpoint returned {r.status_code}"
     except Exception as e:
-        return False, str(e)
+        logger.exception("HTTP validation failed for tool type '%s'", tool_type)
+        return False, "Unable to reach the configured HTTP endpoint; please verify the URL and network connectivity."
