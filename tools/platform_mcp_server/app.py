@@ -592,6 +592,72 @@ def _execute_mysql(config: Dict[str, Any], arguments: Dict[str, Any]) -> str:
         return f"Query error: {e}"
 
 
+def _execute_pageindex(config: Dict[str, Any], arguments: Dict[str, Any]) -> str:
+    """
+    Query PageIndex (vectorless RAG) via legacy retrieval API.
+    Config: api_key (required), base_url (optional), default_doc_id (optional).
+    Arguments: query (required), doc_id (optional), thinking (optional bool).
+    """
+    import time
+    api_key = (config.get("api_key") or "").strip()
+    if not api_key:
+        return "Error: api_key not configured"
+    base = (config.get("base_url") or "https://api.pageindex.ai").strip().rstrip("/")
+    if not base.startswith("http"):
+        base = "https://" + base
+    query = (arguments.get("query") or "").strip()
+    if not query:
+        return "Error: query is required"
+    doc_id = (arguments.get("doc_id") or config.get("default_doc_id") or "").strip()
+    if not doc_id:
+        return "Error: doc_id is required (pass in arguments or set default_doc_id in tool config)"
+    thinking = arguments.get("thinking", False)
+    headers = {"api_key": api_key, "Content-Type": "application/json"}
+    try:
+        with httpx.Client(timeout=30.0) as client:
+            r = client.post(
+                f"{base}/retrieval/",
+                headers=headers,
+                json={"doc_id": doc_id, "query": query, "thinking": thinking},
+            )
+            if r.status_code != 200:
+                return f"PageIndex retrieval start error: {r.status_code} {r.text[:500]}"
+            data = r.json()
+            retrieval_id = data.get("retrieval_id")
+            if not retrieval_id:
+                return f"PageIndex unexpected response: {data}"
+        # Poll for completion (max ~60s)
+        for _ in range(24):
+            time.sleep(2.5)
+            with httpx.Client(timeout=15.0) as client:
+                r = client.get(f"{base}/retrieval/{retrieval_id}/", headers={"api_key": api_key})
+            if r.status_code != 200:
+                return f"PageIndex status error: {r.status_code} {r.text[:300]}"
+            data = r.json()
+            status = (data.get("status") or "").lower()
+            if status == "completed":
+                nodes = data.get("retrieved_nodes") or []
+                if not nodes:
+                    return "No matching content found."
+                lines = []
+                for n in nodes:
+                    title = n.get("title") or "(no title)"
+                    node_id = n.get("node_id") or ""
+                    contents = n.get("relevant_contents") or []
+                    lines.append(f"[{title}] (node_id={node_id})")
+                    for c in contents:
+                        page_idx = c.get("page_index", "")
+                        text = (c.get("relevant_content") or "").strip()
+                        if text:
+                            lines.append(f"  Page {page_idx}: {text}")
+                return "\n".join(lines) if lines else json.dumps(data, indent=2)
+            if status in ("failed", "error"):
+                return f"PageIndex retrieval failed: {data.get('detail', data)}"
+        return "PageIndex retrieval timed out (still processing)."
+    except Exception as e:
+        return f"PageIndex error: {e}"
+
+
 def execute_platform_tool(tool_type: str, config: Dict[str, Any], arguments: Dict[str, Any]) -> str:
     """Dispatch to the right tool implementation."""
     if tool_type == "postgres":
@@ -610,6 +676,8 @@ def execute_platform_tool(tool_type: str, config: Dict[str, Any], arguments: Dic
         return _execute_chroma(config, arguments)
     if tool_type == "vector_db":
         return _execute_vector_db(config, arguments)
+    if tool_type == "pageindex":
+        return _execute_pageindex(config, arguments)
     # Stub implementations for integrations (extend with real SDKs as needed)
     if tool_type == "elasticsearch":
         url = (config.get("url") or config.get("host") or "").strip() or "http://localhost:9200"
