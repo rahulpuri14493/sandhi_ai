@@ -23,8 +23,8 @@ const mockAgent = {
 vi.mock('../../src/lib/api', () => ({
   agentsAPI: {
     get: vi.fn(),
-    getReviewSummary: vi.fn().mockResolvedValue({ average_rating: 4.5, total_reviews: 10 }),
-    listReviews: vi.fn().mockResolvedValue({ reviews: [], total: 0 }),
+    getReviewSummary: vi.fn().mockResolvedValue({ average_rating: 4.5, total_count: 10 }),
+    listReviews: vi.fn().mockResolvedValue({ items: [], total: 0 }),
   },
 }))
 vi.mock('../../src/lib/store', () => ({
