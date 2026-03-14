@@ -718,6 +718,7 @@ def list_jobs(
             "failure_reason": job.failure_reason,
             "allowed_platform_tool_ids": job_platform,
             "allowed_connection_ids": job_conn,
+            "tool_visibility": getattr(job, "tool_visibility", None),
         }
         result.append(JobResponse(**job_dict))
     return result
@@ -1024,6 +1025,7 @@ async def update_job(
         "failure_reason": getattr(job, "failure_reason", None),
         "allowed_platform_tool_ids": job_platform,
         "allowed_connection_ids": job_conn,
+        "tool_visibility": getattr(job, "tool_visibility", None),
     }
 
     return JobResponse(**job_dict)

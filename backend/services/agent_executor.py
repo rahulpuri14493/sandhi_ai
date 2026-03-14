@@ -270,8 +270,8 @@ class AgentExecutor:
 
                 available_mcp_tools = self._get_available_mcp_tools(
                     job.business_id,
-                    platform_tool_ids=effective_platform if effective_platform else None,
-                    connection_ids=effective_conn if effective_conn else None,
+                    platform_tool_ids=effective_platform if effective_platform is not None else None,
+                    connection_ids=effective_conn if effective_conn is not None else None,
                 )
                 # Hybrid A2A: restrict what tool info agents see (credentials never shared)
                 tool_visibility = getattr(step, "tool_visibility", None) or getattr(job, "tool_visibility", None) or "full"
