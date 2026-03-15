@@ -15,6 +15,8 @@ os.environ.setdefault("DATABASE_URL", "sqlite:///:memory:")
 # This prevents CI failures when OBJECT_STORAGE_BACKEND defaults to "s3"
 # but S3_* credentials are intentionally not configured for unit/integration tests.
 os.environ.setdefault("OBJECT_STORAGE_BACKEND", "local")
+# Disable the APScheduler background scheduler during tests
+os.environ.setdefault("DISABLE_SCHEDULER", "true")
 
 from db.database import Base, get_db
 from main import app

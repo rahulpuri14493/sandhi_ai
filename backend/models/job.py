@@ -5,6 +5,11 @@ from datetime import datetime
 from db.database import Base
 
 
+class ScheduleStatus(str, enum.Enum):
+    ACTIVE = "active"
+    INACTIVE = "inactive"
+
+
 class JobStatus(str, enum.Enum):
     DRAFT = "draft"
     PENDING_APPROVAL = "pending_approval"
@@ -44,6 +49,7 @@ class Job(Base):
         back_populates="job",
         cascade="all, delete-orphan",
     )
+    schedules = relationship("JobSchedule", back_populates="job", cascade="all, delete-orphan")
 
 
 class WorkflowStep(Base):
@@ -71,3 +77,23 @@ class WorkflowStep(Base):
     agent = relationship("Agent", back_populates="workflow_steps")
     communications_from = relationship("AgentCommunication", foreign_keys="AgentCommunication.from_workflow_step_id", back_populates="from_step")
     communications_to = relationship("AgentCommunication", foreign_keys="AgentCommunication.to_workflow_step_id", back_populates="to_step")
+
+
+class JobSchedule(Base):
+    __tablename__ = "job_schedules"
+
+    id = Column(Integer, primary_key=True, index=True)
+    job_id = Column(Integer, ForeignKey("jobs.id"), nullable=False)
+    cron_expression = Column(String, nullable=False)  # Generated internally, never shown to users
+    status = Column(Enum(ScheduleStatus, name="schedulestatus"), default=ScheduleStatus.ACTIVE, nullable=False)
+    is_one_time = Column(Boolean, default=False, nullable=False)
+    timezone = Column(String, nullable=False, default="UTC")  # IANA timezone e.g. "Asia/Kolkata"
+    scheduled_at = Column(DateTime(timezone=True), nullable=True)  # One-time only: when to run
+    days_of_week = Column(String, nullable=True)  # Recurring: comma-separated day numbers "1,3,5"
+    schedule_time = Column(String, nullable=True)  # Recurring: "HH:MM" e.g. "09:00"
+    last_run_time = Column(DateTime, nullable=True)
+    next_run_time = Column(DateTime, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    # Relationships
+    job = relationship("Job", back_populates="schedules")

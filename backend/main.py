@@ -2,6 +2,7 @@ import logging
 import time
 import uuid
 import os
+from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.exceptions import RequestValidationError
@@ -18,6 +19,8 @@ from middleware.error_handler import (
 from core.encryption import ensure_encryption_key_for_production
 from core.logging_config import configure_logging
 from services.job_file_storage import verify_s3_connectivity
+from core.config import settings
+from services.job_scheduler import JobSchedulerService
 
 configure_logging()
 logger = logging.getLogger(__name__)
@@ -47,11 +50,22 @@ if _s3_check["ok"]:
     logger.info("S3 storage check passed: %s", _s3_check["detail"])
 else:
     logger.warning("S3 storage check FAILED: %s — file uploads will fail until resolved", _s3_check["detail"])
+_scheduler_service = JobSchedulerService()
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    if not settings.DISABLE_SCHEDULER:
+        _scheduler_service.start()
+    yield
+    _scheduler_service.stop()
+
 
 app = FastAPI(
     title="Sandhi AI API",
     description="API for the Sandhi AI Platform",
-    version="1.0.0"
+    version="1.0.0",
+    lifespan=lifespan,
 )
 
 class RequestLoggingMiddleware(BaseHTTPMiddleware):

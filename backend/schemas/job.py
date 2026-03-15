@@ -1,8 +1,163 @@
-from pydantic import BaseModel, field_validator
+from pydantic import BaseModel, field_validator, model_validator
 from typing import Optional, List, Dict, Any
 from datetime import datetime
 import json
-from models.job import JobStatus
+import re
+from zoneinfo import available_timezones
+from models.job import JobStatus, ScheduleStatus
+
+
+_TIME_PATTERN = re.compile(r"^([01]\d|2[0-3]):([0-5]\d)$")
+_VALID_TIMEZONES = available_timezones()
+
+
+def _validate_timezone(tz: str) -> str:
+    if tz not in _VALID_TIMEZONES:
+        raise ValueError(f"Invalid timezone: {tz}")
+    return tz
+
+
+def _validate_time_str(t: str) -> str:
+    if not _TIME_PATTERN.match(t):
+        raise ValueError("Time must be in HH:MM format (e.g. 09:00)")
+    return t
+
+
+def build_cron_from_schedule(days_of_week: List[int], time: str) -> str:
+    """Convert day list + time to a 5-field cron expression.
+    e.g. [1,3,5] + "09:30" → "30 9 * * 1,3,5"
+    """
+    parts = time.split(":")
+    hour, minute = parts[0].lstrip("0") or "0", parts[1].lstrip("0") or "0"
+    dow = ",".join(str(d) for d in sorted(days_of_week)) if days_of_week else "*"
+    return f"{minute} {hour} * * {dow}"
+
+
+def build_cron_from_datetime(dt: datetime) -> str:
+    """Convert a datetime to a cron expression matching that exact minute.
+    e.g. Mar 20 14:30 → "30 14 20 3 *"
+    """
+    return f"{dt.minute} {dt.hour} {dt.day} {dt.month} *"
+
+
+class JobScheduleCreate(BaseModel):
+    is_one_time: bool
+    timezone: str = "UTC"
+    scheduled_at: Optional[datetime] = None  # Required for one-time
+    days_of_week: Optional[List[int]] = None  # Required for recurring (0=Sun, 6=Sat)
+    time: Optional[str] = None  # Required for recurring, "HH:MM"
+    status: ScheduleStatus = ScheduleStatus.ACTIVE
+
+    @field_validator("timezone")
+    @classmethod
+    def validate_tz(cls, v: str) -> str:
+        return _validate_timezone(v)
+
+    @field_validator("time")
+    @classmethod
+    def validate_time(cls, v: Optional[str]) -> Optional[str]:
+        if v is not None:
+            return _validate_time_str(v)
+        return v
+
+    @field_validator("days_of_week")
+    @classmethod
+    def validate_days(cls, v: Optional[List[int]]) -> Optional[List[int]]:
+        if v is not None:
+            for d in v:
+                if d < 0 or d > 6:
+                    raise ValueError("days_of_week values must be 0-6 (Sun=0, Sat=6)")
+            if not v:
+                raise ValueError("days_of_week must not be empty")
+        return v
+
+    @model_validator(mode="after")
+    def check_required_fields(self):
+        if self.is_one_time:
+            if self.scheduled_at is None:
+                raise ValueError("scheduled_at is required for one-time schedules")
+        else:
+            if self.days_of_week is None:
+                raise ValueError("days_of_week is required for recurring schedules")
+            if self.time is None:
+                raise ValueError("time is required for recurring schedules")
+        return self
+
+
+class JobScheduleUpdate(BaseModel):
+    is_one_time: Optional[bool] = None
+    timezone: Optional[str] = None
+    scheduled_at: Optional[datetime] = None
+    days_of_week: Optional[List[int]] = None
+    time: Optional[str] = None
+    status: Optional[ScheduleStatus] = None
+
+    @field_validator("timezone")
+    @classmethod
+    def validate_tz(cls, v: Optional[str]) -> Optional[str]:
+        if v is not None:
+            return _validate_timezone(v)
+        return v
+
+    @field_validator("time")
+    @classmethod
+    def validate_time(cls, v: Optional[str]) -> Optional[str]:
+        if v is not None:
+            return _validate_time_str(v)
+        return v
+
+    @field_validator("days_of_week")
+    @classmethod
+    def validate_days(cls, v: Optional[List[int]]) -> Optional[List[int]]:
+        if v is not None:
+            for d in v:
+                if d < 0 or d > 6:
+                    raise ValueError("days_of_week values must be 0-6 (Sun=0, Sat=6)")
+        return v
+
+
+class JobScheduleResponse(BaseModel):
+    id: int
+    job_id: int
+    status: ScheduleStatus
+    is_one_time: bool
+    timezone: str
+    scheduled_at: Optional[datetime] = None
+    days_of_week: Optional[List[int]] = None
+    time: Optional[str] = None
+    last_run_time: Optional[datetime] = None
+    next_run_time: Optional[datetime] = None
+    created_at: datetime
+
+    class Config:
+        from_attributes = True
+
+    @field_validator("days_of_week", mode="before")
+    @classmethod
+    def parse_days_of_week(cls, v):
+        if v is None:
+            return None
+        if isinstance(v, str) and v.strip():
+            return [int(d) for d in v.split(",") if d.strip()]
+        if isinstance(v, list):
+            return [int(d) for d in v]
+        return None
+
+    @classmethod
+    def model_validate(cls, obj, **kwargs):
+        """Map DB column 'schedule_time' to response field 'time'."""
+        if hasattr(obj, "schedule_time") and not hasattr(obj, "time"):
+            # Create a dict copy to remap the field
+            data = {c.key: getattr(obj, c.key) for c in obj.__table__.columns}
+            data["time"] = data.pop("schedule_time", None)
+            data.pop("cron_expression", None)  # Internal field, not in response
+            return super().model_validate(data, **kwargs)
+        return super().model_validate(obj, **kwargs)
+
+
+class JobScheduleWithJobResponse(JobScheduleResponse):
+    """Schedule response enriched with job title for cross-job listing."""
+    job_title: str = ""
 
 
 def _parse_int_list(v):
@@ -156,3 +311,4 @@ class WorkflowPreview(BaseModel):
 # Update forward references
 JobResponse.model_rebuild()
 WorkflowStepResponse.model_rebuild()
+JobScheduleResponse.model_rebuild()

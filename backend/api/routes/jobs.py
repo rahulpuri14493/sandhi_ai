@@ -10,12 +10,14 @@ from fastapi.responses import FileResponse, Response, StreamingResponse
 from sqlalchemy.orm import Session
 from pydantic import BaseModel
 from db.database import get_db
-from models.job import Job, JobStatus, WorkflowStep
+from models.job import Job, JobStatus, WorkflowStep, JobSchedule, ScheduleStatus
 from models.agent import Agent
 from models.user import User, UserRole
-from schemas.job import JobCreate, JobUpdate, JobResponse, WorkflowStepResponse, WorkflowPreview, AutoSplitBody, AnswerQuestionBody
+from schemas.job import JobCreate, JobUpdate, JobResponse, WorkflowStepResponse, WorkflowPreview, AutoSplitBody, AnswerQuestionBody, JobScheduleCreate, JobScheduleUpdate, JobScheduleResponse, JobScheduleWithJobResponse, build_cron_from_schedule, build_cron_from_datetime
+from croniter import croniter
 from core.security import get_current_user, get_current_business_user
 from core.config import settings
+from services.job_scheduler import get_scheduler
 from services.workflow_builder import WorkflowBuilder
 from services.payment_processor import PaymentProcessor
 from services.agent_executor import AgentExecutor
@@ -180,6 +182,11 @@ def _validate_tool_visibility(v: Optional[str]) -> Optional[str]:
 async def create_job(
     title: str = Form(...),
     description: Optional[str] = Form(None),
+    schedule_is_one_time: Optional[bool] = Form(None),
+    schedule_timezone: Optional[str] = Form(None),
+    schedule_scheduled_at: Optional[str] = Form(None),
+    schedule_days_of_week: Optional[str] = Form(None),
+    schedule_time: Optional[str] = Form(None),
     files: Optional[List[UploadFile]] = File(None),
     allowed_platform_tool_ids: Optional[str] = Form(None),
     allowed_connection_ids: Optional[str] = Form(None),
@@ -187,7 +194,9 @@ async def create_job(
     current_user: User = Depends(get_current_business_user),
     db: Session = Depends(get_db)
 ):
-    """Create a new job with optional file uploads and optional tool scope."""
+    """Create a new job with optional file uploads and an optional schedule."""
+    file_metadata = []
+
     platform_ids = _parse_int_list_form(allowed_platform_tool_ids)
     connection_ids = _parse_int_list_form(allowed_connection_ids)
     if (platform_ids and len(platform_ids)) or (connection_ids and len(connection_ids)):
@@ -233,6 +242,50 @@ async def create_job(
             raise
 
     # Build response with parsed files (remove storage internals for security)
+    # Optionally attach a schedule at creation time
+    if schedule_is_one_time is not None:
+        try:
+            sched_data = {"is_one_time": schedule_is_one_time, "timezone": schedule_timezone or "UTC"}
+            if schedule_is_one_time:
+                if not schedule_scheduled_at:
+                    raise ValueError("scheduled_at is required for one-time schedules")
+                sched_data["scheduled_at"] = schedule_scheduled_at
+            else:
+                if not schedule_days_of_week or not schedule_time:
+                    raise ValueError("days_of_week and time are required for recurring schedules")
+                sched_data["days_of_week"] = json.loads(schedule_days_of_week)
+                sched_data["time"] = schedule_time
+            schedule_payload = JobScheduleCreate(**sched_data)
+        except (ValueError, json.JSONDecodeError) as exc:
+            raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc))
+
+        # Build cron internally
+        if schedule_payload.is_one_time:
+            cron_expr = build_cron_from_datetime(schedule_payload.scheduled_at)
+        else:
+            cron_expr = build_cron_from_schedule(schedule_payload.days_of_week, schedule_payload.time)
+
+        schedule = JobSchedule(
+            job_id=new_job.id,
+            cron_expression=cron_expr,
+            status=schedule_payload.status,
+            is_one_time=schedule_payload.is_one_time,
+            timezone=schedule_payload.timezone,
+            scheduled_at=schedule_payload.scheduled_at,
+            days_of_week=",".join(str(d) for d in schedule_payload.days_of_week) if schedule_payload.days_of_week else None,
+            schedule_time=schedule_payload.time,
+            next_run_time=_compute_next_run(cron_expr) if schedule_payload.status == ScheduleStatus.ACTIVE else None,
+        )
+        db.add(schedule)
+        db.commit()
+        db.refresh(schedule)
+
+        # Register with APScheduler
+        svc = get_scheduler()
+        if svc and schedule.status == ScheduleStatus.ACTIVE:
+            svc.add_schedule(schedule.id, cron_expr, timezone=schedule.timezone)
+
+    # Build response with parsed files (remove paths for security)
     files_for_response = []
     if file_metadata:
         for file_info in file_metadata:
@@ -1443,6 +1496,26 @@ def execute_job(
     return JobResponse(**job_dict)
 
 
+def _reset_job_for_rerun(db: Session, job: Job):
+    """Reset a job and its workflow steps so it can be executed again.
+
+    Shared by the rerun endpoint and the scheduler service.
+    """
+    workflow_steps = db.query(WorkflowStep).filter(WorkflowStep.job_id == job.id).all()
+    for step in workflow_steps:
+        step.output_data = None
+        step.status = "pending"
+        step.started_at = None
+        step.completed_at = None
+        step.cost = 0.0
+
+    job.status = JobStatus.PENDING_APPROVAL
+    job.completed_at = None
+    job.failure_reason = None
+    db.commit()
+    db.refresh(job)
+
+
 @router.post("/{job_id}/rerun", response_model=JobResponse)
 def rerun_job(
     job_id: int,
@@ -1456,35 +1529,21 @@ def rerun_job(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Job not found"
         )
-    
+
     if job.business_id != current_user.id:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Not authorized"
         )
-    
+
     # Only allow rerunning completed or failed jobs
     if job.status not in [JobStatus.COMPLETED, JobStatus.FAILED]:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Only completed or failed jobs can be rerun"
         )
-    
-    # Reset workflow steps - clear output data and reset status
-    workflow_steps = db.query(WorkflowStep).filter(WorkflowStep.job_id == job_id).all()
-    for step in workflow_steps:
-        step.output_data = None
-        step.status = "pending"
-        step.started_at = None
-        step.completed_at = None
-        step.cost = 0.0
-    
-        # Reset job status to pending_approval so it can be executed again
-        job.status = JobStatus.PENDING_APPROVAL
-        job.completed_at = None
-        job.failure_reason = None  # Clear previous failure reason
-        db.commit()
-    db.refresh(job)
+
+    _reset_job_for_rerun(db, job)
     
     # Parse files and conversation for response
     files_data = None
@@ -1705,3 +1764,212 @@ def download_job_file(
         filename=file_info["name"],
         media_type=file_info["type"]
     )
+
+
+# ---------------------------------------------------------------------------
+# Job Schedule CRUD
+# ---------------------------------------------------------------------------
+
+@router.get("/schedules/all", response_model=List[JobScheduleWithJobResponse])
+def list_all_schedules(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """List all schedules across all jobs owned by the current user."""
+    schedules = (
+        db.query(JobSchedule, Job.title)
+        .join(Job, Job.id == JobSchedule.job_id)
+        .filter(Job.business_id == current_user.id)
+        .order_by(JobSchedule.created_at.desc())
+        .all()
+    )
+    results = []
+    for schedule, job_title in schedules:
+        resp = JobScheduleResponse.model_validate(schedule)
+        data = resp.model_dump()
+        data["job_title"] = job_title
+        results.append(JobScheduleWithJobResponse(**data))
+    return results
+
+
+def _compute_next_run(cron_expression: str) -> datetime:
+    """Return the next scheduled datetime for a cron expression."""
+    return croniter(cron_expression, datetime.utcnow()).get_next(datetime)
+
+
+@router.post("/{job_id}/schedules", response_model=JobScheduleResponse, status_code=status.HTTP_201_CREATED)
+def create_job_schedule(
+    job_id: int,
+    payload: JobScheduleCreate,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_business_user),
+):
+    """Attach a schedule to an existing job using structured date/time fields."""
+    job = db.query(Job).filter(Job.id == job_id, Job.business_id == current_user.id).first()
+    if not job:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Job not found")
+
+    # Build cron expression internally from structured fields
+    if payload.is_one_time:
+        cron_expr = build_cron_from_datetime(payload.scheduled_at)
+    else:
+        cron_expr = build_cron_from_schedule(payload.days_of_week, payload.time)
+
+    next_run = _compute_next_run(cron_expr) if payload.status == ScheduleStatus.ACTIVE else None
+    schedule = JobSchedule(
+        job_id=job_id,
+        cron_expression=cron_expr,
+        status=payload.status,
+        is_one_time=payload.is_one_time,
+        timezone=payload.timezone,
+        scheduled_at=payload.scheduled_at,
+        days_of_week=",".join(str(d) for d in payload.days_of_week) if payload.days_of_week else None,
+        schedule_time=payload.time,
+        next_run_time=next_run,
+    )
+    db.add(schedule)
+    db.commit()
+    db.refresh(schedule)
+
+    # Register with APScheduler if active
+    if schedule.status == ScheduleStatus.ACTIVE:
+        svc = get_scheduler()
+        if svc:
+            svc.add_schedule(schedule.id, cron_expr, timezone=schedule.timezone)
+
+    return JobScheduleResponse.model_validate(schedule)
+
+
+@router.get("/{job_id}/schedules", response_model=List[JobScheduleResponse])
+def list_job_schedules(
+    job_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """List all schedules for a job."""
+    job = db.query(Job).filter(Job.id == job_id).first()
+    if not job:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Job not found")
+    if job.business_id != current_user.id:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Not authorized")
+
+    schedules = db.query(JobSchedule).filter(JobSchedule.job_id == job_id).all()
+    return [JobScheduleResponse.model_validate(s) for s in schedules]
+
+
+@router.get("/{job_id}/schedules/{schedule_id}", response_model=JobScheduleResponse)
+def get_job_schedule(
+    job_id: int,
+    schedule_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Get a specific schedule."""
+    schedule = (
+        db.query(JobSchedule)
+        .filter(JobSchedule.id == schedule_id, JobSchedule.job_id == job_id)
+        .first()
+    )
+    if not schedule:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Schedule not found")
+
+    job = db.query(Job).filter(Job.id == job_id).first()
+    if job.business_id != current_user.id:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Not authorized")
+
+    return JobScheduleResponse.model_validate(schedule)
+
+
+@router.put("/{job_id}/schedules/{schedule_id}", response_model=JobScheduleResponse)
+def update_job_schedule(
+    job_id: int,
+    schedule_id: int,
+    payload: JobScheduleUpdate,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_business_user),
+):
+    """Update a job schedule using structured date/time fields."""
+    schedule = (
+        db.query(JobSchedule)
+        .filter(JobSchedule.id == schedule_id, JobSchedule.job_id == job_id)
+        .first()
+    )
+    if not schedule:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Schedule not found")
+
+    job = db.query(Job).filter(Job.id == job_id).first()
+    if job.business_id != current_user.id:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Not authorized")
+
+    # Apply updates from payload
+    if payload.is_one_time is not None:
+        schedule.is_one_time = payload.is_one_time
+    if payload.timezone is not None:
+        schedule.timezone = payload.timezone
+    if payload.scheduled_at is not None:
+        schedule.scheduled_at = payload.scheduled_at
+    if payload.days_of_week is not None:
+        schedule.days_of_week = ",".join(str(d) for d in payload.days_of_week)
+    if payload.time is not None:
+        schedule.schedule_time = payload.time
+    if payload.status is not None:
+        schedule.status = payload.status
+
+    # Rebuild cron expression from current structured fields
+    if schedule.is_one_time and schedule.scheduled_at:
+        schedule.cron_expression = build_cron_from_datetime(schedule.scheduled_at)
+    elif not schedule.is_one_time and schedule.days_of_week and schedule.schedule_time:
+        days = [int(d) for d in schedule.days_of_week.split(",") if d.strip()]
+        schedule.cron_expression = build_cron_from_schedule(days, schedule.schedule_time)
+
+    # Recompute next_run_time
+    active_status = payload.status if payload.status is not None else schedule.status
+    if active_status == ScheduleStatus.ACTIVE:
+        schedule.next_run_time = _compute_next_run(schedule.cron_expression)
+    else:
+        schedule.next_run_time = None
+
+    db.commit()
+    db.refresh(schedule)
+
+    # Sync with APScheduler
+    svc = get_scheduler()
+    if svc:
+        if schedule.status == ScheduleStatus.ACTIVE:
+            svc.update_schedule(schedule.id, schedule.cron_expression, timezone=schedule.timezone)
+        else:
+            svc.remove_schedule(schedule.id)
+
+    return JobScheduleResponse.model_validate(schedule)
+
+
+@router.delete("/{job_id}/schedules/{schedule_id}", status_code=status.HTTP_204_NO_CONTENT)
+def delete_job_schedule(
+    job_id: int,
+    schedule_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_business_user),
+):
+    """Delete a job schedule."""
+    schedule = (
+        db.query(JobSchedule)
+        .filter(JobSchedule.id == schedule_id, JobSchedule.job_id == job_id)
+        .first()
+    )
+    if not schedule:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Schedule not found")
+
+    job = db.query(Job).filter(Job.id == job_id).first()
+    if job.business_id != current_user.id:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Not authorized")
+
+    schedule_id_to_remove = schedule.id
+    db.delete(schedule)
+    db.commit()
+
+    # Remove from APScheduler
+    svc = get_scheduler()
+    if svc:
+        svc.remove_schedule(schedule_id_to_remove)
+
+    return Response(status_code=status.HTTP_204_NO_CONTENT)
