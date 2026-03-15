@@ -6,7 +6,7 @@ from fastapi.exceptions import RequestValidationError
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from sqlalchemy.exc import OperationalError
 from db.database import engine, Base
-from db.run_mcp_migration import run_mcp_migration_if_needed
+from db.run_mcp_migration import run_initial_migrations_if_needed, run_mcp_migration_if_needed
 from api.routes import auth, agents, jobs, payments, dashboards, hiring, external_jobs, mcp, mcp_internal
 from middleware.error_handler import (
     validation_exception_handler,
@@ -29,6 +29,7 @@ def _init_db():
                 raise
             time.sleep(1)
 _init_db()
+run_initial_migrations_if_needed()
 run_mcp_migration_if_needed()
 ensure_encryption_key_for_production()
 

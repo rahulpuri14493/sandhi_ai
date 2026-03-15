@@ -97,10 +97,10 @@ export const jobsAPI = {
     if (payload.files?.length) {
       payload.files.forEach((f) => form.append('files', f))
     }
-    if (payload.allowed_platform_tool_ids?.length) {
+    if (payload.allowed_platform_tool_ids !== undefined && Array.isArray(payload.allowed_platform_tool_ids)) {
       form.append('allowed_platform_tool_ids', JSON.stringify(payload.allowed_platform_tool_ids))
     }
-    if (payload.allowed_connection_ids?.length) {
+    if (payload.allowed_connection_ids !== undefined && Array.isArray(payload.allowed_connection_ids)) {
       form.append('allowed_connection_ids', JSON.stringify(payload.allowed_connection_ids))
     }
     if (payload.tool_visibility) form.append('tool_visibility', payload.tool_visibility)
@@ -286,7 +286,18 @@ export const mcpAPI = {
     return api.post('/mcp/proxy', { connection_id: connectionId, method, params }).then((res) => res.data)
   },
   getRegistry() {
-    return api.get<{ tools: Array<{ source: string; name: string; tool_type?: string; description?: string }>; platform_tool_count: number }>('/mcp/registry').then((res) => res.data)
+    return api.get<{
+      tools: Array<{
+        source: string
+        name: string
+        tool_type?: string
+        description?: string
+        id?: number
+        connection_id?: number
+        base_url?: string
+      }>;
+      platform_tool_count: number
+    }>('/mcp/registry').then((res) => res.data)
   },
   validateToolConfig(tool_type: string, config: Record<string, unknown>) {
     return api.post<{ valid: boolean; message: string }>('/mcp/tools/validate', { tool_type, config }).then((res) => res.data)

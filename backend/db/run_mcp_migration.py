@@ -1,13 +1,19 @@
 """
-Run MCP migration (013) if MCP tables do not exist.
+Run migrations on startup.
 
-Called after Base.metadata.create_all() so existing databases get
-mcp_server_connections and mcp_tool_configs without manual psql.
-Idempotent: uses CREATE TABLE IF NOT EXISTS and CREATE INDEX IF NOT EXISTS.
+- 001–012 (pricing model, hiring, reviews, A2A, workflow, etc.): applied in order
+  once per DB using schema_migrations table.
+- 013–019 (MCP tables and tool config): applied if relevant tables do not exist.
+
+Called after Base.metadata.create_all(). Skipped for SQLite (test DBs).
 """
+import logging
 import os
 from sqlalchemy import text
 from db.database import engine
+
+# Migrations 001–012 are run automatically in order (once each, tracked in schema_migrations).
+INITIAL_MIGRATION_PREFIX = ("001_", "002_", "003_", "004_", "005_", "006_", "007_", "008_", "009_", "010_", "011_", "012_")
 
 
 def _migration_dir():
@@ -31,6 +37,86 @@ def _table_exists(conn, table_name: str) -> bool:
             {"name": table_name},
         )
     return r.scalar() is not None
+
+
+def _ensure_schema_migrations_table(conn):
+    """Create schema_migrations table if it does not exist (PostgreSQL)."""
+    conn.execute(
+        text(
+            "CREATE TABLE IF NOT EXISTS schema_migrations "
+            "(id SERIAL PRIMARY KEY, name VARCHAR(255) NOT NULL UNIQUE, applied_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)"
+        )
+    )
+    conn.commit()
+
+
+def _migration_applied(conn, name: str) -> bool:
+    """Return True if the migration name is already recorded."""
+    r = conn.execute(
+        text("SELECT 1 FROM schema_migrations WHERE name = :name"),
+        {"name": name},
+    )
+    return r.scalar() is not None
+
+
+def _record_migration(conn, name: str):
+    """Record that a migration has been applied."""
+    conn.execute(
+        text("INSERT INTO schema_migrations (name) VALUES (:name)"),
+        {"name": name},
+    )
+    conn.commit()
+
+
+def _run_sql_file(conn, path: str):
+    """Execute a SQL file. Splits by statement while keeping DO $$ ... END $$ blocks together."""
+    with open(path, "r", encoding="utf-8") as f:
+        sql = f.read()
+    # Split into statements; DO $$ ... END $$ must stay one statement (psycopg2 runs one per execute)
+    statements = []
+    for raw in sql.split(";"):
+        s = raw.strip()
+        if not s or s.startswith("--"):
+            continue
+        # Merge continuation of DO $$ block (contains END $$ but not DO $$) with previous
+        if "END $$" in s and "DO $$" not in s and statements:
+            statements[-1] = statements[-1] + "; " + s
+        else:
+            statements.append(s)
+    for stmt in statements:
+        if not stmt.strip():
+            continue
+        try:
+            conn.execute(text(stmt))
+        except Exception:
+            # Allow idempotent migrations to skip duplicates
+            raise
+    conn.commit()
+
+
+def run_initial_migrations_if_needed():
+    """Run migrations 001–012 in order if not already applied. Skipped for SQLite."""
+    if engine.dialect.name == "sqlite":
+        return
+    migration_dir = _migration_dir()
+    with engine.connect() as conn:
+        _ensure_schema_migrations_table(conn)
+        # List 001_*.sql through 012_*.sql in order
+        for prefix in INITIAL_MIGRATION_PREFIX:
+            candidates = [f for f in os.listdir(migration_dir) if f.startswith(prefix) and f.endswith(".sql")]
+            for filename in sorted(candidates):
+                if _migration_applied(conn, filename):
+                    continue
+                path = os.path.join(migration_dir, filename)
+                if not os.path.isfile(path):
+                    continue
+                try:
+                    _run_sql_file(conn, path)
+                    _record_migration(conn, filename)
+                except Exception as e:
+                    # Log but do not record so it can be retried
+                    logging.getLogger(__name__).warning("Initial migration %s failed: %s", filename, e)
+                    raise
 
 
 def run_mcp_migration_if_needed():

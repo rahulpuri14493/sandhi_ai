@@ -16,6 +16,7 @@ export default function MCPPage() {
   const [connections, setConnections] = useState<MCPServerConnectionRes[]>([])
   const [tools, setTools] = useState<MCPToolConfigRes[]>([])
   const [registryCount, setRegistryCount] = useState<number | null>(null)
+  const [registryTools, setRegistryTools] = useState<Array<{ source: string; name: string; tool_type?: string; description?: string; id?: number; connection_id?: number; base_url?: string }>>([])
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
   const [editTool, setEditTool] = useState<MCPToolConfigRes | null>(null)
@@ -71,7 +72,12 @@ export default function MCPPage() {
 
   useEffect(() => {
     if (user && view === 'choose') {
-      mcpAPI.getRegistry().then((r) => setRegistryCount(r.tools?.length ?? 0)).catch(() => setRegistryCount(0))
+      mcpAPI.getRegistry()
+        .then((r) => {
+          setRegistryTools(r.tools ?? [])
+          setRegistryCount(r.tools?.length ?? 0)
+        })
+        .catch(() => { setRegistryTools([]); setRegistryCount(0) })
     }
   }, [user, view])
 
@@ -101,9 +107,36 @@ export default function MCPPage() {
           View your configured tools and connections below, or connect an MCP server or add platform tools (Vector DB, PostgreSQL, File system, and more). Credentials are stored securely per account.
         </p>
         {registryCount !== null && registryCount > 0 && (
-          <p className="text-primary-400/90 mt-2 text-sm font-medium">
-            {registryCount} tool{registryCount !== 1 ? 's' : ''} available for agents in your jobs.
-          </p>
+          <>
+            <p className="text-primary-400/90 mt-2 text-sm font-medium">
+              {registryCount} tool{registryCount !== 1 ? 's' : ''} available for agents in your jobs.
+            </p>
+            {registryTools.length > 0 && (
+              <div className="mt-3 p-4 rounded-xl bg-dark-100/80 border border-dark-200">
+                <h3 className="text-sm font-semibold text-white/90 mb-2">Tools available in MCP Server</h3>
+                <ul className="flex flex-wrap gap-2">
+                  {registryTools.map((t, idx) => (
+                    <li
+                      key={t.source === 'platform' ? `platform-${t.id ?? idx}` : `ext-${t.connection_id ?? idx}`}
+                      className="inline-flex items-center gap-2 px-3 py-1.5 rounded-lg bg-dark-200/80 border border-dark-300 text-sm"
+                    >
+                      <span className="font-medium text-white truncate max-w-[200px]" title={t.name}>{t.name}</span>
+                      {t.source === 'platform' && t.tool_type && (
+                        <span className="inline-flex px-2 py-0.5 rounded text-xs font-medium bg-primary-500/20 text-primary-300 border border-primary-500/30 shrink-0">
+                          {TOOL_LABELS[t.tool_type] ?? t.tool_type}
+                        </span>
+                      )}
+                      {t.source === 'external' && (
+                        <span className="inline-flex px-2 py-0.5 rounded text-xs font-medium bg-white/10 text-white/80 border border-dark-300 shrink-0">
+                          MCP connection
+                        </span>
+                      )}
+                    </li>
+                  ))}
+                </ul>
+              </div>
+            )}
+          </>
         )}
       </div>
 

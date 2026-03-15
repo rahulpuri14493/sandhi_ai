@@ -26,7 +26,7 @@ All SQL migrations live here. **Run in order** (001 → 017) when setting up or 
 
 **Prerequisites:** Core tables (`users`, `agents`, `jobs`, etc.) must exist. The app creates them via `Base.metadata.create_all()` on startup; if you use a blank DB, start the app once so core tables exist, then run migrations.
 
-**MCP (013):** The backend automatically runs `013_add_mcp_tables.sql` on startup if the `mcp_server_connections` table does not exist. You do not need to run 013 manually when using Docker or the default backend startup.
+**Automatic on startup:** The backend runs **001–012** in order on startup (once per DB, tracked in `schema_migrations`), then **013–019** if the relevant MCP tables/columns are missing. You do not need to run these manually when using Docker or the default backend startup.
 
 ## Run all migrations (Docker)
 
