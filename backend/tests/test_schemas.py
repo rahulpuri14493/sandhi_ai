@@ -12,6 +12,8 @@ from schemas.job import (
     WorkflowStepCreate,
     WorkflowStepResponse,
     WorkflowPreview,
+    AutoSplitBody,
+    StepToolsAssignment,
 )
 from models.job import JobStatus
 
@@ -45,6 +47,12 @@ def test_job_update_partial():
     assert data.status is None
 
 
+def test_job_update_tool_visibility():
+    """JobUpdate accepts tool_visibility."""
+    data = JobUpdate(tool_visibility="none")
+    assert data.tool_visibility == "none"
+
+
 def test_job_update_status():
     """JobUpdate accepts valid status."""
     data = JobUpdate(status=JobStatus.APPROVED)
@@ -66,6 +74,26 @@ def test_workflow_step_create_with_input_data():
     assert data.input_data == input_data
 
 
+def test_workflow_step_create_with_tool_visibility():
+    """WorkflowStepCreate accepts tool_visibility."""
+    data = WorkflowStepCreate(agent_id=1, step_order=1, tool_visibility="names_only")
+    assert data.tool_visibility == "names_only"
+
+
+def test_step_tools_assignment_with_tool_visibility():
+    """StepToolsAssignment accepts tool_visibility."""
+    data = StepToolsAssignment(agent_index=0, tool_visibility="none")
+    assert data.agent_index == 0
+    assert data.tool_visibility == "none"
+
+
+def test_auto_split_body_tool_visibility():
+    """AutoSplitBody accepts tool_visibility."""
+    data = AutoSplitBody(agent_ids=[1, 2], tool_visibility="names_only")
+    assert data.agent_ids == [1, 2]
+    assert data.tool_visibility == "names_only"
+
+
 def test_workflow_step_response_from_attributes():
     """WorkflowStepResponse can be created from ORM-like object."""
     class MockStep:
@@ -79,6 +107,10 @@ def test_workflow_step_response_from_attributes():
         cost = 5.0
         started_at = datetime.utcnow()
         completed_at = datetime.utcnow()
+        depends_on_previous = True
+        allowed_platform_tool_ids = None
+        allowed_connection_ids = None
+        tool_visibility = "full"
 
     step = WorkflowStepResponse.model_validate(MockStep())
     assert step.id == 1
@@ -86,6 +118,7 @@ def test_workflow_step_response_from_attributes():
     assert step.agent_id == 1
     assert step.cost == 5.0
     assert step.status == "completed"
+    assert step.tool_visibility == "full"
 
 
 def test_workflow_preview_valid():

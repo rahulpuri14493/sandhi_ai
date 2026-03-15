@@ -10,6 +10,9 @@ env:
   POSTGRES_PASSWORD: postgres
   POSTGRES_DB: agent_marketplace
 
+permissions:
+  contents: read
+
 jobs:
   docker-compose-stack:
     name: Docker Compose stack
@@ -38,16 +41,20 @@ jobs:
             sleep 2
           done
 
-      - name: Wait for frontend
+      - name: Wait for frontend (if in stack)
         run: |
-          for i in $(seq 1 20); do
-            if curl -sf http://localhost:3000 > /dev/null 2>&1; then
-              echo "Frontend ready"
-              break
-            fi
-            [ "$i" -eq 20 ] && (docker compose logs frontend; exit 1)
-            sleep 2
-          done
+          if docker compose config --services 2>/dev/null | grep -qx frontend; then
+            for i in $(seq 1 20); do
+              if curl -sf http://localhost:3000 > /dev/null 2>&1; then
+                echo "Frontend ready"
+                break
+              fi
+              [ "$i" -eq 20 ] && (docker compose logs frontend; exit 1)
+              sleep 2
+            done
+          else
+            echo "No frontend service in stack, skipping"
+          fi
 
       - name: Stop stack
         if: always()
@@ -88,6 +95,38 @@ jobs:
 
       - name: Run integration tests
         run: pytest tests/integration/ -v
+
+  platform-mcp-tests:
+    name: Platform MCP server tests
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: tools/platform_mcp_server
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Cache pip dependencies
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-mcp-${{ hashFiles('tools/platform_mcp_server/requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-mcp-
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pytest
+
+      - name: Run platform MCP tool tests
+        run: pytest tests/ -v --tb=short
 
   frontend-tests:
     name: Frontend tests

@@ -1,13 +1,19 @@
 import { useState, useEffect } from 'react'
 import { useNavigate } from 'react-router-dom'
-import { jobsAPI, agentsAPI } from '../lib/api'
+import { jobsAPI, agentsAPI, mcpAPI } from '../lib/api'
 import type { Agent } from '../lib/types'
+import type { MCPToolConfigRes, MCPServerConnectionRes } from '../lib/api'
 
 export default function NewJobPage() {
   const [title, setTitle] = useState('')
   const [description, setDescription] = useState('')
   const [selectedAgents, setSelectedAgents] = useState<number[]>([])
   const [availableAgents, setAvailableAgents] = useState<Agent[]>([])
+  const [platformTools, setPlatformTools] = useState<MCPToolConfigRes[]>([])
+  const [connections, setConnections] = useState<MCPServerConnectionRes[]>([])
+  const [selectedPlatformToolIds, setSelectedPlatformToolIds] = useState<number[]>([])
+  const [selectedConnectionIds, setSelectedConnectionIds] = useState<number[]>([])
+  const [toolVisibility, setToolVisibility] = useState<'full' | 'names_only' | 'none'>('full')
   const [selectedFiles, setSelectedFiles] = useState<File[]>([])
   const [isLoading, setIsLoading] = useState(false)
   const [error, setError] = useState('')
@@ -15,6 +21,7 @@ export default function NewJobPage() {
 
   useEffect(() => {
     loadAgents()
+    loadTools()
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
@@ -25,6 +32,27 @@ export default function NewJobPage() {
     } catch (error) {
       console.error('Failed to load agents:', error)
     }
+  }
+
+  const loadTools = async () => {
+    try {
+      const [tools, conns] = await Promise.all([mcpAPI.listTools(), mcpAPI.listConnections()])
+      setPlatformTools(tools)
+      setConnections(conns)
+    } catch (error) {
+      console.error('Failed to load tools:', error)
+    }
+  }
+
+  const togglePlatformTool = (id: number) => {
+    setSelectedPlatformToolIds((prev) =>
+      prev.includes(id) ? prev.filter((x) => x !== id) : [...prev, id]
+    )
+  }
+  const toggleConnection = (id: number) => {
+    setSelectedConnectionIds((prev) =>
+      prev.includes(id) ? prev.filter((x) => x !== id) : [...prev, id]
+    )
   }
 
   const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -68,7 +96,10 @@ export default function NewJobPage() {
       const job = await jobsAPI.create({ 
         title, 
         description,
-        files: selectedFiles.length > 0 ? selectedFiles : undefined
+        files: selectedFiles.length > 0 ? selectedFiles : undefined,
+        allowed_platform_tool_ids: selectedPlatformToolIds.length > 0 ? selectedPlatformToolIds : undefined,
+        allowed_connection_ids: selectedConnectionIds.length > 0 ? selectedConnectionIds : undefined,
+        tool_visibility: toolVisibility,
       })
       navigate(`/jobs/${job.id}`, { state: { selectedAgents } })
     } catch (err: any) {
@@ -141,6 +172,19 @@ export default function NewJobPage() {
             />
           </div>
           <div className="mb-8">
+            <label className="block text-white font-bold mb-2 text-lg">Tool visibility (optional)</label>
+            <p className="text-sm text-white/50 mb-2 font-medium">Control how much tool info agents see. Credentials are never shared.</p>
+            <select
+              value={toolVisibility}
+              onChange={(e) => setToolVisibility(e.target.value as 'full' | 'names_only' | 'none')}
+              className="px-4 py-2.5 bg-white border-2 border-gray-300 rounded-xl text-gray-900 focus:outline-none focus:ring-2 focus:ring-primary-500 w-full max-w-xl"
+            >
+              <option value="full">Full — Names, descriptions, schema & business context</option>
+              <option value="names_only">Names only — Tool names and short description; no schema or DB context</option>
+              <option value="none">None — No tool list; agents cannot use MCP tools for this job</option>
+            </select>
+          </div>
+          <div className="mb-8">
             <label className="block text-white font-bold mb-3 text-lg" htmlFor="files">
               Upload Documents (optional)
             </label>
@@ -205,6 +249,56 @@ export default function NewJobPage() {
                   </div>
                 ))}
               </div>
+            )}
+          </div>
+          <div className="mb-8">
+            <label className="block text-white font-bold mb-3 text-lg">
+              Tools for this job (optional)
+            </label>
+            <p className="text-sm text-white/50 mb-3 font-medium">
+              Choose which tools agents can use for this job. Leave empty to allow all your configured tools. You can assign specific tools per agent when building the workflow.
+            </p>
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-4 mb-4">
+              {platformTools.length > 0 && (
+                <div className="border-2 border-dark-300 rounded-xl p-4 bg-dark-200/30">
+                  <h4 className="text-white font-semibold mb-2">Platform tools</h4>
+                  <div className="space-y-2 max-h-40 overflow-y-auto">
+                    {platformTools.map((t) => (
+                      <label key={t.id} className="flex items-center gap-2 cursor-pointer text-white/90">
+                        <input
+                          type="checkbox"
+                          checked={selectedPlatformToolIds.includes(t.id)}
+                          onChange={() => togglePlatformTool(t.id)}
+                          className="w-4 h-4 text-primary-600 rounded"
+                        />
+                        <span className="text-sm">{t.name}</span>
+                        <span className="text-xs text-white/50">({t.tool_type})</span>
+                      </label>
+                    ))}
+                  </div>
+                </div>
+              )}
+              {connections.length > 0 && (
+                <div className="border-2 border-dark-300 rounded-xl p-4 bg-dark-200/30">
+                  <h4 className="text-white font-semibold mb-2">MCP connections</h4>
+                  <div className="space-y-2 max-h-40 overflow-y-auto">
+                    {connections.map((c) => (
+                      <label key={c.id} className="flex items-center gap-2 cursor-pointer text-white/90">
+                        <input
+                          type="checkbox"
+                          checked={selectedConnectionIds.includes(c.id)}
+                          onChange={() => toggleConnection(c.id)}
+                          className="w-4 h-4 text-primary-600 rounded"
+                        />
+                        <span className="text-sm truncate">{c.name}</span>
+                      </label>
+                    ))}
+                  </div>
+                </div>
+              )}
+            </div>
+            {platformTools.length === 0 && connections.length === 0 && (
+              <p className="text-white/50 text-sm">No tools or connections configured yet. Add them in MCP Server to make them available for jobs.</p>
             )}
           </div>
           <div className="mb-8">

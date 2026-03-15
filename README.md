@@ -29,10 +29,16 @@ Think of this as a talent marketplace—but for AI agents instead of human freel
 ### Running with Docker
 
 1. Clone the repository.
-2. Copy `.env.example` to `.env` and update values if needed.
+2. **(First-time setup)** Create `.env` and set MCP secrets so the platform MCP server works:
+   ```bash
+   python scripts/setup_env.py
+   ```
+   This creates `.env` from `.env.example` and sets `MCP_INTERNAL_SECRET` (and optionally `MCP_ENCRYPTION_KEY`). Alternatively, copy `.env.example` to `.env` and set `MCP_INTERNAL_SECRET` to a random value (e.g. `python -c "import secrets; print(secrets.token_urlsafe(32))"`).
 3. Run `docker-compose up` to start all services.
 
 If you are updating an existing database, run migrations in order (see `backend/migrations/README.md`). For A2A support, ensure `011_add_a2a_enabled_column.sql` is applied. The stack includes the A2A ↔ OpenAI adapter so OpenAI-compatible agents are called via A2A. To run without it (direct OpenAI calls), set `A2A_ADAPTER_URL=` in the backend environment.
+
+**MCP (production):** For the MCP Server feature (connect external MCP servers, configure Vector DB/Postgres/File system tools), set `MCP_ENCRYPTION_KEY` in the backend environment to a long random value so stored credentials are encrypted with a key independent of JWT. See `.env.example` for the generate command. Run migration `013_add_mcp_tables.sql` if you use MCP. The platform runs its own **Platform MCP Server** (`tools/platform_mcp_server`) so agents can discover and invoke enterprise tools (Vector DB, PostgreSQL, File system) per tenant; set `MCP_INTERNAL_SECRET` (same value in backend and platform-mcp-server) to secure internal API calls.
 
 ### Local Development
 

@@ -1,6 +1,6 @@
 # Database migrations
 
-All SQL migrations live here. **Run in order** (001 → 011) when setting up or updating the database. Each file is idempotent where possible (`IF NOT EXISTS`, `IF EXISTS`).
+All SQL migrations live here. **Run in order** (001 → 017) when setting up or updating the database. Each file is idempotent where possible (`IF NOT EXISTS`, `IF EXISTS`).
 
 ## Order
 
@@ -17,8 +17,16 @@ All SQL migrations live here. **Run in order** (001 → 011) when setting up or 
 | `009_add_agent_reviews_table.sql` | agent_reviews table (ratings/reviews) |
 | `010_drop_agent_review_unique_constraint.sql` | Allow multiple reviews per user per agent |
 | `011_add_a2a_enabled_column.sql` | Agents: a2a_enabled (A2A protocol support) |
+| `012_add_workflow_step_depends_on_previous.sql` | Workflow steps: dependency support |
+| `013_add_mcp_tables.sql` | MCP: mcp_server_connections, mcp_tool_configs (encrypted credentials per user) |
+| `014_add_mcp_tool_types.sql` | MCP: add tool types (pinecone, weaviate, qdrant, chroma, mysql, elasticsearch, s3, slack, github, notion, rest_api) |
+| `015_add_mcp_endpoint_path.sql` | MCP connections: endpoint_path |
+| `016_add_job_and_step_allowed_tools.sql` | Jobs/workflow steps: allowed_platform_tool_ids, allowed_connection_ids |
+| `017_add_tool_schema_and_business_context.sql` | MCP tool configs: schema_metadata, business_description (for SQL tools) |
 
 **Prerequisites:** Core tables (`users`, `agents`, `jobs`, etc.) must exist. The app creates them via `Base.metadata.create_all()` on startup; if you use a blank DB, start the app once so core tables exist, then run migrations.
+
+**MCP (013):** The backend automatically runs `013_add_mcp_tables.sql` on startup if the `mcp_server_connections` table does not exist. You do not need to run 013 manually when using Docker or the default backend startup.
 
 ## Run all migrations (Docker)
 

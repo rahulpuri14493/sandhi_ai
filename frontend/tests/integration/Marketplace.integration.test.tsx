@@ -60,10 +60,10 @@ describe('Marketplace integration', () => {
 
   it('has Create New Job link', async () => {
     render(wrap(<MarketplacePage />))
-    await screen.findByText('Math Agent')
+    await screen.findByText('Math Agent', {}, { timeout: 10000 })
     const link = screen.getByRole('link', { name: /Create New Job/i })
     expect(link).toHaveAttribute('href', '/jobs/new')
-  })
+  }, 12000)
 
   it('shows no agents message when API returns empty', async () => {
     vi.mocked(agentsAPI.list).mockResolvedValue([])

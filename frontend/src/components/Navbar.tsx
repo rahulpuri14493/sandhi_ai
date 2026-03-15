@@ -38,12 +38,20 @@ export function Navbar() {
                   Marketplace
                 </Link>
                 {user.role === 'business' && (
-                  <Link 
-                    to="/jobs/new" 
-                    className="px-5 py-2.5 text-white/90 hover:text-white font-semibold rounded-xl hover:bg-dark-100/50 transition-all duration-200"
-                  >
-                    New Job
-                  </Link>
+                  <>
+                    <Link 
+                      to="/mcp" 
+                      className="px-5 py-2.5 text-white/90 hover:text-white font-semibold rounded-xl hover:bg-dark-100/50 transition-all duration-200"
+                    >
+                      MCP Server
+                    </Link>
+                    <Link 
+                      to="/jobs/new" 
+                      className="px-5 py-2.5 text-white/90 hover:text-white font-semibold rounded-xl hover:bg-dark-100/50 transition-all duration-200"
+                    >
+                      New Job
+                    </Link>
+                  </>
                 )}
                 <Link 
                   to="/dashboard" 

@@ -78,8 +78,8 @@ export default function AgentDetailPage() {
         agentsAPI.listReviews(agentId, 20, 0),
       ])
       setSummary(summaryRes)
-      setReviews(listRes.items)
-      setReviewsTotal(listRes.total)
+      setReviews(listRes?.items ?? [])
+      setReviewsTotal(listRes?.total ?? 0)
     } catch (error) {
       console.error('Failed to load reviews:', error)
       setSummary(null)

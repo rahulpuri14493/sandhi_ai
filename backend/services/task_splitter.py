@@ -1,8 +1,11 @@
 """Service to split a job into subtasks for multiple agents (generalized, no hardcoding)."""
+import logging
 import json
 import httpx
 from typing import List, Dict, Any, Optional
 from models.agent import Agent
+
+logger = logging.getLogger(__name__)
 
 
 async def split_job_for_agents(
@@ -135,7 +138,7 @@ AGENTS (each will perform one subtask):
                         })
                 return result
     except Exception as e:
-        print(f"[WARNING] Task split failed: {e}, using fallback")
+        logger.warning("Task split failed: %s, using fallback", e)
 
     return _fallback_tasks(agents, job_title, job_description, documents_content)
 

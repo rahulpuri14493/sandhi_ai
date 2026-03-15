@@ -22,6 +22,7 @@ import ipaddress
 import logging
 import os
 import socket
+import sys
 from typing import Any, Dict, List
 from urllib.parse import urlparse, urlunparse
 
@@ -29,12 +30,25 @@ import httpx
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
+# Log to stdout: <datetime>.<type>.<message>
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s.%(levelname)s.%(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+    stream=sys.stdout,
+    force=True,
+)
 logger = logging.getLogger(__name__)
 
 app = FastAPI(
     title="A2A ↔ OpenAI Adapter",
     description="Translates A2A SendMessage to OpenAI chat/completions and back.",
 )
+
+
+@app.on_event("startup")
+def startup():
+    logger.info("A2A OpenAI adapter started; default_url=%s", OPENAI_URL_DEFAULT or "(none, use metadata)")
 
 # Defaults (used when request metadata does not provide per-request target)
 OPENAI_URL_DEFAULT = os.environ.get("OPENAI_COMPATIBLE_URL", "").strip()
@@ -302,6 +316,15 @@ async def a2a_endpoint(request: Request):
         "messages": messages,
         "temperature": 0.7,
     }
+    openai_tools = metadata.get("openai_tools")
+    if isinstance(openai_tools, list) and len(openai_tools) > 0:
+        payload["tools"] = openai_tools
+
+    num_tools = len(openai_tools) if isinstance(openai_tools, list) else 0
+    logger.info(
+        "A2A SendMessage req_id=%s target=%s model_specified=%s messages=%s tools=%s",
+        req_id, outbound_url, bool(openai_model), len(messages), num_tools,
+    )
 
     try:
         async with httpx.AsyncClient(timeout=120.0) as client:
@@ -310,6 +333,10 @@ async def a2a_endpoint(request: Request):
             response.raise_for_status()
             data = response.json()
     except httpx.HTTPStatusError as e:
+        logger.warning(
+            "A2A upstream API error req_id=%s status=%s body=%s",
+            req_id, e.response.status_code, (e.response.text or "")[:200],
+        )
         return JSONResponse(
             status_code=200,
             content={
@@ -322,7 +349,7 @@ async def a2a_endpoint(request: Request):
             },
         )
     except Exception:
-        logger.exception("Upstream request failed for request id %s", req_id)
+        logger.exception("A2A upstream request failed req_id=%s", req_id)
         return JSONResponse(
             status_code=200,
             content={
@@ -339,9 +366,17 @@ async def a2a_endpoint(request: Request):
     choices = data.get("choices") or []
     if not choices:
         content = data.get("error", {}).get("message", "No choices in response") or "No choices in response"
+        tool_calls = None
     else:
         msg = choices[0].get("message") or {}
         content = _openai_content_to_text(msg.get("content"))
+        tool_calls = msg.get("tool_calls")
+
+    num_tool_calls = len(tool_calls) if tool_calls else 0
+    logger.info(
+        "A2A upstream response req_id=%s content_len=%s tool_calls=%s",
+        req_id, len(content or ""), num_tool_calls,
+    )
 
     # A2A direct message response (same shape the platform's a2a_client expects)
     result = {
@@ -350,6 +385,8 @@ async def a2a_endpoint(request: Request):
             "parts": [{"text": content}],
         }
     }
+    if tool_calls:
+        result["tool_calls"] = tool_calls
 
     return JSONResponse(
         status_code=200,

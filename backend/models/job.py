@@ -29,6 +29,11 @@ class Job(Base):
     files = Column(Text)  # JSON string storing file metadata: [{"name": "...", "path": "...", "type": "..."}]
     conversation = Column(Text)  # JSON string storing Q&A conversation with AI
     failure_reason = Column(Text, nullable=True)  # Reason for job failure
+    # Tool scope for this job: JSON arrays of IDs (empty/null = all business tools)
+    allowed_platform_tool_ids = Column(Text, nullable=True)  # e.g. "[1,2]"
+    allowed_connection_ids = Column(Text, nullable=True)  # e.g. "[1]"
+    # Restrict what tool info agents see: full | names_only | none (credentials never shared)
+    tool_visibility = Column(String(20), nullable=True)  # default full
 
     # Relationships
     business = relationship("User", back_populates="jobs", foreign_keys=[business_id])
@@ -50,6 +55,11 @@ class WorkflowStep(Base):
     cost = Column(Float, default=0.0)
     started_at = Column(DateTime, nullable=True)
     completed_at = Column(DateTime, nullable=True)
+    # Tools this step (agent) can use: JSON arrays (empty/null = use job-level allowed tools)
+    allowed_platform_tool_ids = Column(Text, nullable=True)
+    allowed_connection_ids = Column(Text, nullable=True)
+    # Override job tool_visibility for this step: full | names_only | none
+    tool_visibility = Column(String(20), nullable=True)
 
     # Relationships
     job = relationship("Job", back_populates="workflow_steps")

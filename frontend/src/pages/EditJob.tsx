@@ -1,7 +1,8 @@
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useRef } from 'react'
 import { useNavigate, useParams, useLocation } from 'react-router-dom'
-import { jobsAPI, agentsAPI } from '../lib/api'
+import { jobsAPI, agentsAPI, mcpAPI } from '../lib/api'
 import type { Job, Agent, WorkflowStep } from '../lib/types'
+import type { MCPToolConfigRes, MCPServerConnectionRes } from '../lib/api'
 
 export default function EditJobPage() {
   const { id } = useParams<{ id: string }>()
@@ -13,19 +14,38 @@ export default function EditJobPage() {
     description: '',
     status: 'draft',
   })
+  const [toolVisibility, setToolVisibility] = useState<'full' | 'names_only' | 'none'>('full')
   const [existingFiles, setExistingFiles] = useState<Array<{ id: string; name: string; type: string; size: number }>>([])
   const [selectedFiles, setSelectedFiles] = useState<File[]>([])
   const [selectedAgents, setSelectedAgents] = useState<number[]>(selectedAgentsFromState ?? [])
   const [availableAgents, setAvailableAgents] = useState<Agent[]>([])
+  const [platformTools, setPlatformTools] = useState<MCPToolConfigRes[]>([])
+  const [connections, setConnections] = useState<MCPServerConnectionRes[]>([])
+  const [selectedPlatformToolIds, setSelectedPlatformToolIds] = useState<number[]>([])
+  const [selectedConnectionIds, setSelectedConnectionIds] = useState<number[]>([])
+  /** Job's allowed tool IDs when loaded (for showing "N tools no longer configured") */
+  const [jobOriginalPlatformToolIds, setJobOriginalPlatformToolIds] = useState<number[]>([])
+  const hasSyncedToolSelection = useRef(false)
   const [isLoading, setIsLoading] = useState(false)
   const [isLoadingJob, setIsLoadingJob] = useState(true)
   const [error, setError] = useState('')
 
   useEffect(() => {
+    hasSyncedToolSelection.current = false
     loadJob()
     loadAgents()
+    loadTools()
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [id])
+
+  // Once both job and tools have loaded, set selection to job's tools that still exist (so checkboxes show and save won't 400)
+  useEffect(() => {
+    if (isLoadingJob || platformTools.length === 0 || jobOriginalPlatformToolIds.length === 0 || hasSyncedToolSelection.current) return
+    hasSyncedToolSelection.current = true
+    const currentIds = new Set(platformTools.map((t) => t.id))
+    const validIds = jobOriginalPlatformToolIds.filter((id) => currentIds.has(id))
+    setSelectedPlatformToolIds(validIds)
+  }, [isLoadingJob, platformTools, jobOriginalPlatformToolIds])
 
   useEffect(() => {
     if (selectedAgentsFromState && selectedAgentsFromState.length > 0) {
@@ -44,6 +64,11 @@ export default function EditJobPage() {
         status: job.status || 'draft',
       })
       setExistingFiles(job.files || [])
+      const allowedToolIds = job.allowed_platform_tool_ids ?? []
+      setJobOriginalPlatformToolIds(allowedToolIds)
+      setSelectedPlatformToolIds(allowedToolIds)
+      setSelectedConnectionIds(job.allowed_connection_ids ?? [])
+      if (job.tool_visibility) setToolVisibility(job.tool_visibility)
       if (
         !selectedAgentsFromState?.length &&
         job.workflow_steps &&
@@ -65,6 +90,27 @@ export default function EditJobPage() {
     } catch (err) {
       console.error('Failed to load agents:', err)
     }
+  }
+
+  const loadTools = async () => {
+    try {
+      const [tools, conns] = await Promise.all([mcpAPI.listTools(), mcpAPI.listConnections()])
+      setPlatformTools(tools)
+      setConnections(conns)
+    } catch (err) {
+      console.error('Failed to load tools:', err)
+    }
+  }
+
+  const togglePlatformTool = (id: number) => {
+    setSelectedPlatformToolIds((prev) =>
+      prev.includes(id) ? prev.filter((x) => x !== id) : [...prev, id]
+    )
+  }
+  const toggleConnection = (id: number) => {
+    setSelectedConnectionIds((prev) =>
+      prev.includes(id) ? prev.filter((x) => x !== id) : [...prev, id]
+    )
   }
 
   const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -121,7 +167,12 @@ export default function EditJobPage() {
     setIsLoading(true)
     setError('')
     try {
-      await jobsAPI.update(parseInt(id), formData, selectedFiles.length > 0 ? selectedFiles : undefined)
+      await jobsAPI.update(parseInt(id), {
+        ...formData,
+        allowed_platform_tool_ids: selectedPlatformToolIds,
+        allowed_connection_ids: selectedConnectionIds,
+        tool_visibility: toolVisibility,
+      }, selectedFiles.length > 0 ? selectedFiles : undefined)
       
       // If new files were uploaded, redirect to job detail to show Q&A (analysis happens automatically on backend)
       if (selectedFiles.length > 0) {
@@ -175,7 +226,7 @@ export default function EditJobPage() {
         )}
         <form onSubmit={handleSubmit} className="bg-dark-100/50 backdrop-blur-xl rounded-2xl shadow-2xl p-10 border border-dark-200/50">
           <div className="mb-6">
-            <label className="block text-gray-700 font-bold mb-2" htmlFor="title">
+            <label className="block text-white font-bold mb-2" htmlFor="title">
               Job Title
             </label>
             <input
@@ -188,7 +239,7 @@ export default function EditJobPage() {
             />
           </div>
           <div className="mb-6">
-            <label className="block text-gray-700 font-bold mb-2" htmlFor="description">
+            <label className="block text-white font-bold mb-2" htmlFor="description">
               Description
             </label>
             <textarea
@@ -198,6 +249,79 @@ export default function EditJobPage() {
               rows={5}
               className="w-full px-3 py-2 bg-white border-2 border-gray-300 rounded-lg text-gray-900 focus:outline-none focus:ring-2 focus:ring-primary-500"
             />
+          </div>
+          <div className="mb-8">
+            <label className="block text-white font-bold mb-3 text-lg">
+              Tools for this job
+            </label>
+            <p className="text-sm text-white/60 mb-3 font-medium">
+              Choose which tools agents can use for this job. Leave all unchecked to allow every configured tool.
+            </p>
+            {jobOriginalPlatformToolIds.length > 0 && platformTools.length > 0 && (() => {
+              const currentToolIds = new Set(platformTools.map((t) => t.id))
+              const missingCount = jobOriginalPlatformToolIds.filter((id) => !currentToolIds.has(id)).length
+              if (missingCount === 0) return null
+              return (
+                <p className="text-sm text-amber-400/90 mb-3 font-medium">
+                  This job was run with {missingCount} tool{missingCount !== 1 ? 's' : ''} that are no longer in your list. Re-add them in MCP Server if you want to use them again.
+                </p>
+              )
+            })()}
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-4 mb-4">
+              {platformTools.length > 0 && (
+                <div className="border-2 border-dark-300 rounded-xl p-4 bg-dark-200/30">
+                  <h4 className="text-white font-semibold mb-2">Platform tools</h4>
+                  <div className="space-y-2 max-h-40 overflow-y-auto">
+                    {platformTools.map((t) => (
+                      <label key={t.id} className="flex items-center gap-2 cursor-pointer text-white/90">
+                        <input
+                          type="checkbox"
+                          checked={selectedPlatformToolIds.includes(t.id)}
+                          onChange={() => togglePlatformTool(t.id)}
+                          className="w-4 h-4 text-primary-600 rounded"
+                        />
+                        <span className="text-sm">{t.name}</span>
+                        <span className="text-xs text-white/50">({t.tool_type})</span>
+                      </label>
+                    ))}
+                  </div>
+                </div>
+              )}
+              {connections.length > 0 && (
+                <div className="border-2 border-dark-300 rounded-xl p-4 bg-dark-200/30">
+                  <h4 className="text-white font-semibold mb-2">MCP connections</h4>
+                  <div className="space-y-2 max-h-40 overflow-y-auto">
+                    {connections.map((c) => (
+                      <label key={c.id} className="flex items-center gap-2 cursor-pointer text-white/90">
+                        <input
+                          type="checkbox"
+                          checked={selectedConnectionIds.includes(c.id)}
+                          onChange={() => toggleConnection(c.id)}
+                          className="w-4 h-4 text-primary-600 rounded"
+                        />
+                        <span className="text-sm truncate">{c.name}</span>
+                      </label>
+                    ))}
+                  </div>
+                </div>
+              )}
+            </div>
+            {platformTools.length === 0 && connections.length === 0 && (
+              <p className="text-white/50 text-sm">No tools or connections configured yet. Add them in MCP Server to make them available for jobs.</p>
+            )}
+            <div className="mt-4 pt-4 border-t border-dark-300">
+              <label className="block text-white font-bold mb-2">Tool visibility (what agents see)</label>
+              <select
+                value={toolVisibility}
+                onChange={(e) => setToolVisibility(e.target.value as 'full' | 'names_only' | 'none')}
+                className="px-4 py-2.5 bg-white border-2 border-gray-300 rounded-lg text-gray-900 focus:outline-none focus:ring-2 focus:ring-primary-500 w-full max-w-xl"
+              >
+                <option value="full">Full — Names, descriptions, schema & business context</option>
+                <option value="names_only">Names only — Tool names and short description; no schema or DB context</option>
+                <option value="none">None — No tool list; agents cannot use MCP tools for this job</option>
+              </select>
+              <p className="text-sm text-white/50 mt-1.5">Credentials are never shared. This only controls how much tool metadata agents receive.</p>
+            </div>
           </div>
           <div className="mb-8">
             <label className="block text-white font-bold mb-3 text-lg">
