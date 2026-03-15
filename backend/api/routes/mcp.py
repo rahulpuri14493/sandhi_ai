@@ -446,16 +446,18 @@ async def call_platform_tool(
 # --- Tool registry (for agent orchestration: discover available MCP tools) ---
 
 @router.get("/registry")
-def get_registry(
+async def get_registry(
     current_user: User = Depends(get_current_business_user),
     db: Session = Depends(get_db),
 ):
     """
-    Return combined MCP tool registry for the current business user:
-    - platform_tools: tools from platform MCP server (Vector DB, Postgres, File system)
-    - external_connections: user's external MCP server connections (for tools/list via proxy).
-    Response is used by the executor to inject available_mcp_tools into agent input_data.
+    Return MCP tool registry for the current business user, split so the UI can show:
+    - platform_tools: internal platform MCP server tools (Vector DB, Postgres, File system)
+    - connection_tools: per external MCP connection, the tools exposed by that server (tools/list).
+    Also returns combined "tools" for backward compatibility.
     """
+    from services.mcp_client import list_tools as mcp_list_tools
+
     platform_tools = db.query(MCPToolConfig).filter(
         MCPToolConfig.user_id == current_user.id,
         MCPToolConfig.is_active == True,
@@ -464,16 +466,59 @@ def get_registry(
         MCPServerConnection.user_id == current_user.id,
         MCPServerConnection.is_active == True,
     ).all()
-    # Build registry entries (no credentials)
-    tools = []
+
+    # Build platform registry entries (no credentials)
+    platform_entries = []
     for t in platform_tools:
-        tools.append({
+        platform_entries.append({
             "source": "platform",
             "id": t.id,
             "name": _registry_tool_name(t.id, t.name),
             "tool_type": t.tool_type.value,
             "description": _registry_description(t.tool_type.value, t.name),
         })
+
+    # For each connection, fetch tools from that MCP server (tools/list)
+    connection_tools = []
+    for c in connections:
+        creds = None
+        if c.encrypted_credentials:
+            try:
+                creds = decrypt_json(c.encrypted_credentials)
+            except Exception:
+                creds = None
+        base_url = (c.base_url or "").strip().rstrip("/")
+        endpoint_path = (c.endpoint_path or "/mcp").strip()
+        if not endpoint_path.startswith("/"):
+            endpoint_path = "/" + endpoint_path
+        tools_list = []
+        error_msg = None
+        try:
+            result = await mcp_list_tools(
+                base_url=base_url,
+                endpoint_path=endpoint_path,
+                auth_type=c.auth_type or "none",
+                credentials=creds,
+                timeout=15.0,
+            )
+            for tool in (result.get("tools") or []):
+                tools_list.append({
+                    "name": tool.get("name") or "",
+                    "description": (tool.get("description") or "")[:500],
+                })
+        except Exception as e:
+            logging.getLogger(__name__).warning("Failed to list tools for connection %s (%s): %s", c.name, base_url, e)
+            error_msg = str(e)
+        connection_tools.append({
+            "connection_id": c.id,
+            "name": c.name,
+            "base_url": c.base_url,
+            "tools": tools_list,
+            "error": error_msg,
+        })
+
+    # Combined list for backward compatibility (platform + one entry per connection)
+    tools = list(platform_entries)
     for c in connections:
         tools.append({
             "source": "external",
@@ -481,7 +526,12 @@ def get_registry(
             "name": c.name,
             "base_url": c.base_url,
         })
-    return {"tools": tools, "platform_tool_count": len([x for x in tools if x["source"] == "platform"])}
+    return {
+        "tools": tools,
+        "platform_tools": platform_entries,
+        "connection_tools": connection_tools,
+        "platform_tool_count": len(platform_entries),
+    }
 
 
 def _registry_tool_name(tool_id: int, name: str) -> str:

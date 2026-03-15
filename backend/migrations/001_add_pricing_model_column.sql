@@ -1,5 +1,8 @@
 -- Add pricing model and subscription price columns to agents table.
 -- Requires: agents table (from app create_all or initial setup).
+-- Drop/recreate enum so we always have correct values (fixes existing broken enum from older runs).
+
+DROP TYPE IF EXISTS pricingmodel CASCADE;
 
 DO $$ BEGIN
     CREATE TYPE pricingmodel AS ENUM ('pay_per_use', 'monthly', 'quarterly');

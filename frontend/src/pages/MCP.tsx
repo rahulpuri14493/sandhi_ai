@@ -17,6 +17,8 @@ export default function MCPPage() {
   const [tools, setTools] = useState<MCPToolConfigRes[]>([])
   const [registryCount, setRegistryCount] = useState<number | null>(null)
   const [registryTools, setRegistryTools] = useState<Array<{ source: string; name: string; tool_type?: string; description?: string; id?: number; connection_id?: number; base_url?: string }>>([])
+  const [platformRegistryTools, setPlatformRegistryTools] = useState<Array<{ source: string; id?: number; name: string; tool_type?: string; description?: string }>>([])
+  const [connectionRegistryTools, setConnectionRegistryTools] = useState<Array<{ connection_id: number; name: string; base_url: string; tools: Array<{ name: string; description?: string }>; error?: string }>>([])
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
   const [editTool, setEditTool] = useState<MCPToolConfigRes | null>(null)
@@ -75,9 +77,17 @@ export default function MCPPage() {
       mcpAPI.getRegistry()
         .then((r) => {
           setRegistryTools(r.tools ?? [])
-          setRegistryCount(r.tools?.length ?? 0)
+          setPlatformRegistryTools(r.platform_tools ?? [])
+          setConnectionRegistryTools(r.connection_tools ?? [])
+          const total = (r.platform_tools?.length ?? 0) + (r.connection_tools?.length ?? 0)
+          setRegistryCount(total)
         })
-        .catch(() => { setRegistryTools([]); setRegistryCount(0) })
+        .catch(() => {
+          setRegistryTools([])
+          setPlatformRegistryTools([])
+          setConnectionRegistryTools([])
+          setRegistryCount(0)
+        })
     }
   }, [user, view])
 
@@ -111,29 +121,63 @@ export default function MCPPage() {
             <p className="text-primary-400/90 mt-2 text-sm font-medium">
               {registryCount} tool{registryCount !== 1 ? 's' : ''} available for agents in your jobs.
             </p>
-            {registryTools.length > 0 && (
+            {/* Platform tools (internal MCP server) — Vector DB, Postgres, File system, etc. */}
+            {platformRegistryTools.length > 0 && (
               <div className="mt-3 p-4 rounded-xl bg-dark-100/80 border border-dark-200">
-                <h3 className="text-sm font-semibold text-white/90 mb-2">Tools available in MCP Server</h3>
+                <h3 className="text-sm font-semibold text-white/90 mb-2">Platform tools (internal MCP server)</h3>
+                <p className="text-white/50 text-xs mb-2">Vector DB, PostgreSQL, File system, and other platform-configured tools.</p>
                 <ul className="flex flex-wrap gap-2">
-                  {registryTools.map((t, idx) => (
+                  {platformRegistryTools.map((t, idx) => (
                     <li
-                      key={t.source === 'platform' ? `platform-${t.id ?? idx}` : `ext-${t.connection_id ?? idx}`}
+                      key={`platform-${t.id ?? idx}`}
                       className="inline-flex items-center gap-2 px-3 py-1.5 rounded-lg bg-dark-200/80 border border-dark-300 text-sm"
                     >
                       <span className="font-medium text-white truncate max-w-[200px]" title={t.name}>{t.name}</span>
-                      {t.source === 'platform' && t.tool_type && (
+                      {t.tool_type && (
                         <span className="inline-flex px-2 py-0.5 rounded text-xs font-medium bg-primary-500/20 text-primary-300 border border-primary-500/30 shrink-0">
                           {TOOL_LABELS[t.tool_type] ?? t.tool_type}
-                        </span>
-                      )}
-                      {t.source === 'external' && (
-                        <span className="inline-flex px-2 py-0.5 rounded text-xs font-medium bg-white/10 text-white/80 border border-dark-300 shrink-0">
-                          MCP connection
                         </span>
                       )}
                     </li>
                   ))}
                 </ul>
+              </div>
+            )}
+            {/* Tools from your MCP connections (external servers, e.g. Pageindex) */}
+            {connectionRegistryTools.length > 0 && (
+              <div className="mt-3 p-4 rounded-xl bg-dark-100/80 border border-dark-200">
+                <h3 className="text-sm font-semibold text-white/90 mb-2">Tools from your MCP connections</h3>
+                <p className="text-white/50 text-xs mb-3">Tools exposed by each external MCP server you connected.</p>
+                <div className="space-y-4">
+                  {connectionRegistryTools.map((conn) => (
+                    <div key={conn.connection_id} className="rounded-lg bg-dark-200/60 border border-dark-300 p-3">
+                      <div className="flex items-center gap-2 mb-2">
+                        <span className="font-medium text-white">{conn.name}</span>
+                        <span className="text-white/50 text-xs truncate" title={conn.base_url}>{conn.base_url}</span>
+                      </div>
+                      {conn.error && (
+                        <p className="text-amber-400/90 text-xs mb-2">Could not load tools: {conn.error}</p>
+                      )}
+                      {conn.tools && conn.tools.length > 0 ? (
+                        <ul className="flex flex-wrap gap-2">
+                          {conn.tools.map((tool, idx) => (
+                            <li
+                              key={`${conn.connection_id}-${tool.name}-${idx}`}
+                              className="inline-flex items-center gap-2 px-3 py-1.5 rounded-lg bg-dark-300/60 border border-dark-400 text-sm"
+                            >
+                              <span className="font-medium text-white truncate max-w-[200px]" title={tool.description ?? tool.name}>{tool.name}</span>
+                              {tool.description && (
+                                <span className="text-white/50 text-xs max-w-[180px] truncate" title={tool.description}>{tool.description}</span>
+                              )}
+                            </li>
+                          ))}
+                        </ul>
+                      ) : !conn.error && (
+                        <p className="text-white/50 text-xs">No tools returned from this server.</p>
+                      )}
+                    </div>
+                  ))}
+                </div>
               </div>
             )}
           </>

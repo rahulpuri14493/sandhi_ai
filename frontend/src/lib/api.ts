@@ -296,6 +296,20 @@ export const mcpAPI = {
         connection_id?: number
         base_url?: string
       }>;
+      platform_tools: Array<{
+        source: string
+        id?: number
+        name: string
+        tool_type?: string
+        description?: string
+      }>;
+      connection_tools: Array<{
+        connection_id: number
+        name: string
+        base_url: string
+        tools: Array<{ name: string; description?: string }>;
+        error?: string
+      }>;
       platform_tool_count: number
     }>('/mcp/registry').then((res) => res.data)
   },

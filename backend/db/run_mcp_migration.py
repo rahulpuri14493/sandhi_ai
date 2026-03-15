@@ -68,28 +68,56 @@ def _record_migration(conn, name: str):
     conn.commit()
 
 
+def _strip_leading_comments(stmt: str) -> str:
+    """Remove leading comment lines so we don't skip statements that start with --."""
+    lines = stmt.strip().splitlines()
+    while lines and lines[0].strip().startswith("--"):
+        lines.pop(0)
+    return "\n".join(lines).strip()
+
+
+def _split_sql_statements(sql: str):
+    """Split SQL by ';' only when outside $$ ... $$ blocks (DO $$ ... END $$ stays one statement)."""
+    statements = []
+    start = 0
+    i = 0
+    in_dollar = False
+    n = len(sql)
+    while i < n:
+        if not in_dollar and i + 1 < n and sql[i : i + 2] == "$$":
+            in_dollar = True
+            i += 2
+            continue
+        if in_dollar and i + 1 < n and sql[i : i + 2] == "$$":
+            in_dollar = False
+            i += 2
+            continue
+        if not in_dollar and sql[i] == ";":
+            stmt = _strip_leading_comments(sql[start:i].strip())
+            if stmt:
+                statements.append(stmt)
+            start = i + 1
+            i += 1
+            continue
+        i += 1
+    if start < n:
+        stmt = _strip_leading_comments(sql[start:n].strip())
+        if stmt:
+            statements.append(stmt)
+    return statements
+
+
 def _run_sql_file(conn, path: str):
     """Execute a SQL file. Splits by statement while keeping DO $$ ... END $$ blocks together."""
     with open(path, "r", encoding="utf-8") as f:
         sql = f.read()
-    # Split into statements; DO $$ ... END $$ must stay one statement (psycopg2 runs one per execute)
-    statements = []
-    for raw in sql.split(";"):
-        s = raw.strip()
-        if not s or s.startswith("--"):
-            continue
-        # Merge continuation of DO $$ block (contains END $$ but not DO $$) with previous
-        if "END $$" in s and "DO $$" not in s and statements:
-            statements[-1] = statements[-1] + "; " + s
-        else:
-            statements.append(s)
+    statements = _split_sql_statements(sql)
     for stmt in statements:
         if not stmt.strip():
             continue
         try:
             conn.execute(text(stmt))
         except Exception:
-            # Allow idempotent migrations to skip duplicates
             raise
     conn.commit()
 
