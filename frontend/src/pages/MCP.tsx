@@ -16,7 +16,6 @@ export default function MCPPage() {
   const [connections, setConnections] = useState<MCPServerConnectionRes[]>([])
   const [tools, setTools] = useState<MCPToolConfigRes[]>([])
   const [registryCount, setRegistryCount] = useState<number | null>(null)
-  const [registryTools, setRegistryTools] = useState<Array<{ source: string; name: string; tool_type?: string; description?: string; id?: number; connection_id?: number; base_url?: string }>>([])
   const [platformRegistryTools, setPlatformRegistryTools] = useState<Array<{ source: string; id?: number; name: string; tool_type?: string; description?: string }>>([])
   const [connectionRegistryTools, setConnectionRegistryTools] = useState<Array<{ connection_id: number; name: string; base_url: string; tools: Array<{ name: string; description?: string }>; error?: string }>>([])
   const [loading, setLoading] = useState(true)
@@ -76,14 +75,13 @@ export default function MCPPage() {
     if (user && view === 'choose') {
       mcpAPI.getRegistry()
         .then((r) => {
-          setRegistryTools(r.tools ?? [])
           setPlatformRegistryTools(r.platform_tools ?? [])
           setConnectionRegistryTools(r.connection_tools ?? [])
-          const total = (r.platform_tools?.length ?? 0) + (r.connection_tools?.length ?? 0)
+          const connectionToolsCount = (r.connection_tools ?? []).reduce((sum, conn) => sum + (conn.tools?.length ?? 0), 0)
+          const total = (r.platform_tools?.length ?? 0) + connectionToolsCount
           setRegistryCount(total)
         })
         .catch(() => {
-          setRegistryTools([])
           setPlatformRegistryTools([])
           setConnectionRegistryTools([])
           setRegistryCount(0)

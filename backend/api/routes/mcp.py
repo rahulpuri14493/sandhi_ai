@@ -508,7 +508,7 @@ async def get_registry(
                 })
         except Exception as e:
             logging.getLogger(__name__).warning("Failed to list tools for connection %s (%s): %s", c.name, base_url, e)
-            error_msg = str(e)
+            error_msg = "Failed to list tools for this connection."
         connection_tools.append({
             "connection_id": c.id,
             "name": c.name,
