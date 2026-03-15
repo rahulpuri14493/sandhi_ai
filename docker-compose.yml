@@ -77,6 +77,7 @@ services:
     container_name: sandhi-frontend
     env_file:
       - .env
+    environment:
       VITE_PROXY_TARGET: http://backend:8000
     depends_on:
       - backend
