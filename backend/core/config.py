@@ -6,7 +6,12 @@ load_dotenv()
 
 
 class Settings(BaseSettings):
-        DATABASE_URL: str = os.getenv("DATABASE_URL", "postgresql://postgres:postgres@localhost:5432/agent_marketplace")
+        DATABASE_URL: str = (
+            os.getenv("DATABASE_URL")
+            or os.getenv("POSTGRESQLCONNSTR_DefaultConnection")
+            or os.getenv("CUSTOMCONNSTR_DefaultConnection")
+            or "postgresql://postgres:postgres@localhost:5432/agent_marketplace"
+        )
         SECRET_KEY: str = os.getenv("SECRET_KEY", "your-secret-key-change-in-production")
         ALGORITHM: str = os.getenv("ALGORITHM", "HS256")
         ACCESS_TOKEN_EXPIRE_MINUTES: int = int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", "30"))
