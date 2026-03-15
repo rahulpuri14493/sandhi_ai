@@ -563,7 +563,7 @@ def _execute_chroma(config: Dict[str, Any], arguments: Dict[str, Any]) -> str:
         return json.dumps({"matches": matches}, indent=2)
     except Exception as e:
         logger.exception("Chroma query error")
-        return f"Chroma query error: {e}"
+        return "Chroma query error"
 
 
 def _execute_vector_db(config: Dict[str, Any], arguments: Dict[str, Any]) -> str:
