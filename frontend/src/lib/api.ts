@@ -90,10 +90,22 @@ export const jobsAPI = {
     allowed_platform_tool_ids?: number[]
     allowed_connection_ids?: number[]
     tool_visibility?: 'full' | 'names_only' | 'none'
+    schedule_is_one_time?: boolean
+    schedule_timezone?: string
+    schedule_scheduled_at?: string
+    schedule_days_of_week?: number[]
+    schedule_time?: string
   }) {
     const form = new FormData()
     form.append('title', payload.title)
     if (payload.description) form.append('description', payload.description)
+    if (payload.schedule_is_one_time !== undefined) {
+      form.append('schedule_is_one_time', String(payload.schedule_is_one_time))
+      if (payload.schedule_timezone) form.append('schedule_timezone', payload.schedule_timezone)
+      if (payload.schedule_scheduled_at) form.append('schedule_scheduled_at', payload.schedule_scheduled_at)
+      if (payload.schedule_days_of_week) form.append('schedule_days_of_week', JSON.stringify(payload.schedule_days_of_week))
+      if (payload.schedule_time) form.append('schedule_time', payload.schedule_time)
+    }
     if (payload.files?.length) {
       payload.files.forEach((f) => form.append('files', f))
     }
@@ -140,6 +152,35 @@ export const jobsAPI = {
   },
   downloadFile(jobId: number, fileId: string) {
     return api.get('/jobs/' + jobId + '/files/' + fileId, { responseType: 'blob' }).then((res) => res.data)
+  },
+  listAllSchedules() {
+    return api.get('/jobs/schedules/all').then((res) => res.data)
+  },
+  listSchedules(jobId: number) {
+    return api.get('/jobs/' + jobId + '/schedules').then((res) => res.data)
+  },
+  createSchedule(jobId: number, payload: {
+    is_one_time: boolean
+    timezone?: string
+    scheduled_at?: string
+    days_of_week?: number[]
+    time?: string
+    status?: string
+  }) {
+    return api.post('/jobs/' + jobId + '/schedules', payload).then((res) => res.data)
+  },
+  updateSchedule(jobId: number, scheduleId: number, payload: {
+    is_one_time?: boolean
+    timezone?: string
+    scheduled_at?: string
+    days_of_week?: number[]
+    time?: string
+    status?: string
+  }) {
+    return api.put('/jobs/' + jobId + '/schedules/' + scheduleId, payload).then((res) => res.data)
+  },
+  deleteSchedule(jobId: number, scheduleId: number) {
+    return api.delete('/jobs/' + jobId + '/schedules/' + scheduleId)
   },
   analyzeDocuments(jobId: number) {
     return api.post('/jobs/' + jobId + '/analyze-documents').then((res) => res.data)

@@ -193,3 +193,23 @@ export interface AgentNomination {
 export interface HiringPositionWithNominations extends HiringPosition {
   nominations: AgentNomination[];
 }
+
+export type ScheduleStatus = 'active' | 'inactive'
+
+export interface JobSchedule {
+  id: number
+  job_id: number
+  status: ScheduleStatus
+  is_one_time: boolean
+  timezone: string
+  scheduled_at: string | null
+  days_of_week: number[] | null
+  time: string | null
+  last_run_time: string | null
+  next_run_time: string | null
+  created_at: string
+}
+
+export interface JobScheduleWithJob extends JobSchedule {
+  job_title: string
+}

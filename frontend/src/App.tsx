@@ -13,6 +13,7 @@ import EditAgent from './pages/EditAgent'
 import EditJob from './pages/EditJob'
 import NewHiringPosition from './pages/NewHiringPosition'
 import MCP from './pages/MCP'
+import Schedules from './pages/Schedules'
 
 function App() {
   return (
@@ -29,6 +30,7 @@ function App() {
           <Route path="/jobs/new" element={<NewJob />} />
           <Route path="/jobs/:id" element={<JobDetail />} />
           <Route path="/jobs/edit/:id" element={<EditJob />} />
+          <Route path="/schedules" element={<Schedules />} />
           <Route path="/dashboard" element={<Dashboard />} />
           <Route path="/agents/new" element={<NewAgent />} />
           <Route path="/agents/edit/:id" element={<EditAgent />} />
