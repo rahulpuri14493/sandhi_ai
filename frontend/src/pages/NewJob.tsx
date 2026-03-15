@@ -93,12 +93,14 @@ export default function NewJobPage() {
     setIsLoading(true)
     setError('')
     try {
+      const hasPlatform = selectedPlatformToolIds.length > 0
+      const hasConn = selectedConnectionIds.length > 0
       const job = await jobsAPI.create({ 
         title, 
         description,
         files: selectedFiles.length > 0 ? selectedFiles : undefined,
-        allowed_platform_tool_ids: selectedPlatformToolIds.length > 0 ? selectedPlatformToolIds : undefined,
-        allowed_connection_ids: selectedConnectionIds.length > 0 ? selectedConnectionIds : undefined,
+        allowed_platform_tool_ids: hasPlatform ? selectedPlatformToolIds : (hasConn ? [] : undefined),
+        allowed_connection_ids: hasConn ? selectedConnectionIds : (hasPlatform ? [] : undefined),
         tool_visibility: toolVisibility,
       })
       navigate(`/jobs/${job.id}`, { state: { selectedAgents } })
@@ -256,7 +258,7 @@ export default function NewJobPage() {
               Tools for this job (optional)
             </label>
             <p className="text-sm text-white/50 mb-3 font-medium">
-              Choose which tools agents can use for this job. Leave empty to allow all your configured tools. You can assign specific tools per agent when building the workflow.
+              Choose which tools agents can use for this job. Leave all unchecked to allow every configured tool. If you check only MCP connections (e.g. pageindex), only those connections are used—no platform tools.
             </p>
             <div className="grid grid-cols-1 md:grid-cols-2 gap-4 mb-4">
               {platformTools.length > 0 && (

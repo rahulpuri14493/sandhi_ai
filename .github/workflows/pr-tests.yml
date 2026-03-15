@@ -26,9 +26,14 @@ jobs:
           echo "POSTGRES_PASSWORD=postgres" >> .env
           echo "POSTGRES_DB=agent_marketplace" >> .env
           echo "SECRET_KEY=ci-secret-key" >> .env
+          echo "MCP_INTERNAL_SECRET=ci-mcp-internal-secret" >> .env
 
       - name: Build and start stack
         run: docker compose up -d --build
+
+      - name: Show stack logs on build/start failure
+        if: failure()
+        run: docker compose logs --tail=200
 
       - name: Wait for backend
         run: |
@@ -58,7 +63,7 @@ jobs:
 
       - name: Stop stack
         if: always()
-        run: docker compose down -v
+        run: docker compose down -v || true
 
   backend-tests:
     name: Backend tests
@@ -141,7 +146,7 @@ jobs:
       - name: Set up Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: "20"
+          node-version: "22"
           cache: "npm"
           cache-dependency-path: frontend/package-lock.json
 

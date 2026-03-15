@@ -163,10 +163,15 @@ export function WorkflowBuilder({ jobId, onWorkflowCreated, initialSelectedAgent
       const current = stepToolSelectionsRef.current
       const stepTools = selectedAgents.map((_, idx) => {
         const sel = current[idx]
+        const hasPlatform = (sel?.platformIds?.length ?? 0) > 0
+        const hasConn = (sel?.connectionIds?.length ?? 0) > 0
+        // When only connections are selected, send empty platform list so backend does not inherit job-level platform tools
+        const platformIds = hasPlatform ? sel!.platformIds : (hasConn ? [] : undefined)
+        const connectionIds = hasConn ? sel!.connectionIds : (hasPlatform ? [] : undefined)
         return {
           agent_index: idx,
-          allowed_platform_tool_ids: sel?.platformIds?.length ? sel.platformIds : undefined,
-          allowed_connection_ids: sel?.connectionIds?.length ? sel.connectionIds : undefined,
+          allowed_platform_tool_ids: platformIds,
+          allowed_connection_ids: connectionIds,
           tool_visibility: sel?.toolVisibility,
         }
       })
