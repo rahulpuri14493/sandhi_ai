@@ -8,12 +8,10 @@
 # 1. Download the Publish Profile for your Azure Web App. You can download this file from the Overview page of your Web App in the Azure Portal.
 #    For more information: https://docs.microsoft.com/en-us/azure/app-service/deploy-github-actions?tabs=applevel#generate-deployment-credentials
 #
-# 2. Create a secret in your repository named AZURE_WEBAPP_PUBLISH_PROFILE, paste the publish profile contents as the value of the secret.
-#    For instructions on obtaining the publish profile see: https://docs.microsoft.com/azure/app-service/deploy-github-actions#configure-the-github-secret
-#
-# 2b. Add Azure login credentials: create a secret AZURE_CREDENTIALS with the output of:
+# 2. Add Azure login credentials: create a secret AZURE_CREDENTIALS with the output of:
 #     az ad sp create-for-rbac --name "github-actions" --role contributor --scopes /subscriptions/<subscription-id>/resourceGroups/<resource-group>/providers/Microsoft.Web/sites/<app-name> --sdk-auth
 #     Or use a JSON object: {"clientId":"<app-id>","clientSecret":"<password>","subscriptionId":"<subscription-id>","tenantId":"<tenant-id>"}
+#     Deploy uses this only (no publish profile needed; avoids "Basic authentication is disabled" in Azure).
 #
 # 3. (Optional) If you see "installation not allowed to Create organization package":
 #    - For a user repo: ensure this workflow has packages: write (see permissions below).
@@ -34,8 +32,9 @@
 name: Build and deploy a container to an Azure Web App
 
 env:
-  AZURE_WEBAPP_NAME: sandhi_ai_platform  # set this to the name of your Azure Web App
+  AZURE_WEBAPP_NAME: sandhi-ai  # Azure Web App name (must match App Service in portal)
 
+# Deploy to Azure only when pushing to main (or manual run)
 on:
   push:
     branches: [ "main" ]
@@ -96,6 +95,6 @@ jobs:
         id: deploy-to-webapp
         uses: azure/webapps-deploy@v2
         with:
+          # Must match Azure portal App Service name exactly (e.g. sandhi-ai, not sandhi_ai_platform)
           app-name: ${{ env.AZURE_WEBAPP_NAME }}
-          publish-profile: ${{ secrets.AZURE_WEBAPP_PUBLISH_PROFILE }}
           images: 'ghcr.io/${{ env.REPO }}:${{ github.sha }}'
