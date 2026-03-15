@@ -119,15 +119,19 @@ Builds images with `docker compose build`, starts the stack with `docker compose
 
 Builds the **backend** image (from `backend/Dockerfile`), pushes to GitHub Container Registry, and deploys to the configured Azure Web App. Configure via repo secrets and Azure app settings (see comments in the file).
 
-**Required Application settings** (Configuration → Application settings) so the app starts:
+**Required settings** (Environment variables / Configuration):
 
-| Setting           | Required | Description |
-|-------------------|----------|-------------|
-| `DATABASE_URL`    | Yes      | Full PostgreSQL connection string (e.g. `postgresql://user:password@your-postgres-host:5432/your_db`). **Do not leave unset**—otherwise the app tries `localhost:5432` and fails with "Connection refused". Use your Azure Database for PostgreSQL or other hosted Postgres URL here. |
-| `SECRET_KEY`      | Yes      | Secret for JWT signing (use a long random value in production). |
-| `WEBSITES_PORT`   | Yes      | Set to `8000` so Azure routes HTTP to your container. |
+| Where | Name | Required | Description |
+|-------|------|----------|-------------|
+| **App settings** | `DATABASE_URL` | Yes* | Full PostgreSQL URL (e.g. `postgresql://user:password@host:5432/db`). |
+| **App settings** | `SECRET_KEY` | Yes | Secret for JWT signing (long random value in production). |
+| **App settings** | `WEBSITES_PORT` | Yes | Set to `8000` so Azure routes HTTP to your container. |
 
-If you see **"connection to server at localhost (127.0.0.1), port 5432 failed: Connection refused"** in the log stream, add or fix `DATABASE_URL` in Application settings and restart the app.
+\* **Database URL** can be set in either place (app uses the first it finds):
+- **App settings:** add `DATABASE_URL` with your PostgreSQL connection string, or  
+- **Connection strings:** add a connection string with **name** `DefaultConnection` and **type** PostgreSQL; put the same URL in the value (e.g. `postgresql://user:password@host:5432/db`).
+
+If you see **"connection to server at localhost (127.0.0.1), port 5432 failed: Connection refused"** in the log stream, add the database URL in App settings or Connection strings and restart the app.
 
 ### Environment and configuration
 

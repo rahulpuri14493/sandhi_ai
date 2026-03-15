@@ -6,14 +6,19 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://postgres:postgres@localhost:5432/agent_marketplace")
+# Prefer DATABASE_URL; on Azure, also support Connection strings (POSTGRESQLCONNSTR_* or CUSTOMCONNSTR_*)
+DATABASE_URL = (
+    os.getenv("DATABASE_URL")
+    or os.getenv("POSTGRESQLCONNSTR_DefaultConnection")
+    or os.getenv("CUSTOMCONNSTR_DefaultConnection")
+    or "postgresql://postgres:postgres@localhost:5432/agent_marketplace"
+)
 
 # On Azure Web App, DATABASE_URL must point to a real PostgreSQL server (not localhost)
 if os.getenv("WEBSITES_SITE_NAME") and ("localhost" in DATABASE_URL or "127.0.0.1" in DATABASE_URL):
     raise RuntimeError(
-        "DATABASE_URL must be set in Azure Application settings to your PostgreSQL server URL. "
-        "It cannot be localhost. Add Configuration → Application settings → DATABASE_URL "
-        "(e.g. postgresql://user:password@your-postgres-host:5432/your_db) and restart."
+        "Set your PostgreSQL URL in Azure: Environment variables → App settings (DATABASE_URL) "
+        "or Connection strings (name 'DefaultConnection', type PostgreSQL). It cannot be localhost."
     )
 
 engine = create_engine(DATABASE_URL)
