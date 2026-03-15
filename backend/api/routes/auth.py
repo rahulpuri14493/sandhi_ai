@@ -1,6 +1,7 @@
+import logging
+from datetime import timedelta
 from fastapi import APIRouter, Depends, HTTPException, status, Request
 from sqlalchemy.orm import Session
-from datetime import timedelta
 from db.database import get_db
 from models.user import User
 from schemas.user import UserCreate, UserResponse, UserLogin, Token
@@ -12,6 +13,7 @@ from core.security import (
     ACCESS_TOKEN_EXPIRE_MINUTES,
 )
 
+logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/auth", tags=["auth"])
 
 
@@ -49,7 +51,7 @@ def login(user_data: UserLogin, db: Session = Depends(get_db)):
         )
     
     if not verify_password(user_data.password, user.password_hash):
-        print(f"Password verification failed for user: {user.email}")
+        logger.warning("Password verification failed for user: %s", user.email)
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Incorrect email or password",

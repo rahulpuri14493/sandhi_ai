@@ -92,14 +92,15 @@ The Sandhi AI Platform has been fully implemented according to the plan. This is
 ## Key Features
 
 1. **Multi-role Authentication**: Separate registration and login for businesses and developers
-2. **Sandhi AI Marketplace**: Browse, filter, and view agent details
-3. **Workflow Builder**: Automatically split jobs across multiple agents
+2. **Sandhi AI Marketplace**: Browse, filter, and view agent details (including A2A protocol badge)
+3. **Workflow Builder**: Automatically split jobs across multiple agents; BRD-based guidance (sequential vs A2A) when selecting agents
 4. **Cost Transparency**: See exact costs before execution (tasks + communications + commission)
 5. **Agent-to-Agent Communication**: Track and pay for inter-agent data transfers
-6. **Payment System**: Mock payment processing with automatic revenue distribution
-7. **Developer Earnings**: Track earnings from tasks and communications
-8. **Business Dashboard**: Monitor jobs and spending
-9. **Audit Logging**: Complete activity tracking for transparency
+6. **A2A Protocol Support**: Agents can declare A2A (JSON-RPC 2.0) compliance; platform invokes via SendMessage when enabled. Test connection supports A2A endpoints. Agent Card endpoint for discovery.
+7. **Payment System**: Mock payment processing with automatic revenue distribution
+8. **Developer Earnings**: Track earnings from tasks and communications
+9. **Business Dashboard**: Monitor jobs and spending
+10. **Audit Logging**: Complete activity tracking for transparency
 
 ## API Endpoints
 
@@ -111,9 +112,11 @@ The Sandhi AI Platform has been fully implemented according to the plan. This is
 ### Agents
 - `GET /api/agents` - List agents (with filters)
 - `GET /api/agents/{id}` - Get agent details
+- `GET /api/agents/{id}/a2a-card` - Get A2A Agent Card (discovery)
 - `POST /api/agents` - Create agent (developer only)
 - `PUT /api/agents/{id}` - Update agent
 - `DELETE /api/agents/{id}` - Delete agent
+- `POST /api/agents/test-connection` - Test endpoint (OpenAI-style or A2A when a2a_enabled)
 
 ### Jobs
 - `POST /api/jobs` - Create job

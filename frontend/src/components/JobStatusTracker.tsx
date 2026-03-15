@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react'
 import { jobsAPI } from '../lib/api'
+import { getStepOutputDisplayText } from '../lib/formatStepOutput'
 import type { Job } from '../lib/types'
 
 interface JobStatusTrackerProps {
@@ -80,10 +81,7 @@ export function JobStatusTracker({ jobId, job: initialJob, onJobUpdate }: JobSta
                   } catch {
                     outputData = step.output_data
                   }
-                  const isError = typeof outputData === 'object' && outputData?.error
-                  const content = isError
-                    ? outputData.error
-                    : outputData?.choices?.[0]?.message?.content ?? (typeof outputData === 'object' ? JSON.stringify(outputData, null, 2) : String(outputData || ''))
+                  const content = getStepOutputDisplayText(outputData)
                   return (
                     <div key={step.id} className={`p-4 rounded-xl border ${step.status === 'failed' ? 'bg-red-500/10 border-red-500/30' : 'bg-dark-200/30 border-dark-300'}`}>
                       <div className="font-bold text-white mb-2">
@@ -220,24 +218,11 @@ export function JobStatusTracker({ jobId, job: initialJob, onJobUpdate }: JobSta
                         AI Agent Output
                       </h4>
                       <div className="text-sm text-white/90 whitespace-pre-wrap">
-                        {typeof outputData === 'object' ? (
-                          <div>
-                            {outputData.choices && Array.isArray(outputData.choices) && outputData.choices.length > 0 ? (
-                              <div className="bg-dark-50/50 p-5 rounded-xl border border-dark-200/50">
-                                <p className="font-bold mb-3 text-white">Response:</p>
-                                <pre className="whitespace-pre-wrap text-sm leading-relaxed text-white/90">
-                                  {outputData.choices[0].message?.content || JSON.stringify(outputData, null, 2)}
-                                </pre>
-                              </div>
-                            ) : (
-                              <pre className="bg-dark-50/50 p-5 rounded-xl border border-dark-200/50 overflow-auto max-h-96 font-mono text-xs text-white/80">
-                                {JSON.stringify(outputData, null, 2)}
-                              </pre>
-                            )}
-                          </div>
-                        ) : (
-                          <p className="bg-dark-50/50 p-5 rounded-xl border border-dark-200/50">{String(outputData)}</p>
-                        )}
+                        <div className="bg-dark-50/50 p-5 rounded-xl border border-dark-200/50">
+                          <pre className="whitespace-pre-wrap text-sm leading-relaxed text-white/90">
+                            {getStepOutputDisplayText(outputData)}
+                          </pre>
+                        </div>
                       </div>
                     </div>
                   )}
@@ -257,13 +242,9 @@ export function JobStatusTracker({ jobId, job: initialJob, onJobUpdate }: JobSta
                         Error Details
                       </h4>
                       <div className="text-sm text-red-300 bg-dark-50/50 p-5 rounded-xl border border-dark-200/50">
-                        {typeof outputData === 'object' && outputData.error ? (
-                          <p className="font-bold">{outputData.error}</p>
-                        ) : (
-                          <pre className="overflow-auto max-h-96 font-mono text-xs text-white/80">
-                            {JSON.stringify(outputData, null, 2)}
-                          </pre>
-                        )}
+                        <pre className="overflow-auto max-h-96 font-mono text-xs text-white/80 whitespace-pre-wrap">
+                          {getStepOutputDisplayText(outputData)}
+                        </pre>
                       </div>
                     </div>
                   )}

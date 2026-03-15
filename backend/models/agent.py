@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Integer, String, Float, DateTime, ForeignKey, JSON, Enum
+from sqlalchemy import Column, Integer, String, Float, DateTime, ForeignKey, JSON, Enum, Boolean
 from sqlalchemy.orm import relationship
 import enum
 from datetime import datetime
@@ -27,7 +27,10 @@ class Agent(Base):
     capabilities = Column(JSON)  # List of capability strings
     input_schema = Column(JSON)  # JSON schema for inputs
     output_schema = Column(JSON)  # JSON schema for outputs
-    pricing_model = Column(Enum(PricingModel, name='pricingmodel', create_type=False, native_enum=True), default=PricingModel.PAY_PER_USE)
+    pricing_model = Column(
+        Enum(PricingModel, name='pricingmodel', create_type=False, native_enum=True, values_callable=lambda x: [e.value for e in x]),
+        default=PricingModel.PAY_PER_USE,
+    )
     price_per_task = Column(Float, nullable=False, default=0.0)
     price_per_communication = Column(Float, nullable=False, default=0.0)
     monthly_price = Column(Float, nullable=True, default=None)  # Monthly subscription price
@@ -37,6 +40,7 @@ class Agent(Base):
     llm_model = Column(String, nullable=True, default=None)  # Model name for OpenAI-compatible endpoints
     temperature = Column(Float, nullable=True, default=None)  # Sampling temperature for OpenAI-compatible endpoints
     plugin_config = Column(JSON)  # For plugin-based agents
+    a2a_enabled = Column(Boolean, default=False, nullable=False)  # Use A2A protocol for invocation when True
     status = Column(Enum(AgentStatus), default=AgentStatus.PENDING)
     created_at = Column(DateTime, default=datetime.utcnow)
 

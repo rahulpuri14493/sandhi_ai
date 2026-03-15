@@ -1,0 +1,9 @@
+# CodeQL configuration for code scanning.
+# See: https://docs.github.com/en/code-security/code-scanning/automatically-scanning-your-code-for-vulnerabilities/configuring-code-scanning
+name: "Sandhi AI CodeQL config"
+
+# Exclude local-dev-only script that intentionally writes secrets to .env (gitignored).
+# Alert 27 / py/clear-text-storage: script uses subprocess to avoid secret in main process;
+# excluded here so scanning does not flag intentional local-dev behavior.
+paths-ignore:
+  - "scripts/setup_env.py"

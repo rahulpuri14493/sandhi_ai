@@ -1,17 +1,37 @@
+import time
+import logging
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.exceptions import RequestValidationError
 from starlette.exceptions import HTTPException as StarletteHTTPException
+from sqlalchemy.exc import OperationalError
 from db.database import engine, Base
-from api.routes import auth, agents, jobs, payments, dashboards, hiring, external_jobs
+from db.run_mcp_migration import run_initial_migrations_if_needed, run_mcp_migration_if_needed
+from api.routes import auth, agents, jobs, payments, dashboards, hiring, external_jobs, mcp, mcp_internal
 from middleware.error_handler import (
     validation_exception_handler,
     http_exception_handler,
     general_exception_handler,
 )
+from core.encryption import ensure_encryption_key_for_production
+from core.logging_config import configure_logging
 
-# Create database tables
-Base.metadata.create_all(bind=engine)
+configure_logging()
+
+# Create database tables (retry until DB is ready, e.g. in Docker)
+def _init_db():
+    for attempt in range(30):
+        try:
+            Base.metadata.create_all(bind=engine)
+            return
+        except OperationalError:
+            if attempt == 29:
+                raise
+            time.sleep(1)
+_init_db()
+run_initial_migrations_if_needed()
+run_mcp_migration_if_needed()
+ensure_encryption_key_for_production()
 
 app = FastAPI(
     title="Sandhi AI API",
@@ -41,6 +61,8 @@ app.include_router(payments.router)
 app.include_router(dashboards.router)
 app.include_router(hiring.router)
 app.include_router(external_jobs.router)
+app.include_router(mcp.router)
+app.include_router(mcp_internal.router)
 
 
 @app.get("/")

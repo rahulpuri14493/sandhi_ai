@@ -1,13 +1,196 @@
-from sqlalchemy.orm import Session
+import logging
+import json
 from datetime import datetime
 from typing import Dict, Any, Optional
 import httpx
-import json
+from sqlalchemy.orm import Session
 from models.job import Job, JobStatus, WorkflowStep
 from models.agent import Agent
 from models.communication import AgentCommunication
 from models.audit_log import AuditLog
+from models.mcp_server import MCPToolConfig, MCPServerConnection
 from services.payment_processor import PaymentProcessor
+from services.a2a_client import execute_via_a2a
+from services.mcp_client import call_tool as mcp_call_tool
+from services.db_schema_introspection import format_schema_for_prompt
+from core.config import settings
+
+logger = logging.getLogger(__name__)
+
+
+def _safe_slug(name: str) -> str:
+    """Slug for tool name (alphanumeric and underscore)."""
+    if not name:
+        return ""
+    return "".join(c if c.isalnum() or c in "_-" else "_" for c in (name or "").strip())[:50]
+
+
+def _parse_allowed_ids(value: Optional[str]) -> Optional[list]:
+    """Parse JSON array string from job/step allowed_* columns to list of ints."""
+    if value is None or (isinstance(value, str) and not value.strip()):
+        return None
+    if isinstance(value, list):
+        return value
+    try:
+        out = json.loads(value)
+        return [int(x) for x in out] if isinstance(out, list) else None
+    except (json.JSONDecodeError, TypeError, ValueError):
+        return None
+
+
+def _get_workflow_collaboration_hint_from_job(job: Job) -> Optional[str]:
+    """Get workflow_collaboration_hint from job conversation (BRD). Returns 'sequential', 'async_a2a', or None."""
+    if not getattr(job, "conversation", None):
+        return None
+    try:
+        conv = json.loads(job.conversation)
+        if not isinstance(conv, list):
+            return None
+        for item in reversed(conv):
+            hint = item.get("workflow_collaboration_hint") if isinstance(item, dict) else None
+            if hint in ("sequential", "async_a2a"):
+                return hint
+    except (json.JSONDecodeError, TypeError):
+        pass
+    return None
+
+
+def _apply_tool_visibility(tools: list, visibility: Optional[str]) -> list:
+    """
+    Apply tool_visibility so agents never receive credentials; only allowed tool metadata.
+    full = full descriptors; names_only = name + short description only; none = no tools.
+    """
+    if visibility == "none" or not tools:
+        return []
+    if visibility == "names_only":
+        return [
+            {
+                "name": t.get("name", ""),
+                "description": (t.get("description") or t.get("name", ""))[:200],
+                "source": t.get("source"),
+                "platform_tool_id": t.get("platform_tool_id"),
+                "connection_id": t.get("connection_id"),
+                "tool_type": t.get("tool_type"),
+            }
+            for t in tools
+        ]
+    return tools
+
+
+# OpenAI-style tool parameter schemas for MCP tool types (must match platform MCP server expectations)
+def _input_schema_for_tool_type(tool_type: str) -> dict:
+    sql_schema = {
+        "type": "object",
+        "properties": {"query": {"type": "string", "description": "SQL SELECT query (read-only)"}},
+        "required": ["query"],
+    }
+    vector_schema = {
+        "type": "object",
+        "properties": {
+            "query": {"type": "string", "description": "Search query or embedding query"},
+            "top_k": {"type": "integer", "description": "Max results", "default": 5},
+        },
+        "required": ["query"],
+    }
+    schemas = {
+        "postgres": sql_schema,
+        "mysql": sql_schema,
+        "vector_db": vector_schema,
+        "pinecone": vector_schema,
+        "weaviate": vector_schema,
+        "qdrant": vector_schema,
+        "chroma": vector_schema,
+        "elasticsearch": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "Search query"},
+                "index": {"type": "string", "description": "Index name"},
+                "size": {"type": "integer", "default": 10},
+            },
+            "required": ["query"],
+        },
+        "pageindex": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "Natural language or keyword query over documents"},
+                "doc_id": {"type": "string", "description": "PageIndex document ID (optional if default_doc_id in config)"},
+                "thinking": {"type": "boolean", "description": "Use reasoning before retrieval", "default": False},
+            },
+            "required": ["query"],
+        },
+        "filesystem": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "Relative path under base_path"},
+                "action": {"type": "string", "enum": ["read", "list"], "default": "read"},
+            },
+            "required": ["path"],
+        },
+        "s3": {
+            "type": "object",
+            "properties": {
+                "key": {"type": "string", "description": "Object key or prefix"},
+                "action": {"type": "string", "enum": ["get", "list"], "default": "get"},
+            },
+            "required": ["key"],
+        },
+        "slack": {
+            "type": "object",
+            "properties": {
+                "channel": {"type": "string", "description": "Channel ID or name"},
+                "message": {"type": "string", "description": "Message text"},
+                "action": {"type": "string", "enum": ["list_channels", "send"], "default": "send"},
+            },
+        },
+        "github": {
+            "type": "object",
+            "properties": {
+                "repo": {"type": "string", "description": "owner/repo"},
+                "path": {"type": "string", "description": "File path or 'issues'"},
+                "action": {"type": "string", "enum": ["get_file", "list_issues", "search"], "default": "get_file"},
+            },
+        },
+        "notion": {
+            "type": "object",
+            "properties": {
+                "action": {"type": "string", "enum": ["search", "get_page", "get_database"], "default": "search"},
+                "query": {"type": "string", "description": "Search query or page/database ID"},
+            },
+        },
+        "rest_api": {
+            "type": "object",
+            "properties": {
+                "method": {"type": "string", "enum": ["GET", "POST", "PUT", "PATCH", "DELETE"], "default": "GET"},
+                "path": {"type": "string", "description": "Path or full URL"},
+                "body": {"type": "object", "description": "JSON body for POST/PUT/PATCH"},
+            },
+            "required": ["path"],
+        },
+    }
+    return schemas.get((tool_type or "").lower(), {"type": "object", "properties": {}})
+
+
+def _openai_tools_from_mcp(available_mcp_tools: list) -> list:
+    """Build OpenAI tools array from available_mcp_tools for function calling."""
+    tools = []
+    for t in available_mcp_tools or []:
+        name = t.get("name") or ""
+        if not name:
+            continue
+        description = t.get("description") or name
+        if t.get("schema_metadata") or t.get("business_description"):
+            description = description.rstrip(". ") + ". Database schema and business context are in the system message—use them to write correct SQL."
+        tool_type = t.get("tool_type")
+        schema = _input_schema_for_tool_type(tool_type) if tool_type else {"type": "object", "properties": {}}
+        tools.append({
+            "type": "function",
+            "function": {
+                "name": name,
+                "description": description,
+                "parameters": schema,
+            },
+        })
+    return tools
 
 
 class AgentExecutor:
@@ -38,6 +221,7 @@ class AgentExecutor:
         previous_output = None
         
         try:
+            # Strict sequential execution: steps run in step_order; each step gets previous_output only when depends_on_previous is True
             for step in workflow_steps:
                 # Update step status
                 step.status = "in_progress"
@@ -56,9 +240,10 @@ class AgentExecutor:
                     raise ValueError(f"Agent {step.agent_id} not found")
                 
                 # Prepare input data
-                # If there's previous output, merge it with the step's base input data
-                # Otherwise, use the step's input data (which includes job context and conversation)
-                if previous_output:
+                # Independent steps (depends_on_previous=False) do not receive previous agent output.
+                # Sequential steps receive previous_step_output for handoff.
+                depends_on_previous = getattr(step, "depends_on_previous", True)
+                if previous_output and depends_on_previous:
                     # Merge previous output with base input data from step
                     base_input = json.loads(step.input_data) if step.input_data else {}
                     input_data = {
@@ -66,8 +251,52 @@ class AgentExecutor:
                         "previous_step_output": previous_output  # Output from previous agent
                     }
                 else:
-                    # First step - use step's input data (includes job context, conversation, and documents)
+                    # First step or independent step - use step's input data only (no previous output)
                     input_data = json.loads(step.input_data) if step.input_data else {}
+
+                # Resolve which tools this step (agent) can use: step-level overrides; else job-level; else all business tools
+                job_platform_ids = _parse_allowed_ids(getattr(job, "allowed_platform_tool_ids", None))
+                job_conn_ids = _parse_allowed_ids(getattr(job, "allowed_connection_ids", None))
+                step_platform_ids = _parse_allowed_ids(getattr(step, "allowed_platform_tool_ids", None))
+                step_conn_ids = _parse_allowed_ids(getattr(step, "allowed_connection_ids", None))
+                # Step explicit list (including []) overrides job; else use job list; else None = all business tools
+                effective_platform = step_platform_ids if step_platform_ids is not None else job_platform_ids
+                effective_conn = step_conn_ids if step_conn_ids is not None else job_conn_ids
+                # Step can only use tools that are in job scope
+                if job_platform_ids is not None and effective_platform is not None:
+                    effective_platform = [x for x in effective_platform if x in job_platform_ids]
+                if job_conn_ids is not None and effective_conn is not None:
+                    effective_conn = [x for x in effective_conn if x in job_conn_ids]
+
+                available_mcp_tools = self._get_available_mcp_tools(
+                    job.business_id,
+                    platform_tool_ids=effective_platform if effective_platform is not None else None,
+                    connection_ids=effective_conn if effective_conn is not None else None,
+                )
+                # Hybrid A2A: restrict what tool info agents see (credentials never shared)
+                tool_visibility = getattr(step, "tool_visibility", None) or getattr(job, "tool_visibility", None) or "full"
+                available_mcp_tools = _apply_tool_visibility(available_mcp_tools or [], tool_visibility)
+                if available_mcp_tools:
+                    input_data["available_mcp_tools"] = available_mcp_tools
+                    input_data["business_id"] = job.business_id
+                    if step.step_order == 1:
+                        self._log_action("job", job_id, "mcp_tool_discovery", {
+                            "business_id": job.business_id,
+                            "tool_count": len(available_mcp_tools),
+                            "tool_names": [t.get("name") for t in available_mcp_tools[:20]],
+                        })
+
+                # Hybrid A2A: peer context for async_a2a — agents can call each other; no tools/credentials shared
+                collaboration_hint = _get_workflow_collaboration_hint_from_job(job)
+                if collaboration_hint == "async_a2a":
+                    peer_agents = self._get_peer_agents_for_step(workflow_steps, step, agent)
+                    if peer_agents:
+                        input_data["peer_agents"] = peer_agents
+                        if step.step_order == 1:
+                            self._log_action("job", job_id, "peer_a2a_context", {
+                                "peer_count": len(peer_agents),
+                                "peer_ids": [p["agent_id"] for p in peer_agents],
+                            })
                 
                 # Uploaded documents are requirement documents: agent must understand them, ask questions if any, else execute and answer.
                 documents = input_data.get('documents', [])
@@ -81,40 +310,34 @@ class AgentExecutor:
                         f"Only hired agents with an API endpoint are supported. "
                         f"Agent '{agent.name}' (id={agent.id}) has no api_endpoint configured."
                     )
-                print(f"[DEBUG] ========== Executing Step {step.step_order} ==========")
-                print(f"[DEBUG] Agent: {agent.name} (hired endpoint)")
-                print(f"[DEBUG] Agent endpoint: {agent.api_endpoint}")
-                print(f"[DEBUG] Job Title: {input_data.get('job_title', 'N/A')}")
-                print(f"[DEBUG] Job Description: {input_data.get('job_description', 'N/A')[:100]}...")
+                logger.debug("========== Executing Step %s ==========", step.step_order)
+                logger.debug("Agent: %s (hired endpoint)", agent.name)
+                logger.debug("Agent endpoint: %s", agent.api_endpoint)
+                logger.debug("Job Title: %s", input_data.get('job_title', 'N/A'))
+                logger.debug("Job Description: %s...", (input_data.get('job_description') or 'N/A')[:100])
                 
                 # Log documents
                 if documents:
-                    print(f"[DEBUG] ✓ Found {len(documents)} document(s) to send to agent:")
+                    logger.debug("Found %s document(s) to send to agent", len(documents))
                     for i, doc in enumerate(documents):
                         content_length = len(doc.get('content', '')) if doc.get('content') else 0
                         content_preview = doc.get('content', '')[:150] if doc.get('content') else 'EMPTY'
-                        print(f"[DEBUG]   Document {i+1}: {doc.get('name', 'Unknown')}")
-                        print(f"[DEBUG]     - Type: {doc.get('type', 'unknown')}")
-                        print(f"[DEBUG]     - Content length: {content_length} chars")
-                        print(f"[DEBUG]     - Content preview: {content_preview}...")
+                        logger.debug("Document %s: %s type=%s content_length=%s preview=%s...", i + 1, doc.get('name', 'Unknown'), doc.get('type', 'unknown'), content_length, content_preview)
                 else:
-                    print(f"[DEBUG] ✗ WARNING: No documents found in input_data!")
+                    logger.warning("No documents found in input_data")
                 
                 # Log conversation
                 if conversation:
-                    print(f"[DEBUG] ✓ Found {len(conversation)} conversation item(s):")
                     questions = [item for item in conversation if item.get('type') == 'question']
                     answers = [item for item in conversation if item.get('type') == 'question' and item.get('answer')]
                     completions = [item for item in conversation if item.get('type') == 'completion']
-                    print(f"[DEBUG]   - Questions: {len(questions)}")
-                    print(f"[DEBUG]   - Answered: {len(answers)}")
-                    print(f"[DEBUG]   - Completions: {len(completions)}")
+                    logger.debug("Found %s conversation item(s) questions=%s answered=%s completions=%s", len(conversation), len(questions), len(answers), len(completions))
                     if completions:
-                        print(f"[DEBUG]   - Latest completion: {completions[-1].get('message', 'N/A')[:100]}...")
+                        logger.debug("Latest completion: %s...", (completions[-1].get('message') or 'N/A')[:100])
                 else:
-                    print(f"[DEBUG] ✗ WARNING: No conversation found in input_data!")
+                    logger.warning("No conversation found in input_data")
                 
-                print(f"[DEBUG] =================================================")
+                logger.debug("=================================================")
                 
                 # Execute agent (API or plugin)
                 try:
@@ -184,15 +407,108 @@ class AgentExecutor:
             raise
     
     async def _execute_agent(self, agent: Agent, input_data: Dict[str, Any]) -> Dict[str, Any]:
-        """Execute agent via plugin or hired API endpoint only (no MLOPS)."""
+        """Execute agent via plugin, A2A protocol, or OpenAI-compatible (via platform adapter). Architecture runs A2A everywhere: native A2A agents or OpenAI endpoints via the adapter."""
         if agent.plugin_config:
             return await self._execute_plugin_agent(agent, input_data)
+        if getattr(agent, "a2a_enabled", False):
+            return await self._execute_a2a_agent(agent, input_data)
+        # OpenAI-compatible endpoint: route through platform A2A adapter so architecture is A2A everywhere
+        adapter_url = (getattr(settings, "A2A_ADAPTER_URL", None) or "").strip()
+        if adapter_url:
+            return await self._execute_via_adapter(agent, input_data, adapter_url)
         return await self._execute_api_agent(agent, input_data)
     
+    async def _execute_a2a_agent(self, agent: Agent, input_data: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Execute agent via A2A protocol (JSON-RPC 2.0 SendMessage).
+        Used when agent.a2a_enabled is True.
+        input_data includes available_mcp_tools and previous_step_output for MCP/sequential collaboration.
+        """
+        url = (agent.api_endpoint or "").strip()
+        if not url:
+            raise ValueError(
+                f"A2A-enabled agent must have api_endpoint configured. "
+                f"Agent '{agent.name}' (id={agent.id}) has no api_endpoint."
+            )
+        api_key = (agent.api_key or "").strip() or None
+        logger.debug("Executing agent '%s' via A2A: %s", agent.name, url)
+        result = await execute_via_a2a(
+            url,
+            input_data,
+            api_key=api_key,
+            blocking=True,
+            timeout=120.0,
+        )
+        # Return shape compatible with step output and _extract_agent_output_content
+        return result
+
+    async def _execute_via_adapter(self, agent: Agent, input_data: Dict[str, Any], adapter_url: str) -> Dict[str, Any]:
+        """
+        Execute OpenAI-compatible agent via platform A2A adapter. Adapter receives A2A
+        and forwards to agent.api_endpoint with OpenAI payload; returns A2A response.
+        When MCP tools are available, runs an agentic loop: send tools to the model,
+        on tool_calls invoke the platform MCP server and append results, then call again
+        until the model returns a final answer (no tool_calls).
+        """
+        url = (agent.api_endpoint or "").strip()
+        if not url:
+            raise ValueError(
+                f"Agent must have api_endpoint configured. "
+                f"Agent '{agent.name}' (id={agent.id}) has no api_endpoint."
+            )
+        api_key = (agent.api_key or "").strip() or None
+        model = (getattr(agent, "llm_model", None) or "").strip() or "gpt-4o-mini"
+        logger.debug("Executing agent '%s' via A2A adapter -> %s", agent.name, url)
+        payload = self._format_for_openai(agent, input_data)
+        messages = payload.get("messages", [])
+        available_mcp_tools = input_data.get("available_mcp_tools") or []
+        openai_tools = _openai_tools_from_mcp(available_mcp_tools) if available_mcp_tools else []
+        business_id = input_data.get("business_id")
+        max_tool_iterations = 5
+        content = ""
+
+        for iteration in range(max_tool_iterations):
+            metadata = {
+                "openai_url": url,
+                "openai_api_key": api_key or "",
+                "openai_model": model,
+                "openai_messages": messages,
+            }
+            if openai_tools:
+                metadata["openai_tools"] = openai_tools
+            result = await execute_via_a2a(
+                adapter_url,
+                input_data,
+                api_key=None,
+                blocking=True,
+                timeout=120.0,
+                adapter_metadata=metadata,
+            )
+            content = result.get("content") or ""
+            tool_calls = result.get("tool_calls")
+            if not tool_calls or not business_id:
+                break
+            # Append assistant message with tool_calls
+            messages.append({"role": "assistant", "content": content or None, "tool_calls": tool_calls})
+            for tc in tool_calls:
+                tc_id = tc.get("id")
+                fn = tc.get("function") or {}
+                tool_name = fn.get("name")
+                args_raw = fn.get("arguments") or "{}"
+                try:
+                    args = json.loads(args_raw) if isinstance(args_raw, str) else args_raw
+                except (json.JSONDecodeError, TypeError):
+                    args = {}
+                tool_result = await self._call_platform_mcp_tool(business_id, tool_name, args)
+                messages.append({"role": "tool", "tool_call_id": tc_id, "content": tool_result})
+            logger.info("MCP tool round %s: %s tool call(s), continuing agent loop", iteration + 1, len(tool_calls))
+
+        return {"content": content}
+
     async def _execute_api_agent(self, agent: Agent, input_data: Dict[str, Any]) -> Dict[str, Any]:
         """
         Execute agent via its configured API endpoint (hired agent only).
-        Only agents with api_endpoint are supported; MLOPS inference is not used.
+        Only agents with api_endpoint are supported.
         """
         payload = self._format_input_for_agent(agent, input_data)
         headers = {"Content-Type": "application/json"}
@@ -208,10 +524,10 @@ class AgentExecutor:
         if isinstance(payload, dict):
             payload["model"] = payload.get("model") or "gpt-4o-mini"
         client_kwargs = {"timeout": 120.0, "verify": False}
-        print(f"[DEBUG] Executing agent '{agent.name}' via hired endpoint: {url}")
+        logger.debug("Executing agent '%s' via hired endpoint: %s", agent.name, url)
 
         payload_for_log = self._truncate_payload_for_log(payload, max_content_len=1500)
-        print(f"[LOG] Request payload: {json.dumps(payload_for_log, indent=2, default=str)}")
+        logger.info("Request payload: %s", json.dumps(payload_for_log, indent=2, default=str))
 
         async with httpx.AsyncClient(**client_kwargs) as client:
             response = await client.post(url, json=payload, headers=headers)
@@ -221,12 +537,12 @@ class AgentExecutor:
             except Exception:
                 response_body = "(unable to read response body)"
             response_for_log = response_body if len(response_body) <= 2000 else response_body[:2000] + "\n... (truncated)"
-            print(f"[LOG] Response status: {response.status_code} {response.reason_phrase}")
-            print(f"[LOG] Response body: {response_for_log}")
+            logger.info("Response status: %s %s", response.status_code, response.reason_phrase)
+            logger.info("Response body: %s", response_for_log)
 
             if response.status_code >= 400:
                 body = response_body if len(response_body) <= 800 else response_body[:800] + "..."
-                print(f"[ERROR] Agent API returned {response.status_code}: {body}")
+                logger.error("Agent API returned %s: %s", response.status_code, body)
                 raise Exception(
                     f"Agent inference returned {response.status_code} {response.reason_phrase}. Response: {body}"
                 )
@@ -328,17 +644,67 @@ class AgentExecutor:
         assigned_task = input_data.get('assigned_task', '')
         step_order = input_data.get('step_order')
         total_steps = input_data.get('total_steps')
+        has_previous_output = input_data.get('previous_step_output') is not None
         if assigned_task and assigned_task.strip():
             system_content += "═══════════════════════════════════════════════════════\n"
             system_content += "CRITICAL: YOUR ASSIGNED TASK (multi-agent workflow)\n"
             system_content += "═══════════════════════════════════════════════════════\n\n"
             if step_order is not None and total_steps is not None and total_steps > 1:
                 system_content += f"You are Agent {step_order} of {total_steps}. "
+                if has_previous_output:
+                    system_content += "This is a sequential workflow: you will receive the previous agent's output below. Use it as your input.\n"
             system_content += "Perform ONLY your assigned subtask below. Do NOT perform work assigned to other agents.\n"
             system_content += "If the documents describe the full workflow, IGNORE the parts that are not your assignment.\n\n"
             system_content += f"YOUR TASK:\n{assigned_task.strip()}\n\n"
         else:
+            if has_previous_output and step_order is not None and total_steps is not None and total_steps > 1:
+                system_content += "SEQUENTIAL WORKFLOW: You receive the previous agent's output below. Use it as your input and continue the pipeline.\n\n"
             system_content += "TASK: Execute the job from the requirements above and provide your complete, correct answer. Do not ask questions unless something is strictly required and impossible to infer.\n"
+        # Hybrid A2A: peer agents (endpoints only; no credentials or tool lists shared)
+        peer_agents = input_data.get("peer_agents") or []
+        if peer_agents:
+            system_content += "\n═══════════════════════════════════════════════════════\n"
+            system_content += "PEER AGENTS (optional direct A2A)\n"
+            system_content += "═══════════════════════════════════════════════════════\n\n"
+            system_content += "You may call these agents directly via the A2A protocol (SendMessage to their endpoint). "
+            system_content += "Only endpoint URLs are provided; no API keys or tool information are shared.\n\n"
+            for p in peer_agents:
+                system_content += f"  - {p.get('name', '')} (step {p.get('step_order', '')}): {p.get('a2a_endpoint', '')}\n"
+            system_content += "\n"
+        # MCP tool discovery: inform agent of available tools (platform + external) for collaboration
+        available_mcp_tools = input_data.get("available_mcp_tools") or []
+        if available_mcp_tools:
+            system_content += "\n═══════════════════════════════════════════════════════\n"
+            system_content += "AVAILABLE MCP TOOLS (data sources / APIs for this job)\n"
+            system_content += "═══════════════════════════════════════════════════════\n\n"
+            system_content += "The following tools are available. When the task requires running a query or fetching data, you MUST invoke the corresponding tool (use a function/tool call). "
+            system_content += "Do NOT only describe or write the query in text—the platform runs the query only when you call the tool. "
+            system_content += "Call the tool with the appropriate arguments (e.g. the SQL query); then use the tool result in your final answer.\n\n"
+            for t in available_mcp_tools:
+                system_content += f"  - {t.get('name', '')}: {t.get('description', '')}\n"
+            system_content += "\n"
+            # Database schema and business context for SQL tools (so the agent can write correct queries)
+            schema_tools = [t for t in available_mcp_tools if t.get("schema_metadata") or t.get("business_description")]
+            if schema_tools:
+                system_content += "═══════════════════════════════════════════════════════\n"
+                system_content += "DATABASE SCHEMA AND CONTEXT (use this to write correct SQL)\n"
+                system_content += "═══════════════════════════════════════════════════════\n\n"
+                for t in schema_tools:
+                    tool_name = t.get("name", "")
+                    system_content += f"--- Database context for tool: {tool_name} ---\n"
+                    if t.get("business_description"):
+                        system_content += f"Business context: {t.get('business_description')}\n"
+                    if t.get("schema_metadata"):
+                        try:
+                            schema_dict = json.loads(t["schema_metadata"])
+                            formatted = format_schema_for_prompt(schema_dict, max_chars=8000)
+                            if formatted:
+                                system_content += "Schema:\n" + formatted + "\n"
+                        except (TypeError, json.JSONDecodeError):
+                            pass
+                    system_content += "\n"
+                system_content += "Use the schema above to write valid SQL for the corresponding tool. Do not guess table or column names. "
+                system_content += "Then invoke that tool with your SQL so the platform executes it and returns results; do not only show the SQL in your message.\n\n"
         messages.append({"role": "system", "content": system_content})
         
         # Add document content to messages with clear formatting (if documents exist)
@@ -364,7 +730,7 @@ class AgentExecutor:
                     return False
                 return True
 
-            print(f"[DEBUG] Formatting {len(documents)} requirement documents for API (content is inline below)")
+            logger.debug("Formatting %s requirement documents for API (content is inline below)", len(documents))
             messages.append({
                 "role": "user",
                 "content": "═══════════════════════════════════════════════════════\n📋 REQUIREMENT DOCUMENTS (text below):\n═══════════════════════════════════════════════════════\n\nThe requirement document text is in the next message(s). Use it to execute the job and provide your correct answer. Do not ask unnecessary questions.\n\nDocument(s) follow:"
@@ -375,7 +741,7 @@ class AgentExecutor:
                 doc_type = doc.get('type', 'unknown')
                 doc_content = (doc.get('content') or '').strip()
 
-                print(f"[DEBUG] Document {i+1}: {doc_name} - Content length: {len(doc_content)} chars")
+                logger.debug("Document %s: %s - Content length: %s chars", i + 1, doc_name, len(doc_content))
 
                 if _is_extracted_content(doc_content):
                     doc_message = f"""═══════════════════════════════════════════════════════
@@ -398,14 +764,14 @@ END DOCUMENT {i+1}: {doc_name}
                         f"Execute the task based on that and provide your complete answer. Do not refuse; infer from the job context if needed.]"
                     )
                     messages.append({"role": "user", "content": fallback})
-                    print(f"[DEBUG] Document {doc_name}: no extractable content – sent fallback (use job title/description)")
+                    logger.debug("Document %s: no extractable content – sent fallback (use job title/description)", doc_name)
 
             messages.append({
                 "role": "user",
                 "content": "═══════════════════════════════════════════════════════\nEND OF REQUIREMENT DOCUMENTS\n═══════════════════════════════════════════════════════\n\nExecute the job based on the requirement documents above and provide your complete, correct answer."
             })
         else:
-            print("[DEBUG] No documents provided - agent will work with job title and description only")
+            logger.debug("No documents provided - agent will work with job title and description only")
         
         # Convert conversation Q&A to messages (if any)
         if conversation:
@@ -502,6 +868,124 @@ END DOCUMENT {i+1}: {doc_name}
         self.db.add(communication)
         self.db.commit()
     
+    def _get_peer_agents_for_step(
+        self, workflow_steps: list, current_step: WorkflowStep, current_agent: Agent
+    ) -> list:
+        """
+        For hybrid A2A (async_a2a): return other agents in this workflow that support A2A.
+        Only endpoint URL and identity are shared; no API keys, no tool lists, no credentials.
+        """
+        peer_list = []
+        for s in workflow_steps:
+            if s.id == current_step.id or s.agent_id == current_agent.id:
+                continue
+            peer_agent = self.db.query(Agent).filter(Agent.id == s.agent_id).first()
+            if not peer_agent or not getattr(peer_agent, "a2a_enabled", False):
+                continue
+            endpoint = (getattr(peer_agent, "api_endpoint", None) or "").strip()
+            if not endpoint:
+                continue
+            peer_list.append({
+                "agent_id": peer_agent.id,
+                "name": peer_agent.name or "",
+                "a2a_endpoint": endpoint,
+                "step_order": s.step_order,
+            })
+        return peer_list
+
+    def _get_available_mcp_tools(
+        self,
+        business_id: int,
+        platform_tool_ids: Optional[list] = None,
+        connection_ids: Optional[list] = None,
+    ) -> list:
+        """
+        Return list of MCP tool descriptors for the business (tenant) for agent context.
+        If platform_tool_ids/connection_ids are provided, only those tools are returned
+        (per-step or per-job allowlist). Otherwise all active business tools are returned.
+        """
+        TOOL_TYPE_DESC = {
+            "vector_db": "Vector database (semantic search)",
+            "pinecone": "Pinecone vector store",
+            "weaviate": "Weaviate vector store",
+            "qdrant": "Qdrant vector store",
+            "chroma": "Chroma vector store",
+            "postgres": "PostgreSQL database",
+            "mysql": "MySQL database",
+            "elasticsearch": "Elasticsearch search",
+            "pageindex": "PageIndex (vectorless document retrieval)",
+            "filesystem": "File system access",
+            "s3": "AWS S3 storage",
+            "slack": "Slack integration",
+            "github": "GitHub API",
+            "notion": "Notion API",
+            "rest_api": "REST API client",
+        }
+        tools = []
+        platform_query = self.db.query(MCPToolConfig).filter(
+            MCPToolConfig.user_id == business_id,
+            MCPToolConfig.is_active == True,
+        )
+        if platform_tool_ids:
+            platform_query = platform_query.filter(MCPToolConfig.id.in_(platform_tool_ids))
+        platform = platform_query.order_by(MCPToolConfig.name).all()
+        for t in platform:
+            name = f"platform_{t.id}_{_safe_slug(t.name)}" if _safe_slug(t.name) else f"platform_{t.id}"
+            desc = TOOL_TYPE_DESC.get(t.tool_type.value, t.tool_type.value)
+            entry = {
+                "name": name,
+                "description": f"{desc}: {t.name}",
+                "source": "platform",
+                "platform_tool_id": t.id,
+                "tool_type": t.tool_type.value,
+            }
+            if getattr(t, "schema_metadata", None):
+                entry["schema_metadata"] = t.schema_metadata
+            if getattr(t, "business_description", None):
+                entry["business_description"] = t.business_description
+            tools.append(entry)
+        conn_query = self.db.query(MCPServerConnection).filter(
+            MCPServerConnection.user_id == business_id,
+            MCPServerConnection.is_active == True,
+        )
+        if connection_ids:
+            conn_query = conn_query.filter(MCPServerConnection.id.in_(connection_ids))
+        conns = conn_query.all()
+        for c in conns:
+            tools.append({
+                "name": c.name,
+                "description": f"External MCP server: {c.base_url}",
+                "source": "external",
+                "connection_id": c.id,
+            })
+        return tools
+
+    async def _call_platform_mcp_tool(
+        self, business_id: int, tool_name: str, arguments: Dict[str, Any]
+    ) -> str:
+        """Invoke a platform MCP tool by name; returns result content as string for tool result message."""
+        base = (getattr(settings, "PLATFORM_MCP_SERVER_URL", None) or "").strip().rstrip("/")
+        if not base:
+            return json.dumps({"error": "Platform MCP server not configured"})
+        extra_headers = {"X-MCP-Business-Id": str(business_id)}
+        try:
+            result = await mcp_call_tool(
+                base_url=base,
+                tool_name=tool_name,
+                arguments=arguments,
+                endpoint_path="/mcp",
+                timeout=60.0,
+                extra_headers=extra_headers,
+            )
+        except Exception as e:
+            return json.dumps({"error": str(e)})
+        content_list = result.get("content") or []
+        texts = []
+        for part in content_list:
+            if isinstance(part, dict) and part.get("type") == "text":
+                texts.append(part.get("text", ""))
+        return "\n".join(texts) if texts else json.dumps(result)
+
     def _log_action(self, entity_type: str, entity_id: int, action: str, details: Dict[str, Any]):
         """Log an action to the audit log"""
         log_entry = AuditLog(

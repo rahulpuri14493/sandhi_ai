@@ -1,11 +1,18 @@
-from sqlalchemy.orm import Session
-from typing import List, Dict, Any
+import logging
 import asyncio
+import json
+from typing import List, Dict, Any, Optional
+from sqlalchemy.orm import Session
+from sqlalchemy import or_
 from models.job import Job, WorkflowStep
 from models.agent import Agent
+from models.transaction import Earnings
+from models.communication import AgentCommunication
 from schemas.job import WorkflowPreview, WorkflowStepResponse
 from services.payment_processor import PaymentProcessor
 from services.task_splitter import split_job_for_agents
+
+logger = logging.getLogger(__name__)
 
 
 class WorkflowBuilder:
@@ -13,15 +20,43 @@ class WorkflowBuilder:
         self.db = db
         self.payment_processor = PaymentProcessor(db)
     
-    def auto_split_workflow(self, job_id: int, agent_ids: List[int]) -> WorkflowPreview:
-        """Automatically split a job across selected agents"""
+    def _get_workflow_collaboration_hint(self, job: Job) -> Optional[str]:
+        """Get workflow_collaboration_hint from job conversation (BRD/analyze-documents). Returns 'sequential', 'async_a2a', or None."""
+        if not job.conversation:
+            return None
+        try:
+            conv = json.loads(job.conversation)
+            if not isinstance(conv, list):
+                return None
+            for item in reversed(conv):
+                hint = item.get("workflow_collaboration_hint") if isinstance(item, dict) else None
+                if hint in ("sequential", "async_a2a"):
+                    return hint
+        except (json.JSONDecodeError, TypeError):
+            pass
+        return None
+
+    def auto_split_workflow(
+        self,
+        job_id: int,
+        agent_ids: List[int],
+        workflow_mode: Optional[str] = None,
+        step_tools: Optional[List[Dict[str, Any]]] = None,
+        tool_visibility: Optional[str] = None,
+    ) -> WorkflowPreview:
+        """Automatically split a job across selected agents. workflow_mode: 'independent' | 'sequential' | None.
+        step_tools: optional list of {agent_index, allowed_platform_tool_ids, allowed_connection_ids, tool_visibility} per step.
+        tool_visibility: job-level full | names_only | none (restricts what tool info agents see; credentials never shared)."""
         import json
         import asyncio
         
         job = self.db.query(Job).filter(Job.id == job_id).first()
         if not job:
             raise ValueError("Job not found")
-        
+        if tool_visibility is not None:
+            job.tool_visibility = tool_visibility
+            self.db.commit()
+
         # Get agents
         agents = self.db.query(Agent).filter(Agent.id.in_(agent_ids)).all()
         if len(agents) != len(agent_ids):
@@ -52,10 +87,10 @@ class WorkflowBuilder:
                             content = asyncio.run(analyzer.read_document(file_path))
                             # Validate content was extracted - skip empty documents (they're optional)
                             if not content or not content.strip():
-                                print(f"[WARNING] Document {file_info.get('name')} has empty content - skipping (documents are optional)")
+                                logger.warning("Document %s has empty content - skipping (documents are optional)", file_info.get('name'))
                                 continue
                             
-                            print(f"[DEBUG] Successfully read document: {file_info.get('name')} - Content length: {len(content)} chars")
+                            logger.debug("Successfully read document: %s - Content length: %s chars", file_info.get('name'), len(content))
                             documents_content.append({
                                 "name": file_info.get("name", "Unknown"),
                                 "type": file_info.get("type", "unknown"),
@@ -63,19 +98,19 @@ class WorkflowBuilder:
                             })
                         except Exception as e:
                             # If document reading fails, skip it (documents are optional)
-                            print(f"[WARNING] Failed to read document {file_info.get('name')}: {str(e)} - skipping (documents are optional)")
+                            logger.warning("Failed to read document %s: %s - skipping (documents are optional)", file_info.get('name'), e)
                             continue
                     else:
-                        print(f"[WARNING] Document {file_info.get('name')} has no file path")
+                        logger.warning("Document %s has no file path", file_info.get('name'))
             except (json.JSONDecodeError, TypeError, Exception) as e:
                 # If document parsing fails, continue without document content (documents are optional)
-                print(f"[WARNING] Failed to parse job.files: {str(e)} - Continuing without documents (they are optional)")
+                logger.warning("Failed to parse job.files: %s - Continuing without documents (they are optional)", e)
         
         # Log document status
         if documents_content:
-            print(f"[DEBUG] {len(documents_content)} document(s) will be included as additional information")
+            logger.debug("%s document(s) will be included as additional information", len(documents_content))
         else:
-            print(f"[DEBUG] No documents provided - agent will work with job title and description only")
+            logger.debug("No documents provided - agent will work with job title and description only")
         
         # Prepare base input data with job context, Q&A conversation, and documents
         base_input_data = {
@@ -102,15 +137,59 @@ class WorkflowBuilder:
                         )
                     )
             except Exception as e:
-                print(f"[WARNING] Task split failed: {e}, using fallback")
+                logger.warning("Task split failed: %s, using fallback", e)
             if not task_assignments:
                 task_assignments = [
                     {"agent_index": i, "task": f"Execute the job. You are agent {i+1} of {len(agents)}. {job.description or job.title}"}
                     for i in range(len(agents))
                 ]
         
-        # Clear existing workflow steps
-        self.db.query(WorkflowStep).filter(WorkflowStep.job_id == job_id).delete()
+        # Independent vs sequential: from request override or BRD/conversation hint
+        if workflow_mode == "independent":
+            steps_independent = True
+        elif workflow_mode == "sequential":
+            steps_independent = False
+        else:
+            hint = self._get_workflow_collaboration_hint(job)
+            steps_independent = hint == "async_a2a"
+        logger.debug("Workflow mode: %s (workflow_mode=%r, BRD hint used when None)", 'independent' if steps_independent else 'sequential', workflow_mode)
+        
+        # Unlink earnings and delete dependent rows, then clear existing workflow steps
+        step_ids = [s.id for s in self.db.query(WorkflowStep.id).filter(WorkflowStep.job_id == job_id).all()]
+        if step_ids:
+            self.db.query(Earnings).filter(Earnings.workflow_step_id.in_(step_ids)).update(
+                {Earnings.workflow_step_id: None}, synchronize_session=False
+            )
+            comm_filter = or_(
+                AgentCommunication.from_workflow_step_id.in_(step_ids),
+                AgentCommunication.to_workflow_step_id.in_(step_ids),
+            )
+            comm_ids = [r.id for r in self.db.query(AgentCommunication.id).filter(comm_filter).all()]
+            if comm_ids:
+                self.db.query(Earnings).filter(Earnings.communication_id.in_(comm_ids)).update(
+                    {Earnings.communication_id: None}, synchronize_session=False
+                )
+                self.db.query(AgentCommunication).filter(comm_filter).delete(synchronize_session=False)
+        self.db.query(WorkflowStep).filter(WorkflowStep.job_id == job_id).delete(synchronize_session=False)
+        
+        # When no step_tools provided (e.g. "From BRD/document"): assign job-level tools to every step so selection is saved and visible when job is opened
+        job_platform_ids = None
+        job_conn_ids = None
+        if not step_tools:
+            if getattr(job, "allowed_platform_tool_ids", None):
+                try:
+                    parsed = json.loads(job.allowed_platform_tool_ids)
+                    if isinstance(parsed, list) and len(parsed) > 0:
+                        job_platform_ids = [int(x) for x in parsed if x is not None]
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    pass
+            if getattr(job, "allowed_connection_ids", None):
+                try:
+                    parsed = json.loads(job.allowed_connection_ids)
+                    if isinstance(parsed, list) and len(parsed) > 0:
+                        job_conn_ids = [int(x) for x in parsed if x is not None]
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    pass
         
         # Create workflow steps - each agent gets assigned task + base context
         steps = []
@@ -122,6 +201,9 @@ class WorkflowBuilder:
                     break
             if not assigned_task:
                 assigned_task = f"Execute the job. You are agent {idx+1} of {len(agents)}. {job.description or job.title}"
+            
+            # Step 1 never receives previous output; step 2+ depend on previous only in sequential mode
+            depends_on_previous = False if idx == 0 else (not steps_independent)
             
             # Each agent gets base context + their specific task assignment
             step_input_data = {
@@ -137,16 +219,33 @@ class WorkflowBuilder:
             # Validate step input data includes documents and conversation
             step_docs = step_input_data.get('documents', [])
             step_conv = step_input_data.get('conversation', [])
-            print(f"[DEBUG] Step {idx + 1} for agent '{agent.name}':")
-            print(f"[DEBUG]   - Documents: {len(step_docs)}")
-            print(f"[DEBUG]   - Conversation items: {len(step_conv)}")
+            logger.debug("Step %s for agent '%s': depends_on_previous=%s documents=%s conversation_items=%s", idx + 1, agent.name, depends_on_previous, len(step_docs), len(step_conv))
             
+            step_platform = step_conn = step_tool_visibility = None
+            if step_tools:
+                for st in step_tools:
+                    if st.get("agent_index") == idx:
+                        step_platform = st.get("allowed_platform_tool_ids")
+                        step_conn = st.get("allowed_connection_ids")
+                        step_tool_visibility = st.get("tool_visibility")
+                        break
+            else:
+                # Auto-assign job-level tools to this step (From BRD/document: tools selection by system, saved for completed job view)
+                if job_platform_ids is not None:
+                    step_platform = job_platform_ids
+                if job_conn_ids is not None:
+                    step_conn = job_conn_ids
+            step_visibility = step_tool_visibility if step_tool_visibility is not None else (tool_visibility or getattr(job, "tool_visibility", None))
             step = WorkflowStep(
                 job_id=job_id,
                 agent_id=agent.id,
                 step_order=idx + 1,
                 input_data=json.dumps(step_input_data),
-                status="pending"
+                status="pending",
+                depends_on_previous=depends_on_previous,
+                allowed_platform_tool_ids=json.dumps(step_platform) if step_platform else None,
+                allowed_connection_ids=json.dumps(step_conn) if step_conn else None,
+                tool_visibility=step_visibility,
             )
             self.db.add(step)
             steps.append(step)
@@ -191,10 +290,10 @@ class WorkflowBuilder:
                             content = asyncio.run(analyzer.read_document(file_path))
                             # Validate content was extracted - skip empty documents (they're optional)
                             if not content or not content.strip():
-                                print(f"[WARNING] Document {file_info.get('name')} has empty content - skipping (documents are optional)")
+                                logger.warning("Document %s has empty content - skipping (documents are optional)", file_info.get('name'))
                                 continue
                             
-                            print(f"[DEBUG] Successfully read document: {file_info.get('name')} - Content length: {len(content)} chars")
+                            logger.debug("Successfully read document: %s - Content length: %s chars", file_info.get('name'), len(content))
                             documents_content.append({
                                 "name": file_info.get("name", "Unknown"),
                                 "type": file_info.get("type", "unknown"),
@@ -202,25 +301,22 @@ class WorkflowBuilder:
                             })
                         except Exception as e:
                             # If document reading fails, skip it (documents are optional)
-                            print(f"[WARNING] Failed to read document {file_info.get('name')}: {str(e)} - skipping (documents are optional)")
+                            logger.warning("Failed to read document %s: %s - skipping (documents are optional)", file_info.get('name'), e)
                             continue
                     else:
-                        print(f"[WARNING] Document {file_info.get('name')} has no file path")
+                        logger.warning("Document %s has no file path", file_info.get('name'))
             except (json.JSONDecodeError, TypeError, Exception) as e:
                 # If document parsing fails, continue without document content (documents are optional)
-                print(f"[WARNING] Failed to parse job.files: {str(e)} - Continuing without documents (they are optional)")
+                logger.warning("Failed to parse job.files: %s - Continuing without documents (they are optional)", e)
         
         # Log document status
         if documents_content:
-            print(f"[DEBUG] {len(documents_content)} document(s) will be included as additional information")
+            logger.debug("%s document(s) will be included as additional information", len(documents_content))
         else:
-            print(f"[DEBUG] No documents provided - agent will work with job title and description only")
+            logger.debug("No documents provided - agent will work with job title and description only")
         
         # Prepare base input data with job context, Q&A conversation, and documents
-        print(f"[DEBUG] Building manual workflow for job {job_id}")
-        print(f"[DEBUG] Job title: {job.title}")
-        print(f"[DEBUG] Conversation items: {len(conversation_data) if conversation_data else 0}")
-        print(f"[DEBUG] Documents to include: {len(documents_content)}")
+        logger.debug("Building manual workflow for job %s title=%s conversation_items=%s documents=%s", job_id, job.title, len(conversation_data) if conversation_data else 0, len(documents_content))
         
         base_input_data = {
             "job_title": job.title,
@@ -231,19 +327,33 @@ class WorkflowBuilder:
         
         # Validate that documents and conversation are included
         if not documents_content:
-            print(f"[WARNING] No document content found for job {job_id}")
+            logger.warning("No document content found for job %s", job_id)
         else:
             total_content_length = sum(len(doc.get('content', '')) for doc in documents_content)
-            print(f"[DEBUG] Total document content length: {total_content_length} characters")
+            logger.debug("Total document content length: %s characters", total_content_length)
         
         if not conversation_data:
-            print(f"[WARNING] No conversation data found for job {job_id}")
+            logger.warning("No conversation data found for job %s", job_id)
         else:
-            print(f"[DEBUG] Conversation includes {len([item for item in conversation_data if item.get('type') == 'question'])} questions")
-            print(f"[DEBUG] Conversation includes {len([item for item in conversation_data if item.get('type') == 'completion'])} completion messages")
+            logger.debug("Conversation includes %s questions and %s completion messages", len([item for item in conversation_data if item.get('type') == 'question']), len([item for item in conversation_data if item.get('type') == 'completion']))
         
-        # Clear existing workflow steps
-        self.db.query(WorkflowStep).filter(WorkflowStep.job_id == job_id).delete()
+        # Unlink earnings and delete dependent rows, then clear existing workflow steps
+        step_ids = [s.id for s in self.db.query(WorkflowStep.id).filter(WorkflowStep.job_id == job_id).all()]
+        if step_ids:
+            self.db.query(Earnings).filter(Earnings.workflow_step_id.in_(step_ids)).update(
+                {Earnings.workflow_step_id: None}, synchronize_session=False
+            )
+            comm_filter = or_(
+                AgentCommunication.from_workflow_step_id.in_(step_ids),
+                AgentCommunication.to_workflow_step_id.in_(step_ids),
+            )
+            comm_ids = [r.id for r in self.db.query(AgentCommunication.id).filter(comm_filter).all()]
+            if comm_ids:
+                self.db.query(Earnings).filter(Earnings.communication_id.in_(comm_ids)).update(
+                    {Earnings.communication_id: None}, synchronize_session=False
+                )
+                self.db.query(AgentCommunication).filter(comm_filter).delete(synchronize_session=False)
+        self.db.query(WorkflowStep).filter(WorkflowStep.job_id == job_id).delete(synchronize_session=False)
         
         # Create workflow steps
         for step_data in workflow_steps:
@@ -267,9 +377,7 @@ class WorkflowBuilder:
             # Validate step input data includes documents and conversation
             step_docs = step_input_data.get('documents', [])
             step_conv = step_input_data.get('conversation', [])
-            print(f"[DEBUG] Manual workflow step {step_order} for agent '{agent.name}':")
-            print(f"[DEBUG]   - Documents: {len(step_docs)}")
-            print(f"[DEBUG]   - Conversation items: {len(step_conv)}")
+            logger.debug("Manual workflow step %s for agent '%s': documents=%s conversation_items=%s", step_order, agent.name, len(step_docs), len(step_conv))
             
             # If custom input data is provided, merge it
             if custom_input_data:
@@ -283,12 +391,23 @@ class WorkflowBuilder:
                     except (json.JSONDecodeError, TypeError):
                         step_input_data["custom_input"] = custom_input_data
             
+            # Step 1 never receives previous output; default step 2+ to True (sequential) unless overridden
+            depends_on_previous = step_data.get("depends_on_previous")
+            if not isinstance(depends_on_previous, bool):
+                depends_on_previous = step_order != 1
+            step_platform = step_data.get("allowed_platform_tool_ids")
+            step_conn = step_data.get("allowed_connection_ids")
+            step_tool_visibility = step_data.get("tool_visibility")
             step = WorkflowStep(
                 job_id=job_id,
                 agent_id=agent_id,
                 step_order=step_order,
                 input_data=json.dumps(step_input_data),
-                status="pending"
+                status="pending",
+                depends_on_previous=depends_on_previous,
+                allowed_platform_tool_ids=json.dumps(step_platform) if step_platform else None,
+                allowed_connection_ids=json.dumps(step_conn) if step_conn else None,
+                tool_visibility=step_tool_visibility,
             )
             self.db.add(step)
         

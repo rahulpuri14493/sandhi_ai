@@ -1,9 +1,9 @@
-version: "3.9"
-
 services:
   db:
     image: postgres:15-alpine
     container_name: sandhi-db
+    env_file:
+      - .env
     environment:
       POSTGRES_USER: ${POSTGRES_USER:-postgres}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
@@ -12,36 +12,77 @@ services:
       - "5432:5432"
     volumes:
       - db_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U \"$$POSTGRES_USER\" -d \"$$POSTGRES_DB\""]
+      interval: 3s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
 
-  # backend:
-  #   build:
-  #     context: ./backend
-  #     dockerfile: Dockerfile
-  #   container_name: sandhi-backend
-  #   restart: always
-  #   command: uvicorn main:app --host 0.0.0.0 --port 8000 --reload
-  #   volumes:
-  #     - ./backend:/app
-  #   ports:
-  #     - "8000:8000"
-  #   environment:
-  #     DATABASE_URL: postgresql+psycopg2://postgres:postgres@db:5432/agent_marketplace
-  #   env_file:
-  #     - .env
-  #   depends_on:
-  #     - db
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: sandhi-backend
+    restart: unless-stopped
+    command: python run.py
+    volumes:
+      - ./backend:/app
+    ports:
+      - "8000:8000"
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@db:5432/${POSTGRES_DB:-agent_marketplace}
+      A2A_ADAPTER_URL: http://a2a-openai-adapter:8080
+      PLATFORM_MCP_SERVER_URL: http://platform-mcp-server:8081
+      # Use dev default so stack runs without .env; set MCP_INTERNAL_SECRET in .env for production
+      MCP_INTERNAL_SECRET: ${MCP_INTERNAL_SECRET:-dev-mcp-internal-secret}
+    env_file:
+      - .env
+    depends_on:
+      db:
+        condition: service_healthy
+      a2a-openai-adapter:
+        condition: service_started
 
-  # frontend:
-  #   build:
-  #     context: ./frontend
-  #     dockerfile: Dockerfile
-  #   container_name: sandhi-frontend
-  #   environment:
-  #     VITE_API_URL: ${VITE_API_URL:-http://localhost:8000}
-  #   depends_on:
-  #     - backend
-  #   ports:
-  #     - "3000:3000"
+  a2a-openai-adapter:
+    build:
+      context: ./tools/a2a_openai_adapter
+      dockerfile: Dockerfile
+    container_name: a2a-openai-adapter
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    # No OPENAI_* env needed: platform sends openai_url/openai_api_key/openai_model per request in metadata
+
+  platform-mcp-server:
+    build:
+      context: ./tools/platform_mcp_server
+      dockerfile: Dockerfile
+    container_name: platform-mcp-server
+    restart: unless-stopped
+    ports:
+      - "8081:8081"
+    environment:
+      BACKEND_INTERNAL_URL: http://backend:8000
+      MCP_INTERNAL_SECRET: ${MCP_INTERNAL_SECRET:-dev-mcp-internal-secret}
+    env_file:
+      - .env
+    depends_on:
+      - backend
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: sandhi-frontend
+    env_file:
+      - .env
+    environment:
+      VITE_PROXY_TARGET: http://backend:8000
+    depends_on:
+      - backend
+    ports:
+      - "3000:3000"
 
 volumes:
   db_data:

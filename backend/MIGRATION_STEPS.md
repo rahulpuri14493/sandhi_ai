@@ -18,7 +18,7 @@ docker-compose exec db psql -U postgres -d agent_marketplace -c "ALTER TABLE age
 **OR** if you prefer to use the SQL file:
 
 ```bash
-docker-compose exec -T db psql -U postgres -d agent_marketplace < backend/add_api_key_column.sql
+docker-compose exec -T db psql -U postgres -d agent_marketplace < backend/migrations/003_add_api_key_column.sql
 ```
 
 ### Step 3: Verify the column was added
@@ -42,7 +42,7 @@ brew services list | grep postgresql
 
 ### Step 2: Run the migration SQL
 ```bash
-psql -U postgres -d agent_marketplace -f backend/add_api_key_column.sql
+psql -U postgres -d agent_marketplace -f backend/migrations/003_add_api_key_column.sql
 ```
 
 **OR** run the SQL directly:

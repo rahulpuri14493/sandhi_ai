@@ -20,6 +20,7 @@ class AgentCreate(BaseModel):
     llm_model: Optional[str] = None
     temperature: Optional[float] = None
     plugin_config: Optional[Dict[str, Any]] = None
+    a2a_enabled: bool = False
 
 
 class AgentUpdate(BaseModel):
@@ -39,6 +40,7 @@ class AgentUpdate(BaseModel):
     temperature: Optional[float] = None
     plugin_config: Optional[Dict[str, Any]] = None
     status: Optional[AgentStatus] = None
+    a2a_enabled: Optional[bool] = None
 
 
 class AgentResponse(BaseModel):
@@ -59,8 +61,12 @@ class AgentResponse(BaseModel):
     llm_model: Optional[str] = None
     temperature: Optional[float] = None
     plugin_config: Optional[Dict[str, Any]]
+    a2a_enabled: bool = False
     status: AgentStatus
     created_at: datetime
+    # Optional: included in list for marketplace cards
+    average_rating: Optional[float] = None
+    review_count: Optional[int] = None
 
     class Config:
         from_attributes = True

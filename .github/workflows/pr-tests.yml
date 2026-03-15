@@ -5,10 +5,71 @@ on:
   pull_request:
     branches: ["**"]
 
+env:
+  POSTGRES_USER: postgres
+  POSTGRES_PASSWORD: postgres
+  POSTGRES_DB: agent_marketplace
+
+permissions:
+  contents: read
+
 jobs:
+  docker-compose-stack:
+    name: Docker Compose stack
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Create minimal .env for CI
+        run: |
+          echo "POSTGRES_USER=postgres" >> .env
+          echo "POSTGRES_PASSWORD=postgres" >> .env
+          echo "POSTGRES_DB=agent_marketplace" >> .env
+          echo "SECRET_KEY=ci-secret-key" >> .env
+          echo "MCP_INTERNAL_SECRET=ci-mcp-internal-secret" >> .env
+
+      - name: Build and start stack
+        run: docker compose up -d --build
+
+      - name: Show stack logs on build/start failure
+        if: failure()
+        run: docker compose logs --tail=200
+
+      - name: Wait for backend
+        run: |
+          for i in $(seq 1 45); do
+            if curl -sf http://localhost:8000/docs > /dev/null 2>&1; then
+              echo "Backend ready"
+              break
+            fi
+            [ "$i" -eq 45 ] && (docker compose logs backend; exit 1)
+            sleep 2
+          done
+
+      - name: Wait for frontend (if in stack)
+        run: |
+          if docker compose config --services 2>/dev/null | grep -qx frontend; then
+            for i in $(seq 1 20); do
+              if curl -sf http://localhost:3000 > /dev/null 2>&1; then
+                echo "Frontend ready"
+                break
+              fi
+              [ "$i" -eq 20 ] && (docker compose logs frontend; exit 1)
+              sleep 2
+            done
+          else
+            echo "No frontend service in stack, skipping"
+          fi
+
+      - name: Stop stack
+        if: always()
+        run: docker compose down -v || true
+
   backend-tests:
     name: Backend tests
     runs-on: ubuntu-latest
+    env:
+      SECRET_KEY: ci-secret-key
     defaults:
       run:
         working-directory: backend
@@ -35,7 +96,42 @@ jobs:
           pip install -r requirements.txt
 
       - name: Run pytest
-        run: pytest
+        run: pytest -v
+
+      - name: Run integration tests
+        run: pytest tests/integration/ -v
+
+  platform-mcp-tests:
+    name: Platform MCP server tests
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: tools/platform_mcp_server
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Cache pip dependencies
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-mcp-${{ hashFiles('tools/platform_mcp_server/requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-mcp-
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pytest
+
+      - name: Run platform MCP tool tests
+        run: pytest tests/ -v --tb=short
 
   frontend-tests:
     name: Frontend tests
@@ -50,7 +146,7 @@ jobs:
       - name: Set up Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: "20"
+          node-version: "22"
           cache: "npm"
           cache-dependency-path: frontend/package-lock.json
 
@@ -58,4 +154,11 @@ jobs:
         run: npm ci
 
       - name: Run tests
-        run: npm run test
+        run: npm run test -- --run
+        env:
+          CI: true
+
+      - name: Run integration tests
+        run: npm run test -- --run tests/integration
+        env:
+          CI: true

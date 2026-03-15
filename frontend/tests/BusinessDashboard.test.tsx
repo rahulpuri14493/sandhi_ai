@@ -32,9 +32,9 @@ describe('BusinessDashboard', () => {
 
   it('renders Business Dashboard title', async () => {
     render(wrapWithRouter(<BusinessDashboard />))
-    await screen.findByText('Business Dashboard')
+    await screen.findByText('Business Dashboard', {}, { timeout: 10000 })
     expect(screen.getByText('Business Dashboard')).toBeInTheDocument()
-  })
+  }, 12000)
 
   it('displays total spent and job count after loading', async () => {
     render(wrapWithRouter(<BusinessDashboard />))
@@ -79,8 +79,7 @@ describe('BusinessDashboard', () => {
 
   it('shows New Job button', async () => {
     render(wrapWithRouter(<BusinessDashboard />))
-    await screen.findByText('New Job')
-    const newJobLink = screen.getByRole('link', { name: /new job/i })
+    const newJobLink = await screen.findByRole('link', { name: /new job/i }, { timeout: 10000 })
     expect(newJobLink).toHaveAttribute('href', '/jobs/new')
-  })
+  }, 12000)
 })

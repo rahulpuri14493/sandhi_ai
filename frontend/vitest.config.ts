@@ -9,6 +9,8 @@ export default defineConfig({
     setupFiles: ['./tests/setup.ts'],
     include: ['tests/**/*.test.{ts,tsx}'],
     globals: true,
+    // Use threads instead of forks to avoid "Timeout waiting for worker to respond" on Windows
+    pool: 'threads',
   },
   resolve: {
     alias: {

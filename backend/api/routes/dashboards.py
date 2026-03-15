@@ -78,6 +78,7 @@ def get_developer_agents(
             api_endpoint=agent.api_endpoint,
             api_key=agent.api_key,  # Include api_key for own agents
             plugin_config=agent.plugin_config,
+            a2a_enabled=getattr(agent, "a2a_enabled", False),
             status=agent.status,
             created_at=agent.created_at,
         ))
@@ -159,7 +160,8 @@ def get_business_jobs(
                 status=step.status,
                 cost=step.cost or 0.0,
                 started_at=step.started_at,
-                completed_at=step.completed_at
+                completed_at=step.completed_at,
+                depends_on_previous=getattr(step, "depends_on_previous", True),
             ))
         
         job_dict = {

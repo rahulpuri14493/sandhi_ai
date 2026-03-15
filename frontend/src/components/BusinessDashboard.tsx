@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react'
 import { dashboardsAPI, jobsAPI } from '../lib/api'
+import { getStepOutputDisplayText } from '../lib/formatStepOutput'
 import type { Job } from '../lib/types'
 import { Link, useNavigate } from 'react-router-dom'
 
@@ -359,19 +360,9 @@ export function BusinessDashboard() {
                                 </span>
                               </div>
                               <div className="text-sm text-white/90 bg-dark-50/50 p-4 rounded-xl border border-dark-200/50">
-                                {typeof outputData === 'object' ? (
-                                  outputData.choices && Array.isArray(outputData.choices) && outputData.choices.length > 0 ? (
-                                    <p className="whitespace-pre-wrap leading-relaxed">
-                                      {outputData.choices[0].message?.content || 'No content'}
-                                    </p>
-                                  ) : (
-                                    <pre className="text-xs overflow-auto max-h-48 font-mono text-white/80">
-                                      {JSON.stringify(outputData, null, 2)}
-                                    </pre>
-                                  )
-                                ) : (
-                                  <p className="whitespace-pre-wrap">{String(outputData)}</p>
-                                )}
+                                <pre className="text-xs overflow-auto max-h-48 font-mono text-white/80 whitespace-pre-wrap">
+                                  {getStepOutputDisplayText(outputData)}
+                                </pre>
                               </div>
                             </div>
                           )

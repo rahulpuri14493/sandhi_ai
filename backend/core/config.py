@@ -15,11 +15,14 @@ class Settings(BaseSettings):
         EXTERNAL_API_KEY: str = os.getenv("EXTERNAL_API_KEY", "")
         EXTERNAL_TOKEN_EXPIRE_DAYS: int = int(os.getenv("EXTERNAL_TOKEN_EXPIRE_DAYS", "7"))
         EXTERNAL_API_BASE_URL: str = os.getenv("EXTERNAL_API_BASE_URL", "http://localhost:8000")
-        # MLOps Inference Endpoint Configuration
-        MLOPS_API_URL: str = os.getenv("MLOPS_API_URL", "https://mle-uat-mlops.cloud.workfusion.com:4437/mlops-api/mlops-inference-service/v1/chat/completions")
-        MLOPS_CERT_FILE: str = os.getenv("MLOPS_CERT_FILE", "/Users/rahulpuri/Desktop/me/test/crt")
-        MLOPS_KEY_FILE: str = os.getenv("MLOPS_KEY_FILE", "/Users/rahulpuri/Desktop/me/test/key")
-        MLOPS_MODEL: str = os.getenv("MLOPS_MODEL", "llama-3-1-8b-model")
+        # A2A adapter: when set, OpenAI-compatible agents are called via this A2A endpoint (platform runs A2A everywhere)
+        A2A_ADAPTER_URL: str = os.getenv("A2A_ADAPTER_URL", "http://a2a-openai-adapter:8080")
+        # Platform MCP server: URL for the platform-hosted MCP server (tool discovery + invocation for agents)
+        PLATFORM_MCP_SERVER_URL: str = os.getenv("PLATFORM_MCP_SERVER_URL", "http://platform-mcp-server:8081")
+        # Internal secret for platform MCP server and backend-to-MCP-server calls (same secret in both)
+        MCP_INTERNAL_SECRET: str = os.getenv("MCP_INTERNAL_SECRET", "")
+        # When True, allow agent endpoints that resolve to private/loopback IPs (dev, Docker, same host). Default False in production.
+        ALLOW_PRIVATE_AGENT_ENDPOINTS: bool = os.getenv("ALLOW_PRIVATE_AGENT_ENDPOINTS", "false").lower() in ("true", "1", "yes")
 
         class Config:
             env_file = ".env"
