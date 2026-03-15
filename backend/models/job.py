@@ -49,6 +49,7 @@ class Job(Base):
         back_populates="job",
         cascade="all, delete-orphan",
     )
+    schedules = relationship("JobSchedule", back_populates="job", cascade="all, delete-orphan")
 
 
 class WorkflowStep(Base):
