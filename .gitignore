@@ -19,6 +19,8 @@ MANIFEST
 # Upload directories (user-uploaded files)
 upload/
 uploads/
+uploads/jobs/
+backend/uploads/
 
 # PyInstaller
 #  Usually these files are written by a python script from a template

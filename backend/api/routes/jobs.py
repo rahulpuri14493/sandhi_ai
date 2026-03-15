@@ -34,8 +34,8 @@ router = APIRouter(prefix="/api/jobs", tags=["jobs"])
 
 def _validate_allowed_tools(db: Session, business_id: int, platform_ids: Optional[List[int]], connection_ids: Optional[List[int]]):
     """Validate that platform_tool_ids and connection_ids belong to business_id. Returns (platform_ids, connection_ids) as JSON-serializable lists or None."""
-    out_platform = None
-    if platform_ids:
+    out_platform = [] if platform_ids is not None and len(platform_ids) == 0 else None
+    if platform_ids and len(platform_ids):
         valid = db.query(MCPToolConfig.id).filter(
             MCPToolConfig.user_id == business_id,
             MCPToolConfig.id.in_(platform_ids),
@@ -46,8 +46,8 @@ def _validate_allowed_tools(db: Session, business_id: int, platform_ids: Optiona
         if invalid:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Invalid or unauthorized platform tool ids: {sorted(invalid)}")
         out_platform = list(valid_set)
-    out_conn = None
-    if connection_ids:
+    out_conn = [] if connection_ids is not None and len(connection_ids) == 0 else None
+    if connection_ids and len(connection_ids):
         valid = db.query(MCPServerConnection.id).filter(
             MCPServerConnection.user_id == business_id,
             MCPServerConnection.id.in_(connection_ids),
@@ -224,8 +224,8 @@ async def create_job(
         status=JobStatus.DRAFT,
         files=json.dumps(file_metadata) if file_metadata else None,
         conversation=json.dumps([]),  # Initialize empty conversation
-        allowed_platform_tool_ids=json.dumps(platform_ids) if platform_ids else None,
-        allowed_connection_ids=json.dumps(connection_ids) if connection_ids else None,
+        allowed_platform_tool_ids=json.dumps(platform_ids) if platform_ids is not None else None,
+        allowed_connection_ids=json.dumps(connection_ids) if connection_ids is not None else None,
         tool_visibility=tv,
     )
     db.add(new_job)
@@ -870,12 +870,12 @@ async def update_job(
         pids = _parse_int_list_form(allowed_platform_tool_ids)
         if pids:
             pids, _ = _validate_allowed_tools(db, current_user.id, pids, None)
-        job.allowed_platform_tool_ids = json.dumps(pids) if pids else None
+        job.allowed_platform_tool_ids = json.dumps(pids) if pids is not None else None
     if allowed_connection_ids is not None:
         cids = _parse_int_list_form(allowed_connection_ids)
         if cids:
             _, cids = _validate_allowed_tools(db, current_user.id, None, cids)
-        job.allowed_connection_ids = json.dumps(cids) if cids else None
+        job.allowed_connection_ids = json.dumps(cids) if cids is not None else None
     if tool_visibility is not None:
         job.tool_visibility = _validate_tool_visibility(tool_visibility)
 

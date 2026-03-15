@@ -27,7 +27,10 @@ class Agent(Base):
     capabilities = Column(JSON)  # List of capability strings
     input_schema = Column(JSON)  # JSON schema for inputs
     output_schema = Column(JSON)  # JSON schema for outputs
-    pricing_model = Column(Enum(PricingModel, name='pricingmodel', create_type=False, native_enum=True), default=PricingModel.PAY_PER_USE)
+    pricing_model = Column(
+        Enum(PricingModel, name='pricingmodel', create_type=False, native_enum=True, values_callable=lambda x: [e.value for e in x]),
+        default=PricingModel.PAY_PER_USE,
+    )
     price_per_task = Column(Float, nullable=False, default=0.0)
     price_per_communication = Column(Float, nullable=False, default=0.0)
     monthly_price = Column(Float, nullable=True, default=None)  # Monthly subscription price
