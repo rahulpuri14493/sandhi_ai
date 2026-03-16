@@ -119,6 +119,20 @@ Builds images with `docker compose build`, starts the stack with `docker compose
 
 Builds the **backend** image (from `backend/Dockerfile`), pushes to GitHub Container Registry, and deploys to the configured Azure Web App. Configure via repo secrets and Azure app settings (see comments in the file).
 
+**Required settings** (Environment variables / Configuration):
+
+| Where | Name | Required | Description |
+|-------|------|----------|-------------|
+| **App settings** | `DATABASE_URL` | Yes* | Full PostgreSQL URL (e.g. `postgresql://user:password@host:5432/db`). |
+| **App settings** | `SECRET_KEY` | Yes | Secret for JWT signing (long random value in production). |
+| **App settings** | `WEBSITES_PORT` | Yes | Set to `8000` so Azure routes HTTP to your container. |
+
+\* **Database URL** can be set in either place (app uses the first it finds):
+- **App settings:** add `DATABASE_URL` with your PostgreSQL connection string, or  
+- **Connection strings:** add a connection string with **name** `DefaultConnection` and **type** PostgreSQL; put the same URL in the value (e.g. `postgresql://user:password@host:5432/db`).
+
+If you see **"connection to server at localhost (127.0.0.1), port 5432 failed: Connection refused"** in the log stream, add the database URL in App settings or Connection strings and restart the app.
+
 ### Environment and configuration
 
 - **PR Tests / Docker CI:** `.env` is created in the job with `POSTGRES_*`, `SECRET_KEY`, and `POSTGRES_DB` so Compose and backend can start. Backend pytest uses in-memory SQLite and does not need PostgreSQL or `A2A_ADAPTER_URL`.
