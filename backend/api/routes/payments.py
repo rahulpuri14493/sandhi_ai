@@ -23,7 +23,7 @@ def calculate_cost(job_id: int, db: Session = Depends(get_db)):
 def process_payment(
     job_id: int,
     current_user: User = Depends(get_current_user),
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
 ):
     """Process payment for a job (mock implementation)"""
     payment_processor = PaymentProcessor(db)
@@ -33,11 +33,10 @@ def process_payment(
 
 @router.get("/transactions", response_model=List[TransactionResponse])
 def list_transactions(
-    current_user: User = Depends(get_current_user),
-    db: Session = Depends(get_db)
+    current_user: User = Depends(get_current_user), db: Session = Depends(get_db)
 ):
     """List transactions for the current user"""
-    transactions = db.query(Transaction).filter(
-        Transaction.payer_id == current_user.id
-    ).all()
+    transactions = (
+        db.query(Transaction).filter(Transaction.payer_id == current_user.id).all()
+    )
     return transactions

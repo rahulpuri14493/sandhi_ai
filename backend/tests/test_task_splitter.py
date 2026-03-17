@@ -1,4 +1,5 @@
 """Unit tests for task_splitter service (multi-agent workflow)."""
+
 import asyncio
 import json
 import pytest
@@ -37,14 +38,16 @@ def multi_agents():
 
 def test_split_single_agent_returns_full_context(single_agent):
     """Single agent gets full task context, no API call."""
-    result = asyncio.run(split_job_for_agents(
-        job_title="Test Job",
-        job_description="Do something",
-        documents_content=[{"name": "doc.txt", "content": "Hello"}],
-        conversation_data=None,
-        agents=[single_agent],
-        splitter_agent=single_agent,
-    ))
+    result = asyncio.run(
+        split_job_for_agents(
+            job_title="Test Job",
+            job_description="Do something",
+            documents_content=[{"name": "doc.txt", "content": "Hello"}],
+            conversation_data=None,
+            agents=[single_agent],
+            splitter_agent=single_agent,
+        )
+    )
     assert len(result) == 1
     assert result[0]["agent_index"] == 0
     assert "Test Job" in result[0]["task"]
@@ -56,14 +59,16 @@ def test_split_fallback_when_no_api_endpoint(multi_agents):
     """When splitter has no api_endpoint, uses fallback tasks."""
     splitter = multi_agents[0]
     splitter.api_endpoint = None
-    result = asyncio.run(split_job_for_agents(
-        job_title="Multi Job",
-        job_description="Split this",
-        documents_content=[],
-        conversation_data=None,
-        agents=multi_agents,
-        splitter_agent=splitter,
-    ))
+    result = asyncio.run(
+        split_job_for_agents(
+            job_title="Multi Job",
+            job_description="Split this",
+            documents_content=[],
+            conversation_data=None,
+            agents=multi_agents,
+            splitter_agent=splitter,
+        )
+    )
     assert len(result) == 3
     for i, r in enumerate(result):
         assert r["agent_index"] == i
@@ -83,14 +88,16 @@ def test_split_fallback_when_api_returns_error(multi_agents):
         mock_client.return_value.__aenter__.return_value.post = AsyncMock(
             return_value=mock_resp
         )
-        result = asyncio.run(split_job_for_agents(
-            job_title="Fail Job",
-            job_description="Will fail",
-            documents_content=[],
-            conversation_data=None,
-            agents=multi_agents,
-            splitter_agent=splitter,
-        ))
+        result = asyncio.run(
+            split_job_for_agents(
+                job_title="Fail Job",
+                job_description="Will fail",
+                documents_content=[],
+                conversation_data=None,
+                agents=multi_agents,
+                splitter_agent=splitter,
+            )
+        )
     assert len(result) == 3
     for i, r in enumerate(result):
         assert r["agent_index"] == i
@@ -117,14 +124,16 @@ def test_split_success_parses_json_from_api(multi_agents):
         mock_client.return_value.__aenter__.return_value.post = AsyncMock(
             return_value=mock_resp
         )
-        result = asyncio.run(split_job_for_agents(
-            job_title="API Job",
-            job_description="Use API",
-            documents_content=[],
-            conversation_data=None,
-            agents=multi_agents,
-            splitter_agent=splitter,
-        ))
+        result = asyncio.run(
+            split_job_for_agents(
+                job_title="API Job",
+                job_description="Use API",
+                documents_content=[],
+                conversation_data=None,
+                agents=multi_agents,
+                splitter_agent=splitter,
+            )
+        )
     assert len(result) == 3
     assert result[0]["task"] == "Task A for agent 1"
     assert result[1]["task"] == "Task B for agent 2"
@@ -152,14 +161,16 @@ def test_split_strips_markdown_code_blocks(multi_agents):
         mock_client.return_value.__aenter__.return_value.post = AsyncMock(
             return_value=mock_resp
         )
-        result = asyncio.run(split_job_for_agents(
-            job_title="Markdown Job",
-            job_description="",
-            documents_content=[],
-            conversation_data=None,
-            agents=multi_agents,
-            splitter_agent=splitter,
-        ))
+        result = asyncio.run(
+            split_job_for_agents(
+                job_title="Markdown Job",
+                job_description="",
+                documents_content=[],
+                conversation_data=None,
+                agents=multi_agents,
+                splitter_agent=splitter,
+            )
+        )
     assert len(result) == 3
     assert result[0]["task"] == "Task 1"
     assert result[1]["task"] == "Task 2"

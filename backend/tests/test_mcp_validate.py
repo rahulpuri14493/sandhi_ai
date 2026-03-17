@@ -2,10 +2,10 @@
 Positive: valid inputs that should pass.
 Negative: invalid/missing inputs that should fail with clear messages.
 """
+
 import pytest
 
 from services.mcp_validate import validate_tool_config
-
 
 # ---------- Positive test cases (valid inputs, expect success or skip) ----------
 
@@ -72,7 +72,9 @@ class TestValidateToolConfigNegative:
         assert "Base path is required" in msg
 
     def test_negative_filesystem_nonexistent_path(self):
-        valid, msg = validate_tool_config("filesystem", {"base_path": "/nonexistent/path/xyz"})
+        valid, msg = validate_tool_config(
+            "filesystem", {"base_path": "/nonexistent/path/xyz"}
+        )
         assert valid is False
         assert "not a directory" in msg or "does not exist" in msg
 
@@ -96,7 +98,12 @@ class TestValidateToolConfigAllTypes:
     def test_chroma_returns_skip_message(self):
         valid, msg = validate_tool_config("chroma", {})
         assert valid is True
-        assert "not available" in msg or "save" in msg.lower() or "store" in msg.lower() or "credentials" in msg.lower()
+        assert (
+            "not available" in msg
+            or "save" in msg.lower()
+            or "store" in msg.lower()
+            or "credentials" in msg.lower()
+        )
 
     def test_pinecone_accepts_without_validation(self):
         valid, msg = validate_tool_config("pinecone", {})
@@ -105,12 +112,22 @@ class TestValidateToolConfigAllTypes:
     def test_weaviate_returns_skip_message(self):
         valid, msg = validate_tool_config("weaviate", {})
         assert valid is True
-        assert "not available" in msg or "save" in msg.lower() or "store" in msg.lower() or "credentials" in msg.lower()
+        assert (
+            "not available" in msg
+            or "save" in msg.lower()
+            or "store" in msg.lower()
+            or "credentials" in msg.lower()
+        )
 
     def test_qdrant_returns_skip_message(self):
         valid, msg = validate_tool_config("qdrant", {})
         assert valid is True
-        assert "not available" in msg or "save" in msg.lower() or "store" in msg.lower() or "credentials" in msg.lower()
+        assert (
+            "not available" in msg
+            or "save" in msg.lower()
+            or "store" in msg.lower()
+            or "credentials" in msg.lower()
+        )
 
     def test_vector_db_returns_skip_message(self):
         valid, msg = validate_tool_config("vector_db", {})
@@ -120,17 +137,32 @@ class TestValidateToolConfigAllTypes:
     def test_s3_returns_skip_message(self):
         valid, msg = validate_tool_config("s3", {})
         assert valid is True
-        assert "not available" in msg or "save" in msg.lower() or "store" in msg.lower() or "credentials" in msg.lower()
+        assert (
+            "not available" in msg
+            or "save" in msg.lower()
+            or "store" in msg.lower()
+            or "credentials" in msg.lower()
+        )
 
     def test_github_returns_skip_message(self):
         valid, msg = validate_tool_config("github", {})
         assert valid is True
-        assert "not available" in msg or "save" in msg.lower() or "store" in msg.lower() or "credentials" in msg.lower()
+        assert (
+            "not available" in msg
+            or "save" in msg.lower()
+            or "store" in msg.lower()
+            or "credentials" in msg.lower()
+        )
 
     def test_notion_returns_skip_message(self):
         valid, msg = validate_tool_config("notion", {})
         assert valid is True
-        assert "not available" in msg or "save" in msg.lower() or "store" in msg.lower() or "credentials" in msg.lower()
+        assert (
+            "not available" in msg
+            or "save" in msg.lower()
+            or "store" in msg.lower()
+            or "credentials" in msg.lower()
+        )
 
     def test_rest_api_empty_url_fails(self):
         valid, msg = validate_tool_config("rest_api", {"base_url": ""})

@@ -2,6 +2,7 @@
 Integration tests for MCP flows: create connection, create tool, list, update, delete.
 Uses integration_client and business_user from integration/conftest.
 """
+
 import pytest
 from fastapi.testclient import TestClient
 
@@ -55,7 +56,9 @@ class TestMCPIntegrationFlow:
         assert r4.json()["name"] == "E2E MCP Server Updated"
 
         # Delete
-        r5 = integration_client.delete(f"/api/mcp/connections/{cid}", headers=auth_headers)
+        r5 = integration_client.delete(
+            f"/api/mcp/connections/{cid}", headers=auth_headers
+        )
         assert r5.status_code == 204
         r6 = integration_client.get(f"/api/mcp/connections/{cid}", headers=auth_headers)
         assert r6.status_code == 404
@@ -69,7 +72,10 @@ class TestMCPIntegrationFlow:
             json={
                 "tool_type": "postgres",
                 "name": "E2E Postgres",
-                "config": {"connection_string": "postgresql://u:p@host/db", "schema": "public"},
+                "config": {
+                    "connection_string": "postgresql://u:p@host/db",
+                    "schema": "public",
+                },
             },
         )
         assert r.status_code == 201, r.text
@@ -103,7 +109,9 @@ class TestMCPIntegrationFlow:
         r6 = integration_client.get(f"/api/mcp/tools/{tid}", headers=auth_headers)
         assert r6.status_code == 404
 
-    def test_validate_then_create_tool(self, integration_client: TestClient, auth_headers, tmp_path):
+    def test_validate_then_create_tool(
+        self, integration_client: TestClient, auth_headers, tmp_path
+    ):
         """Validate filesystem config then create tool (no real connection)."""
         r = integration_client.post(
             "/api/mcp/tools/validate",
@@ -125,7 +133,9 @@ class TestMCPIntegrationFlow:
         assert r2.status_code == 201
         assert r2.json()["name"] == "E2E FS"
 
-    def test_registry_after_creating_tools(self, integration_client: TestClient, auth_headers, tmp_path):
+    def test_registry_after_creating_tools(
+        self, integration_client: TestClient, auth_headers, tmp_path
+    ):
         """Create multiple tool types then fetch registry; platform_tool_count and tools shape."""
         for tool_type, config in [
             ("chroma", {"url": "http://localhost:8000", "index_name": "c1"}),
@@ -134,7 +144,11 @@ class TestMCPIntegrationFlow:
             r = integration_client.post(
                 "/api/mcp/tools",
                 headers=auth_headers,
-                json={"tool_type": tool_type, "name": f"E2E {tool_type}", "config": config},
+                json={
+                    "tool_type": tool_type,
+                    "name": f"E2E {tool_type}",
+                    "config": config,
+                },
             )
             assert r.status_code == 201
         r = integration_client.get("/api/mcp/registry", headers=auth_headers)
@@ -146,17 +160,24 @@ class TestMCPIntegrationFlow:
         assert any(t.get("tool_type") == "chroma" for t in data["tools"])
         assert any(t.get("tool_type") == "filesystem" for t in data["tools"])
 
-    def test_validate_tool_chroma_accepts_without_live_server(self, integration_client: TestClient, auth_headers):
+    def test_validate_tool_chroma_accepts_without_live_server(
+        self, integration_client: TestClient, auth_headers
+    ):
         """Chroma validation returns valid=True and message (no live Chroma required)."""
         r = integration_client.post(
             "/api/mcp/tools/validate",
             headers=auth_headers,
-            json={"tool_type": "chroma", "config": {"url": "http://localhost:8000", "index_name": "test"}},
+            json={
+                "tool_type": "chroma",
+                "config": {"url": "http://localhost:8000", "index_name": "test"},
+            },
         )
         assert r.status_code == 200
         assert r.json()["valid"] is True
 
-    def test_refresh_schema_postgres_returns_400_when_unreachable(self, integration_client: TestClient, auth_headers):
+    def test_refresh_schema_postgres_returns_400_when_unreachable(
+        self, integration_client: TestClient, auth_headers
+    ):
         """Create postgres tool then refresh-schema; expect 400 (connection failure) or success."""
         cr = integration_client.post(
             "/api/mcp/tools",
@@ -164,7 +185,9 @@ class TestMCPIntegrationFlow:
             json={
                 "tool_type": "postgres",
                 "name": "E2E Postgres Schema",
-                "config": {"connection_string": "postgresql://u:p@invalid-host:5432/db"},
+                "config": {
+                    "connection_string": "postgresql://u:p@invalid-host:5432/db"
+                },
             },
         )
         assert cr.status_code == 201

@@ -1,4 +1,5 @@
 """Service to split a job into subtasks for multiple agents (generalized, no hardcoding)."""
+
 import logging
 import json
 import httpx
@@ -22,7 +23,14 @@ async def split_job_for_agents(
     Falls back to equal-share if split fails.
     """
     if len(agents) <= 1:
-        return [{"agent_index": 0, "task": _build_full_task_context(job_title, job_description, documents_content)}]
+        return [
+            {
+                "agent_index": 0,
+                "task": _build_full_task_context(
+                    job_title, job_description, documents_content
+                ),
+            }
+        ]
 
     url = (splitter_agent.api_endpoint or "").strip()
     if not url:
@@ -108,12 +116,13 @@ AGENTS (each will perform one subtask):
         async with httpx.AsyncClient(timeout=60.0, verify=False) as client:
             resp = await client.post(url, json=payload, headers=headers)
             if resp.status_code >= 400:
-                return _fallback_tasks(agents, job_title, job_description, documents_content)
+                return _fallback_tasks(
+                    agents, job_title, job_description, documents_content
+                )
 
             data = resp.json()
             text = (
-                data.get("choices", [{}])[0].get("message", {}).get("content", "")
-                or ""
+                data.get("choices", [{}])[0].get("message", {}).get("content", "") or ""
             ).strip()
             # Remove markdown code blocks if present
             if text.startswith("```"):
@@ -130,12 +139,18 @@ AGENTS (each will perform one subtask):
                     if entry and isinstance(entry.get("task"), str):
                         result.append({"agent_index": i, "task": entry["task"]})
                     else:
-                        result.append({
-                            "agent_index": i,
-                            "task": _build_agent_task_fallback(
-                                agents[i], job_title, job_description, i, len(agents)
-                            ),
-                        })
+                        result.append(
+                            {
+                                "agent_index": i,
+                                "task": _build_agent_task_fallback(
+                                    agents[i],
+                                    job_title,
+                                    job_description,
+                                    i,
+                                    len(agents),
+                                ),
+                            }
+                        )
                 return result
     except Exception as e:
         logger.warning("Task split failed: %s, using fallback", e)

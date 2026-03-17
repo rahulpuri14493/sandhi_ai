@@ -1,4 +1,5 @@
 """API tests for external job endpoints (share links, token-based access)."""
+
 import json
 import uuid
 import pytest
@@ -145,7 +146,9 @@ def test_external_get_status(client_with_data):
     from core.external_token import create_job_token
 
     token = create_job_token(job.id)
-    response = client.get(f"/api/external/jobs/{job.id}/status", params={"token": token})
+    response = client.get(
+        f"/api/external/jobs/{job.id}/status", params={"token": token}
+    )
     assert response.status_code == 200
     data = response.json()
     assert data["id"] == job.id
@@ -182,7 +185,10 @@ def test_external_create_job_success(mock_get_key, client_with_data):
     assert "share_url" in data
     assert "token" in data
     assert "/api/external/jobs/" in data["share_url"]
-    assert f"token={data['token']}" in data["share_url"] or data["token"] in data["share_url"]
+    assert (
+        f"token={data['token']}" in data["share_url"]
+        or data["token"] in data["share_url"]
+    )
 
 
 @patch("api.routes.external_jobs._get_external_api_key")

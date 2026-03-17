@@ -9,6 +9,7 @@ Compatible with:
 
 Platform uses this to forward requests to user's MCP server with their stored credentials.
 """
+
 import json
 import httpx
 from typing import Optional, Dict, Any
@@ -36,7 +37,9 @@ def _parse_sse_to_json(raw: str) -> dict:
     return json.loads(payload)
 
 
-def build_jsonrpc_body(method: str, params: Optional[dict] = None, request_id: Optional[int] = 1) -> dict:
+def build_jsonrpc_body(
+    method: str, params: Optional[dict] = None, request_id: Optional[int] = 1
+) -> dict:
     body = {
         "jsonrpc": JSONRPC_VERSION,
         "method": method,
@@ -96,6 +99,7 @@ async def call_mcp_server(
             headers["Authorization"] = f"Bearer {raw}"
     elif auth_type == "basic" and credentials:
         import base64
+
         u = (credentials.get("username") or "").strip()
         p = (credentials.get("password") or "").strip()
         # Only set Basic if at least one credential present (avoid empty "Basic Og==")
@@ -116,7 +120,9 @@ async def call_mcp_server(
                 "MCP server returned an empty response. "
                 "The server may require a different endpoint or transport."
             )
-        content_type = (response.headers.get("content-type") or "").split(";")[0].strip().lower()
+        content_type = (
+            (response.headers.get("content-type") or "").split(";")[0].strip().lower()
+        )
         try:
             if content_type == "text/event-stream":
                 data = _parse_sse_to_json(raw)

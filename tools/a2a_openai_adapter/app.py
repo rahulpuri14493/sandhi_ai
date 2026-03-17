@@ -18,6 +18,7 @@ Configure via environment (optional when platform sends metadata):
   OPENAI_MODEL          - default model name
   ADAPTER_PORT          - default 8080
 """
+
 import ipaddress
 import logging
 import os
@@ -48,14 +49,22 @@ app = FastAPI(
 
 @app.on_event("startup")
 def startup():
-    logger.info("A2A OpenAI adapter started; default_url=%s", OPENAI_URL_DEFAULT or "(none, use metadata)")
+    logger.info(
+        "A2A OpenAI adapter started; default_url=%s",
+        OPENAI_URL_DEFAULT or "(none, use metadata)",
+    )
+
 
 # Defaults (used when request metadata does not provide per-request target)
 OPENAI_URL_DEFAULT = os.environ.get("OPENAI_COMPATIBLE_URL", "").strip()
 OPENAI_API_KEY_DEFAULT = os.environ.get("OPENAI_API_KEY", "").strip() or None
 OPENAI_MODEL_DEFAULT = os.environ.get("OPENAI_MODEL", "").strip() or "gpt-4o-mini"
 # When set, per-request openai_url must match or be subdomain of this host (SSRF mitigation)
-_default_hostname = (urlparse(OPENAI_URL_DEFAULT).hostname or "").strip().lower() if OPENAI_URL_DEFAULT else ""
+_default_hostname = (
+    (urlparse(OPENAI_URL_DEFAULT).hostname or "").strip().lower()
+    if OPENAI_URL_DEFAULT
+    else ""
+)
 JSONRPC_VERSION = "2.0"
 METHOD_SEND_MESSAGE = "SendMessage"
 ROLE_AGENT = "ROLE_AGENT"
@@ -77,8 +86,7 @@ def _openai_content_to_text(content: Any) -> str:
         return content
     if isinstance(content, list):
         return " ".join(
-            p.get("text", "") if isinstance(p, dict) else str(p)
-            for p in content
+            p.get("text", "") if isinstance(p, dict) else str(p) for p in content
         )
     return str(content) if content is not None else ""
 
@@ -184,14 +192,16 @@ def _validate_outbound_url(url: str) -> str:
 
     # Return reconstructed URL from validated components so the sink receives
     # a server-constructed value, not the raw user string (breaks taint for CodeQL).
-    return urlunparse((
-        parsed.scheme,
-        parsed.netloc,
-        parsed.path or "",
-        parsed.params,
-        parsed.query,
-        parsed.fragment,
-    ))
+    return urlunparse(
+        (
+            parsed.scheme,
+            parsed.netloc,
+            parsed.path or "",
+            parsed.params,
+            parsed.query,
+            parsed.fragment,
+        )
+    )
 
 
 def _resolve_target(metadata: Dict[str, Any]) -> tuple:
@@ -202,7 +212,9 @@ def _resolve_target(metadata: Dict[str, Any]) -> tuple:
     else:
         validated_url = _validate_openai_url(raw_url)
     key = (metadata.get("openai_api_key") or "").strip() or OPENAI_API_KEY_DEFAULT
-    model = (metadata.get("openai_model") or metadata.get("model") or "").strip() or OPENAI_MODEL_DEFAULT
+    model = (
+        metadata.get("openai_model") or metadata.get("model") or ""
+    ).strip() or OPENAI_MODEL_DEFAULT
     return validated_url, key, model
 
 
@@ -323,7 +335,11 @@ async def a2a_endpoint(request: Request):
     num_tools = len(openai_tools) if isinstance(openai_tools, list) else 0
     logger.info(
         "A2A SendMessage req_id=%s target=%s model_specified=%s messages=%s tools=%s",
-        req_id, outbound_url, bool(openai_model), len(messages), num_tools,
+        req_id,
+        outbound_url,
+        bool(openai_model),
+        len(messages),
+        num_tools,
     )
 
     try:
@@ -335,7 +351,9 @@ async def a2a_endpoint(request: Request):
     except httpx.HTTPStatusError as e:
         logger.warning(
             "A2A upstream API error req_id=%s status=%s body=%s",
-            req_id, e.response.status_code, (e.response.text or "")[:200],
+            req_id,
+            e.response.status_code,
+            (e.response.text or "")[:200],
         )
         return JSONResponse(
             status_code=200,
@@ -365,7 +383,10 @@ async def a2a_endpoint(request: Request):
     # Parse OpenAI-style response
     choices = data.get("choices") or []
     if not choices:
-        content = data.get("error", {}).get("message", "No choices in response") or "No choices in response"
+        content = (
+            data.get("error", {}).get("message", "No choices in response")
+            or "No choices in response"
+        )
         tool_calls = None
     else:
         msg = choices[0].get("message") or {}
@@ -375,7 +396,9 @@ async def a2a_endpoint(request: Request):
     num_tool_calls = len(tool_calls) if tool_calls else 0
     logger.info(
         "A2A upstream response req_id=%s content_len=%s tool_calls=%s",
-        req_id, len(content or ""), num_tool_calls,
+        req_id,
+        len(content or ""),
+        num_tool_calls,
     )
 
     # A2A direct message response (same shape the platform's a2a_client expects)

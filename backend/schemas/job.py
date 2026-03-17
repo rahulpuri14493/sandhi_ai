@@ -28,8 +28,12 @@ class JobCreate(BaseModel):
     description: Optional[str] = None
     agent_ids: Optional[List[int]] = []  # For auto-split
     workflow_steps: Optional[List["WorkflowStepCreate"]] = []  # For manual assignment
-    allowed_platform_tool_ids: Optional[List[int]] = None  # Tools in scope for this job (empty = all)
-    allowed_connection_ids: Optional[List[int]] = None  # MCP connections in scope (empty = all)
+    allowed_platform_tool_ids: Optional[List[int]] = (
+        None  # Tools in scope for this job (empty = all)
+    )
+    allowed_connection_ids: Optional[List[int]] = (
+        None  # MCP connections in scope (empty = all)
+    )
     tool_visibility: Optional[str] = None  # full | names_only | none (default full)
 
 
@@ -44,6 +48,7 @@ class JobUpdate(BaseModel):
 
 class StepToolsAssignment(BaseModel):
     """Per-step tool allowlist for auto-split (by agent index)."""
+
     agent_index: int  # 0-based index into agent_ids
     allowed_platform_tool_ids: Optional[List[int]] = None
     allowed_connection_ids: Optional[List[int]] = None
@@ -52,16 +57,24 @@ class StepToolsAssignment(BaseModel):
 
 class AutoSplitBody(BaseModel):
     """Request body for POST /jobs/{job_id}/workflow/auto-split."""
+
     agent_ids: List[int] = []
-    workflow_mode: Optional[str] = None  # "independent" | "sequential" | None (infer from BRD/conversation)
-    step_tools: Optional[List[StepToolsAssignment]] = None  # Which tools each agent (step) can use
+    workflow_mode: Optional[str] = (
+        None  # "independent" | "sequential" | None (infer from BRD/conversation)
+    )
+    step_tools: Optional[List[StepToolsAssignment]] = (
+        None  # Which tools each agent (step) can use
+    )
     tool_visibility: Optional[str] = None  # Job-level: full | names_only | none
 
 
 class AnswerQuestionBody(BaseModel):
     """Request body for POST /jobs/{job_id}/answer-question. Accepts 'answer' (preferred) or legacy 'question'."""
+
     answer: Optional[str] = None
-    question: Optional[str] = None  # Legacy: frontend used to send user's answer under this key
+    question: Optional[str] = (
+        None  # Legacy: frontend used to send user's answer under this key
+    )
 
     def get_answer(self) -> str:
         """Return the user's answer from either 'answer' or legacy 'question'."""
@@ -72,7 +85,9 @@ class WorkflowStepCreate(BaseModel):
     agent_id: int
     step_order: int
     input_data: Optional[Dict[str, Any]] = None
-    allowed_platform_tool_ids: Optional[List[int]] = None  # Tools this step can use (empty = job-level)
+    allowed_platform_tool_ids: Optional[List[int]] = (
+        None  # Tools this step can use (empty = job-level)
+    )
     allowed_connection_ids: Optional[List[int]] = None
     tool_visibility: Optional[str] = None  # full | names_only | none (step override)
 
@@ -96,7 +111,9 @@ class JobResponse(BaseModel):
     class Config:
         from_attributes = True
 
-    @field_validator("allowed_platform_tool_ids", "allowed_connection_ids", mode="before")
+    @field_validator(
+        "allowed_platform_tool_ids", "allowed_connection_ids", mode="before"
+    )
     @classmethod
     def _coerce_int_list(cls, v):
         return _parse_int_list(v)
@@ -104,14 +121,14 @@ class JobResponse(BaseModel):
     @classmethod
     def model_validate(cls, obj, **kwargs):
         # Parse files JSON string if it exists
-        if hasattr(obj, 'files') and obj.files:
+        if hasattr(obj, "files") and obj.files:
             try:
                 files_data = json.loads(obj.files)
                 obj_dict = {k: v for k, v in obj.__dict__.items()}
-                obj_dict['files'] = files_data
+                obj_dict["files"] = files_data
                 # Remove file paths from response for security, only return metadata
                 for file_info in files_data:
-                    file_info.pop('path', None)
+                    file_info.pop("path", None)
                 obj = type(obj)(**obj_dict)
             except (json.JSONDecodeError, TypeError):
                 pass
@@ -130,7 +147,9 @@ class WorkflowStepResponse(BaseModel):
     cost: float
     started_at: Optional[datetime]
     completed_at: Optional[datetime]
-    depends_on_previous: Optional[bool] = True  # False = step works independently (no previous output)
+    depends_on_previous: Optional[bool] = (
+        True  # False = step works independently (no previous output)
+    )
     allowed_platform_tool_ids: Optional[List[int]] = None
     allowed_connection_ids: Optional[List[int]] = None
     tool_visibility: Optional[str] = None  # full | names_only | none
@@ -138,7 +157,9 @@ class WorkflowStepResponse(BaseModel):
     class Config:
         from_attributes = True
 
-    @field_validator("allowed_platform_tool_ids", "allowed_connection_ids", mode="before")
+    @field_validator(
+        "allowed_platform_tool_ids", "allowed_connection_ids", mode="before"
+    )
     @classmethod
     def _coerce_int_list(cls, v):
         return _parse_int_list(v)

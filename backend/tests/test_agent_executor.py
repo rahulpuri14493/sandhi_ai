@@ -1,4 +1,5 @@
 """Unit tests for AgentExecutor service."""
+
 import json
 from unittest.mock import MagicMock
 
@@ -26,7 +27,11 @@ def test_format_for_openai_includes_documents():
         "job_title": "Add numbers",
         "job_description": "Add 2 and 3",
         "documents": [
-            {"name": "req.txt", "type": "text/plain", "content": "Add 2 and 3. Result: 5."}
+            {
+                "name": "req.txt",
+                "type": "text/plain",
+                "content": "Add 2 and 3. Result: 5.",
+            }
         ],
         "conversation": [],
     }
@@ -63,14 +68,21 @@ def test_format_for_openai_rejects_extraction_error_content():
         "job_title": "Job",
         "job_description": "",
         "documents": [
-            {"name": "x.docx", "type": "docx", "content": "[DOCX extraction requires python-docx library. File: x.docx]"}
+            {
+                "name": "x.docx",
+                "type": "docx",
+                "content": "[DOCX extraction requires python-docx library. File: x.docx]",
+            }
         ],
         "conversation": [],
     }
     payload = _get_executor_format_input(agent, input_data)
     content_str = json.dumps([m.get("content", "") for m in payload["messages"]])
     # Should use fallback instructing to use job title/description, not the raw error
-    assert "could not extract" in content_str or "Text could not be extracted" in content_str
+    assert (
+        "could not extract" in content_str
+        or "Text could not be extracted" in content_str
+    )
     assert "JOB TITLE" in content_str or "job title" in content_str.lower()
 
 
@@ -82,7 +94,11 @@ def test_format_for_openai_accepts_real_content_starting_with_bracket():
         "job_title": "Job",
         "job_description": "",
         "documents": [
-            {"name": "req.txt", "type": "text", "content": "[Requirement] Add 2 and 3. The task requires the sum."}
+            {
+                "name": "req.txt",
+                "type": "text",
+                "content": "[Requirement] Add 2 and 3. The task requires the sum.",
+            }
         ],
         "conversation": [],
     }
@@ -140,7 +156,11 @@ def test_positive_format_includes_available_mcp_tools():
         "documents": [],
         "conversation": [],
         "available_mcp_tools": [
-            {"name": "platform_1_my_db", "description": "PostgreSQL: My DB", "source": "platform"},
+            {
+                "name": "platform_1_my_db",
+                "description": "PostgreSQL: My DB",
+                "source": "platform",
+            },
         ],
     }
     payload = _get_executor_format_input(agent, input_data)
@@ -165,7 +185,9 @@ def test_positive_format_sequential_workflow_message_when_previous_output():
     }
     payload = _get_executor_format_input(agent, input_data)
     content_str = json.dumps([m.get("content", "") for m in payload["messages"]])
-    assert "INTER-AGENT COMMUNICATION" in content_str or "previous" in content_str.lower()
+    assert (
+        "INTER-AGENT COMMUNICATION" in content_str or "previous" in content_str.lower()
+    )
     assert "First step result" in content_str
 
 
@@ -252,7 +274,12 @@ def test_apply_tool_visibility_none_returns_empty():
 def test_apply_tool_visibility_names_only_strips_schema():
     """tool_visibility 'names_only' returns name/description only, no schema or business_description."""
     tools = [
-        {"name": "db1", "description": "PostgreSQL DB", "schema_metadata": "{}", "business_description": "Sales DB"},
+        {
+            "name": "db1",
+            "description": "PostgreSQL DB",
+            "schema_metadata": "{}",
+            "business_description": "Sales DB",
+        },
     ]
     out = _apply_tool_visibility(tools, "names_only")
     assert len(out) == 1
@@ -272,19 +299,23 @@ def test_apply_tool_visibility_full_returns_unchanged():
 def test_get_workflow_collaboration_hint_from_job_sequential():
     """Extract workflow_collaboration_hint 'sequential' from job conversation."""
     job = MagicMock()
-    job.conversation = json.dumps([
-        {"type": "question", "question": "Q1"},
-        {"type": "completion", "workflow_collaboration_hint": "sequential"},
-    ])
+    job.conversation = json.dumps(
+        [
+            {"type": "question", "question": "Q1"},
+            {"type": "completion", "workflow_collaboration_hint": "sequential"},
+        ]
+    )
     assert _get_workflow_collaboration_hint_from_job(job) == "sequential"
 
 
 def test_get_workflow_collaboration_hint_from_job_async_a2a():
     """Extract workflow_collaboration_hint 'async_a2a' from job conversation."""
     job = MagicMock()
-    job.conversation = json.dumps([
-        {"workflow_collaboration_hint": "async_a2a"},
-    ])
+    job.conversation = json.dumps(
+        [
+            {"workflow_collaboration_hint": "async_a2a"},
+        ]
+    )
     assert _get_workflow_collaboration_hint_from_job(job) == "async_a2a"
 
 
@@ -307,7 +338,12 @@ def test_format_for_openai_includes_peer_agents_when_present():
         "documents": [],
         "conversation": [],
         "peer_agents": [
-            {"agent_id": 2, "name": "Agent 2", "a2a_endpoint": "https://a2.example.com", "step_order": 2},
+            {
+                "agent_id": 2,
+                "name": "Agent 2",
+                "a2a_endpoint": "https://a2.example.com",
+                "step_order": 2,
+            },
         ],
     }
     payload = _get_executor_format_input(agent, input_data)

@@ -11,6 +11,7 @@ Note: .env is in .gitignore and must not be committed. Writing secrets to .env i
 for local development only; production should use a secrets manager or environment injection.
 Secrets are generated and written in a subprocess so the main process never holds them (CodeQL).
 """
+
 import os
 import re
 import subprocess
@@ -70,7 +71,9 @@ def ensure_env():
         with open(ENV_FILE, "w", encoding="utf-8") as f:
             f.writelines(out)
         # Generate and substitute each secret in a subprocess so this process never holds it
-        n_placeholders = out.count("MCP_INTERNAL_SECRET=<REPLACE_SECRET>\n") + out.count("MCP_ENCRYPTION_KEY=<REPLACE_SECRET>\n")
+        n_placeholders = out.count(
+            "MCP_INTERNAL_SECRET=<REPLACE_SECRET>\n"
+        ) + out.count("MCP_ENCRYPTION_KEY=<REPLACE_SECRET>\n")
         for _ in range(n_placeholders):
             subprocess.run(
                 [sys.executable, "-c", _SUBPROCESS_SCRIPT],

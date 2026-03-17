@@ -1,4 +1,5 @@
 """Unit tests for external job token helpers."""
+
 from core.external_token import create_job_token, verify_job_token, get_share_url
 
 

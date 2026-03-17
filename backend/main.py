@@ -13,7 +13,10 @@ from fastapi.exceptions import RequestValidationError
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from sqlalchemy.exc import OperationalError
 from db.database import engine, Base
-from db.run_mcp_migration import run_initial_migrations_if_needed, run_mcp_migration_if_needed
+from db.run_mcp_migration import (
+    run_initial_migrations_if_needed,
+    run_mcp_migration_if_needed,
+)
 from api.routes import (
     auth_router,
     agents_router,
@@ -36,6 +39,7 @@ from core.logging_config import configure_logging
 # Configure logging
 configure_logging()
 
+
 # Create database tables (retry until DB is ready, e.g. in Docker)
 def _init_db() -> None:
     """
@@ -55,8 +59,10 @@ def _init_db() -> None:
                 raise
             time.sleep(1)
 
+
 # Initialize the database
 _init_db()
+
 
 # Run initial migrations if needed
 def _run_initial_migrations() -> None:
@@ -65,6 +71,7 @@ def _run_initial_migrations() -> None:
     """
     run_initial_migrations_if_needed()
 
+
 # Run MCP migration if needed
 def _run_mcp_migration() -> None:
     """
@@ -72,12 +79,14 @@ def _run_mcp_migration() -> None:
     """
     run_mcp_migration_if_needed()
 
+
 # Ensure encryption key for production
 def _ensure_encryption_key() -> None:
     """
     Ensure encryption key for production.
     """
     ensure_encryption_key_for_production()
+
 
 # Initialize the encryption key and run migrations
 _init_db()
@@ -91,6 +100,7 @@ app = FastAPI(
     description="API for the Sandhi AI Platform",
     version="1.0.0",
 )
+
 
 # CORS middleware
 def _cors_config() -> CORSMiddleware:
@@ -107,8 +117,10 @@ def _cors_config() -> CORSMiddleware:
         allow_headers=["*"],
     )
 
+
 # Add CORS middleware
 app.add_middleware(_cors_config())
+
 
 # Error handlers
 def _add_exception_handlers() -> None:
@@ -119,8 +131,10 @@ def _add_exception_handlers() -> None:
     app.add_exception_handler(StarletteHTTPException, http_exception_handler)
     app.add_exception_handler(Exception, general_exception_handler)
 
+
 # Add exception handlers
 _add_exception_handlers()
+
 
 # Include routers
 def _include_routers() -> None:
@@ -137,8 +151,10 @@ def _include_routers() -> None:
     app.include_router(mcp_router)
     app.include_router(mcp_internal_router)
 
+
 # Include routers
 _include_routers()
+
 
 # Root endpoint
 @app.get("/")
@@ -150,6 +166,7 @@ def _root() -> dict:
         dict: A dictionary with the API message and version.
     """
     return {"message": "Sandhi AI API", "version": "1.0.0"}
+
 
 # Health check endpoint
 @app.get("/health")

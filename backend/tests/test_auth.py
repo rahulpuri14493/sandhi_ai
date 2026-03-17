@@ -1,4 +1,5 @@
 """API tests for auth endpoints (register, login, /me)."""
+
 import uuid
 import pytest
 from fastapi.testclient import TestClient

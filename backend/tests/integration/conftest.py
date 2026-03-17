@@ -1,4 +1,5 @@
 """Shared fixtures for integration tests."""
+
 import json
 import os
 import tempfile
@@ -74,8 +75,11 @@ def sample_agent(integration_db_session, developer_user):
 
 
 @pytest.fixture
-def integration_client(integration_db_session, business_user, developer_user, sample_agent):
+def integration_client(
+    integration_db_session, business_user, developer_user, sample_agent
+):
     """Test client with DB override; business and developer users and one agent exist."""
+
     def override_get_db():
         try:
             yield integration_db_session

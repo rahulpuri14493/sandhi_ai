@@ -42,7 +42,9 @@ class Earnings(Base):
     developer_id = Column(Integer, ForeignKey("users.id"), nullable=False)
     transaction_id = Column(Integer, ForeignKey("transactions.id"), nullable=False)
     workflow_step_id = Column(Integer, ForeignKey("workflow_steps.id"), nullable=True)
-    communication_id = Column(Integer, ForeignKey("agent_communications.id"), nullable=True)
+    communication_id = Column(
+        Integer, ForeignKey("agent_communications.id"), nullable=True
+    )
     amount = Column(Float, nullable=False)
     status = Column(Enum(EarningsStatus), default=EarningsStatus.PENDING)
     created_at = Column(DateTime, default=datetime.utcnow)

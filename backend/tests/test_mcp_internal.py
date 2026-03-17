@@ -3,6 +3,7 @@ Unit tests for internal MCP API (used by platform MCP server).
 Endpoints: GET /api/internal/mcp/tools, POST /api/internal/mcp/tools/{id}/config.
 Protected by X-Internal-Secret header.
 """
+
 import uuid
 
 import pytest
@@ -24,6 +25,7 @@ def internal_secret():
 def client_internal(db_session, business_user, internal_secret):
     """Override get_db and MCP_INTERNAL_SECRET so internal routes accept the test secret."""
     from core import config
+
     original_secret = getattr(config.settings, "MCP_INTERNAL_SECRET", None)
     config.settings.MCP_INTERNAL_SECRET = internal_secret
 
@@ -61,11 +63,14 @@ def business_user(db_session):
 def platform_tool(db_session, business_user):
     """One platform tool config (postgres) for the business user."""
     from core.encryption import encrypt_json
+
     tool = MCPToolConfig(
         user_id=business_user.id,
         tool_type=MCPToolType.POSTGRES,
         name="Test DB",
-        encrypted_config=encrypt_json({"connection_string": "postgresql://u:p@localhost/db"}),
+        encrypted_config=encrypt_json(
+            {"connection_string": "postgresql://u:p@localhost/db"}
+        ),
         is_active=True,
     )
     db_session.add(tool)
@@ -81,14 +86,18 @@ class TestInternalMCPAuth:
         r = client_internal.get("/api/internal/mcp/tools?business_id=1")
         assert r.status_code == 403
 
-    def test_list_tools_with_wrong_secret_returns_403(self, client_internal, internal_secret):
+    def test_list_tools_with_wrong_secret_returns_403(
+        self, client_internal, internal_secret
+    ):
         r = client_internal.get(
             "/api/internal/mcp/tools?business_id=1",
             headers={"X-Internal-Secret": "wrong-secret"},
         )
         assert r.status_code == 403
 
-    def test_get_config_without_secret_returns_403(self, client_internal, platform_tool):
+    def test_get_config_without_secret_returns_403(
+        self, client_internal, platform_tool
+    ):
         r = client_internal.post(
             f"/api/internal/mcp/tools/{platform_tool.id}/config",
             json={"business_id": platform_tool.user_id},
@@ -109,7 +118,9 @@ class TestInternalMCPListTools:
         assert "tools" in data
         assert data["tools"] == []
 
-    def test_list_tools_returns_tool_descriptor(self, client_internal, internal_secret, platform_tool):
+    def test_list_tools_returns_tool_descriptor(
+        self, client_internal, internal_secret, platform_tool
+    ):
         business_id = platform_tool.user_id
         r = client_internal.get(
             f"/api/internal/mcp/tools?business_id={business_id}",
@@ -124,8 +135,11 @@ class TestInternalMCPListTools:
         assert "inputSchema" in t
         assert t["inputSchema"]["required"] == ["query"]
 
-    def test_list_tools_excludes_inactive(self, db_session, client_internal, internal_secret, business_user):
+    def test_list_tools_excludes_inactive(
+        self, db_session, client_internal, internal_secret, business_user
+    ):
         from core.encryption import encrypt_json
+
         tool = MCPToolConfig(
             user_id=business_user.id,
             tool_type=MCPToolType.FILESYSTEM,
@@ -159,9 +173,13 @@ class TestInternalMCPGetConfig:
         assert data["tool_type"] == "postgres"
         assert data["name"] == "Test DB"
         assert "config" in data
-        assert data["config"].get("connection_string") == "postgresql://u:p@localhost/db"
+        assert (
+            data["config"].get("connection_string") == "postgresql://u:p@localhost/db"
+        )
 
-    def test_get_config_wrong_business_returns_404(self, client_internal, internal_secret, platform_tool):
+    def test_get_config_wrong_business_returns_404(
+        self, client_internal, internal_secret, platform_tool
+    ):
         r = client_internal.post(
             f"/api/internal/mcp/tools/{platform_tool.id}/config",
             headers={"X-Internal-Secret": internal_secret},
@@ -169,7 +187,9 @@ class TestInternalMCPGetConfig:
         )
         assert r.status_code == 404
 
-    def test_get_config_nonexistent_tool_returns_404(self, client_internal, internal_secret, business_user):
+    def test_get_config_nonexistent_tool_returns_404(
+        self, client_internal, internal_secret, business_user
+    ):
         r = client_internal.post(
             "/api/internal/mcp/tools/99999/config",
             headers={"X-Internal-Secret": internal_secret},

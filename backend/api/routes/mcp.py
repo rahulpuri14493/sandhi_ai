@@ -2,6 +2,7 @@
 MCP (Model Context Protocol) API: connections and tool configs per user.
 Credentials stored encrypted; platform talks to MCP server via API (JSON-RPC proxy).
 """
+
 import json
 import logging
 from fastapi import APIRouter, Depends, HTTPException, status
@@ -79,6 +80,7 @@ async def validate_connection(
     Returns { "valid": true, "message": "..." } or { "valid": false, "message": "..." }.
     """
     from services.mcp_client import call_mcp_server
+
     base_url = (body.base_url or "").strip().rstrip("/")
     if not base_url:
         return {"valid": False, "message": "Server URL is required"}
@@ -103,7 +105,11 @@ async def validate_connection(
         )
         return {"valid": True, "message": "MCP server connection successful"}
     except Exception as e:
-        logging.exception("MCP server connection validation failed for base_url=%s, endpoint_path=%s", base_url, endpoint_path)
+        logging.exception(
+            "MCP server connection validation failed for base_url=%s, endpoint_path=%s",
+            base_url,
+            endpoint_path,
+        )
         return {
             "valid": False,
             "message": "Failed to connect to MCP server. Please verify the server URL, endpoint, and credentials.",
@@ -116,13 +122,20 @@ def list_connections(
     db: Session = Depends(get_db),
 ):
     """List current user's MCP server connections."""
-    rows = db.query(MCPServerConnection).filter(
-        MCPServerConnection.user_id == current_user.id
-    ).order_by(MCPServerConnection.created_at.desc()).all()
+    rows = (
+        db.query(MCPServerConnection)
+        .filter(MCPServerConnection.user_id == current_user.id)
+        .order_by(MCPServerConnection.created_at.desc())
+        .all()
+    )
     return [_connection_to_response(r) for r in rows]
 
 
-@router.post("/connections", response_model=MCPServerConnectionResponse, status_code=status.HTTP_201_CREATED)
+@router.post(
+    "/connections",
+    response_model=MCPServerConnectionResponse,
+    status_code=status.HTTP_201_CREATED,
+)
 def create_connection(
     body: MCPServerConnectionCreate,
     current_user: User = Depends(get_current_business_user),
@@ -156,26 +169,36 @@ def get_connection(
     current_user: User = Depends(get_current_business_user),
     db: Session = Depends(get_db),
 ):
-    conn = db.query(MCPServerConnection).filter(
-        MCPServerConnection.id == connection_id,
-        MCPServerConnection.user_id == current_user.id,
-    ).first()
+    conn = (
+        db.query(MCPServerConnection)
+        .filter(
+            MCPServerConnection.id == connection_id,
+            MCPServerConnection.user_id == current_user.id,
+        )
+        .first()
+    )
     if not conn:
         raise HTTPException(status_code=404, detail="Connection not found")
     return _connection_to_response(conn)
 
 
-@router.patch("/connections/{connection_id}", response_model=MCPServerConnectionResponse)
+@router.patch(
+    "/connections/{connection_id}", response_model=MCPServerConnectionResponse
+)
 def update_connection(
     connection_id: int,
     body: MCPServerConnectionUpdate,
     current_user: User = Depends(get_current_business_user),
     db: Session = Depends(get_db),
 ):
-    conn = db.query(MCPServerConnection).filter(
-        MCPServerConnection.id == connection_id,
-        MCPServerConnection.user_id == current_user.id,
-    ).first()
+    conn = (
+        db.query(MCPServerConnection)
+        .filter(
+            MCPServerConnection.id == connection_id,
+            MCPServerConnection.user_id == current_user.id,
+        )
+        .first()
+    )
     if not conn:
         raise HTTPException(status_code=404, detail="Connection not found")
     if body.name is not None:
@@ -202,10 +225,14 @@ def delete_connection(
     current_user: User = Depends(get_current_business_user),
     db: Session = Depends(get_db),
 ):
-    conn = db.query(MCPServerConnection).filter(
-        MCPServerConnection.id == connection_id,
-        MCPServerConnection.user_id == current_user.id,
-    ).first()
+    conn = (
+        db.query(MCPServerConnection)
+        .filter(
+            MCPServerConnection.id == connection_id,
+            MCPServerConnection.user_id == current_user.id,
+        )
+        .first()
+    )
     if not conn:
         raise HTTPException(status_code=404, detail="Connection not found")
     db.delete(conn)
@@ -215,15 +242,19 @@ def delete_connection(
 
 # --- Platform tool configs (Vector DB, Postgres, File system) ---
 
+
 @router.get("/tools", response_model=List[MCPToolConfigResponse])
 def list_tools(
     current_user: User = Depends(get_current_business_user),
     db: Session = Depends(get_db),
 ):
     """List current user's platform MCP tool configs (no credentials in response)."""
-    rows = db.query(MCPToolConfig).filter(
-        MCPToolConfig.user_id == current_user.id
-    ).order_by(MCPToolConfig.created_at.desc()).all()
+    rows = (
+        db.query(MCPToolConfig)
+        .filter(MCPToolConfig.user_id == current_user.id)
+        .order_by(MCPToolConfig.created_at.desc())
+        .all()
+    )
     return [_tool_to_response(r) for r in rows]
 
 
@@ -234,6 +265,7 @@ def validate_tool_config(
 ):
     """Validate tool config (test connection) before save. Does not store anything."""
     from services.mcp_validate import validate_tool_config as do_validate
+
     tool_type_str = (body.tool_type or "").strip().lower()
     try:
         MCPToolType(tool_type_str)
@@ -243,7 +275,9 @@ def validate_tool_config(
     return {"valid": valid, "message": message}
 
 
-@router.post("/tools", response_model=MCPToolConfigResponse, status_code=status.HTTP_201_CREATED)
+@router.post(
+    "/tools", response_model=MCPToolConfigResponse, status_code=status.HTTP_201_CREATED
+)
 def create_tool(
     body: MCPToolConfigCreate,
     current_user: User = Depends(get_current_business_user),
@@ -280,10 +314,14 @@ def get_tool(
     current_user: User = Depends(get_current_business_user),
     db: Session = Depends(get_db),
 ):
-    t = db.query(MCPToolConfig).filter(
-        MCPToolConfig.id == tool_id,
-        MCPToolConfig.user_id == current_user.id,
-    ).first()
+    t = (
+        db.query(MCPToolConfig)
+        .filter(
+            MCPToolConfig.id == tool_id,
+            MCPToolConfig.user_id == current_user.id,
+        )
+        .first()
+    )
     if not t:
         raise HTTPException(status_code=404, detail="Tool config not found")
     return _tool_to_response(t)
@@ -296,10 +334,14 @@ def update_tool(
     current_user: User = Depends(get_current_business_user),
     db: Session = Depends(get_db),
 ):
-    t = db.query(MCPToolConfig).filter(
-        MCPToolConfig.id == tool_id,
-        MCPToolConfig.user_id == current_user.id,
-    ).first()
+    t = (
+        db.query(MCPToolConfig)
+        .filter(
+            MCPToolConfig.id == tool_id,
+            MCPToolConfig.user_id == current_user.id,
+        )
+        .first()
+    )
     if not t:
         raise HTTPException(status_code=404, detail="Tool config not found")
     if body.name is not None:
@@ -329,10 +371,14 @@ def refresh_tool_schema(
     from services.db_schema_introspection import introspect_sql_tool
     from core.encryption import decrypt_json
 
-    t = db.query(MCPToolConfig).filter(
-        MCPToolConfig.id == tool_id,
-        MCPToolConfig.user_id == current_user.id,
-    ).first()
+    t = (
+        db.query(MCPToolConfig)
+        .filter(
+            MCPToolConfig.id == tool_id,
+            MCPToolConfig.user_id == current_user.id,
+        )
+        .first()
+    )
     if not t:
         raise HTTPException(status_code=404, detail="Tool config not found")
     if t.tool_type not in (MCPToolType.POSTGRES, MCPToolType.MYSQL):
@@ -348,7 +394,11 @@ def refresh_tool_schema(
     db.commit()
     db.refresh(t)
     table_count = len(schema_dict.get("tables", []))
-    return {"success": True, "message": f"Schema refreshed: {table_count} table(s)", "table_count": table_count}
+    return {
+        "success": True,
+        "message": f"Schema refreshed: {table_count} table(s)",
+        "table_count": table_count,
+    }
 
 
 @router.delete("/tools/{tool_id}", status_code=status.HTTP_204_NO_CONTENT)
@@ -357,10 +407,14 @@ def delete_tool(
     current_user: User = Depends(get_current_business_user),
     db: Session = Depends(get_db),
 ):
-    t = db.query(MCPToolConfig).filter(
-        MCPToolConfig.id == tool_id,
-        MCPToolConfig.user_id == current_user.id,
-    ).first()
+    t = (
+        db.query(MCPToolConfig)
+        .filter(
+            MCPToolConfig.id == tool_id,
+            MCPToolConfig.user_id == current_user.id,
+        )
+        .first()
+    )
     if not t:
         raise HTTPException(status_code=404, detail="Tool config not found")
     db.delete(t)
@@ -370,6 +424,7 @@ def delete_tool(
 
 # --- MCP proxy: forward JSON-RPC to user's MCP server ---
 
+
 @router.post("/proxy")
 async def mcp_proxy(
     body: MCPProxyRequest,
@@ -377,11 +432,15 @@ async def mcp_proxy(
     db: Session = Depends(get_db),
 ):
     """Forward a JSON-RPC request to the user's MCP server using stored credentials."""
-    conn = db.query(MCPServerConnection).filter(
-        MCPServerConnection.id == body.connection_id,
-        MCPServerConnection.user_id == current_user.id,
-        MCPServerConnection.is_active == True,
-    ).first()
+    conn = (
+        db.query(MCPServerConnection)
+        .filter(
+            MCPServerConnection.id == body.connection_id,
+            MCPServerConnection.user_id == current_user.id,
+            MCPServerConnection.is_active == True,
+        )
+        .first()
+    )
     if not conn:
         raise HTTPException(status_code=404, detail="Connection not found or inactive")
     credentials = None
@@ -397,6 +456,7 @@ async def mcp_proxy(
     db.add(log_entry)
     db.commit()
     from services.mcp_client import call_mcp_server
+
     result = await call_mcp_server(
         base_url=conn.base_url,
         endpoint_path=conn.endpoint_path or "/mcp",
@@ -409,6 +469,7 @@ async def mcp_proxy(
 
 
 # --- Invoke platform MCP tool (for UI or agent-driven invocation) ---
+
 
 class InvokePlatformToolRequest(BaseModel):
     tool_name: str
@@ -425,9 +486,13 @@ async def call_platform_tool(
     Backend calls the platform MCP server with X-MCP-Business-Id so tools are scoped to the current user.
     """
     from core.config import settings
+
     if not settings.PLATFORM_MCP_SERVER_URL or not settings.MCP_INTERNAL_SECRET:
-        raise HTTPException(status_code=503, detail="Platform MCP server not configured")
+        raise HTTPException(
+            status_code=503, detail="Platform MCP server not configured"
+        )
     from services.mcp_client import call_tool
+
     base = settings.PLATFORM_MCP_SERVER_URL.rstrip("/")
     extra_headers = {"X-MCP-Business-Id": str(current_user.id)}
     try:
@@ -445,6 +510,7 @@ async def call_platform_tool(
 
 # --- Tool registry (for agent orchestration: discover available MCP tools) ---
 
+
 @router.get("/registry")
 async def get_registry(
     current_user: User = Depends(get_current_business_user),
@@ -458,25 +524,36 @@ async def get_registry(
     """
     from services.mcp_client import list_tools as mcp_list_tools
 
-    platform_tools = db.query(MCPToolConfig).filter(
-        MCPToolConfig.user_id == current_user.id,
-        MCPToolConfig.is_active == True,
-    ).order_by(MCPToolConfig.name).all()
-    connections = db.query(MCPServerConnection).filter(
-        MCPServerConnection.user_id == current_user.id,
-        MCPServerConnection.is_active == True,
-    ).all()
+    platform_tools = (
+        db.query(MCPToolConfig)
+        .filter(
+            MCPToolConfig.user_id == current_user.id,
+            MCPToolConfig.is_active == True,
+        )
+        .order_by(MCPToolConfig.name)
+        .all()
+    )
+    connections = (
+        db.query(MCPServerConnection)
+        .filter(
+            MCPServerConnection.user_id == current_user.id,
+            MCPServerConnection.is_active == True,
+        )
+        .all()
+    )
 
     # Build platform registry entries (no credentials)
     platform_entries = []
     for t in platform_tools:
-        platform_entries.append({
-            "source": "platform",
-            "id": t.id,
-            "name": _registry_tool_name(t.id, t.name),
-            "tool_type": t.tool_type.value,
-            "description": _registry_description(t.tool_type.value, t.name),
-        })
+        platform_entries.append(
+            {
+                "source": "platform",
+                "id": t.id,
+                "name": _registry_tool_name(t.id, t.name),
+                "tool_type": t.tool_type.value,
+                "description": _registry_description(t.tool_type.value, t.name),
+            }
+        )
 
     # For each connection, fetch tools from that MCP server (tools/list)
     connection_tools = []
@@ -501,31 +578,39 @@ async def get_registry(
                 credentials=creds,
                 timeout=15.0,
             )
-            for tool in (result.get("tools") or []):
-                tools_list.append({
-                    "name": tool.get("name") or "",
-                    "description": (tool.get("description") or "")[:500],
-                })
+            for tool in result.get("tools") or []:
+                tools_list.append(
+                    {
+                        "name": tool.get("name") or "",
+                        "description": (tool.get("description") or "")[:500],
+                    }
+                )
         except Exception as e:
-            logging.getLogger(__name__).warning("Failed to list tools for connection %s (%s): %s", c.name, base_url, e)
+            logging.getLogger(__name__).warning(
+                "Failed to list tools for connection %s (%s): %s", c.name, base_url, e
+            )
             error_msg = "Failed to list tools for this connection."
-        connection_tools.append({
-            "connection_id": c.id,
-            "name": c.name,
-            "base_url": c.base_url,
-            "tools": tools_list,
-            "error": error_msg,
-        })
+        connection_tools.append(
+            {
+                "connection_id": c.id,
+                "name": c.name,
+                "base_url": c.base_url,
+                "tools": tools_list,
+                "error": error_msg,
+            }
+        )
 
     # Combined list for backward compatibility (platform + one entry per connection)
     tools = list(platform_entries)
     for c in connections:
-        tools.append({
-            "source": "external",
-            "connection_id": c.id,
-            "name": c.name,
-            "base_url": c.base_url,
-        })
+        tools.append(
+            {
+                "source": "external",
+                "connection_id": c.id,
+                "name": c.name,
+                "base_url": c.base_url,
+            }
+        )
     return {
         "tools": tools,
         "platform_tools": platform_entries,
@@ -535,7 +620,9 @@ async def get_registry(
 
 
 def _registry_tool_name(tool_id: int, name: str) -> str:
-    safe = "".join(c if c.isalnum() or c in "_-" else "_" for c in (name or "").strip())[:50]
+    safe = "".join(
+        c if c.isalnum() or c in "_-" else "_" for c in (name or "").strip()
+    )[:50]
     return f"platform_{tool_id}_{safe}" if safe else f"platform_{tool_id}"
 
 

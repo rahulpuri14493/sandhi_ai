@@ -36,7 +36,9 @@ def _verify_job_token(token: str, job_id: int) -> bool:
     return verify_job_token(token, job_id)
 
 
-async def _verify_external_api_key(api_key: Optional[str] = Depends(api_key_header)) -> bool:
+async def _verify_external_api_key(
+    api_key: Optional[str] = Depends(api_key_header),
+) -> bool:
     """Verify X-API-Key for external job creation."""
     expected = _get_external_api_key()
     if not expected:
@@ -52,7 +54,9 @@ async def _verify_external_api_key(api_key: Optional[str] = Depends(api_key_head
     return True
 
 
-def _verify_job_token_for_request(job_id: int, token: Optional[str], x_job_token: Optional[str]) -> None:
+def _verify_job_token_for_request(
+    job_id: int, token: Optional[str], x_job_token: Optional[str]
+) -> None:
     """Verify token for job access (query param or header)."""
     token_to_verify = token or x_job_token
     if not token_to_verify or not _verify_job_token(token_to_verify, job_id):
@@ -72,7 +76,12 @@ def _build_job_response(job: Job, db: Session) -> dict:
         job_conversation = None
 
     workflow_steps_data = []
-    steps = db.query(WorkflowStep).filter(WorkflowStep.job_id == job.id).order_by(WorkflowStep.step_order).all()
+    steps = (
+        db.query(WorkflowStep)
+        .filter(WorkflowStep.job_id == job.id)
+        .order_by(WorkflowStep.step_order)
+        .all()
+    )
     for step in steps:
         agent = db.query(Agent).filter(Agent.id == step.agent_id).first()
         workflow_steps_data.append(
@@ -126,7 +135,9 @@ def get_job_external(
     _verify_job_token_for_request(job_id, token, x_job_token)
     job = db.query(Job).filter(Job.id == job_id).first()
     if not job:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Job not found")
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Job not found"
+        )
     return _build_job_response(job, db)
 
 
@@ -144,7 +155,9 @@ def get_job_status_external(
     _verify_job_token_for_request(job_id, token, x_job_token)
     job = db.query(Job).filter(Job.id == job_id).first()
     if not job:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Job not found")
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Job not found"
+        )
     return {
         "id": job.id,
         "title": job.title,
@@ -199,6 +212,7 @@ async def create_job_external(
     db.refresh(job)
 
     from core.external_token import create_job_token, get_share_url
+
     token = create_job_token(job.id)
     share_url = get_share_url(job.id)
 

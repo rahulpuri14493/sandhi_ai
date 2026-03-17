@@ -1,4 +1,5 @@
 """Helpers for external job access tokens (share links)."""
+
 from datetime import datetime, timedelta
 from typing import Optional
 from jose import jwt, JWTError
@@ -21,7 +22,9 @@ def verify_job_token(token: str, job_id: int) -> bool:
         return False
     try:
         payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
-        return payload.get("job_id") == job_id and payload.get("type") == "external_view"
+        return (
+            payload.get("job_id") == job_id and payload.get("type") == "external_view"
+        )
     except (JWTError, Exception):
         return False
 

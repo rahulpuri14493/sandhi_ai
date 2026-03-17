@@ -5,6 +5,7 @@ Exposes MCP protocol (JSON-RPC 2.0): initialize, tools/list, tools/call.
 Tools are resolved per business (tenant) via the Sandhi AI backend internal API.
 Implements Vector DB, PostgreSQL, and File system tools using tenant-stored config.
 """
+
 import json
 import logging
 import os
@@ -37,8 +38,11 @@ app = FastAPI(
 def startup():
     logger.info("Platform MCP server started; BACKEND_INTERNAL_URL=%s", BACKEND_BASE)
 
+
 # Backend internal API (same network as platform)
-BACKEND_BASE = os.environ.get("BACKEND_INTERNAL_URL", "http://backend:8000").strip().rstrip("/")
+BACKEND_BASE = (
+    os.environ.get("BACKEND_INTERNAL_URL", "http://backend:8000").strip().rstrip("/")
+)
 MCP_INTERNAL_SECRET = os.environ.get("MCP_INTERNAL_SECRET", "").strip()
 INTERNAL_HEADERS = {"Content-Type": "application/json"}
 if MCP_INTERNAL_SECRET:
@@ -50,7 +54,9 @@ BUSINESS_ID_HEADER = "x-mcp-business-id"
 
 def _get_business_id(request: Request) -> int:
     """Extract business_id from header (set by backend when calling this server)."""
-    raw = request.headers.get(BUSINESS_ID_HEADER) or request.headers.get("X-MCP-Business-Id")
+    raw = request.headers.get(BUSINESS_ID_HEADER) or request.headers.get(
+        "X-MCP-Business-Id"
+    )
     if not raw:
         raise HTTPException(status_code=400, detail="Missing X-MCP-Business-Id header")
     try:
@@ -73,7 +79,9 @@ def _fetch_tool_config(business_id: int, tool_id: int) -> Dict[str, Any]:
     """Fetch decrypted tool config from backend."""
     url = f"{BACKEND_BASE}/api/internal/mcp/tools/{tool_id}/config"
     with httpx.Client(timeout=15.0) as client:
-        r = client.post(url, json={"business_id": business_id}, headers=INTERNAL_HEADERS)
+        r = client.post(
+            url, json={"business_id": business_id}, headers=INTERNAL_HEADERS
+        )
         r.raise_for_status()
         return r.json()
 
@@ -108,6 +116,7 @@ def _parse_platform_tool_id(name: str) -> Optional[int]:
 
 # --- Tool execution (vector_db, postgres, filesystem) ---
 
+
 def _execute_postgres(config: Dict[str, Any], arguments: Dict[str, Any]) -> str:
     """Run a read-only query against configured PostgreSQL.
 
@@ -116,6 +125,7 @@ def _execute_postgres(config: Dict[str, Any], arguments: Dict[str, Any]) -> str:
     (arguments["params"]) and bound using psycopg2's parameterized execution.
     """
     import psycopg2
+
     conn_str = config.get("connection_string") or ""
     if not conn_str:
         return "Error: connection_string not configured"
@@ -151,6 +161,7 @@ def _execute_postgres(config: Dict[str, Any], arguments: Dict[str, Any]) -> str:
 def _execute_filesystem(config: Dict[str, Any], arguments: Dict[str, Any]) -> str:
     """Read file or list directory under base_path."""
     import pathlib
+
     base = (config.get("base_path") or "").strip()
     if not base:
         return "Error: base_path not configured"
@@ -195,13 +206,17 @@ def _embed_with_user_key(
     query_text: str, config: Dict[str, Any], dimensions: Optional[int] = None
 ) -> Optional[List[float]]:
     """Embed query text using the end-user's OpenAI API key from tool config. Platform does not provide a key.
-    dimensions: optional output size for text-embedding-3-* (e.g. 1024 to match Chroma collection)."""
-    api_key = (config.get("openai_api_key") or config.get("embedding_api_key") or "").strip()
+    dimensions: optional output size for text-embedding-3-* (e.g. 1024 to match Chroma collection).
+    """
+    api_key = (
+        config.get("openai_api_key") or config.get("embedding_api_key") or ""
+    ).strip()
     if not api_key:
         return None
     model = (config.get("embedding_model") or "text-embedding-3-small").strip()
     try:
         from openai import OpenAI
+
         client = OpenAI(api_key=api_key)
         kwargs: Dict[str, Any] = {"model": model, "input": query_text}
         if dimensions is not None and "text-embedding-3" in model:
@@ -228,7 +243,9 @@ def _execute_pinecone(config: Dict[str, Any], arguments: Dict[str, Any]) -> str:
     query_text = (arguments.get("query") or "").strip()
     top_k = min(max(int(arguments.get("top_k") or 5), 1), 10000)
     # Pinecone default namespace: API uses "__default__"; UI often shows "_default_"
-    namespace = (arguments.get("namespace") or config.get("namespace") or "").strip() or "__default__"
+    namespace = (
+        arguments.get("namespace") or config.get("namespace") or ""
+    ).strip() or "__default__"
     if namespace == "_default_":
         namespace = "__default__"
 
@@ -239,20 +256,35 @@ def _execute_pinecone(config: Dict[str, Any], arguments: Dict[str, Any]) -> str:
     if not host:
         return "Error: Pinecone host (URL) is not configured. Use the index host from Pinecone console."
 
-    index_host = host.replace("https://", "").replace("http://", "").split("/")[0].strip()
+    index_host = (
+        host.replace("https://", "").replace("http://", "").split("/")[0].strip()
+    )
 
     def _normalize_result(result: Any, ns: Optional[str]) -> str:
         """Build a consistent JSON response from Pinecone search/query result.
-        search() returns result.result.hits with _id, _score, fields; query() returns matches with id, score, metadata."""
+        search() returns result.result.hits with _id, _score, fields; query() returns matches with id, score, metadata.
+        """
         matches = getattr(result, "matches", None) or getattr(result, "hits", None)
         if matches is None:
-            inner = getattr(result, "result", None) or (result.get("result") if isinstance(result, dict) else None)
+            inner = getattr(result, "result", None) or (
+                result.get("result") if isinstance(result, dict) else None
+            )
             if inner is not None:
-                matches = getattr(inner, "hits", None) or (inner.get("hits") if isinstance(inner, dict) else None)
+                matches = getattr(inner, "hits", None) or (
+                    inner.get("hits") if isinstance(inner, dict) else None
+                )
         if matches is None and isinstance(result, dict):
             matches = result.get("matches") or result.get("hits") or []
         matches = matches or []
-        namespace_out = getattr(result, "namespace", None) or (getattr(result, "namespace", None) if hasattr(result, "namespace") else None) or ns
+        namespace_out = (
+            getattr(result, "namespace", None)
+            or (
+                getattr(result, "namespace", None)
+                if hasattr(result, "namespace")
+                else None
+            )
+            or ns
+        )
         out = {"matches": [], "namespace": namespace_out}
         for m in matches:
             mid = getattr(m, "id", None) or getattr(m, "_id", None)
@@ -263,7 +295,15 @@ def _execute_pinecone(config: Dict[str, Any], arguments: Dict[str, Any]) -> str:
                 score = m.get("score") or m.get("_score")
             meta = getattr(m, "metadata", None) or getattr(m, "fields", None)
             if meta is None and isinstance(m, dict):
-                meta = m.get("metadata") or m.get("fields") or {k: v for k, v in m.items() if k not in ("id", "_id", "score", "_score")}
+                meta = (
+                    m.get("metadata")
+                    or m.get("fields")
+                    or {
+                        k: v
+                        for k, v in m.items()
+                        if k not in ("id", "_id", "score", "_score")
+                    }
+                )
             entry = {"id": mid, "score": score}
             if meta:
                 entry["metadata"] = dict(meta) if hasattr(meta, "items") else meta
@@ -272,6 +312,7 @@ def _execute_pinecone(config: Dict[str, Any], arguments: Dict[str, Any]) -> str:
 
     try:
         from pinecone import Pinecone
+
         pc = Pinecone(api_key=api_key)
         index = pc.Index(host=index_host)
 
@@ -285,12 +326,21 @@ def _execute_pinecone(config: Dict[str, Any], arguments: Dict[str, Any]) -> str:
         except Exception as text_err:
             err_msg = str(text_err).lower()
             fallback = (
-                "integrated" in err_msg or "inputs" in err_msg or "not supported" in err_msg
-                or "text search" in err_msg or "400" in err_msg or "invalid" in err_msg
-                or isinstance(text_err, AttributeError)  # e.g. .search() not in this SDK
+                "integrated" in err_msg
+                or "inputs" in err_msg
+                or "not supported" in err_msg
+                or "text search" in err_msg
+                or "400" in err_msg
+                or "invalid" in err_msg
+                or isinstance(
+                    text_err, AttributeError
+                )  # e.g. .search() not in this SDK
             )
             if fallback:
-                logger.info("Pinecone integrated text search not available, falling back to vector query: %s", text_err)
+                logger.info(
+                    "Pinecone integrated text search not available, falling back to vector query: %s",
+                    text_err,
+                )
             else:
                 raise
 
@@ -301,7 +351,12 @@ def _execute_pinecone(config: Dict[str, Any], arguments: Dict[str, Any]) -> str:
                 "This Pinecone index does not support query-by-text (integrated embedding). "
                 + _MSG_ADD_OPENAI_IN_CONFIG
             )
-        payload = {"vector": vector, "topK": top_k, "includeMetadata": True, "namespace": namespace}
+        payload = {
+            "vector": vector,
+            "topK": top_k,
+            "includeMetadata": True,
+            "namespace": namespace,
+        }
         result = index.query(**payload)
         return _normalize_result(result, namespace)
     except Exception as e:
@@ -313,6 +368,7 @@ def _execute_pinecone(config: Dict[str, Any], arguments: Dict[str, Any]) -> str:
 def _parse_url(url_str: str) -> tuple:
     """Return (host, port, secure) from URL."""
     from urllib.parse import urlparse
+
     u = urlparse(url_str.strip() or "http://localhost")
     host = u.hostname or "localhost"
     port = u.port or (443 if u.scheme == "https" else 8080)
@@ -323,6 +379,7 @@ def _parse_url(url_str: str) -> tuple:
 def _url_host(url_str: str) -> str:
     """Return lowercase hostname from URL for safe domain checks (avoids substring-in-URL)."""
     from urllib.parse import urlparse
+
     u = urlparse((url_str or "").strip() or "http://localhost")
     return (u.hostname or "localhost").lower()
 
@@ -331,7 +388,9 @@ def _execute_weaviate(config: Dict[str, Any], arguments: Dict[str, Any]) -> str:
     """Query Weaviate. Try near_text first (no key). If that fails, use user's OpenAI key from config + near_vector."""
     url = (config.get("url") or "").strip()
     api_key = (config.get("api_key") or "").strip() or None
-    class_name = (config.get("index_name") or config.get("class_name") or "Document").strip()
+    class_name = (
+        config.get("index_name") or config.get("class_name") or "Document"
+    ).strip()
     query_text = (arguments.get("query") or "").strip()
     top_k = min(max(int(arguments.get("top_k") or 5), 1), 100)
 
@@ -343,6 +402,7 @@ def _execute_weaviate(config: Dict[str, Any], arguments: Dict[str, Any]) -> str:
     try:
         import weaviate
         from weaviate.classes.init import Auth
+
         auth = Auth.api_key(api_key) if api_key else None
         host = _url_host(url)
         is_weaviate_cloud = host == "weaviate.cloud" or host.endswith(".weaviate.io")
@@ -369,22 +429,42 @@ def _execute_weaviate(config: Dict[str, Any], arguments: Dict[str, Any]) -> str:
                 response = collection.query.near_text(query=query_text, limit=top_k)
                 out = {"matches": []}
                 for obj in response.objects:
-                    entry = {"id": str(obj.uuid), "properties": dict(obj.properties) if obj.properties else {}}
-                    if hasattr(obj, "metadata") and obj.metadata and getattr(obj.metadata, "distance", None) is not None:
+                    entry = {
+                        "id": str(obj.uuid),
+                        "properties": dict(obj.properties) if obj.properties else {},
+                    }
+                    if (
+                        hasattr(obj, "metadata")
+                        and obj.metadata
+                        and getattr(obj.metadata, "distance", None) is not None
+                    ):
                         entry["score"] = 1 - (obj.metadata.distance or 0)
                     out["matches"].append(entry)
                 return json.dumps(out, indent=2)
             except Exception as text_err:
-                logger.info("Weaviate near_text not available, trying embed + near_vector: %s", text_err)
+                logger.info(
+                    "Weaviate near_text not available, trying embed + near_vector: %s",
+                    text_err,
+                )
             # 2) Fall back: user's OpenAI key from config + near_vector
             vector = _embed_with_user_key(query_text, config)
             if not vector:
-                return "Weaviate collection has no vectorizer for query-by-text. " + _MSG_ADD_OPENAI_IN_CONFIG
+                return (
+                    "Weaviate collection has no vectorizer for query-by-text. "
+                    + _MSG_ADD_OPENAI_IN_CONFIG
+                )
             response = collection.query.near_vector(near_vector=vector, limit=top_k)
             out = {"matches": []}
             for obj in response.objects:
-                entry = {"id": str(obj.uuid), "properties": dict(obj.properties) if obj.properties else {}}
-                if hasattr(obj, "metadata") and obj.metadata and getattr(obj.metadata, "distance", None) is not None:
+                entry = {
+                    "id": str(obj.uuid),
+                    "properties": dict(obj.properties) if obj.properties else {},
+                }
+                if (
+                    hasattr(obj, "metadata")
+                    and obj.metadata
+                    and getattr(obj.metadata, "distance", None) is not None
+                ):
                     entry["score"] = 1 - (obj.metadata.distance or 0)
                 out["matches"].append(entry)
             return json.dumps(out, indent=2)
@@ -410,7 +490,11 @@ def _execute_qdrant(config: Dict[str, Any], arguments: Dict[str, Any]) -> str:
         "multilingual e5 small": "intfloat/multilingual-e5-small",
         "multilingual-e5-small": "intfloat/multilingual-e5-small",
     }
-    raw_model = (config.get("embedding_model") or config.get("qdrant_model") or "sentence-transformers/all-minilm-l6-v2").strip()
+    raw_model = (
+        config.get("embedding_model")
+        or config.get("qdrant_model")
+        or "sentence-transformers/all-minilm-l6-v2"
+    ).strip()
     qdrant_model = _qdrant_model_aliases.get(raw_model.lower()) or raw_model
 
     if not query_text:
@@ -420,23 +504,37 @@ def _execute_qdrant(config: Dict[str, Any], arguments: Dict[str, Any]) -> str:
         points = result.points if hasattr(result, "points") else []
         out = {"matches": []}
         for p in points:
-            pid = p.id if hasattr(p, "id") else (p.get("id") if isinstance(p, dict) else None)
-            score = getattr(p, "score", None) if not isinstance(p, dict) else p.get("score")
-            payload = getattr(p, "payload", None) if not isinstance(p, dict) else p.get("payload")
+            pid = (
+                p.id
+                if hasattr(p, "id")
+                else (p.get("id") if isinstance(p, dict) else None)
+            )
+            score = (
+                getattr(p, "score", None) if not isinstance(p, dict) else p.get("score")
+            )
+            payload = (
+                getattr(p, "payload", None)
+                if not isinstance(p, dict)
+                else p.get("payload")
+            )
             entry = {"id": str(pid), "score": score}
             if payload:
-                entry["metadata"] = dict(payload) if hasattr(payload, "items") else payload
+                entry["metadata"] = (
+                    dict(payload) if hasattr(payload, "items") else payload
+                )
             out["matches"].append(entry)
         return json.dumps(out, indent=2)
 
     try:
         from qdrant_client import QdrantClient
+
         host = _url_host(url)
         is_cloud = host == "cloud.qdrant.io" or host.endswith(".cloud.qdrant.io")
         # 1) Qdrant Cloud: use Document(text=..., model=...) so Qdrant embeds server-side (no OpenAI key)
         if is_cloud and api_key:
             try:
                 from qdrant_client.http.models import Document
+
                 client = QdrantClient(url=url, api_key=api_key, cloud_inference=True)
                 result = client.query_points(
                     collection_name=collection_name,
@@ -447,13 +545,20 @@ def _execute_qdrant(config: Dict[str, Any], arguments: Dict[str, Any]) -> str:
                 return _parse_points_result(result)
             except Exception as doc_err:
                 err_str = str(doc_err).lower()
-                if "404" in err_str or "doesn't exist" in err_str or "not found" in err_str:
+                if (
+                    "404" in err_str
+                    or "doesn't exist" in err_str
+                    or "not found" in err_str
+                ):
                     return (
                         f"Qdrant collection '{collection_name}' was not found. "
                         "Cluster name is not the same as collection name: in the tool config, set **Collection name** to the exact name of your collection. "
                         "List collections in Qdrant Cloud (Cluster UI → Collections) to see the correct name."
                     )
-                logger.info("Qdrant Cloud Document query failed, falling back to vector query: %s", doc_err)
+                logger.info(
+                    "Qdrant Cloud Document query failed, falling back to vector query: %s",
+                    doc_err,
+                )
         # 2) Self-hosted or fallback: embed with user's OpenAI key then query by vector
         vector = _embed_with_user_key(query_text, config)
         if not vector:
@@ -462,7 +567,9 @@ def _execute_qdrant(config: Dict[str, Any], arguments: Dict[str, Any]) -> str:
                     "Qdrant Cloud Document query failed (check embedding_model matches your collection). "
                     "Or add your OpenAI API key in this tool's config to use vector search."
                 )
-            return "Qdrant query-by-text requires embedding. " + _MSG_ADD_OPENAI_IN_CONFIG
+            return (
+                "Qdrant query-by-text requires embedding. " + _MSG_ADD_OPENAI_IN_CONFIG
+            )
         client = QdrantClient(url=url, api_key=api_key)
         result = client.query_points(
             collection_name=collection_name,
@@ -491,6 +598,7 @@ def _execute_chroma(config: Dict[str, Any], arguments: Dict[str, Any]) -> str:
 
     try:
         import chromadb
+
         host = _url_host(url)
         is_cloud = host == "trychroma.com" or host.endswith(".trychroma.com")
         if is_cloud and api_key:
@@ -522,7 +630,9 @@ def _execute_chroma(config: Dict[str, Any], arguments: Dict[str, Any]) -> str:
                 pass
             vector = _embed_with_user_key(query_text, config, dimensions=want_dim)
             if not vector:
-                reason = str(text_err).strip() or "collection may have no embedding function"
+                reason = (
+                    str(text_err).strip() or "collection may have no embedding function"
+                )
                 return (
                     f"Chroma query by text failed ({reason}). "
                     "Add your **OpenAI API key** in this tool's config (field 'OpenAI API key (optional, for embedding)') so the query can be embedded and searched. "
@@ -530,14 +640,22 @@ def _execute_chroma(config: Dict[str, Any], arguments: Dict[str, Any]) -> str:
                 )
             try:
                 result = coll.query(query_embeddings=[vector], n_results=top_k)
-            except Exception as dim_err:  # e.g. InvalidArgumentError: dimension 1024 vs 1536
+            except (
+                Exception
+            ) as dim_err:  # e.g. InvalidArgumentError: dimension 1024 vs 1536
                 err_str = str(dim_err)
-                match = re.search(r"dimension\s+of\s+(\d+)", err_str, re.IGNORECASE) or re.search(
-                    r"expecting\s+embedding\s+with\s+dimension\s+of\s+(\d+)", err_str, re.IGNORECASE
+                match = re.search(
+                    r"dimension\s+of\s+(\d+)", err_str, re.IGNORECASE
+                ) or re.search(
+                    r"expecting\s+embedding\s+with\s+dimension\s+of\s+(\d+)",
+                    err_str,
+                    re.IGNORECASE,
                 )
                 if match:
                     want_dim = int(match.group(1))
-                    vector = _embed_with_user_key(query_text, config, dimensions=want_dim)
+                    vector = _embed_with_user_key(
+                        query_text, config, dimensions=want_dim
+                    )
                     if vector and len(vector) == want_dim:
                         result = coll.query(query_embeddings=[vector], n_results=top_k)
                     else:
@@ -547,7 +665,11 @@ def _execute_chroma(config: Dict[str, Any], arguments: Dict[str, Any]) -> str:
                         )
                 else:
                     raise
-        out = {"ids": result.get("ids", [[]])[0], "metadatas": result.get("metadatas", [[]])[0], "documents": result.get("documents", [[]])[0]}
+        out = {
+            "ids": result.get("ids", [[]])[0],
+            "metadatas": result.get("metadatas", [[]])[0],
+            "documents": result.get("documents", [[]])[0],
+        }
         # Normalize to matches list for consistency
         matches = []
         ids = out["ids"] or []
@@ -580,7 +702,10 @@ def _execute_vector_db(config: Dict[str, Any], arguments: Dict[str, Any]) -> str
                 r = client.post(
                     url.rstrip("/") + "/query",
                     json={"query": query, "top_k": top_k},
-                    headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+                    headers={
+                        "Authorization": f"Bearer {api_key}",
+                        "Content-Type": "application/json",
+                    },
                 )
                 if r.status_code == 200:
                     return json.dumps(r.json(), indent=2)
@@ -635,6 +760,7 @@ def _execute_pageindex(config: Dict[str, Any], arguments: Dict[str, Any]) -> str
     Arguments: query (required), doc_id (optional), thinking (optional bool).
     """
     import time
+
     api_key = (config.get("api_key") or "").strip()
     if not api_key:
         return "Error: api_key not configured"
@@ -657,7 +783,9 @@ def _execute_pageindex(config: Dict[str, Any], arguments: Dict[str, Any]) -> str
                 json={"doc_id": doc_id, "query": query, "thinking": thinking},
             )
             if r.status_code != 200:
-                return f"PageIndex retrieval start error: {r.status_code} {r.text[:500]}"
+                return (
+                    f"PageIndex retrieval start error: {r.status_code} {r.text[:500]}"
+                )
             data = r.json()
             retrieval_id = data.get("retrieval_id")
             if not retrieval_id:
@@ -666,7 +794,9 @@ def _execute_pageindex(config: Dict[str, Any], arguments: Dict[str, Any]) -> str
         for _ in range(24):
             time.sleep(2.5)
             with httpx.Client(timeout=15.0) as client:
-                r = client.get(f"{base}/retrieval/{retrieval_id}/", headers={"api_key": api_key})
+                r = client.get(
+                    f"{base}/retrieval/{retrieval_id}/", headers={"api_key": api_key}
+                )
             if r.status_code != 200:
                 return f"PageIndex status error: {r.status_code} {r.text[:300]}"
             data = r.json()
@@ -695,7 +825,9 @@ def _execute_pageindex(config: Dict[str, Any], arguments: Dict[str, Any]) -> str
         return "PageIndex error"
 
 
-def execute_platform_tool(tool_type: str, config: Dict[str, Any], arguments: Dict[str, Any]) -> str:
+def execute_platform_tool(
+    tool_type: str, config: Dict[str, Any], arguments: Dict[str, Any]
+) -> str:
     """Dispatch to the right tool implementation."""
     if tool_type == "postgres":
         return _execute_postgres(config, arguments)
@@ -717,13 +849,22 @@ def execute_platform_tool(tool_type: str, config: Dict[str, Any], arguments: Dic
         return _execute_pageindex(config, arguments)
     # Stub implementations for integrations (extend with real SDKs as needed)
     if tool_type == "elasticsearch":
-        url = (config.get("url") or config.get("host") or "").strip() or "http://localhost:9200"
+        url = (
+            config.get("url") or config.get("host") or ""
+        ).strip() or "http://localhost:9200"
         query = (arguments.get("query") or "").strip()
         if not query:
             return "Error: query is required"
         try:
             with httpx.Client(timeout=10.0) as client:
-                r = client.get(f"{url.rstrip('/')}/_search", json={"query": {"query_string": {"query": query}}, "size": arguments.get("size", 10)}, headers={"Content-Type": "application/json"})
+                r = client.get(
+                    f"{url.rstrip('/')}/_search",
+                    json={
+                        "query": {"query_string": {"query": query}},
+                        "size": arguments.get("size", 10),
+                    },
+                    headers={"Content-Type": "application/json"},
+                )
                 if r.status_code == 200:
                     return json.dumps(r.json(), indent=2)
                 return f"Elasticsearch error: {r.status_code} {r.text}"
@@ -751,8 +892,28 @@ def execute_platform_tool(tool_type: str, config: Dict[str, Any], arguments: Dic
         url = base.rstrip("/") + "/" + path.lstrip("/")
         try:
             with httpx.Client(timeout=15.0) as client:
-                r = client.request(method, url, json=arguments.get("body"), headers={"Authorization": f"Bearer {config.get('api_key', '')}"} if config.get("api_key") else {})
-                return json.dumps({"status": r.status_code, "body": r.json() if r.headers.get("content-type", "").startswith("application/json") else r.text})
+                r = client.request(
+                    method,
+                    url,
+                    json=arguments.get("body"),
+                    headers=(
+                        {"Authorization": f"Bearer {config.get('api_key', '')}"}
+                        if config.get("api_key")
+                        else {}
+                    ),
+                )
+                return json.dumps(
+                    {
+                        "status": r.status_code,
+                        "body": (
+                            r.json()
+                            if r.headers.get("content-type", "").startswith(
+                                "application/json"
+                            )
+                            else r.text
+                        ),
+                    }
+                )
         except Exception as e:
             logger.exception("REST API error")
             return "REST API error"
@@ -760,6 +921,7 @@ def execute_platform_tool(tool_type: str, config: Dict[str, Any], arguments: Dic
 
 
 # --- JSON-RPC handler ---
+
 
 @app.get("/health")
 def health():
@@ -779,62 +941,90 @@ async def jsonrpc(request: Request, x_mcp_business_id: Optional[str] = Header(No
     method = (body.get("method") or "").strip()
     params = body.get("params") or {}
     if not method:
-        return JSONResponse({"jsonrpc": JSONRPC_VERSION, "id": req_id, "error": {"code": -32600, "message": "Invalid method"}})
+        return JSONResponse(
+            {
+                "jsonrpc": JSONRPC_VERSION,
+                "id": req_id,
+                "error": {"code": -32600, "message": "Invalid method"},
+            }
+        )
     business_id = _get_business_id(request)
-    logger.info("MCP request method=%s business_id=%s id=%s", method, business_id, req_id)
+    logger.info(
+        "MCP request method=%s business_id=%s id=%s", method, business_id, req_id
+    )
 
     if method == "initialize":
         logger.info("MCP initialize OK business_id=%s", business_id)
-        return JSONResponse({
-            "jsonrpc": JSONRPC_VERSION,
-            "id": req_id,
-            "result": {
-                "protocolVersion": "2024-11-05",
-                "capabilities": {"tools": {}},
-                "serverInfo": {"name": "sandhi-platform-mcp", "version": "1.0.0"},
-            },
-        })
+        return JSONResponse(
+            {
+                "jsonrpc": JSONRPC_VERSION,
+                "id": req_id,
+                "result": {
+                    "protocolVersion": "2024-11-05",
+                    "capabilities": {"tools": {}},
+                    "serverInfo": {"name": "sandhi-platform-mcp", "version": "1.0.0"},
+                },
+            }
+        )
 
     if method == "tools/list":
         try:
             tools = _fetch_platform_tools(business_id)
-            logger.info("MCP tools/list business_id=%s tool_count=%s", business_id, len(tools))
-            return JSONResponse({
-                "jsonrpc": JSONRPC_VERSION,
-                "id": req_id,
-                "result": {"tools": tools, "nextCursor": None},
-            })
+            logger.info(
+                "MCP tools/list business_id=%s tool_count=%s", business_id, len(tools)
+            )
+            return JSONResponse(
+                {
+                    "jsonrpc": JSONRPC_VERSION,
+                    "id": req_id,
+                    "result": {"tools": tools, "nextCursor": None},
+                }
+            )
         except httpx.HTTPStatusError as e:
             logger.exception("Backend tools/list failed business_id=%s", business_id)
-            return JSONResponse({
-                "jsonrpc": JSONRPC_VERSION,
-                "id": req_id,
-                "error": {"code": -32000, "message": "Failed to fetch tool list from backend"},
-            })
+            return JSONResponse(
+                {
+                    "jsonrpc": JSONRPC_VERSION,
+                    "id": req_id,
+                    "error": {
+                        "code": -32000,
+                        "message": "Failed to fetch tool list from backend",
+                    },
+                }
+            )
         except Exception as e:
             logger.exception("tools/list error")
-            return JSONResponse({
-                "jsonrpc": JSONRPC_VERSION,
-                "id": req_id,
-                "error": {"code": -32603, "message": "Internal server error"},
-            })
+            return JSONResponse(
+                {
+                    "jsonrpc": JSONRPC_VERSION,
+                    "id": req_id,
+                    "error": {"code": -32603, "message": "Internal server error"},
+                }
+            )
 
     if method == "tools/call":
         name = (params.get("name") or "").strip()
         arguments = params.get("arguments") or {}
         if not name:
-            return JSONResponse({
-                "jsonrpc": JSONRPC_VERSION,
-                "id": req_id,
-                "error": {"code": -32602, "message": "Missing tool name"},
-            })
+            return JSONResponse(
+                {
+                    "jsonrpc": JSONRPC_VERSION,
+                    "id": req_id,
+                    "error": {"code": -32602, "message": "Missing tool name"},
+                }
+            )
         tool_id = _parse_platform_tool_id(name)
         if tool_id is None:
-            return JSONResponse({
-                "jsonrpc": JSONRPC_VERSION,
-                "id": req_id,
-                "error": {"code": -32602, "message": "Unknown tool; only platform tools are supported"},
-            })
+            return JSONResponse(
+                {
+                    "jsonrpc": JSONRPC_VERSION,
+                    "id": req_id,
+                    "error": {
+                        "code": -32602,
+                        "message": "Unknown tool; only platform tools are supported",
+                    },
+                }
+            )
         try:
             data = _fetch_tool_config(business_id, tool_id)
             config = data.get("config") or {}
@@ -844,34 +1034,53 @@ async def jsonrpc(request: Request, x_mcp_business_id: Optional[str] = Header(No
             preview = (result_text[:80] + "…") if len(result_text) > 80 else result_text
             logger.info(
                 "MCP tools/call business_id=%s tool=%s tool_type=%s is_error=%s result_preview=%s",
-                business_id, name, tool_type, is_err, preview.replace("\n", " "),
+                business_id,
+                name,
+                tool_type,
+                is_err,
+                preview.replace("\n", " "),
             )
-            return JSONResponse({
-                "jsonrpc": JSONRPC_VERSION,
-                "id": req_id,
-                "result": {
-                    "content": [{"type": "text", "text": result_text}],
-                    "isError": is_err,
-                },
-            })
+            return JSONResponse(
+                {
+                    "jsonrpc": JSONRPC_VERSION,
+                    "id": req_id,
+                    "result": {
+                        "content": [{"type": "text", "text": result_text}],
+                        "isError": is_err,
+                    },
+                }
+            )
         except httpx.HTTPStatusError as e:
-            logger.exception("Backend config fetch failed business_id=%s tool_id=%s", business_id, tool_id)
-            return JSONResponse({
-                "jsonrpc": JSONRPC_VERSION,
-                "id": req_id,
-                "error": {"code": -32000, "message": "Failed to fetch tool configuration from backend"},
-            })
+            logger.exception(
+                "Backend config fetch failed business_id=%s tool_id=%s",
+                business_id,
+                tool_id,
+            )
+            return JSONResponse(
+                {
+                    "jsonrpc": JSONRPC_VERSION,
+                    "id": req_id,
+                    "error": {
+                        "code": -32000,
+                        "message": "Failed to fetch tool configuration from backend",
+                    },
+                }
+            )
         except Exception:
             logger.error("tools/call error business_id=%s tool=%s", business_id, name)
-            return JSONResponse({
-                "jsonrpc": JSONRPC_VERSION,
-                "id": req_id,
-                "error": {"code": -32603, "message": "Internal server error"},
-            })
+            return JSONResponse(
+                {
+                    "jsonrpc": JSONRPC_VERSION,
+                    "id": req_id,
+                    "error": {"code": -32603, "message": "Internal server error"},
+                }
+            )
 
     logger.warning("MCP method not found method=%s business_id=%s", method, business_id)
-    return JSONResponse({
-        "jsonrpc": JSONRPC_VERSION,
-        "id": req_id,
-        "error": {"code": -32601, "message": f"Method not found: {method}"},
-    })
+    return JSONResponse(
+        {
+            "jsonrpc": JSONRPC_VERSION,
+            "id": req_id,
+            "error": {"code": -32601, "message": f"Method not found: {method}"},
+        }
+    )

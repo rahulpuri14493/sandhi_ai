@@ -1,4 +1,5 @@
 """Unit tests for DocumentAnalyzer service."""
+
 import asyncio
 import pytest
 from services.document_analyzer import DocumentAnalyzer
@@ -34,6 +35,7 @@ def temp_txt_file():
     """Create a temporary .txt file."""
     import tempfile
     from pathlib import Path
+
     with tempfile.NamedTemporaryFile(
         mode="w", suffix=".txt", delete=False, encoding="utf-8"
     ) as f:
@@ -59,16 +61,21 @@ def test_analyze_documents_no_agent_extraction_only(temp_txt_file):
     assert "questions" in result
     assert result["questions"] == []
     assert "analysis" in result
-    assert "Select and assign agents" in result["analysis"] or "extracted" in result["analysis"].lower()
+    assert (
+        "Select and assign agents" in result["analysis"]
+        or "extracted" in result["analysis"].lower()
+    )
 
 
 def test_format_conversation_handles_dict_values():
     """_format_conversation should handle dict question/answer without crashing."""
     analyzer = DocumentAnalyzer()
-    formatted = analyzer._format_conversation([
-        {"question": {"text": "Q1"}, "answer": "A1"},
-        {"question": "Q2", "answer": {"value": "A2"}},
-    ])
+    formatted = analyzer._format_conversation(
+        [
+            {"question": {"text": "Q1"}, "answer": "A1"},
+            {"question": "Q2", "answer": {"value": "A2"}},
+        ]
+    )
     assert "Q1" in formatted or "A1" in formatted
     assert "Q2" in formatted or "A2" in formatted or "value" in formatted
 
@@ -92,4 +99,10 @@ def test_extract_recommendations():
     """
     recs = analyzer._extract_recommendations(text)
     assert len(recs) <= 5
-    assert any("recommend" in r.lower() or "Python" in r or "validation" in r or "calculator" in r for r in recs)
+    assert any(
+        "recommend" in r.lower()
+        or "Python" in r
+        or "validation" in r
+        or "calculator" in r
+        for r in recs
+    )

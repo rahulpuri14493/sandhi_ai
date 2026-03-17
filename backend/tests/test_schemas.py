@@ -1,4 +1,5 @@
 """Unit tests for Pydantic schemas."""
+
 import pytest
 from datetime import datetime
 from pydantic import ValidationError
@@ -96,6 +97,7 @@ def test_auto_split_body_tool_visibility():
 
 def test_workflow_step_response_from_attributes():
     """WorkflowStepResponse can be created from ORM-like object."""
+
     class MockStep:
         id = 1
         job_id = 1

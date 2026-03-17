@@ -31,19 +31,27 @@ class HiringPosition(Base):
 
     # Relationships
     business = relationship("User", foreign_keys=[business_id])
-    nominations = relationship("AgentNomination", back_populates="hiring_position", cascade="all, delete-orphan")
+    nominations = relationship(
+        "AgentNomination",
+        back_populates="hiring_position",
+        cascade="all, delete-orphan",
+    )
 
 
 class AgentNomination(Base):
     __tablename__ = "agent_nominations"
 
     id = Column(Integer, primary_key=True, index=True)
-    hiring_position_id = Column(Integer, ForeignKey("hiring_positions.id"), nullable=False)
+    hiring_position_id = Column(
+        Integer, ForeignKey("hiring_positions.id"), nullable=False
+    )
     agent_id = Column(Integer, ForeignKey("agents.id"), nullable=False)
     developer_id = Column(Integer, ForeignKey("users.id"), nullable=False)
     cover_letter = Column(Text)  # Optional message from developer
     status = Column(Enum(NominationStatus), default=NominationStatus.PENDING)
-    reviewed_by = Column(Integer, ForeignKey("users.id"), nullable=True)  # Business user who reviewed
+    reviewed_by = Column(
+        Integer, ForeignKey("users.id"), nullable=True
+    )  # Business user who reviewed
     reviewed_at = Column(DateTime, nullable=True)
     review_notes = Column(Text, nullable=True)  # Notes from reviewer
     created_at = Column(DateTime, default=datetime.utcnow)

@@ -20,7 +20,11 @@ class User(Base):
     created_at = Column(DateTime, default=datetime.utcnow)
 
     # Relationships
-    agents = relationship("Agent", back_populates="developer", foreign_keys="Agent.developer_id")
-    jobs = relationship("Job", back_populates="business", foreign_keys="Job.business_id")
+    agents = relationship(
+        "Agent", back_populates="developer", foreign_keys="Agent.developer_id"
+    )
+    jobs = relationship(
+        "Job", back_populates="business", foreign_keys="Job.business_id"
+    )
     transactions = relationship("Transaction", back_populates="payer")
     earnings = relationship("Earnings", back_populates="developer")

@@ -16,53 +16,62 @@ class DocumentAnalyzer:
         """Read document content based on file type and extract text for inference endpoint"""
         path = Path(file_path)
         file_ext = path.suffix.lower()
-        
+
         try:
             # Text-based files
-            if file_ext in ['.txt', '.md', '.rtf']:
-                with open(path, 'r', encoding='utf-8', errors='ignore') as f:
+            if file_ext in [".txt", ".md", ".rtf"]:
+                with open(path, "r", encoding="utf-8", errors="ignore") as f:
                     return f.read()
-            
-            elif file_ext == '.csv':
+
+            elif file_ext == ".csv":
                 import csv
+
                 content = []
-                with open(path, 'r', encoding='utf-8', errors='ignore') as f:
+                with open(path, "r", encoding="utf-8", errors="ignore") as f:
                     reader = csv.reader(f)
                     for row in reader:
-                        content.append(','.join(row))
-                return '\n'.join(content)
-            
-            elif file_ext == '.json':
-                with open(path, 'r', encoding='utf-8') as f:
+                        content.append(",".join(row))
+                return "\n".join(content)
+
+            elif file_ext == ".json":
+                with open(path, "r", encoding="utf-8") as f:
                     data = json.load(f)
                     return json.dumps(data, indent=2)
-            
-            elif file_ext == '.xml':
-                with open(path, 'r', encoding='utf-8', errors='ignore') as f:
+
+            elif file_ext == ".xml":
+                with open(path, "r", encoding="utf-8", errors="ignore") as f:
                     return f.read()
-            
+
             # PDF files
-            elif file_ext == '.pdf':
+            elif file_ext == ".pdf":
                 try:
                     import PyPDF2
+
                     content = []
-                    with open(path, 'rb') as f:
+                    with open(path, "rb") as f:
                         pdf_reader = PyPDF2.PdfReader(f)
                         for page_num, page in enumerate(pdf_reader.pages):
                             text = page.extract_text()
                             if text.strip():
                                 content.append(f"--- Page {page_num + 1} ---\n{text}")
-                    return '\n\n'.join(content) if content else "[PDF file contains no extractable text]"
+                    return (
+                        "\n\n".join(content)
+                        if content
+                        else "[PDF file contains no extractable text]"
+                    )
                 except ImportError:
-                    return f"[PDF extraction requires PyPDF2 library. File: {path.name}]"
+                    return (
+                        f"[PDF extraction requires PyPDF2 library. File: {path.name}]"
+                    )
                 except Exception as e:
                     return f"[Error extracting PDF content: {str(e)}]"
-            
+
             # Word documents (.docx) - try python-docx first, then docx2txt fallback
-            elif file_ext == '.docx':
+            elif file_ext == ".docx":
                 # Primary: python-docx (better structure for paragraphs/tables)
                 try:
                     from docx import Document
+
                     doc = Document(path)
                     content = []
                     for paragraph in doc.paragraphs:
@@ -70,11 +79,17 @@ class DocumentAnalyzer:
                             content.append(paragraph.text)
                     for table in doc.tables:
                         for row in table.rows:
-                            row_text = ' | '.join([cell.text.strip() for cell in row.cells if cell.text.strip()])
+                            row_text = " | ".join(
+                                [
+                                    cell.text.strip()
+                                    for cell in row.cells
+                                    if cell.text.strip()
+                                ]
+                            )
                             if row_text:
                                 content.append(row_text)
                     if content:
-                        return '\n'.join(content)
+                        return "\n".join(content)
                     # Empty body - try docx2txt which can get more content (headers, footers)
                 except ImportError:
                     pass
@@ -83,29 +98,42 @@ class DocumentAnalyzer:
                 # Fallback: docx2txt (works without python-docx, extracts text from .docx)
                 try:
                     import docx2txt
+
                     text = docx2txt.process(str(path))
-                    return text.strip() if text and text.strip() else "[DOCX file contains no extractable text]"
+                    return (
+                        text.strip()
+                        if text and text.strip()
+                        else "[DOCX file contains no extractable text]"
+                    )
                 except ImportError:
                     return f"[DOCX extraction requires python-docx or docx2txt. File: {path.name}]"
                 except Exception as e:
                     return f"[Error extracting DOCX content: {str(e)}]"
-            
+
             # Legacy Word documents (.doc) - requires additional library
-            elif file_ext == '.doc':
+            elif file_ext == ".doc":
                 try:
                     # Try using python-docx2txt or textract
                     import docx2txt
+
                     text = docx2txt.process(path)
-                    return text if text.strip() else "[DOC file contains no extractable text]"
+                    return (
+                        text
+                        if text.strip()
+                        else "[DOC file contains no extractable text]"
+                    )
                 except ImportError:
-                    return f"[DOC extraction requires docx2txt library. File: {path.name}]"
+                    return (
+                        f"[DOC extraction requires docx2txt library. File: {path.name}]"
+                    )
                 except Exception as e:
                     return f"[Error extracting DOC content: {str(e)}]"
-            
+
             # Excel files (.xlsx, .xls)
-            elif file_ext in ['.xlsx', '.xls']:
+            elif file_ext in [".xlsx", ".xls"]:
                 try:
                     import pandas as pd
+
                     # Read all sheets
                     excel_file = pd.ExcelFile(path)
                     content = []
@@ -114,17 +142,22 @@ class DocumentAnalyzer:
                         content.append(f"--- Sheet: {sheet_name} ---")
                         # Convert DataFrame to string representation
                         content.append(df.to_string(index=False))
-                    return '\n\n'.join(content) if content else "[Excel file contains no data]"
+                    return (
+                        "\n\n".join(content)
+                        if content
+                        else "[Excel file contains no data]"
+                    )
                 except ImportError:
                     return f"[Excel extraction requires pandas and openpyxl libraries. File: {path.name}]"
                 except Exception as e:
                     return f"[Error extracting Excel content: {str(e)}]"
-            
+
             # OpenDocument formats (.odt, .ods)
-            elif file_ext == '.odt':
+            elif file_ext == ".odt":
                 try:
                     from odf import text, teletype
                     from odf.opendocument import load
+
                     doc = load(path)
                     paragraphs = doc.getElementsByType(text.P)
                     content = []
@@ -132,28 +165,37 @@ class DocumentAnalyzer:
                         text_content = teletype.extractText(para)
                         if text_content.strip():
                             content.append(text_content)
-                    return '\n'.join(content) if content else "[ODT file contains no extractable text]"
+                    return (
+                        "\n".join(content)
+                        if content
+                        else "[ODT file contains no extractable text]"
+                    )
                 except ImportError:
                     return f"[ODT extraction requires odfpy library. File: {path.name}]"
                 except Exception as e:
                     return f"[Error extracting ODT content: {str(e)}]"
-            
-            elif file_ext == '.ods':
+
+            elif file_ext == ".ods":
                 try:
                     import pandas as pd
-                    df = pd.read_excel(path, engine='odf')
-                    return df.to_string(index=False) if not df.empty else "[ODS file contains no data]"
+
+                    df = pd.read_excel(path, engine="odf")
+                    return (
+                        df.to_string(index=False)
+                        if not df.empty
+                        else "[ODS file contains no data]"
+                    )
                 except ImportError:
                     return f"[ODS extraction requires pandas and odfpy libraries. File: {path.name}]"
                 except Exception as e:
                     return f"[Error extracting ODS content: {str(e)}]"
-            
+
             else:
                 return f"[Unsupported file type: {file_ext}. File: {path.name}]"
-                
+
         except Exception as e:
             return f"[Error reading file {path.name}: {str(e)}]"
-    
+
     async def _analyze_documents_via_a2a(
         self,
         all_content: str,
@@ -172,7 +214,7 @@ class DocumentAnalyzer:
             "job_description": job_description or "",
             "documents_content": all_content,
             "conversation_history": conversation_history,
-            "task": "Analyze the documents and requirements. Ask ONLY important clarifying questions (critical gaps, real ambiguities, risks). Do NOT ask minor or obvious questions (e.g. for simple math like 'add 2+5' do not ask output format—integer/float; use a reasonable default). Return valid JSON: {\"analysis\": \"...\", \"questions\": [] (only if truly needed), \"recommendations\": [], \"solutions\": [], \"next_steps\": []}. Works for both sequential and A2A workflows.",
+            "task": 'Analyze the documents and requirements. Ask ONLY important clarifying questions (critical gaps, real ambiguities, risks). Do NOT ask minor or obvious questions (e.g. for simple math like \'add 2+5\' do not ask output format—integer/float; use a reasonable default). Return valid JSON: {"analysis": "...", "questions": [] (only if truly needed), "recommendations": [], "solutions": [], "next_steps": []}. Works for both sequential and A2A workflows.',
         }
         if adapter_url and adapter_metadata is not None:
             result = await execute_via_a2a(
@@ -204,7 +246,11 @@ class DocumentAnalyzer:
                 "solutions": parsed.get("solutions", []),
                 "next_steps": parsed.get("next_steps", []),
                 "workflow_collaboration_hint": hint,
-                "workflow_collaboration_reason": (parsed.get("workflow_collaboration_reason") or "").strip() or None if hint else None,
+                "workflow_collaboration_reason": (
+                    (parsed.get("workflow_collaboration_reason") or "").strip() or None
+                    if hint
+                    else None
+                ),
                 "raw_response": content,
             }
         except json.JSONDecodeError:
@@ -218,10 +264,10 @@ class DocumentAnalyzer:
                 "workflow_collaboration_reason": None,
                 "raw_response": content,
             }
-    
+
     async def analyze_documents_and_generate_questions(
-        self, 
-        documents: List[Dict[str, str]], 
+        self,
+        documents: List[Dict[str, str]],
         job_title: str,
         job_description: Optional[str] = None,
         conversation_history: Optional[List[Dict[str, str]]] = None,
@@ -239,7 +285,9 @@ class DocumentAnalyzer:
         """
         conversation_history = conversation_history or []
         job_title = str(job_title).strip() if job_title is not None else ""
-        job_description = str(job_description).strip() if job_description is not None else None
+        job_description = (
+            str(job_description).strip() if job_description is not None else None
+        )
         if job_description is not None and not job_description:
             job_description = None
         # Extract data from all documents (no inference)
@@ -254,7 +302,7 @@ class DocumentAnalyzer:
             except Exception as e:
                 content = f"[Error reading {name}: {str(e)}]"
             document_contents.append(f"=== {name} ===\n{content}\n")
-        
+
         if not document_contents:
             return {
                 "analysis": f"No documents could be read for job '{job_title}'.",
@@ -265,7 +313,7 @@ class DocumentAnalyzer:
                 "raw_response": "",
             }
         all_content = "\n".join(document_contents)
-        
+
         # No hired agent endpoint → extraction only
         if not (agent_api_url and (agent_api_url or "").strip()):
             return {
@@ -276,7 +324,7 @@ class DocumentAnalyzer:
                 "next_steps": [],
                 "raw_response": "",
             }
-        
+
         # A2A path: call hired agent via A2A protocol (same semantics, different transport)
         if use_a2a:
             return await self._analyze_documents_via_a2a(
@@ -287,7 +335,7 @@ class DocumentAnalyzer:
                 agent_api_url=agent_api_url.strip(),
                 agent_api_key=agent_api_key,
             )
-        
+
         # OpenAI-compatible via platform adapter: route through A2A so architecture is A2A everywhere
         adapter_url = (getattr(settings, "A2A_ADAPTER_URL", None) or "").strip()
         if adapter_url:
@@ -306,7 +354,7 @@ class DocumentAnalyzer:
                     "openai_model": model,
                 },
             )
-        
+
         # Hired agent: build the prompt and call agent endpoint (OpenAI-compatible, no adapter)
         system_prompt = """You are an expert AI assistant specialized in deeply understanding business requirements from documents and providing intelligent solutions.
 
@@ -358,14 +406,16 @@ IMPORTANT: You must respond with valid JSON only. Format your response as JSON w
 }
 
 When you have enough information to understand the problem, provide solutions and recommendations instead of asking more questions."""
-        
+
         # Build user prompt
-        job_desc_part = f'Job Description: {job_description}\n\n' if job_description else ''
-        conv_part = ''
+        job_desc_part = (
+            f"Job Description: {job_description}\n\n" if job_description else ""
+        )
+        conv_part = ""
         if conversation_history:
             formatted_conv = self._format_conversation(conversation_history)
-            conv_part = f'\n\nPrevious Conversation History:\n{formatted_conv}\n\n'
-        
+            conv_part = f"\n\nPrevious Conversation History:\n{formatted_conv}\n\n"
+
         user_prompt = f"""Job Title: {job_title}
 {job_desc_part}=== UPLOADED DOCUMENTS WITH REQUIREMENTS ===
 {all_content}
@@ -378,12 +428,12 @@ TASK:
 5. Once you understand the problem, provide SOLUTIONS and RECOMMENDATIONS
 
 Be thorough and solution-oriented. Prefer sensible defaults over asking trivial questions."""
-        
+
         messages = [
             {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt}
+            {"role": "user", "content": user_prompt},
         ]
-        
+
         # Add conversation history if provided - only include Q&A pairs with both question and answer
         def _str_strip(val: Any) -> str:
             if val is None:
@@ -403,14 +453,19 @@ Be thorough and solution-oriented. Prefer sensible defaults over asking trivial 
                 elif item.get("type") == "analysis":
                     content = _str_strip(item.get("content"))
                     if content:
-                        messages.append({"role": "assistant", "content": f"Analysis: {content}"})
-        
+                        messages.append(
+                            {"role": "assistant", "content": f"Analysis: {content}"}
+                        )
+
         try:
             max_content_length = 50000
             for msg in messages:
                 if len(msg.get("content", "")) > max_content_length:
-                    msg["content"] = msg["content"][:max_content_length] + "\n\n[Content truncated due to length...]"
-            
+                    msg["content"] = (
+                        msg["content"][:max_content_length]
+                        + "\n\n[Content truncated due to length...]"
+                    )
+
             model = (agent_llm_model or "").strip() or "gpt-4o-mini"
             temperature = agent_temperature if agent_temperature is not None else 0.7
             payload = {
@@ -422,7 +477,7 @@ Be thorough and solution-oriented. Prefer sensible defaults over asking trivial 
             headers = {"Content-Type": "application/json"}
             if agent_api_key and (agent_api_key or "").strip():
                 headers["Authorization"] = f"Bearer {(agent_api_key or '').strip()}"
-            
+
             async with httpx.AsyncClient(timeout=120.0, verify=False) as client:
                 response = await client.post(
                     agent_api_url.strip(),
@@ -435,14 +490,18 @@ Be thorough and solution-oriented. Prefer sensible defaults over asking trivial 
                 # OpenAI can return content as string or list of parts (e.g. multimodal)
                 if isinstance(raw_content, list):
                     assistant_message = " ".join(
-                        p.get("text", p.get("content", "")) if isinstance(p, dict) else str(p)
+                        (
+                            p.get("text", p.get("content", ""))
+                            if isinstance(p, dict)
+                            else str(p)
+                        )
                         for p in raw_content
                     )
                 elif isinstance(raw_content, str):
                     assistant_message = raw_content
                 else:
                     assistant_message = str(raw_content or "")
-                
+
                 try:
                     parsed = json.loads(assistant_message)
                     hint = parsed.get("workflow_collaboration_hint")
@@ -455,14 +514,21 @@ Be thorough and solution-oriented. Prefer sensible defaults over asking trivial 
                         "solutions": parsed.get("solutions", []),
                         "next_steps": parsed.get("next_steps", []),
                         "workflow_collaboration_hint": hint,
-                        "workflow_collaboration_reason": (parsed.get("workflow_collaboration_reason") or "").strip() or None if hint else None,
+                        "workflow_collaboration_reason": (
+                            (parsed.get("workflow_collaboration_reason") or "").strip()
+                            or None
+                            if hint
+                            else None
+                        ),
                         "raw_response": assistant_message,
                     }
                 except json.JSONDecodeError:
                     return {
                         "analysis": assistant_message,
                         "questions": self._extract_questions(assistant_message),
-                        "recommendations": self._extract_recommendations(assistant_message),
+                        "recommendations": self._extract_recommendations(
+                            assistant_message
+                        ),
                         "solutions": [],
                         "next_steps": [],
                         "workflow_collaboration_hint": None,
@@ -480,7 +546,7 @@ Be thorough and solution-oriented. Prefer sensible defaults over asking trivial 
             raise Exception(f"Hired agent API request error: {str(e)}")
         except Exception as e:
             raise Exception(f"Error analyzing documents: {str(e)}")
-    
+
     async def process_user_response(
         self,
         user_answer: str,
@@ -501,25 +567,27 @@ Be thorough and solution-oriented. Prefer sensible defaults over asking trivial 
             if item.get("type") == "question" and not item.get("answer"):
                 last_question = item.get("question") or ""
                 break
-        
+
         updated_history = []
         answer_added = False
         for item in conversation_history:
-            if item.get("type") == "question" and not item.get("answer") and not answer_added:
+            if (
+                item.get("type") == "question"
+                and not item.get("answer")
+                and not answer_added
+            ):
                 updated_item = item.copy()
                 updated_item["answer"] = user_answer
                 updated_history.append(updated_item)
                 answer_added = True
             else:
                 updated_history.append(item)
-        
+
         if not answer_added and last_question:
-            updated_history.append({
-                "type": "question",
-                "question": last_question,
-                "answer": user_answer
-            })
-        
+            updated_history.append(
+                {"type": "question", "question": last_question, "answer": user_answer}
+            )
+
         return await self.analyze_documents_and_generate_questions(
             documents,
             job_title,
@@ -531,7 +599,7 @@ Be thorough and solution-oriented. Prefer sensible defaults over asking trivial 
             agent_temperature=agent_temperature,
             use_a2a=use_a2a,
         )
-    
+
     async def generate_workflow_clarification_questions(
         self,
         job_title: str,
@@ -566,7 +634,11 @@ Be thorough and solution-oriented. Prefer sensible defaults over asking trivial 
             f"Step {t.get('step_order', i+1)} ({t.get('agent_name', 'Agent')}): {t.get('assigned_task', '')}"
             for i, t in enumerate(workflow_tasks)
         )
-        conv_text = self._format_conversation(conversation_history) if conversation_history else "(none)"
+        conv_text = (
+            self._format_conversation(conversation_history)
+            if conversation_history
+            else "(none)"
+        )
         user_prompt = f"""JOB TITLE: {job_title}
 JOB DESCRIPTION: {job_description}
 
@@ -593,7 +665,11 @@ Return ONLY valid JSON: {{"questions": ["Question 1?"]}} or {{"questions": []}}.
         adapter_url = (getattr(settings, "A2A_ADAPTER_URL", None) or "").strip()
         if use_a2a and not adapter_url:
             # Direct A2A to agent
-            input_data = {"job_title": job_title, "job_description": job_description, "prompt": user_prompt}
+            input_data = {
+                "job_title": job_title,
+                "job_description": job_description,
+                "prompt": user_prompt,
+            }
             result = await execute_via_a2a(
                 agent_api_url.strip(),
                 input_data,
@@ -604,7 +680,11 @@ Return ONLY valid JSON: {{"questions": ["Question 1?"]}} or {{"questions": []}}.
             content = (result.get("content") or "").strip()
         elif adapter_url:
             model = (agent_llm_model or "").strip() or "gpt-4o-mini"
-            input_data = {"job_title": job_title, "job_description": job_description, "prompt": user_prompt}
+            input_data = {
+                "job_title": job_title,
+                "job_description": job_description,
+                "prompt": user_prompt,
+            }
             result = await execute_via_a2a(
                 adapter_url,
                 input_data,
@@ -624,24 +704,35 @@ Return ONLY valid JSON: {{"questions": ["Question 1?"]}} or {{"questions": []}}.
             payload = {
                 "model": model,
                 "messages": [
-                    {"role": "system", "content": "You generate 0–3 clarifying questions for an end user. End users get frustrated by minor questions. Ask ONLY when critical: missing required input that cannot be inferred, real conflict/ambiguity, or missing hard constraint. Do NOT ask: output format, display format, method/tool preference, context for result, additional operations, precision, or anything with a sensible default. For simple tasks (e.g. add two numbers), return empty array unless a required input is genuinely missing. Return only valid JSON: {\"questions\": [\"...?\"]} or {\"questions\": []}. No markdown."},
+                    {
+                        "role": "system",
+                        "content": 'You generate 0–3 clarifying questions for an end user. End users get frustrated by minor questions. Ask ONLY when critical: missing required input that cannot be inferred, real conflict/ambiguity, or missing hard constraint. Do NOT ask: output format, display format, method/tool preference, context for result, additional operations, precision, or anything with a sensible default. For simple tasks (e.g. add two numbers), return empty array unless a required input is genuinely missing. Return only valid JSON: {"questions": ["...?"]} or {"questions": []}. No markdown.',
+                    },
                     {"role": "user", "content": user_prompt[:50000]},
                 ],
-                "temperature": agent_temperature if agent_temperature is not None else 0.5,
+                "temperature": (
+                    agent_temperature if agent_temperature is not None else 0.5
+                ),
                 "max_tokens": 1500,
             }
             headers = {"Content-Type": "application/json"}
             if agent_api_key and (agent_api_key or "").strip():
                 headers["Authorization"] = f"Bearer {(agent_api_key or '').strip()}"
             async with httpx.AsyncClient(timeout=120.0, verify=False) as client:
-                resp = await client.post(agent_api_url.strip(), json=payload, headers=headers)
+                resp = await client.post(
+                    agent_api_url.strip(), json=payload, headers=headers
+                )
                 resp.raise_for_status()
                 data = resp.json()
                 raw = (data.get("choices") or [{}])[0].get("message") or {}
                 content = (raw.get("content") or "").strip()
                 if isinstance(content, list):
                     content = " ".join(
-                        p.get("text", p.get("content", "")) if isinstance(p, dict) else str(p)
+                        (
+                            p.get("text", p.get("content", ""))
+                            if isinstance(p, dict)
+                            else str(p)
+                        )
                         for p in content
                     )
 
@@ -656,7 +747,11 @@ Return ONLY valid JSON: {{"questions": ["Question 1?"]}} or {{"questions": []}}.
             parsed = json.loads(content)
             questions = parsed.get("questions")
             if isinstance(questions, list):
-                return {"questions": [str(q).strip() for q in questions if str(q).strip()][:10]}
+                return {
+                    "questions": [str(q).strip() for q in questions if str(q).strip()][
+                        :10
+                    ]
+                }
         except (json.JSONDecodeError, TypeError):
             pass
         return {"questions": self._extract_questions(content)}
@@ -675,28 +770,44 @@ Return ONLY valid JSON: {{"questions": ["Question 1?"]}} or {{"questions": []}}.
                 if answer:
                     formatted.append(f"A{i}: {answer}")
         return "\n".join(formatted)
-    
+
     def _extract_questions(self, text: str) -> List[str]:
         """Extract questions from text if JSON parsing fails"""
         import re
+
         # Look for lines ending with ?
-        questions = re.findall(r'[^.!?]*\?', text)
+        questions = re.findall(r"[^.!?]*\?", text)
         return [q.strip() for q in questions if q.strip()][:3]  # Limit to 3 questions
-    
+
     def _extract_recommendations(self, text: str) -> List[str]:
         """Extract recommendations/solutions from text if JSON parsing fails"""
         import re
+
         recommendations = []
         # Look for bullet points, numbered lists, or lines starting with keywords
-        lines = text.split('\n')
+        lines = text.split("\n")
         for line in lines:
             line = line.strip()
             # Match bullet points, numbered items, or lines with recommendation keywords
-            if (line.startswith('-') or line.startswith('*') or 
-                re.match(r'^\d+[\.\)]', line) or
-                any(keyword in line.lower() for keyword in ['recommend', 'suggest', 'solution', 'should', 'consider'])):
+            if (
+                line.startswith("-")
+                or line.startswith("*")
+                or re.match(r"^\d+[\.\)]", line)
+                or any(
+                    keyword in line.lower()
+                    for keyword in [
+                        "recommend",
+                        "suggest",
+                        "solution",
+                        "should",
+                        "consider",
+                    ]
+                )
+            ):
                 # Clean up the line
-                cleaned = re.sub(r'^[-*\d+\.\)]\s*', '', line)
-                if cleaned and len(cleaned) > 10:  # Only include substantial recommendations
+                cleaned = re.sub(r"^[-*\d+\.\)]\s*", "", line)
+                if (
+                    cleaned and len(cleaned) > 10
+                ):  # Only include substantial recommendations
                     recommendations.append(cleaned)
         return recommendations[:5]  # Limit to 5 recommendations

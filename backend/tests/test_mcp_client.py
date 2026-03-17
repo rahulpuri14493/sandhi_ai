@@ -6,11 +6,11 @@ Validates compatibility with:
 - Legacy HTTP+SSE (2024-11-05): POST to endpoint, SSE message events
 - Open-source servers that return application/json (e.g. many self-hosted) or text/event-stream (e.g. PageIndex).
 """
+
 import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from services.mcp_client import _parse_sse_to_json, call_mcp_server
-
 
 # ---------- SSE parsing: works with all MCP servers that use SSE ----------
 
@@ -53,13 +53,21 @@ async def test_call_mcp_server_json_response():
     """Server returns Content-Type: application/json (common for self-hosted MCP)."""
     mock_response = MagicMock()
     mock_response.status_code = 200
-    mock_response.text = '{"jsonrpc":"2.0","id":1,"result":{"serverInfo":{"name":"test"}}}'
+    mock_response.text = (
+        '{"jsonrpc":"2.0","id":1,"result":{"serverInfo":{"name":"test"}}}'
+    )
     mock_response.headers = {"content-type": "application/json"}
-    mock_response.json.return_value = {"jsonrpc": "2.0", "id": 1, "result": {"serverInfo": {"name": "test"}}}
+    mock_response.json.return_value = {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "result": {"serverInfo": {"name": "test"}},
+    }
     mock_response.raise_for_status = MagicMock()
 
     with patch("services.mcp_client.httpx.AsyncClient") as mock_client:
-        mock_client.return_value.__aenter__.return_value.post = AsyncMock(return_value=mock_response)
+        mock_client.return_value.__aenter__.return_value.post = AsyncMock(
+            return_value=mock_response
+        )
         result = await call_mcp_server(
             base_url="https://mcp.example.com",
             method="initialize",
@@ -72,7 +80,7 @@ async def test_call_mcp_server_json_response():
 async def test_call_mcp_server_sse_response():
     """Server returns Content-Type: text/event-stream (e.g. PageIndex)."""
     sse_body = (
-        'event: message\n'
+        "event: message\n"
         'data: {"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2024-11-05","serverInfo":{"name":"pageindex-mcp"}}}\n\n'
     )
     mock_response = MagicMock()
@@ -82,7 +90,9 @@ async def test_call_mcp_server_sse_response():
     mock_response.raise_for_status = MagicMock()
 
     with patch("services.mcp_client.httpx.AsyncClient") as mock_client:
-        mock_client.return_value.__aenter__.return_value.post = AsyncMock(return_value=mock_response)
+        mock_client.return_value.__aenter__.return_value.post = AsyncMock(
+            return_value=mock_response
+        )
         result = await call_mcp_server(
             base_url="https://api.pageindex.ai",
             method="initialize",
@@ -110,11 +120,18 @@ async def test_call_mcp_server_sends_accept_and_protocol_version():
         return mock_response
 
     with patch("services.mcp_client.httpx.AsyncClient") as mock_client:
-        mock_client.return_value.__aenter__.return_value.post = AsyncMock(side_effect=capture_post)
-        await call_mcp_server(base_url="https://mcp.example.com", method="initialize", params={})
+        mock_client.return_value.__aenter__.return_value.post = AsyncMock(
+            side_effect=capture_post
+        )
+        await call_mcp_server(
+            base_url="https://mcp.example.com", method="initialize", params={}
+        )
 
     headers = post_called_with["kwargs"]["headers"]
-    assert "application/json" in headers["Accept"] and "text/event-stream" in headers["Accept"]
+    assert (
+        "application/json" in headers["Accept"]
+        and "text/event-stream" in headers["Accept"]
+    )
     assert headers.get("MCP-Protocol-Version") == "2024-11-05"
 
 
@@ -155,6 +172,7 @@ def _capture_post(capture_dict):
         r.json.return_value = {"jsonrpc": "2.0", "id": 1, "result": {}}
         r.raise_for_status = MagicMock()
         return r
+
     return _post
 
 
@@ -180,6 +198,7 @@ async def test_call_mcp_server_api_key_auth_sent_as_bearer():
 async def test_call_mcp_server_basic_auth():
     """Basic auth: username:password base64-encoded, trimmed."""
     import base64
+
     captured = {}
     with patch("services.mcp_client.httpx.AsyncClient") as mock_client:
         mock_client.return_value.__aenter__.return_value.post = AsyncMock(

@@ -1,4 +1,5 @@
 """Unit tests for PaymentProcessor service."""
+
 import pytest
 from unittest.mock import MagicMock
 from datetime import datetime
@@ -71,7 +72,9 @@ def test_calculate_job_cost_job_not_found(mock_db):
 
 def test_calculate_job_cost_empty_workflow(mock_db, sample_job):
     """calculate_job_cost returns empty preview when no workflow steps."""
-    mock_db.query.return_value.filter.return_value.order_by.return_value.all.return_value = []
+    mock_db.query.return_value.filter.return_value.order_by.return_value.all.return_value = (
+        []
+    )
     mock_db.query.return_value.filter.return_value.first.return_value = sample_job
     processor = PaymentProcessor(mock_db)
     result = processor.calculate_job_cost(1)
@@ -100,6 +103,7 @@ def test_distribute_earnings_job_not_found(mock_db):
 
 def test_distribute_earnings_transaction_not_found(mock_db, sample_job):
     """distribute_earnings raises ValueError when transaction not found."""
+
     def query_side_effect(model):
         q = MagicMock()
         if model == Job:
@@ -107,6 +111,7 @@ def test_distribute_earnings_transaction_not_found(mock_db, sample_job):
         else:
             q.filter.return_value.first.return_value = None
         return q
+
     mock_db.query.side_effect = query_side_effect
     processor = PaymentProcessor(mock_db)
     with pytest.raises(ValueError, match="Transaction not found"):

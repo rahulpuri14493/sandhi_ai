@@ -1,4 +1,5 @@
 """API tests for MCP routes: connections, tools, validate, registry."""
+
 import uuid
 
 import pytest
@@ -23,7 +24,11 @@ def business_user(db_session):
     db_session.commit()
     db_session.refresh(user)
     token = create_access_token(data={"sub": user.id})
-    return {"user": user, "token": token, "headers": {"Authorization": f"Bearer {token}"}}
+    return {
+        "user": user,
+        "token": token,
+        "headers": {"Authorization": f"Bearer {token}"},
+    }
 
 
 @pytest.fixture
@@ -39,12 +44,17 @@ def developer_user(db_session):
     db_session.commit()
     db_session.refresh(user)
     token = create_access_token(data={"sub": user.id})
-    return {"user": user, "token": token, "headers": {"Authorization": f"Bearer {token}"}}
+    return {
+        "user": user,
+        "token": token,
+        "headers": {"Authorization": f"Bearer {token}"},
+    }
 
 
 @pytest.fixture
 def client_mcp(db_session, business_user):
     """Test client with DB override and business user (use business_user['headers'] for auth)."""
+
     def override_get_db():
         try:
             yield db_session
@@ -68,7 +78,9 @@ class TestMCPAuth:
         r = client.get("/api/mcp/tools")
         assert r.status_code == 401
 
-    def test_list_connections_requires_business_role(self, client_mcp: TestClient, developer_user):
+    def test_list_connections_requires_business_role(
+        self, client_mcp: TestClient, developer_user
+    ):
         r = client_mcp.get("/api/mcp/connections", headers=developer_user["headers"])
         assert r.status_code == 403
 
@@ -104,7 +116,9 @@ class TestMCPConnections:
         assert data["endpoint_path"] == "/mcp"
         assert "id" in data
 
-    def test_create_connection_normalizes_endpoint_path(self, client_mcp: TestClient, business_user):
+    def test_create_connection_normalizes_endpoint_path(
+        self, client_mcp: TestClient, business_user
+    ):
         r = client_mcp.post(
             "/api/mcp/connections",
             headers=business_user["headers"],
@@ -135,7 +149,9 @@ class TestMCPConnections:
             json={"name": "ToDelete", "base_url": "https://x.com", "auth_type": "none"},
         )
         cid = cr.json()["id"]
-        r = client_mcp.delete(f"/api/mcp/connections/{cid}", headers=business_user["headers"])
+        r = client_mcp.delete(
+            f"/api/mcp/connections/{cid}", headers=business_user["headers"]
+        )
         assert r.status_code == 204
         r2 = client_mcp.get("/api/mcp/connections", headers=business_user["headers"])
         assert len(r2.json()) == 0
@@ -173,7 +189,11 @@ class TestMCPTools:
         client_mcp.post(
             "/api/mcp/tools",
             headers=business_user["headers"],
-            json={"tool_type": "filesystem", "name": "FS1", "config": {"base_path": "/tmp"}},
+            json={
+                "tool_type": "filesystem",
+                "name": "FS1",
+                "config": {"base_path": "/tmp"},
+            },
         )
         r = client_mcp.get("/api/mcp/tools", headers=business_user["headers"])
         assert r.status_code == 200
@@ -194,7 +214,11 @@ class TestMCPTools:
             r = client_mcp.post(
                 "/api/mcp/tools",
                 headers=business_user["headers"],
-                json={"tool_type": tool_type, "name": f"V-{tool_type}", "config": config},
+                json={
+                    "tool_type": tool_type,
+                    "name": f"V-{tool_type}",
+                    "config": config,
+                },
             )
             assert r.status_code == 201, f"create {tool_type}: {r.text}"
             assert r.json()["tool_type"] == tool_type
@@ -207,13 +231,20 @@ class TestMCPTools:
             ("github", {"token": "ghp-x"}),
             ("notion", {"api_key": "secret-x"}),
             ("elasticsearch", {"url": "http://localhost:9200"}),
-            ("mysql", {"host": "localhost", "user": "u", "password": "p", "database": "d"}),
+            (
+                "mysql",
+                {"host": "localhost", "user": "u", "password": "p", "database": "d"},
+            ),
         ]
         for tool_type, config in types_and_configs:
             r = client_mcp.post(
                 "/api/mcp/tools",
                 headers=business_user["headers"],
-                json={"tool_type": tool_type, "name": f"I-{tool_type}", "config": config},
+                json={
+                    "tool_type": tool_type,
+                    "name": f"I-{tool_type}",
+                    "config": config,
+                },
             )
             assert r.status_code == 201, f"create {tool_type}: {r.text}"
             assert r.json()["tool_type"] == tool_type
@@ -222,7 +253,11 @@ class TestMCPTools:
         cr = client_mcp.post(
             "/api/mcp/tools",
             headers=business_user["headers"],
-            json={"tool_type": "rest_api", "name": "API1", "config": {"base_url": "https://api.example.com"}},
+            json={
+                "tool_type": "rest_api",
+                "name": "API1",
+                "config": {"base_url": "https://api.example.com"},
+            },
         )
         tid = cr.json()["id"]
         r = client_mcp.patch(
@@ -252,11 +287,17 @@ class TestMCPConnectionValidate:
     def test_validate_connection_requires_auth(self, client: TestClient):
         r = client.post(
             "/api/mcp/connections/validate",
-            json={"name": "Test", "base_url": "https://mcp.example.com", "auth_type": "none"},
+            json={
+                "name": "Test",
+                "base_url": "https://mcp.example.com",
+                "auth_type": "none",
+            },
         )
         assert r.status_code == 401
 
-    def test_validate_connection_missing_url(self, client_mcp: TestClient, business_user):
+    def test_validate_connection_missing_url(
+        self, client_mcp: TestClient, business_user
+    ):
         r = client_mcp.post(
             "/api/mcp/connections/validate",
             headers=business_user["headers"],
@@ -266,7 +307,9 @@ class TestMCPConnectionValidate:
         assert r.json()["valid"] is False
         assert "required" in r.json()["message"].lower()
 
-    def test_validate_connection_unreachable_returns_false(self, client_mcp: TestClient, business_user):
+    def test_validate_connection_unreachable_returns_false(
+        self, client_mcp: TestClient, business_user
+    ):
         r = client_mcp.post(
             "/api/mcp/connections/validate",
             headers=business_user["headers"],
@@ -289,11 +332,16 @@ class TestMCPValidate:
     def test_validate_requires_auth(self, client: TestClient):
         r = client.post(
             "/api/mcp/tools/validate",
-            json={"tool_type": "postgres", "config": {"connection_string": "postgresql://x/y"}},
+            json={
+                "tool_type": "postgres",
+                "config": {"connection_string": "postgresql://x/y"},
+            },
         )
         assert r.status_code == 401
 
-    def test_validate_postgres_missing_connection_string(self, client_mcp: TestClient, business_user):
+    def test_validate_postgres_missing_connection_string(
+        self, client_mcp: TestClient, business_user
+    ):
         r = client_mcp.post(
             "/api/mcp/tools/validate",
             headers=business_user["headers"],
@@ -304,7 +352,9 @@ class TestMCPValidate:
         assert data["valid"] is False
         assert "Connection string is required" in data["message"]
 
-    def test_validate_filesystem_valid_path(self, client_mcp: TestClient, business_user, tmp_path):
+    def test_validate_filesystem_valid_path(
+        self, client_mcp: TestClient, business_user, tmp_path
+    ):
         r = client_mcp.post(
             "/api/mcp/tools/validate",
             headers=business_user["headers"],
@@ -338,11 +388,17 @@ class TestMCPRegistry:
             assert "platform_tool_count" in data
             assert isinstance(data["tools"], list)
 
-    def test_registry_includes_platform_tools(self, client_mcp: TestClient, business_user):
+    def test_registry_includes_platform_tools(
+        self, client_mcp: TestClient, business_user
+    ):
         client_mcp.post(
             "/api/mcp/tools",
             headers=business_user["headers"],
-            json={"tool_type": "chroma", "name": "My Chroma", "config": {"url": "http://localhost:8000"}},
+            json={
+                "tool_type": "chroma",
+                "name": "My Chroma",
+                "config": {"url": "http://localhost:8000"},
+            },
         )
         r = client_mcp.get("/api/mcp/registry", headers=business_user["headers"])
         assert r.status_code == 200
@@ -358,7 +414,10 @@ class TestMCPProxy:
     """POST /api/mcp/proxy - forward JSON-RPC to user's MCP server."""
 
     def test_proxy_requires_auth(self, client: TestClient):
-        r = client.post("/api/mcp/proxy", json={"connection_id": 1, "method": "initialize", "params": {}})
+        r = client.post(
+            "/api/mcp/proxy",
+            json={"connection_id": 1, "method": "initialize", "params": {}},
+        )
         assert r.status_code == 401
 
     def test_proxy_connection_not_found(self, client_mcp: TestClient, business_user):
@@ -370,8 +429,11 @@ class TestMCPProxy:
         assert r.status_code == 404
         assert "not found" in r.json().get("detail", "").lower()
 
-    def test_proxy_connection_inactive_returns_404(self, client_mcp: TestClient, business_user, db_session):
+    def test_proxy_connection_inactive_returns_404(
+        self, client_mcp: TestClient, business_user, db_session
+    ):
         from models.mcp_server import MCPServerConnection
+
         conn = MCPServerConnection(
             user_id=business_user["user"].id,
             name="Inactive",
@@ -401,9 +463,12 @@ class TestMCPCallPlatformTool:
         )
         assert r.status_code == 401
 
-    def test_call_platform_tool_not_configured_returns_503(self, client_mcp: TestClient, business_user):
+    def test_call_platform_tool_not_configured_returns_503(
+        self, client_mcp: TestClient, business_user
+    ):
         """When PLATFORM_MCP_SERVER_URL or MCP_INTERNAL_SECRET unset, returns 503."""
         from core import config
+
         orig_url = config.settings.PLATFORM_MCP_SERVER_URL
         orig_secret = config.settings.MCP_INTERNAL_SECRET
         config.settings.PLATFORM_MCP_SERVER_URL = ""
@@ -412,7 +477,10 @@ class TestMCPCallPlatformTool:
             r = client_mcp.post(
                 "/api/mcp/call-platform-tool",
                 headers=business_user["headers"],
-                json={"tool_name": "platform_1_MyDB", "arguments": {"query": "SELECT 1"}},
+                json={
+                    "tool_name": "platform_1_MyDB",
+                    "arguments": {"query": "SELECT 1"},
+                },
             )
             assert r.status_code == 503
             assert "not configured" in r.json().get("detail", "").lower()
@@ -427,15 +495,23 @@ class TestMCPCallPlatformTool:
 class TestMCPPositive:
     """Positive: valid operations succeed and return expected shape."""
 
-    def test_positive_create_connection_and_get(self, client_mcp: TestClient, business_user):
+    def test_positive_create_connection_and_get(
+        self, client_mcp: TestClient, business_user
+    ):
         cr = client_mcp.post(
             "/api/mcp/connections",
             headers=business_user["headers"],
-            json={"name": "GetMe", "base_url": "https://mcp.example.com", "auth_type": "none"},
+            json={
+                "name": "GetMe",
+                "base_url": "https://mcp.example.com",
+                "auth_type": "none",
+            },
         )
         assert cr.status_code == 201
         cid = cr.json()["id"]
-        r = client_mcp.get(f"/api/mcp/connections/{cid}", headers=business_user["headers"])
+        r = client_mcp.get(
+            f"/api/mcp/connections/{cid}", headers=business_user["headers"]
+        )
         assert r.status_code == 200
         assert r.json()["name"] == "GetMe"
 
@@ -443,7 +519,11 @@ class TestMCPPositive:
         cr = client_mcp.post(
             "/api/mcp/tools",
             headers=business_user["headers"],
-            json={"tool_type": "rest_api", "name": "GetMeTool", "config": {"base_url": "https://api.example.com"}},
+            json={
+                "tool_type": "rest_api",
+                "name": "GetMeTool",
+                "config": {"base_url": "https://api.example.com"},
+            },
         )
         assert cr.status_code == 201
         tid = cr.json()["id"]
@@ -451,7 +531,9 @@ class TestMCPPositive:
         assert r.status_code == 200
         assert r.json()["name"] == "GetMeTool"
 
-    def test_positive_validate_tool_filesystem_success(self, client_mcp: TestClient, business_user, tmp_path):
+    def test_positive_validate_tool_filesystem_success(
+        self, client_mcp: TestClient, business_user, tmp_path
+    ):
         r = client_mcp.post(
             "/api/mcp/tools/validate",
             headers=business_user["headers"],
@@ -468,7 +550,9 @@ class TestMCPNegative:
     """Negative: invalid requests return 4xx or expected error response."""
 
     def test_negative_get_connection_404(self, client_mcp: TestClient, business_user):
-        r = client_mcp.get("/api/mcp/connections/99999", headers=business_user["headers"])
+        r = client_mcp.get(
+            "/api/mcp/connections/99999", headers=business_user["headers"]
+        )
         assert r.status_code == 404
         assert "not found" in r.json().get("detail", "").lower()
 
@@ -485,15 +569,21 @@ class TestMCPNegative:
         )
         assert r.status_code == 404
 
-    def test_negative_delete_connection_404(self, client_mcp: TestClient, business_user):
-        r = client_mcp.delete("/api/mcp/connections/99999", headers=business_user["headers"])
+    def test_negative_delete_connection_404(
+        self, client_mcp: TestClient, business_user
+    ):
+        r = client_mcp.delete(
+            "/api/mcp/connections/99999", headers=business_user["headers"]
+        )
         assert r.status_code == 404
 
     def test_negative_delete_tool_404(self, client_mcp: TestClient, business_user):
         r = client_mcp.delete("/api/mcp/tools/99999", headers=business_user["headers"])
         assert r.status_code == 404
 
-    def test_negative_create_connection_missing_base_url(self, client_mcp: TestClient, business_user):
+    def test_negative_create_connection_missing_base_url(
+        self, client_mcp: TestClient, business_user
+    ):
         r = client_mcp.post(
             "/api/mcp/connections",
             headers=business_user["headers"],
@@ -501,7 +591,9 @@ class TestMCPNegative:
         )
         assert r.status_code == 422
 
-    def test_negative_create_tool_invalid_type(self, client_mcp: TestClient, business_user):
+    def test_negative_create_tool_invalid_type(
+        self, client_mcp: TestClient, business_user
+    ):
         r = client_mcp.post(
             "/api/mcp/tools",
             headers=business_user["headers"],
@@ -509,7 +601,9 @@ class TestMCPNegative:
         )
         assert r.status_code == 400
 
-    def test_negative_validate_tool_invalid_type(self, client_mcp: TestClient, business_user):
+    def test_negative_validate_tool_invalid_type(
+        self, client_mcp: TestClient, business_user
+    ):
         r = client_mcp.post(
             "/api/mcp/tools/validate",
             headers=business_user["headers"],

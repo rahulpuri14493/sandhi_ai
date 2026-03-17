@@ -70,12 +70,18 @@ class AgentResponse(BaseModel):
 
     class Config:
         from_attributes = True
-    
+
     @classmethod
     def model_validate(cls, obj, **kwargs):
         # Exclude api_key from response for security
-        if hasattr(obj, '__dict__'):
+        if hasattr(obj, "__dict__"):
             obj_dict = obj.__dict__.copy()
-            obj_dict.pop('api_key', None)
-            obj = type(obj)(**{k: v for k, v in obj_dict.items() if k in obj.__table__.columns.keys()})
+            obj_dict.pop("api_key", None)
+            obj = type(obj)(
+                **{
+                    k: v
+                    for k, v in obj_dict.items()
+                    if k in obj.__table__.columns.keys()
+                }
+            )
         return super().model_validate(obj, **kwargs)

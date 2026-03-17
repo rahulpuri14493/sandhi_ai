@@ -1,4 +1,14 @@
-from sqlalchemy import Column, Integer, String, Float, DateTime, ForeignKey, Enum, Text, Boolean
+from sqlalchemy import (
+    Column,
+    Integer,
+    String,
+    Float,
+    DateTime,
+    ForeignKey,
+    Enum,
+    Text,
+    Boolean,
+)
 from sqlalchemy.orm import relationship
 import enum
 from datetime import datetime
@@ -26,7 +36,9 @@ class Job(Base):
     total_cost = Column(Float, default=0.0)
     created_at = Column(DateTime, default=datetime.utcnow)
     completed_at = Column(DateTime, nullable=True)
-    files = Column(Text)  # JSON string storing file metadata: [{"name": "...", "path": "...", "type": "..."}]
+    files = Column(
+        Text
+    )  # JSON string storing file metadata: [{"name": "...", "path": "...", "type": "..."}]
     conversation = Column(Text)  # JSON string storing Q&A conversation with AI
     failure_reason = Column(Text, nullable=True)  # Reason for job failure
     # Tool scope for this job: JSON arrays of IDs (empty/null = all business tools)
@@ -37,7 +49,9 @@ class Job(Base):
 
     # Relationships
     business = relationship("User", back_populates="jobs", foreign_keys=[business_id])
-    workflow_steps = relationship("WorkflowStep", back_populates="job", order_by="WorkflowStep.step_order")
+    workflow_steps = relationship(
+        "WorkflowStep", back_populates="job", order_by="WorkflowStep.step_order"
+    )
     transaction = relationship("Transaction", back_populates="job", uselist=False)
 
 
@@ -50,8 +64,12 @@ class WorkflowStep(Base):
     step_order = Column(Integer, nullable=False)
     input_data = Column(Text)  # JSON string
     output_data = Column(Text)  # JSON string
-    status = Column(String, default="pending")  # pending, in_progress, completed, failed
-    depends_on_previous = Column(Boolean, default=True, nullable=False)  # False = independent (no previous output)
+    status = Column(
+        String, default="pending"
+    )  # pending, in_progress, completed, failed
+    depends_on_previous = Column(
+        Boolean, default=True, nullable=False
+    )  # False = independent (no previous output)
     cost = Column(Float, default=0.0)
     started_at = Column(DateTime, nullable=True)
     completed_at = Column(DateTime, nullable=True)
@@ -64,5 +82,13 @@ class WorkflowStep(Base):
     # Relationships
     job = relationship("Job", back_populates="workflow_steps")
     agent = relationship("Agent", back_populates="workflow_steps")
-    communications_from = relationship("AgentCommunication", foreign_keys="AgentCommunication.from_workflow_step_id", back_populates="from_step")
-    communications_to = relationship("AgentCommunication", foreign_keys="AgentCommunication.to_workflow_step_id", back_populates="to_step")
+    communications_from = relationship(
+        "AgentCommunication",
+        foreign_keys="AgentCommunication.from_workflow_step_id",
+        back_populates="from_step",
+    )
+    communications_to = relationship(
+        "AgentCommunication",
+        foreign_keys="AgentCommunication.to_workflow_step_id",
+        back_populates="to_step",
+    )

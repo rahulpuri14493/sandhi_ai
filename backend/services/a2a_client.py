@@ -3,6 +3,7 @@ A2A (Agent-to-Agent) protocol client.
 Uses JSON-RPC 2.0 over HTTP to call SendMessage and optionally GetTask.
 See: https://a2a-protocol.org/latest/specification/
 """
+
 from typing import Dict, Any, List, Optional
 import ipaddress
 import json
@@ -11,7 +12,6 @@ import uuid
 import httpx
 
 from core.config import settings
-
 
 # JSON-RPC 2.0 and A2A constants
 JSONRPC_VERSION = "2.0"
@@ -49,7 +49,9 @@ def _extract_text_from_parts(parts: List[Dict[str, Any]]) -> str:
     return "\n".join(texts)
 
 
-def _extract_result_from_send_message_response(response_body: Dict[str, Any]) -> Dict[str, Any]:
+def _extract_result_from_send_message_response(
+    response_body: Dict[str, Any],
+) -> Dict[str, Any]:
     """
     Parse SendMessage response (result = SendMessageResponse).
     Response has either 'task' or 'message'. Extract agent output as our standard shape.
@@ -87,7 +89,11 @@ def _extract_result_from_send_message_response(response_body: Dict[str, Any]) ->
             first_artifact = artifacts[0]
             parts = first_artifact.get("parts") or []
             content = _extract_text_from_parts(parts)
-            return {"content": content, "artifacts": artifacts, "task_id": task.get("id")}
+            return {
+                "content": content,
+                "artifacts": artifacts,
+                "task_id": task.get("id"),
+            }
         # No artifacts: use task status message if any
         status_msg = status.get("message")
         if status_msg and isinstance(status_msg, dict):
@@ -113,7 +119,12 @@ def _extract_result_from_send_message_response(response_body: Dict[str, Any]) ->
         first_artifact = artifacts[0]
         parts = first_artifact.get("parts") or []
         content = _extract_text_from_parts(parts)
-        return {"content": content, "artifacts": artifacts, "task_id": task.get("id"), "state": state}
+        return {
+            "content": content,
+            "artifacts": artifacts,
+            "task_id": task.get("id"),
+            "state": state,
+        }
     return {"content": "", "task_id": task.get("id"), "state": state}
 
 

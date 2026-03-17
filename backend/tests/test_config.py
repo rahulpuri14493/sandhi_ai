@@ -1,4 +1,5 @@
 """Unit tests for configuration."""
+
 import pytest
 
 from core.config import settings

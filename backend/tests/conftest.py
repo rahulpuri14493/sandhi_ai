@@ -1,4 +1,5 @@
 """Pytest configuration and shared fixtures."""
+
 import os
 import tempfile
 from pathlib import Path
@@ -36,9 +37,7 @@ def test_db(engine):
 @pytest.fixture
 def db_session(test_db):
     """Create a fresh database session for each test."""
-    TestingSessionLocal = sessionmaker(
-        autocommit=False, autoflush=False, bind=test_db
-    )
+    TestingSessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=test_db)
     session = TestingSessionLocal()
     try:
         yield session

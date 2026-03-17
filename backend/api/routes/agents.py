@@ -16,7 +16,11 @@ from schemas.agent_review import (
     AgentReviewSummaryResponse,
     AgentReviewListResponse,
 )
-from core.security import get_current_user, get_current_user_optional, get_current_developer_user
+from core.security import (
+    get_current_user,
+    get_current_user_optional,
+    get_current_developer_user,
+)
 from core.config import settings
 from models.user import User
 import logging
@@ -40,9 +44,14 @@ def list_agents(
     response: Response,
     status: Optional[AgentStatus] = Query(None, description="Filter by status"),
     capability: Optional[str] = Query(None, description="Filter by capability"),
-    limit: Optional[int] = Query(None, ge=1, le=500, description="Max agents to return (pagination); omit for all"),
+    limit: Optional[int] = Query(
+        None,
+        ge=1,
+        le=500,
+        description="Max agents to return (pagination); omit for all",
+    ),
     offset: int = Query(0, ge=0, description="Pagination offset"),
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
 ):
     """List agents (marketplace). Optional limit/offset for scale (e.g. 200+ agents). X-Total-Count header set with total matching count."""
     query = db.query(Agent)
@@ -71,14 +80,19 @@ def list_agents(
         .filter(AgentReview.agent_id.in_(agent_ids))
         .group_by(AgentReview.agent_id)
     )
-    stats_by_agent = {r.agent_id: (r.count, round(float(r.avg_rating), 2)) for r in review_stats}
+    stats_by_agent = {
+        r.agent_id: (r.count, round(float(r.avg_rating), 2)) for r in review_stats
+    }
 
     # Exclude api_key from responses for security; include overall rating for marketplace
     result = []
     for agent in agents:
         # Handle pricing_model - default to 'pay_per_use' if None (for existing agents)
         from models.agent import PricingModel
-        pricing_model = agent.pricing_model if agent.pricing_model else PricingModel.PAY_PER_USE
+
+        pricing_model = (
+            agent.pricing_model if agent.pricing_model else PricingModel.PAY_PER_USE
+        )
 
         count, avg = stats_by_agent.get(agent.id, (0, 0.0))
 
@@ -120,8 +134,7 @@ def get_agent(
     agent = db.query(Agent).filter(Agent.id == agent_id).first()
     if not agent:
         raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Agent not found"
+            status_code=status.HTTP_404_NOT_FOUND, detail="Agent not found"
         )
     # api_endpoint: only for authenticated users (any logged-in user)
     # api_key: only for the agent owner
@@ -129,7 +142,11 @@ def get_agent(
     api_endpoint = agent.api_endpoint if current_user is not None else None
     api_key = agent.api_key if is_owner else None
     # Handle None pricing_model for agents created before migration
-    pricing_model = agent.pricing_model if agent.pricing_model is not None else PricingModel.PAY_PER_USE
+    pricing_model = (
+        agent.pricing_model
+        if agent.pricing_model is not None
+        else PricingModel.PAY_PER_USE
+    )
     return AgentResponse(
         id=agent.id,
         developer_id=agent.developer_id,
@@ -208,7 +225,9 @@ def list_agent_reviews(
     _get_agent_or_404(agent_id, db)
     query = db.query(AgentReview).filter(AgentReview.agent_id == agent_id)
     total = query.count()
-    rows = query.order_by(AgentReview.created_at.desc()).offset(offset).limit(limit).all()
+    rows = (
+        query.order_by(AgentReview.created_at.desc()).offset(offset).limit(limit).all()
+    )
     items = [
         AgentReviewResponse(
             id=r.id,
@@ -273,7 +292,9 @@ def update_agent_review(
     )
 
 
-@router.delete("/{agent_id}/reviews/{review_id}", status_code=status.HTTP_204_NO_CONTENT)
+@router.delete(
+    "/{agent_id}/reviews/{review_id}", status_code=status.HTTP_204_NO_CONTENT
+)
 def delete_agent_review(
     agent_id: int,
     review_id: int,
@@ -293,7 +314,11 @@ def delete_agent_review(
     return None
 
 
-@router.post("/{agent_id}/reviews", response_model=AgentReviewResponse, status_code=status.HTTP_201_CREATED)
+@router.post(
+    "/{agent_id}/reviews",
+    response_model=AgentReviewResponse,
+    status_code=status.HTTP_201_CREATED,
+)
 def create_agent_review(
     agent_id: int,
     payload: AgentReviewCreate,
@@ -331,18 +356,19 @@ def create_agent_review(
 def create_agent(
     agent_data: AgentCreate,
     current_user: User = Depends(get_current_developer_user),
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
 ):
-    new_agent = Agent(
-        developer_id=current_user.id,
-        **agent_data.model_dump()
-    )
+    new_agent = Agent(developer_id=current_user.id, **agent_data.model_dump())
     db.add(new_agent)
     db.commit()
     db.refresh(new_agent)
     # Exclude api_key from response for security
     # Handle None pricing_model for agents created before migration
-    pricing_model = new_agent.pricing_model if new_agent.pricing_model is not None else PricingModel.PAY_PER_USE
+    pricing_model = (
+        new_agent.pricing_model
+        if new_agent.pricing_model is not None
+        else PricingModel.PAY_PER_USE
+    )
     return AgentResponse(
         id=new_agent.id,
         developer_id=new_agent.developer_id,
@@ -371,34 +397,37 @@ def update_agent(
     agent_id: int,
     agent_data: AgentUpdate,
     current_user: User = Depends(get_current_developer_user),
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
 ):
     agent = db.query(Agent).filter(Agent.id == agent_id).first()
     if not agent:
         raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Agent not found"
+            status_code=status.HTTP_404_NOT_FOUND, detail="Agent not found"
         )
-    
+
     if agent.developer_id != current_user.id:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
-            detail="Not authorized to update this agent"
+            detail="Not authorized to update this agent",
         )
-    
+
     update_data = agent_data.model_dump(exclude_unset=True)
     # If api_key is provided as empty string, don't update it (keep existing)
-    if 'api_key' in update_data and update_data['api_key'] == '':
-        del update_data['api_key']
-    
+    if "api_key" in update_data and update_data["api_key"] == "":
+        del update_data["api_key"]
+
     for field, value in update_data.items():
         setattr(agent, field, value)
-    
+
     db.commit()
     db.refresh(agent)
     # Include api_key for owner
     # Handle None pricing_model for agents created before migration
-    pricing_model = agent.pricing_model if agent.pricing_model is not None else PricingModel.PAY_PER_USE
+    pricing_model = (
+        agent.pricing_model
+        if agent.pricing_model is not None
+        else PricingModel.PAY_PER_USE
+    )
     return AgentResponse(
         id=agent.id,
         developer_id=agent.developer_id,
@@ -427,28 +456,29 @@ def update_agent(
 def delete_agent(
     agent_id: int,
     current_user: User = Depends(get_current_developer_user),
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
 ):
     agent = db.query(Agent).filter(Agent.id == agent_id).first()
     if not agent:
         raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Agent not found"
+            status_code=status.HTTP_404_NOT_FOUND, detail="Agent not found"
         )
-    
+
     if agent.developer_id != current_user.id:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
-            detail="Not authorized to delete this agent"
+            detail="Not authorized to delete this agent",
         )
-    
+
     # Delete related workflow steps first (to avoid foreign key constraint issues)
     from models.job import WorkflowStep
     from models.communication import AgentCommunication
     from models.transaction import Earnings
 
     # Get all workflow steps that use this agent
-    workflow_steps = db.query(WorkflowStep).filter(WorkflowStep.agent_id == agent_id).all()
+    workflow_steps = (
+        db.query(WorkflowStep).filter(WorkflowStep.agent_id == agent_id).all()
+    )
     step_ids = [s.id for s in workflow_steps]
 
     # Unlink earnings from these steps so we can delete the steps
@@ -460,23 +490,28 @@ def delete_agent(
     # Delete communications related to these workflow steps
     for step in workflow_steps:
         db.query(AgentCommunication).filter(
-            (AgentCommunication.from_workflow_step_id == step.id) |
-            (AgentCommunication.to_workflow_step_id == step.id)
+            (AgentCommunication.from_workflow_step_id == step.id)
+            | (AgentCommunication.to_workflow_step_id == step.id)
         ).delete(synchronize_session=False)
 
     # Delete the workflow steps
-    db.query(WorkflowStep).filter(WorkflowStep.agent_id == agent_id).delete(synchronize_session=False)
-    
+    db.query(WorkflowStep).filter(WorkflowStep.agent_id == agent_id).delete(
+        synchronize_session=False
+    )
+
     # Delete communications where this agent is referenced directly
     db.query(AgentCommunication).filter(
-        (AgentCommunication.from_agent_id == agent_id) |
-        (AgentCommunication.to_agent_id == agent_id)
+        (AgentCommunication.from_agent_id == agent_id)
+        | (AgentCommunication.to_agent_id == agent_id)
     ).delete(synchronize_session=False)
-    
+
     # Delete agent nominations if any
     from models.hiring import AgentNomination
-    db.query(AgentNomination).filter(AgentNomination.agent_id == agent_id).delete(synchronize_session=False)
-    
+
+    db.query(AgentNomination).filter(AgentNomination.agent_id == agent_id).delete(
+        synchronize_session=False
+    )
+
     # Now delete the agent
     db.delete(agent)
     db.commit()
@@ -508,7 +543,9 @@ def get_agent_a2a_card(
     card = {
         "name": agent.name or f"Agent {agent.id}",
         "description": agent.description or "",
-        "capabilities": agent.capabilities if isinstance(agent.capabilities, list) else [],
+        "capabilities": (
+            agent.capabilities if isinstance(agent.capabilities, list) else []
+        ),
         "url": agent.api_endpoint.strip(),
         "protocolVersion": "1.0",
         "authentication": {
@@ -523,15 +560,14 @@ def get_agent_a2a_card(
 @router.post("/test-connection", status_code=status.HTTP_200_OK)
 async def test_agent_connection(
     test_request: TestConnectionRequest,
-    current_user: User = Depends(get_current_developer_user)
+    current_user: User = Depends(get_current_developer_user),
 ):
     """Test connectivity to an agent API endpoint (OpenAI-style or A2A)."""
     if not test_request.api_endpoint:
         raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="API endpoint is required"
+            status_code=status.HTTP_400_BAD_REQUEST, detail="API endpoint is required"
         )
-    
+
     # A2A path: send minimal SendMessage (direct to agent or via platform adapter)
     from services.a2a_client import send_message, _validate_public_http_url
 
@@ -608,16 +644,16 @@ async def test_agent_connection(
     headers = {"Content-Type": "application/json"}
     if test_request.api_key:
         headers["Authorization"] = f"Bearer {test_request.api_key}"
-    
+
     # Use custom test data if provided, otherwise try to detect API type and use appropriate payload
     if test_request.test_data:
         test_payload = test_request.test_data
     else:
         # Try to detect API type from endpoint URL
         endpoint_lower = test_request.api_endpoint.lower()
-        
+
         # OpenAI-style API
-        if 'openai' in endpoint_lower or '/v1/chat/completions' in endpoint_lower:
+        if "openai" in endpoint_lower or "/v1/chat/completions" in endpoint_lower:
             model = (test_request.llm_model or "").strip() or "gpt-4o-mini"
             test_payload = {
                 "model": model,
@@ -632,29 +668,24 @@ async def test_agent_connection(
                 ),
             }
         # Anthropic Claude API
-        elif 'anthropic' in endpoint_lower or 'claude' in endpoint_lower:
+        elif "anthropic" in endpoint_lower or "claude" in endpoint_lower:
             test_payload = {
                 "model": "claude-3-haiku-20240307",
                 "max_tokens": 10,
                 "messages": [
                     {"role": "user", "content": "Hello! This is a connection test."}
-                ]
+                ],
             }
         # Generic REST API - try a simple test
         else:
-            test_payload = {
-                "test": True,
-                "message": "Connection test from Sandhi AI"
-            }
-    
+            test_payload = {"test": True, "message": "Connection test from Sandhi AI"}
+
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
             response = await client.post(
-                test_request.api_endpoint,
-                json=test_payload,
-                headers=headers
+                test_request.api_endpoint, json=test_payload, headers=headers
             )
-            
+
             # Consider 2xx and 3xx as successful connections
             # Even if the API returns an error, if we got a response, the connection works
             if response.status_code < 400:
@@ -662,7 +693,9 @@ async def test_agent_connection(
                     "success": True,
                     "message": "Connection successful",
                     "status_code": response.status_code,
-                    "response_preview": str(response.text)[:200] if response.text else None
+                    "response_preview": (
+                        str(response.text)[:200] if response.text else None
+                    ),
                 }
             else:
                 # Got a response but with error status - connection works but API rejected
@@ -670,27 +703,34 @@ async def test_agent_connection(
                     "success": True,
                     "message": f"Connection successful but API returned error (status {response.status_code})",
                     "status_code": response.status_code,
-                    "response_preview": str(response.text)[:200] if response.text else None,
-                    "warning": "The endpoint is reachable but returned an error. Please verify your API key and request format."
+                    "response_preview": (
+                        str(response.text)[:200] if response.text else None
+                    ),
+                    "warning": "The endpoint is reachable but returned an error. Please verify your API key and request format.",
                 }
     except httpx.TimeoutException:
         raise HTTPException(
             status_code=status.HTTP_408_REQUEST_TIMEOUT,
-            detail="Connection timeout - the API endpoint did not respond within 10 seconds"
+            detail="Connection timeout - the API endpoint did not respond within 10 seconds",
         )
     except httpx.ConnectError:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="Connection failed - unable to reach the API endpoint. Please check the URL."
+            detail="Connection failed - unable to reach the API endpoint. Please check the URL.",
         )
     except httpx.RequestError:
-        logger.exception("Connection test request error for endpoint %s", test_request.api_endpoint)
+        logger.exception(
+            "Connection test request error for endpoint %s", test_request.api_endpoint
+        )
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Connection error",
         )
     except Exception:
-        logger.exception("Unexpected error testing connection for endpoint %s", test_request.api_endpoint)
+        logger.exception(
+            "Unexpected error testing connection for endpoint %s",
+            test_request.api_endpoint,
+        )
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Unexpected error testing connection",

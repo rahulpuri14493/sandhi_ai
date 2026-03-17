@@ -4,6 +4,7 @@ End-to-end integration tests for all main API features.
 Uses in-memory SQLite and TestClient. Mocks external HTTP (document analyzer, agent executor)
 where needed so tests don't call real endpoints.
 """
+
 import json
 import uuid
 from unittest.mock import AsyncMock, patch
@@ -271,16 +272,22 @@ class TestE2EDashboards:
         self, integration_client: TestClient, developer_user, sample_agent
     ):
         token = developer_user["token"]
-        for path in ["/api/developers/earnings", "/api/developers/agents", "/api/developers/stats"]:
-            r = integration_client.get(path, headers={"Authorization": f"Bearer {token}"})
+        for path in [
+            "/api/developers/earnings",
+            "/api/developers/agents",
+            "/api/developers/stats",
+        ]:
+            r = integration_client.get(
+                path, headers={"Authorization": f"Bearer {token}"}
+            )
             assert r.status_code == 200
 
-    def test_business_dashboard(
-        self, integration_client: TestClient, business_user
-    ):
+    def test_business_dashboard(self, integration_client: TestClient, business_user):
         token = business_user["token"]
         for path in ["/api/businesses/jobs", "/api/businesses/spending"]:
-            r = integration_client.get(path, headers={"Authorization": f"Bearer {token}"})
+            r = integration_client.get(
+                path, headers={"Authorization": f"Bearer {token}"}
+            )
             assert r.status_code == 200
 
 

@@ -4,31 +4,37 @@ from fastapi.exceptions import RequestValidationError
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 
-async def validation_exception_handler(request: Request, exc: RequestValidationError) -> JSONResponse:
+async def validation_exception_handler(
+    request: Request, exc: RequestValidationError
+) -> JSONResponse:
     """
     Handles validation exceptions by returning a JSON response with a 422 status code.
-    
+
     Args:
     request: The incoming request.
     exc: The validation error.
-    
+
     Returns:
     A JSON response with a 422 status code and the validation errors.
     """
     return JSONResponse(
         status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-        content={"detail": exc.errors()},  # Extract validation errors from the exception
+        content={
+            "detail": exc.errors()
+        },  # Extract validation errors from the exception
     )
 
 
-async def http_exception_handler(request: Request, exc: StarletteHTTPException) -> JSONResponse:
+async def http_exception_handler(
+    request: Request, exc: StarletteHTTPException
+) -> JSONResponse:
     """
     Handles HTTP exceptions by returning a JSON response with the exception's status code and detail.
-    
+
     Args:
     request: The incoming request.
     exc: The HTTP exception.
-    
+
     Returns:
     A JSON response with the exception's status code and detail.
     """
@@ -41,11 +47,11 @@ async def http_exception_handler(request: Request, exc: StarletteHTTPException) 
 async def general_exception_handler(request: Request, exc: Exception) -> JSONResponse:
     """
     Handles general exceptions by returning a JSON response with a 500 status code.
-    
+
     Args:
     request: The incoming request.
     exc: The general exception.
-    
+
     Returns:
     A JSON response with a 500 status code and a generic error message.
     """

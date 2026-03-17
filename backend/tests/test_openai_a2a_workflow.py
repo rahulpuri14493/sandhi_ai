@@ -6,6 +6,7 @@ Step 2: Agent with a2a_enabled=True (A2A) receives previous_step_output and retu
 
 Verifies no break in handoff between the two protocol paths.
 """
+
 import json
 import uuid
 from unittest.mock import AsyncMock, patch
@@ -121,7 +122,9 @@ def job_two_agents_openai_then_a2a(db_session):
 
 
 @pytest.mark.asyncio
-async def test_openai_agent_and_a2a_agent_communicate_in_workflow(job_two_agents_openai_then_a2a):
+async def test_openai_agent_and_a2a_agent_communicate_in_workflow(
+    job_two_agents_openai_then_a2a,
+):
     """Run 2-step job: OpenAI-compatible (via adapter) → A2A. Assert handoff works."""
     job, agent1, agent2, step1, step2, db_session = job_two_agents_openai_then_a2a
     job_id = job.id
@@ -132,8 +135,18 @@ async def test_openai_agent_and_a2a_agent_communicate_in_workflow(job_two_agents
 
     call_log = []
 
-    async def mock_execute_via_a2a(url, input_data, *, api_key=None, blocking=True, timeout=120.0, adapter_metadata=None):
-        call_log.append({"url": url, "input_data": input_data, "adapter_metadata": adapter_metadata})
+    async def mock_execute_via_a2a(
+        url,
+        input_data,
+        *,
+        api_key=None,
+        blocking=True,
+        timeout=120.0,
+        adapter_metadata=None,
+    ):
+        call_log.append(
+            {"url": url, "input_data": input_data, "adapter_metadata": adapter_metadata}
+        )
         if adapter_metadata is not None:
             # First call: platform routing to adapter (OpenAI-compatible agent)
             assert "openai_url" in adapter_metadata
@@ -143,12 +156,16 @@ async def test_openai_agent_and_a2a_agent_communicate_in_workflow(job_two_agents
         prev = input_data.get("previous_step_output")
         assert prev is not None, "Step 2 must receive previous_step_output"
         if isinstance(prev, dict) and "content" in prev:
-            assert prev["content"] == step1_output["content"], "Step 2 should see Step 1 content"
+            assert (
+                prev["content"] == step1_output["content"]
+            ), "Step 2 should see Step 1 content"
         return step2_output
 
     with patch("services.agent_executor.settings") as mock_settings:
         mock_settings.A2A_ADAPTER_URL = adapter_url
-        with patch("services.agent_executor.execute_via_a2a", side_effect=mock_execute_via_a2a):
+        with patch(
+            "services.agent_executor.execute_via_a2a", side_effect=mock_execute_via_a2a
+        ):
             executor = AgentExecutor(db=db_session)
             await executor.execute_job(job_id)
 
@@ -176,7 +193,9 @@ async def test_openai_agent_and_a2a_agent_communicate_in_workflow(job_two_agents
 async def test_a2a_agent_then_openai_agent_communicate_in_workflow(db_session):
     """Run 2-step job: A2A first → OpenAI-compatible (via adapter) second. Assert handoff works."""
     unique = uuid.uuid4().hex[:8]
-    business = User(email=f"b-{unique}@test.com", password_hash="h", role=UserRole.BUSINESS)
+    business = User(
+        email=f"b-{unique}@test.com", password_hash="h", role=UserRole.BUSINESS
+    )
     dev = User(email=f"d-{unique}@test.com", password_hash="h", role=UserRole.DEVELOPER)
     db_session.add_all([business, dev])
     db_session.commit()
@@ -215,9 +234,26 @@ async def test_a2a_agent_then_openai_agent_communicate_in_workflow(db_session):
     db_session.commit()
     db_session.refresh(job)
 
-    base_input = {"job_title": job.title, "job_description": "", "documents": [], "conversation": []}
-    s1 = WorkflowStep(job_id=job.id, agent_id=agent_a2a.id, step_order=1, status="pending", input_data=json.dumps(base_input))
-    s2 = WorkflowStep(job_id=job.id, agent_id=agent_openai.id, step_order=2, status="pending", input_data=json.dumps(base_input))
+    base_input = {
+        "job_title": job.title,
+        "job_description": "",
+        "documents": [],
+        "conversation": [],
+    }
+    s1 = WorkflowStep(
+        job_id=job.id,
+        agent_id=agent_a2a.id,
+        step_order=1,
+        status="pending",
+        input_data=json.dumps(base_input),
+    )
+    s2 = WorkflowStep(
+        job_id=job.id,
+        agent_id=agent_openai.id,
+        step_order=2,
+        status="pending",
+        input_data=json.dumps(base_input),
+    )
     db_session.add_all([s1, s2])
     db_session.commit()
 
@@ -225,8 +261,22 @@ async def test_a2a_agent_then_openai_agent_communicate_in_workflow(db_session):
     step2_out = {"content": "OpenAI-step2-received-handoff"}
     call_log = []
 
-    async def mock_execute_via_a2a(url, input_data, *, api_key=None, blocking=True, timeout=120.0, adapter_metadata=None):
-        call_log.append({"url": url, "adapter_metadata": adapter_metadata, "has_prev": "previous_step_output" in input_data})
+    async def mock_execute_via_a2a(
+        url,
+        input_data,
+        *,
+        api_key=None,
+        blocking=True,
+        timeout=120.0,
+        adapter_metadata=None,
+    ):
+        call_log.append(
+            {
+                "url": url,
+                "adapter_metadata": adapter_metadata,
+                "has_prev": "previous_step_output" in input_data,
+            }
+        )
         if adapter_metadata is not None:
             assert input_data.get("previous_step_output") == step1_out
             return step2_out
@@ -234,7 +284,9 @@ async def test_a2a_agent_then_openai_agent_communicate_in_workflow(db_session):
 
     with patch("services.agent_executor.settings") as mock_settings:
         mock_settings.A2A_ADAPTER_URL = "http://adapter:8080"
-        with patch("services.agent_executor.execute_via_a2a", side_effect=mock_execute_via_a2a):
+        with patch(
+            "services.agent_executor.execute_via_a2a", side_effect=mock_execute_via_a2a
+        ):
             executor = AgentExecutor(db=db_session)
             await executor.execute_job(job.id)
 

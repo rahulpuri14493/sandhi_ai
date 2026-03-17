@@ -4,6 +4,7 @@ BRD files are expected in uploads/jobs (project root) or backend/uploads/jobs.
 When running tests in Docker, mount project uploads so the backend sees them:
   docker compose run --rm --no-deps -v ./uploads:/app/uploads backend pytest tests/integration/test_job_flow_brd.py -v
 """
+
 import uuid
 from pathlib import Path
 
@@ -14,7 +15,6 @@ from db.database import get_db
 from main import app
 from models.user import User, UserRole
 from core.security import get_password_hash, create_access_token
-
 
 # Possible locations for BRD docs: backend root (e.g. /app/uploads/jobs in Docker) or project root uploads/jobs.
 # __file__ is tests/integration/test_job_flow_brd.py -> parent.parent.parent = backend
@@ -76,7 +76,16 @@ def test_job_create_and_analyze_documents_with_brd(client_with_business):
     create_resp = client.post(
         "/api/jobs",
         data={"title": "BRD test job", "description": "Test analyze with BRD"},
-        files=[("files", (brd_path.name, file_bytes, "application/vnd.openxmlformats-officedocument.wordprocessingml.document"))],
+        files=[
+            (
+                "files",
+                (
+                    brd_path.name,
+                    file_bytes,
+                    "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                ),
+            )
+        ],
         headers=headers,
     )
     assert create_resp.status_code == 201, create_resp.text

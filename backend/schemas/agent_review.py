@@ -1,8 +1,8 @@
 """Pydantic schemas for agent reviews and ratings."""
+
 from pydantic import BaseModel, Field, field_validator
 from typing import Optional
 from datetime import datetime
-
 
 # Rating must be 1-5 (industry standard 5-star)
 RATING_MIN = 1
@@ -21,7 +21,9 @@ def _empty_str_to_none(v: Optional[str]) -> Optional[str]:
 class AgentReviewCreate(BaseModel):
     """Payload to create or update a user's review for an agent. Review text is optional."""
 
-    rating: float = Field(..., ge=RATING_MIN, le=RATING_MAX, description="Rating from 1 to 5")
+    rating: float = Field(
+        ..., ge=RATING_MIN, le=RATING_MAX, description="Rating from 1 to 5"
+    )
     review_text: Optional[str] = Field(None, max_length=REVIEW_TEXT_MAX_LENGTH)
 
     @field_validator("review_text", mode="before")

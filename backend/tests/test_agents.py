@@ -1,4 +1,5 @@
 """API tests for agents endpoints and agent reviews."""
+
 import uuid
 import pytest
 from fastapi.testclient import TestClient
@@ -129,7 +130,9 @@ def test_get_agent_returns_api_key_for_owner(client_with_agents):
     assert "api_endpoint" in data
 
 
-def test_get_agent_returns_api_endpoint_when_authenticated(client_with_agents, db_session):
+def test_get_agent_returns_api_endpoint_when_authenticated(
+    client_with_agents, db_session
+):
     """GET /api/agents/{id} returns api_endpoint when user is logged in (any valid user)."""
     client, dev, agent1, _ = client_with_agents
     agent1.api_endpoint = "https://api.example.com/v1/chat"
@@ -185,7 +188,9 @@ def test_reviews_summary_public(client_with_agents):
 def test_reviews_list_public(client_with_agents):
     """GET /api/agents/{id}/reviews returns paginated list without auth."""
     client, _, agent1, _ = client_with_agents
-    response = client.get(f"/api/agents/{agent1.id}/reviews", params={"limit": 10, "offset": 0})
+    response = client.get(
+        f"/api/agents/{agent1.id}/reviews", params={"limit": 10, "offset": 0}
+    )
     assert response.status_code == 200
     data = response.json()
     assert "items" in data
@@ -440,7 +445,10 @@ def test_a2a_card_success(client_with_agents):
     # Update agent to have an endpoint (via API)
     client.put(
         f"/api/agents/{agent1.id}",
-        json={"api_endpoint": "https://agent.example.com/a2a", "capabilities": ["nlp", "code"]},
+        json={
+            "api_endpoint": "https://agent.example.com/a2a",
+            "capabilities": ["nlp", "code"],
+        },
         headers={"Authorization": f"Bearer {token}"},
     )
     r = client.get(f"/api/agents/{agent1.id}/a2a-card")

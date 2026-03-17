@@ -22,7 +22,9 @@ def _safe_slug(name: str) -> str:
     """Slug for tool name (alphanumeric and underscore)."""
     if not name:
         return ""
-    return "".join(c if c.isalnum() or c in "_-" else "_" for c in (name or "").strip())[:50]
+    return "".join(
+        c if c.isalnum() or c in "_-" else "_" for c in (name or "").strip()
+    )[:50]
 
 
 def _parse_allowed_ids(value: Optional[str]) -> Optional[list]:
@@ -47,7 +49,11 @@ def _get_workflow_collaboration_hint_from_job(job: Job) -> Optional[str]:
         if not isinstance(conv, list):
             return None
         for item in reversed(conv):
-            hint = item.get("workflow_collaboration_hint") if isinstance(item, dict) else None
+            hint = (
+                item.get("workflow_collaboration_hint")
+                if isinstance(item, dict)
+                else None
+            )
             if hint in ("sequential", "async_a2a"):
                 return hint
     except (json.JSONDecodeError, TypeError):
@@ -81,13 +87,18 @@ def _apply_tool_visibility(tools: list, visibility: Optional[str]) -> list:
 def _input_schema_for_tool_type(tool_type: str) -> dict:
     sql_schema = {
         "type": "object",
-        "properties": {"query": {"type": "string", "description": "SQL SELECT query (read-only)"}},
+        "properties": {
+            "query": {"type": "string", "description": "SQL SELECT query (read-only)"}
+        },
         "required": ["query"],
     }
     vector_schema = {
         "type": "object",
         "properties": {
-            "query": {"type": "string", "description": "Search query or embedding query"},
+            "query": {
+                "type": "string",
+                "description": "Search query or embedding query",
+            },
             "top_k": {"type": "integer", "description": "Max results", "default": 5},
         },
         "required": ["query"],
@@ -112,17 +123,34 @@ def _input_schema_for_tool_type(tool_type: str) -> dict:
         "pageindex": {
             "type": "object",
             "properties": {
-                "query": {"type": "string", "description": "Natural language or keyword query over documents"},
-                "doc_id": {"type": "string", "description": "PageIndex document ID (optional if default_doc_id in config)"},
-                "thinking": {"type": "boolean", "description": "Use reasoning before retrieval", "default": False},
+                "query": {
+                    "type": "string",
+                    "description": "Natural language or keyword query over documents",
+                },
+                "doc_id": {
+                    "type": "string",
+                    "description": "PageIndex document ID (optional if default_doc_id in config)",
+                },
+                "thinking": {
+                    "type": "boolean",
+                    "description": "Use reasoning before retrieval",
+                    "default": False,
+                },
             },
             "required": ["query"],
         },
         "filesystem": {
             "type": "object",
             "properties": {
-                "path": {"type": "string", "description": "Relative path under base_path"},
-                "action": {"type": "string", "enum": ["read", "list"], "default": "read"},
+                "path": {
+                    "type": "string",
+                    "description": "Relative path under base_path",
+                },
+                "action": {
+                    "type": "string",
+                    "enum": ["read", "list"],
+                    "default": "read",
+                },
             },
             "required": ["path"],
         },
@@ -139,7 +167,11 @@ def _input_schema_for_tool_type(tool_type: str) -> dict:
             "properties": {
                 "channel": {"type": "string", "description": "Channel ID or name"},
                 "message": {"type": "string", "description": "Message text"},
-                "action": {"type": "string", "enum": ["list_channels", "send"], "default": "send"},
+                "action": {
+                    "type": "string",
+                    "enum": ["list_channels", "send"],
+                    "default": "send",
+                },
             },
         },
         "github": {
@@ -147,22 +179,40 @@ def _input_schema_for_tool_type(tool_type: str) -> dict:
             "properties": {
                 "repo": {"type": "string", "description": "owner/repo"},
                 "path": {"type": "string", "description": "File path or 'issues'"},
-                "action": {"type": "string", "enum": ["get_file", "list_issues", "search"], "default": "get_file"},
+                "action": {
+                    "type": "string",
+                    "enum": ["get_file", "list_issues", "search"],
+                    "default": "get_file",
+                },
             },
         },
         "notion": {
             "type": "object",
             "properties": {
-                "action": {"type": "string", "enum": ["search", "get_page", "get_database"], "default": "search"},
-                "query": {"type": "string", "description": "Search query or page/database ID"},
+                "action": {
+                    "type": "string",
+                    "enum": ["search", "get_page", "get_database"],
+                    "default": "search",
+                },
+                "query": {
+                    "type": "string",
+                    "description": "Search query or page/database ID",
+                },
             },
         },
         "rest_api": {
             "type": "object",
             "properties": {
-                "method": {"type": "string", "enum": ["GET", "POST", "PUT", "PATCH", "DELETE"], "default": "GET"},
+                "method": {
+                    "type": "string",
+                    "enum": ["GET", "POST", "PUT", "PATCH", "DELETE"],
+                    "default": "GET",
+                },
                 "path": {"type": "string", "description": "Path or full URL"},
-                "body": {"type": "object", "description": "JSON body for POST/PUT/PATCH"},
+                "body": {
+                    "type": "object",
+                    "description": "JSON body for POST/PUT/PATCH",
+                },
             },
             "required": ["path"],
         },
@@ -179,17 +229,26 @@ def _openai_tools_from_mcp(available_mcp_tools: list) -> list:
             continue
         description = t.get("description") or name
         if t.get("schema_metadata") or t.get("business_description"):
-            description = description.rstrip(". ") + ". Database schema and business context are in the system message—use them to write correct SQL."
+            description = (
+                description.rstrip(". ")
+                + ". Database schema and business context are in the system message—use them to write correct SQL."
+            )
         tool_type = t.get("tool_type")
-        schema = _input_schema_for_tool_type(tool_type) if tool_type else {"type": "object", "properties": {}}
-        tools.append({
-            "type": "function",
-            "function": {
-                "name": name,
-                "description": description,
-                "parameters": schema,
-            },
-        })
+        schema = (
+            _input_schema_for_tool_type(tool_type)
+            if tool_type
+            else {"type": "object", "properties": {}}
+        )
+        tools.append(
+            {
+                "type": "function",
+                "function": {
+                    "name": name,
+                    "description": description,
+                    "parameters": schema,
+                },
+            }
+        )
     return tools
 
 
@@ -197,29 +256,32 @@ class AgentExecutor:
     def __init__(self, db: Session):
         self.db = db
         self.payment_processor = PaymentProcessor(db)
-    
+
     async def execute_job(self, job_id: int):
         """Execute a job by running all workflow steps"""
         job = self.db.query(Job).filter(Job.id == job_id).first()
         if not job:
             raise ValueError("Job not found")
-        
+
         # Process payment first
         transaction = self.payment_processor.process_payment(job_id)
-        
+
         # Get workflow steps in order
-        workflow_steps = self.db.query(WorkflowStep).filter(
-            WorkflowStep.job_id == job_id
-        ).order_by(WorkflowStep.step_order).all()
-        
+        workflow_steps = (
+            self.db.query(WorkflowStep)
+            .filter(WorkflowStep.job_id == job_id)
+            .order_by(WorkflowStep.step_order)
+            .all()
+        )
+
         if not workflow_steps:
             job.status = JobStatus.FAILED
             job.failure_reason = "No workflow steps found for this job"
             self.db.commit()
             return
-        
+
         previous_output = None
-        
+
         try:
             # Strict sequential execution: steps run in step_order; each step gets previous_output only when depends_on_previous is True
             for step in workflow_steps:
@@ -227,18 +289,20 @@ class AgentExecutor:
                 step.status = "in_progress"
                 step.started_at = datetime.utcnow()
                 self.db.commit()
-                
+
                 # Log execution start
-                self._log_action("workflow_step", step.id, "execution_started", {
-                    "job_id": job_id,
-                    "agent_id": step.agent_id
-                })
-                
+                self._log_action(
+                    "workflow_step",
+                    step.id,
+                    "execution_started",
+                    {"job_id": job_id, "agent_id": step.agent_id},
+                )
+
                 # Execute agent
                 agent = self.db.query(Agent).filter(Agent.id == step.agent_id).first()
                 if not agent:
                     raise ValueError(f"Agent {step.agent_id} not found")
-                
+
                 # Prepare input data
                 # Independent steps (depends_on_previous=False) do not receive previous agent output.
                 # Sequential steps receive previous_step_output for handoff.
@@ -248,60 +312,100 @@ class AgentExecutor:
                     base_input = json.loads(step.input_data) if step.input_data else {}
                     input_data = {
                         **base_input,  # Job context, conversation, documents, etc.
-                        "previous_step_output": previous_output  # Output from previous agent
+                        "previous_step_output": previous_output,  # Output from previous agent
                     }
                 else:
                     # First step or independent step - use step's input data only (no previous output)
                     input_data = json.loads(step.input_data) if step.input_data else {}
 
                 # Resolve which tools this step (agent) can use: step-level overrides; else job-level; else all business tools
-                job_platform_ids = _parse_allowed_ids(getattr(job, "allowed_platform_tool_ids", None))
-                job_conn_ids = _parse_allowed_ids(getattr(job, "allowed_connection_ids", None))
-                step_platform_ids = _parse_allowed_ids(getattr(step, "allowed_platform_tool_ids", None))
-                step_conn_ids = _parse_allowed_ids(getattr(step, "allowed_connection_ids", None))
+                job_platform_ids = _parse_allowed_ids(
+                    getattr(job, "allowed_platform_tool_ids", None)
+                )
+                job_conn_ids = _parse_allowed_ids(
+                    getattr(job, "allowed_connection_ids", None)
+                )
+                step_platform_ids = _parse_allowed_ids(
+                    getattr(step, "allowed_platform_tool_ids", None)
+                )
+                step_conn_ids = _parse_allowed_ids(
+                    getattr(step, "allowed_connection_ids", None)
+                )
                 # Step explicit list (including []) overrides job; else use job list; else None = all business tools
-                effective_platform = step_platform_ids if step_platform_ids is not None else job_platform_ids
-                effective_conn = step_conn_ids if step_conn_ids is not None else job_conn_ids
+                effective_platform = (
+                    step_platform_ids
+                    if step_platform_ids is not None
+                    else job_platform_ids
+                )
+                effective_conn = (
+                    step_conn_ids if step_conn_ids is not None else job_conn_ids
+                )
                 # Step can only use tools that are in job scope
                 if job_platform_ids is not None and effective_platform is not None:
-                    effective_platform = [x for x in effective_platform if x in job_platform_ids]
+                    effective_platform = [
+                        x for x in effective_platform if x in job_platform_ids
+                    ]
                 if job_conn_ids is not None and effective_conn is not None:
                     effective_conn = [x for x in effective_conn if x in job_conn_ids]
 
                 available_mcp_tools = self._get_available_mcp_tools(
                     job.business_id,
-                    platform_tool_ids=effective_platform if effective_platform is not None else None,
-                    connection_ids=effective_conn if effective_conn is not None else None,
+                    platform_tool_ids=(
+                        effective_platform if effective_platform is not None else None
+                    ),
+                    connection_ids=(
+                        effective_conn if effective_conn is not None else None
+                    ),
                 )
                 # Hybrid A2A: restrict what tool info agents see (credentials never shared)
-                tool_visibility = getattr(step, "tool_visibility", None) or getattr(job, "tool_visibility", None) or "full"
-                available_mcp_tools = _apply_tool_visibility(available_mcp_tools or [], tool_visibility)
+                tool_visibility = (
+                    getattr(step, "tool_visibility", None)
+                    or getattr(job, "tool_visibility", None)
+                    or "full"
+                )
+                available_mcp_tools = _apply_tool_visibility(
+                    available_mcp_tools or [], tool_visibility
+                )
                 if available_mcp_tools:
                     input_data["available_mcp_tools"] = available_mcp_tools
                     input_data["business_id"] = job.business_id
                     if step.step_order == 1:
-                        self._log_action("job", job_id, "mcp_tool_discovery", {
-                            "business_id": job.business_id,
-                            "tool_count": len(available_mcp_tools),
-                            "tool_names": [t.get("name") for t in available_mcp_tools[:20]],
-                        })
+                        self._log_action(
+                            "job",
+                            job_id,
+                            "mcp_tool_discovery",
+                            {
+                                "business_id": job.business_id,
+                                "tool_count": len(available_mcp_tools),
+                                "tool_names": [
+                                    t.get("name") for t in available_mcp_tools[:20]
+                                ],
+                            },
+                        )
 
                 # Hybrid A2A: peer context for async_a2a — agents can call each other; no tools/credentials shared
                 collaboration_hint = _get_workflow_collaboration_hint_from_job(job)
                 if collaboration_hint == "async_a2a":
-                    peer_agents = self._get_peer_agents_for_step(workflow_steps, step, agent)
+                    peer_agents = self._get_peer_agents_for_step(
+                        workflow_steps, step, agent
+                    )
                     if peer_agents:
                         input_data["peer_agents"] = peer_agents
                         if step.step_order == 1:
-                            self._log_action("job", job_id, "peer_a2a_context", {
-                                "peer_count": len(peer_agents),
-                                "peer_ids": [p["agent_id"] for p in peer_agents],
-                            })
-                
+                            self._log_action(
+                                "job",
+                                job_id,
+                                "peer_a2a_context",
+                                {
+                                    "peer_count": len(peer_agents),
+                                    "peer_ids": [p["agent_id"] for p in peer_agents],
+                                },
+                            )
+
                 # Uploaded documents are requirement documents: agent must understand them, ask questions if any, else execute and answer.
-                documents = input_data.get('documents', [])
-                conversation = input_data.get('conversation', [])
-                
+                documents = input_data.get("documents", [])
+                conversation = input_data.get("conversation", [])
+
                 # Execution flow: 1) Get step's input_data (job context, requirement docs, conversation).
                 # 2) Only hired agents (with api_endpoint) are supported – call agent's endpoint with api_key.
                 # 3) If agent has plugin_config → run plugin. 4) Response is stored as step output.
@@ -313,36 +417,73 @@ class AgentExecutor:
                 logger.debug("========== Executing Step %s ==========", step.step_order)
                 logger.debug("Agent: %s (hired endpoint)", agent.name)
                 logger.debug("Agent endpoint: %s", agent.api_endpoint)
-                logger.debug("Job Title: %s", input_data.get('job_title', 'N/A'))
-                logger.debug("Job Description: %s...", (input_data.get('job_description') or 'N/A')[:100])
-                
+                logger.debug("Job Title: %s", input_data.get("job_title", "N/A"))
+                logger.debug(
+                    "Job Description: %s...",
+                    (input_data.get("job_description") or "N/A")[:100],
+                )
+
                 # Log documents
                 if documents:
-                    logger.debug("Found %s document(s) to send to agent", len(documents))
+                    logger.debug(
+                        "Found %s document(s) to send to agent", len(documents)
+                    )
                     for i, doc in enumerate(documents):
-                        content_length = len(doc.get('content', '')) if doc.get('content') else 0
-                        content_preview = doc.get('content', '')[:150] if doc.get('content') else 'EMPTY'
-                        logger.debug("Document %s: %s type=%s content_length=%s preview=%s...", i + 1, doc.get('name', 'Unknown'), doc.get('type', 'unknown'), content_length, content_preview)
+                        content_length = (
+                            len(doc.get("content", "")) if doc.get("content") else 0
+                        )
+                        content_preview = (
+                            doc.get("content", "")[:150]
+                            if doc.get("content")
+                            else "EMPTY"
+                        )
+                        logger.debug(
+                            "Document %s: %s type=%s content_length=%s preview=%s...",
+                            i + 1,
+                            doc.get("name", "Unknown"),
+                            doc.get("type", "unknown"),
+                            content_length,
+                            content_preview,
+                        )
                 else:
                     logger.warning("No documents found in input_data")
-                
+
                 # Log conversation
                 if conversation:
-                    questions = [item for item in conversation if item.get('type') == 'question']
-                    answers = [item for item in conversation if item.get('type') == 'question' and item.get('answer')]
-                    completions = [item for item in conversation if item.get('type') == 'completion']
-                    logger.debug("Found %s conversation item(s) questions=%s answered=%s completions=%s", len(conversation), len(questions), len(answers), len(completions))
+                    questions = [
+                        item for item in conversation if item.get("type") == "question"
+                    ]
+                    answers = [
+                        item
+                        for item in conversation
+                        if item.get("type") == "question" and item.get("answer")
+                    ]
+                    completions = [
+                        item
+                        for item in conversation
+                        if item.get("type") == "completion"
+                    ]
+                    logger.debug(
+                        "Found %s conversation item(s) questions=%s answered=%s completions=%s",
+                        len(conversation),
+                        len(questions),
+                        len(answers),
+                        len(completions),
+                    )
                     if completions:
-                        logger.debug("Latest completion: %s...", (completions[-1].get('message') or 'N/A')[:100])
+                        logger.debug(
+                            "Latest completion: %s...",
+                            (completions[-1].get("message") or "N/A")[:100],
+                        )
                 else:
                     logger.warning("No conversation found in input_data")
-                
+
                 logger.debug("=================================================")
-                
+
                 # Execute agent (API or plugin)
                 try:
                     output_data = await self._execute_agent(agent, input_data)
-                    
+
                     # Update step with output
                     step.output_data = json.dumps(output_data)
                     step.status = "completed"
@@ -358,38 +499,43 @@ class AgentExecutor:
                     # Store error in output_data for reference
                     step.output_data = json.dumps({"error": error_msg})
                     self.db.commit()
-                    
+
                     # Re-raise to mark job as failed
-                    raise Exception(f"Workflow step {step.step_order} failed: {error_msg}")
-                
+                    raise Exception(
+                        f"Workflow step {step.step_order} failed: {error_msg}"
+                    )
+
                 # Log communication if there's a previous step
                 if previous_output is not None:
                     previous_step = workflow_steps[workflow_steps.index(step) - 1]
                     self._log_communication(previous_step, step, previous_output)
-                
+
                 previous_output = output_data
                 self.db.commit()
-                
+
                 # Log execution completion
-                self._log_action("workflow_step", step.id, "execution_completed", {
-                    "job_id": job_id,
-                    "agent_id": step.agent_id,
-                    "output_size": len(str(output_data))
-                })
-            
+                self._log_action(
+                    "workflow_step",
+                    step.id,
+                    "execution_completed",
+                    {
+                        "job_id": job_id,
+                        "agent_id": step.agent_id,
+                        "output_size": len(str(output_data)),
+                    },
+                )
+
             # Mark job as completed
             job.status = JobStatus.COMPLETED
             job.completed_at = datetime.utcnow()
             self.db.commit()
-            
+
             # Distribute earnings
             self.payment_processor.distribute_earnings(job_id)
-            
+
             # Log job completion
-            self._log_action("job", job_id, "completed", {
-                "total_cost": job.total_cost
-            })
-        
+            self._log_action("job", job_id, "completed", {"total_cost": job.total_cost})
+
         except Exception as e:
             # Mark job as failed with reason
             job.status = JobStatus.FAILED
@@ -399,14 +545,14 @@ class AgentExecutor:
                 error_message = error_message[:500] + "..."
             job.failure_reason = error_message
             self.db.commit()
-            
+
             # Log error
-            self._log_action("job", job_id, "failed", {
-                "error": error_message
-            })
+            self._log_action("job", job_id, "failed", {"error": error_message})
             raise
-    
-    async def _execute_agent(self, agent: Agent, input_data: Dict[str, Any]) -> Dict[str, Any]:
+
+    async def _execute_agent(
+        self, agent: Agent, input_data: Dict[str, Any]
+    ) -> Dict[str, Any]:
         """Execute agent via plugin, A2A protocol, or OpenAI-compatible (via platform adapter). Architecture runs A2A everywhere: native A2A agents or OpenAI endpoints via the adapter."""
         if agent.plugin_config:
             return await self._execute_plugin_agent(agent, input_data)
@@ -417,8 +563,10 @@ class AgentExecutor:
         if adapter_url:
             return await self._execute_via_adapter(agent, input_data, adapter_url)
         return await self._execute_api_agent(agent, input_data)
-    
-    async def _execute_a2a_agent(self, agent: Agent, input_data: Dict[str, Any]) -> Dict[str, Any]:
+
+    async def _execute_a2a_agent(
+        self, agent: Agent, input_data: Dict[str, Any]
+    ) -> Dict[str, Any]:
         """
         Execute agent via A2A protocol (JSON-RPC 2.0 SendMessage).
         Used when agent.a2a_enabled is True.
@@ -442,7 +590,9 @@ class AgentExecutor:
         # Return shape compatible with step output and _extract_agent_output_content
         return result
 
-    async def _execute_via_adapter(self, agent: Agent, input_data: Dict[str, Any], adapter_url: str) -> Dict[str, Any]:
+    async def _execute_via_adapter(
+        self, agent: Agent, input_data: Dict[str, Any], adapter_url: str
+    ) -> Dict[str, Any]:
         """
         Execute OpenAI-compatible agent via platform A2A adapter. Adapter receives A2A
         and forwards to agent.api_endpoint with OpenAI payload; returns A2A response.
@@ -462,7 +612,9 @@ class AgentExecutor:
         payload = self._format_for_openai(agent, input_data)
         messages = payload.get("messages", [])
         available_mcp_tools = input_data.get("available_mcp_tools") or []
-        openai_tools = _openai_tools_from_mcp(available_mcp_tools) if available_mcp_tools else []
+        openai_tools = (
+            _openai_tools_from_mcp(available_mcp_tools) if available_mcp_tools else []
+        )
         business_id = input_data.get("business_id")
         max_tool_iterations = 5
         content = ""
@@ -489,23 +641,41 @@ class AgentExecutor:
             if not tool_calls or not business_id:
                 break
             # Append assistant message with tool_calls
-            messages.append({"role": "assistant", "content": content or None, "tool_calls": tool_calls})
+            messages.append(
+                {
+                    "role": "assistant",
+                    "content": content or None,
+                    "tool_calls": tool_calls,
+                }
+            )
             for tc in tool_calls:
                 tc_id = tc.get("id")
                 fn = tc.get("function") or {}
                 tool_name = fn.get("name")
                 args_raw = fn.get("arguments") or "{}"
                 try:
-                    args = json.loads(args_raw) if isinstance(args_raw, str) else args_raw
+                    args = (
+                        json.loads(args_raw) if isinstance(args_raw, str) else args_raw
+                    )
                 except (json.JSONDecodeError, TypeError):
                     args = {}
-                tool_result = await self._call_platform_mcp_tool(business_id, tool_name, args)
-                messages.append({"role": "tool", "tool_call_id": tc_id, "content": tool_result})
-            logger.info("MCP tool round %s: %s tool call(s), continuing agent loop", iteration + 1, len(tool_calls))
+                tool_result = await self._call_platform_mcp_tool(
+                    business_id, tool_name, args
+                )
+                messages.append(
+                    {"role": "tool", "tool_call_id": tc_id, "content": tool_result}
+                )
+            logger.info(
+                "MCP tool round %s: %s tool call(s), continuing agent loop",
+                iteration + 1,
+                len(tool_calls),
+            )
 
         return {"content": content}
 
-    async def _execute_api_agent(self, agent: Agent, input_data: Dict[str, Any]) -> Dict[str, Any]:
+    async def _execute_api_agent(
+        self, agent: Agent, input_data: Dict[str, Any]
+    ) -> Dict[str, Any]:
         """
         Execute agent via its configured API endpoint (hired agent only).
         Only agents with api_endpoint are supported.
@@ -527,7 +697,9 @@ class AgentExecutor:
         logger.debug("Executing agent '%s' via hired endpoint: %s", agent.name, url)
 
         payload_for_log = self._truncate_payload_for_log(payload, max_content_len=1500)
-        logger.info("Request payload: %s", json.dumps(payload_for_log, indent=2, default=str))
+        logger.info(
+            "Request payload: %s", json.dumps(payload_for_log, indent=2, default=str)
+        )
 
         async with httpx.AsyncClient(**client_kwargs) as client:
             response = await client.post(url, json=payload, headers=headers)
@@ -536,12 +708,22 @@ class AgentExecutor:
                 response_body = response.text
             except Exception:
                 response_body = "(unable to read response body)"
-            response_for_log = response_body if len(response_body) <= 2000 else response_body[:2000] + "\n... (truncated)"
-            logger.info("Response status: %s %s", response.status_code, response.reason_phrase)
+            response_for_log = (
+                response_body
+                if len(response_body) <= 2000
+                else response_body[:2000] + "\n... (truncated)"
+            )
+            logger.info(
+                "Response status: %s %s", response.status_code, response.reason_phrase
+            )
             logger.info("Response body: %s", response_for_log)
 
             if response.status_code >= 400:
-                body = response_body if len(response_body) <= 800 else response_body[:800] + "..."
+                body = (
+                    response_body
+                    if len(response_body) <= 800
+                    else response_body[:800] + "..."
+                )
                 logger.error("Agent API returned %s: %s", response.status_code, body)
                 raise Exception(
                     f"Agent inference returned {response.status_code} {response.reason_phrase}. Response: {body}"
@@ -569,7 +751,9 @@ class AgentExecutor:
                     return str(prev_output[key]).strip()
         return json.dumps(prev_output, indent=2)
 
-    def _truncate_payload_for_log(self, payload: Dict[str, Any], max_content_len: int = 1500) -> Dict[str, Any]:
+    def _truncate_payload_for_log(
+        self, payload: Dict[str, Any], max_content_len: int = 1500
+    ) -> Dict[str, Any]:
         """Return a copy of the payload with long message content truncated for logging."""
         if not isinstance(payload, dict):
             return payload
@@ -578,9 +762,18 @@ class AgentExecutor:
             if k == "messages" and isinstance(v, list):
                 out[k] = []
                 for msg in v:
-                    if isinstance(msg, dict) and "content" in msg and isinstance(msg["content"], str):
+                    if (
+                        isinstance(msg, dict)
+                        and "content" in msg
+                        and isinstance(msg["content"], str)
+                    ):
                         c = msg["content"]
-                        truncated = c if len(c) <= max_content_len else c[:max_content_len] + f"... [truncated, total {len(c)} chars]"
+                        truncated = (
+                            c
+                            if len(c) <= max_content_len
+                            else c[:max_content_len]
+                            + f"... [truncated, total {len(c)} chars]"
+                        )
                         out[k].append({**msg, "content": truncated})
                     else:
                         out[k].append(msg)
@@ -588,20 +781,24 @@ class AgentExecutor:
                 out[k] = v
         return out
 
-    def _format_input_for_agent(self, agent: Agent, input_data: Dict[str, Any]) -> Dict[str, Any]:
+    def _format_input_for_agent(
+        self, agent: Agent, input_data: Dict[str, Any]
+    ) -> Dict[str, Any]:
         """Format input data for hired agent API (OpenAI-compatible format)."""
         return self._format_for_openai(agent, input_data)
-    
-    def _format_for_openai(self, agent: Agent, input_data: Dict[str, Any]) -> Dict[str, Any]:
+
+    def _format_for_openai(
+        self, agent: Agent, input_data: Dict[str, Any]
+    ) -> Dict[str, Any]:
         """Format input data for OpenAI-compatible API"""
         messages = []
-        
+
         # Get job information
-        job_title = input_data.get('job_title', 'N/A')
-        job_description = input_data.get('job_description', '')
-        documents = input_data.get('documents', [])
-        conversation = input_data.get('conversation', [])
-        
+        job_title = input_data.get("job_title", "N/A")
+        job_description = input_data.get("job_description", "")
+        documents = input_data.get("documents", [])
+        conversation = input_data.get("conversation", [])
+
         # Build comprehensive system message
         system_content = "You are an AI agent operating within the Sandhi AI platform. Your job is to answer correctly and deliver the requested output.\n\n"
         system_content += "BEHAVIOR:\n"
@@ -609,18 +806,22 @@ class AgentExecutor:
         system_content += "2. Execute the task and provide your complete, correct answer. Do NOT ask unnecessary or redundant questions.\n"
         system_content += "3. Only ask questions when information is strictly necessary and completely missing (e.g. a value that cannot be inferred). When in doubt, proceed with reasonable interpretation and answer.\n"
         system_content += "4. Give direct, accurate answers. Use exact values and criteria from the documents; do not deviate.\n\n"
-        
+
         # Add agent context
-        if input_data.get('agent_name'):
+        if input_data.get("agent_name"):
             system_content += f"Your Role: {input_data.get('agent_name')}"
-            if input_data.get('agent_description'):
+            if input_data.get("agent_description"):
                 system_content += f" - {input_data.get('agent_description')}"
             system_content += "\n\n"
-        
+
         if documents:
-            system_content += "═══════════════════════════════════════════════════════\n"
+            system_content += (
+                "═══════════════════════════════════════════════════════\n"
+            )
             system_content += "REQUIREMENT DOCUMENTS (primary source of truth)\n"
-            system_content += "═══════════════════════════════════════════════════════\n\n"
+            system_content += (
+                "═══════════════════════════════════════════════════════\n\n"
+            )
             system_content += "The uploaded documents define the requirements. Answer based on these documents and any Q&A below. Prioritize correct execution over asking questions.\n\n"
             system_content += "JOB CONTEXT:\n"
             system_content += f"  - Job Title: {job_title}\n"
@@ -628,27 +829,39 @@ class AgentExecutor:
                 system_content += f"  - Job Description: {job_description}\n"
             system_content += "\n"
             system_content += "Requirement document text is provided below. Use it to produce your answer.\n\n"
-            system_content += "═══════════════════════════════════════════════════════\n\n"
+            system_content += (
+                "═══════════════════════════════════════════════════════\n\n"
+            )
         else:
-            system_content += "═══════════════════════════════════════════════════════\n"
+            system_content += (
+                "═══════════════════════════════════════════════════════\n"
+            )
             system_content += "PRIMARY REQUIREMENTS:\n"
-            system_content += "═══════════════════════════════════════════════════════\n\n"
+            system_content += (
+                "═══════════════════════════════════════════════════════\n\n"
+            )
             system_content += f"JOB TITLE: {job_title}\n\n"
             if job_description and job_description.strip():
                 system_content += f"JOB DESCRIPTION:\n{job_description}\n\n"
             else:
                 system_content += "JOB DESCRIPTION: (No description provided)\n\n"
-            system_content += "═══════════════════════════════════════════════════════\n\n"
-        
+            system_content += (
+                "═══════════════════════════════════════════════════════\n\n"
+            )
+
         # Use assigned_task when present (multi-agent workflow)
-        assigned_task = input_data.get('assigned_task', '')
-        step_order = input_data.get('step_order')
-        total_steps = input_data.get('total_steps')
-        has_previous_output = input_data.get('previous_step_output') is not None
+        assigned_task = input_data.get("assigned_task", "")
+        step_order = input_data.get("step_order")
+        total_steps = input_data.get("total_steps")
+        has_previous_output = input_data.get("previous_step_output") is not None
         if assigned_task and assigned_task.strip():
-            system_content += "═══════════════════════════════════════════════════════\n"
+            system_content += (
+                "═══════════════════════════════════════════════════════\n"
+            )
             system_content += "CRITICAL: YOUR ASSIGNED TASK (multi-agent workflow)\n"
-            system_content += "═══════════════════════════════════════════════════════\n\n"
+            system_content += (
+                "═══════════════════════════════════════════════════════\n\n"
+            )
             if step_order is not None and total_steps is not None and total_steps > 1:
                 system_content += f"You are Agent {step_order} of {total_steps}. "
                 if has_previous_output:
@@ -657,15 +870,24 @@ class AgentExecutor:
             system_content += "If the documents describe the full workflow, IGNORE the parts that are not your assignment.\n\n"
             system_content += f"YOUR TASK:\n{assigned_task.strip()}\n\n"
         else:
-            if has_previous_output and step_order is not None and total_steps is not None and total_steps > 1:
+            if (
+                has_previous_output
+                and step_order is not None
+                and total_steps is not None
+                and total_steps > 1
+            ):
                 system_content += "SEQUENTIAL WORKFLOW: You receive the previous agent's output below. Use it as your input and continue the pipeline.\n\n"
             system_content += "TASK: Execute the job from the requirements above and provide your complete, correct answer. Do not ask questions unless something is strictly required and impossible to infer.\n"
         # Hybrid A2A: peer agents (endpoints only; no credentials or tool lists shared)
         peer_agents = input_data.get("peer_agents") or []
         if peer_agents:
-            system_content += "\n═══════════════════════════════════════════════════════\n"
+            system_content += (
+                "\n═══════════════════════════════════════════════════════\n"
+            )
             system_content += "PEER AGENTS (optional direct A2A)\n"
-            system_content += "═══════════════════════════════════════════════════════\n\n"
+            system_content += (
+                "═══════════════════════════════════════════════════════\n\n"
+            )
             system_content += "You may call these agents directly via the A2A protocol (SendMessage to their endpoint). "
             system_content += "Only endpoint URLs are provided; no API keys or tool information are shared.\n\n"
             for p in peer_agents:
@@ -674,30 +896,52 @@ class AgentExecutor:
         # MCP tool discovery: inform agent of available tools (platform + external) for collaboration
         available_mcp_tools = input_data.get("available_mcp_tools") or []
         if available_mcp_tools:
-            system_content += "\n═══════════════════════════════════════════════════════\n"
+            system_content += (
+                "\n═══════════════════════════════════════════════════════\n"
+            )
             system_content += "AVAILABLE MCP TOOLS (data sources / APIs for this job)\n"
-            system_content += "═══════════════════════════════════════════════════════\n\n"
+            system_content += (
+                "═══════════════════════════════════════════════════════\n\n"
+            )
             system_content += "The following tools are available. When the task requires running a query or fetching data, you MUST invoke the corresponding tool (use a function/tool call). "
             system_content += "Do NOT only describe or write the query in text—the platform runs the query only when you call the tool. "
             system_content += "Call the tool with the appropriate arguments (e.g. the SQL query); then use the tool result in your final answer.\n\n"
             for t in available_mcp_tools:
-                system_content += f"  - {t.get('name', '')}: {t.get('description', '')}\n"
+                system_content += (
+                    f"  - {t.get('name', '')}: {t.get('description', '')}\n"
+                )
             system_content += "\n"
             # Database schema and business context for SQL tools (so the agent can write correct queries)
-            schema_tools = [t for t in available_mcp_tools if t.get("schema_metadata") or t.get("business_description")]
+            schema_tools = [
+                t
+                for t in available_mcp_tools
+                if t.get("schema_metadata") or t.get("business_description")
+            ]
             if schema_tools:
-                system_content += "═══════════════════════════════════════════════════════\n"
-                system_content += "DATABASE SCHEMA AND CONTEXT (use this to write correct SQL)\n"
-                system_content += "═══════════════════════════════════════════════════════\n\n"
+                system_content += (
+                    "═══════════════════════════════════════════════════════\n"
+                )
+                system_content += (
+                    "DATABASE SCHEMA AND CONTEXT (use this to write correct SQL)\n"
+                )
+                system_content += (
+                    "═══════════════════════════════════════════════════════\n\n"
+                )
                 for t in schema_tools:
                     tool_name = t.get("name", "")
-                    system_content += f"--- Database context for tool: {tool_name} ---\n"
+                    system_content += (
+                        f"--- Database context for tool: {tool_name} ---\n"
+                    )
                     if t.get("business_description"):
-                        system_content += f"Business context: {t.get('business_description')}\n"
+                        system_content += (
+                            f"Business context: {t.get('business_description')}\n"
+                        )
                     if t.get("schema_metadata"):
                         try:
                             schema_dict = json.loads(t["schema_metadata"])
-                            formatted = format_schema_for_prompt(schema_dict, max_chars=8000)
+                            formatted = format_schema_for_prompt(
+                                schema_dict, max_chars=8000
+                            )
                             if formatted:
                                 system_content += "Schema:\n" + formatted + "\n"
                         except (TypeError, json.JSONDecodeError):
@@ -706,7 +950,7 @@ class AgentExecutor:
                 system_content += "Use the schema above to write valid SQL for the corresponding tool. Do not guess table or column names. "
                 system_content += "Then invoke that tool with your SQL so the platform executes it and returns results; do not only show the SQL in your message.\n\n"
         messages.append({"role": "system", "content": system_content})
-        
+
         # Add document content to messages with clear formatting (if documents exist)
         # Platform extracts text from uploaded files and sends it here so the agent can use it (no file access needed).
         if documents:
@@ -724,24 +968,37 @@ class AgentExecutor:
                     return False
                 if "extraction requires" in lower and "library" in lower:
                     return False
-                if "contains no extractable text" in lower or "contains no data" in lower:
+                if (
+                    "contains no extractable text" in lower
+                    or "contains no data" in lower
+                ):
                     return False
                 if "unsupported file type" in lower:
                     return False
                 return True
 
-            logger.debug("Formatting %s requirement documents for API (content is inline below)", len(documents))
-            messages.append({
-                "role": "user",
-                "content": "═══════════════════════════════════════════════════════\n📋 REQUIREMENT DOCUMENTS (text below):\n═══════════════════════════════════════════════════════\n\nThe requirement document text is in the next message(s). Use it to execute the job and provide your correct answer. Do not ask unnecessary questions.\n\nDocument(s) follow:"
-            })
+            logger.debug(
+                "Formatting %s requirement documents for API (content is inline below)",
+                len(documents),
+            )
+            messages.append(
+                {
+                    "role": "user",
+                    "content": "═══════════════════════════════════════════════════════\n📋 REQUIREMENT DOCUMENTS (text below):\n═══════════════════════════════════════════════════════\n\nThe requirement document text is in the next message(s). Use it to execute the job and provide your correct answer. Do not ask unnecessary questions.\n\nDocument(s) follow:",
+                }
+            )
 
             for i, doc in enumerate(documents):
-                doc_name = doc.get('name', 'Unknown')
-                doc_type = doc.get('type', 'unknown')
-                doc_content = (doc.get('content') or '').strip()
+                doc_name = doc.get("name", "Unknown")
+                doc_type = doc.get("type", "unknown")
+                doc_content = (doc.get("content") or "").strip()
 
-                logger.debug("Document %s: %s - Content length: %s chars", i + 1, doc_name, len(doc_content))
+                logger.debug(
+                    "Document %s: %s - Content length: %s chars",
+                    i + 1,
+                    doc_name,
+                    len(doc_content),
+                )
 
                 if _is_extracted_content(doc_content):
                     doc_message = f"""═══════════════════════════════════════════════════════
@@ -764,36 +1021,55 @@ END DOCUMENT {i+1}: {doc_name}
                         f"Execute the task based on that and provide your complete answer. Do not refuse; infer from the job context if needed.]"
                     )
                     messages.append({"role": "user", "content": fallback})
-                    logger.debug("Document %s: no extractable content – sent fallback (use job title/description)", doc_name)
+                    logger.debug(
+                        "Document %s: no extractable content – sent fallback (use job title/description)",
+                        doc_name,
+                    )
 
-            messages.append({
-                "role": "user",
-                "content": "═══════════════════════════════════════════════════════\nEND OF REQUIREMENT DOCUMENTS\n═══════════════════════════════════════════════════════\n\nExecute the job based on the requirement documents above and provide your complete, correct answer."
-            })
+            messages.append(
+                {
+                    "role": "user",
+                    "content": "═══════════════════════════════════════════════════════\nEND OF REQUIREMENT DOCUMENTS\n═══════════════════════════════════════════════════════\n\nExecute the job based on the requirement documents above and provide your complete, correct answer.",
+                }
+            )
         else:
-            logger.debug("No documents provided - agent will work with job title and description only")
-        
+            logger.debug(
+                "No documents provided - agent will work with job title and description only"
+            )
+
         # Convert conversation Q&A to messages (if any)
         if conversation:
-            messages.append({
-                "role": "user", 
-                "content": "═══════════════════════════════════════════════════════\nCLARIFICATION QUESTIONS & ANSWERS:\n═══════════════════════════════════════════════════════\n\nThe following Q&A may provide additional context about the requirements:"
-            })
+            messages.append(
+                {
+                    "role": "user",
+                    "content": "═══════════════════════════════════════════════════════\nCLARIFICATION QUESTIONS & ANSWERS:\n═══════════════════════════════════════════════════════\n\nThe following Q&A may provide additional context about the requirements:",
+                }
+            )
             for item in conversation:
-                if item.get('type') == 'question':
-                    if item.get('question'):
-                        messages.append({"role": "user", "content": f"Q: {item['question']}"})
-                    if item.get('answer'):
-                        messages.append({"role": "assistant", "content": f"A: {item['answer']}"})
-                elif item.get('type') == 'analysis' and item.get('content'):
-                    messages.append({"role": "assistant", "content": f"Analysis: {item['content']}"})
-                elif item.get('type') == 'completion' and item.get('message'):
-                    messages.append({"role": "assistant", "content": f"Summary: {item['message']}"})
-            messages.append({
-                "role": "user",
-                "content": "═══════════════════════════════════════════════════════\nEND OF CLARIFICATION QUESTIONS & ANSWERS\n═══════════════════════════════════════════════════════"
-            })
-        
+                if item.get("type") == "question":
+                    if item.get("question"):
+                        messages.append(
+                            {"role": "user", "content": f"Q: {item['question']}"}
+                        )
+                    if item.get("answer"):
+                        messages.append(
+                            {"role": "assistant", "content": f"A: {item['answer']}"}
+                        )
+                elif item.get("type") == "analysis" and item.get("content"):
+                    messages.append(
+                        {"role": "assistant", "content": f"Analysis: {item['content']}"}
+                    )
+                elif item.get("type") == "completion" and item.get("message"):
+                    messages.append(
+                        {"role": "assistant", "content": f"Summary: {item['message']}"}
+                    )
+            messages.append(
+                {
+                    "role": "user",
+                    "content": "═══════════════════════════════════════════════════════\nEND OF CLARIFICATION QUESTIONS & ANSWERS\n═══════════════════════════════════════════════════════",
+                }
+            )
+
         # Add final task instruction
         task_instruction = "═══════════════════════════════════════════════════════\nWHAT TO DO NOW:\n═══════════════════════════════════════════════════════\n\n"
         task_instruction += "Using the requirement documents"
@@ -801,17 +1077,23 @@ END DOCUMENT {i+1}: {doc_name}
             task_instruction += " and the Q&A above"
         task_instruction += ", provide your complete, correct answer. Execute the task; do not ask unnecessary questions. Only ask if something is strictly required and cannot be inferred.\n"
         # Inter-agent communication: pass previous agent's output (extract content, not raw API JSON)
-        prev_output = input_data.get('previous_step_output')
+        prev_output = input_data.get("previous_step_output")
         if prev_output is not None:
             prev_content = self._extract_agent_output_content(prev_output)
-            task_instruction += "\n\n═══════════════════════════════════════════════════════\n"
-            task_instruction += "INTER-AGENT COMMUNICATION (output from previous agent):\n"
+            task_instruction += (
+                "\n\n═══════════════════════════════════════════════════════\n"
+            )
+            task_instruction += (
+                "INTER-AGENT COMMUNICATION (output from previous agent):\n"
+            )
             task_instruction += "The previous agent in this workflow produced the following. Use it as your input.\n"
-            task_instruction += "═══════════════════════════════════════════════════════\n\n"
+            task_instruction += (
+                "═══════════════════════════════════════════════════════\n\n"
+            )
             task_instruction += prev_content
             task_instruction += "\n"
         messages.append({"role": "user", "content": task_instruction})
-        
+
         # Build OpenAI-compatible payload for hired agent API
         payload = {
             "model": (getattr(agent, "llm_model", None) or "").strip() or "gpt-4o-mini",
@@ -823,24 +1105,28 @@ END DOCUMENT {i+1}: {doc_name}
             ),
         }
         return payload
-    
-    def _map_to_schema(self, input_schema: Dict[str, Any], input_data: Dict[str, Any]) -> Dict[str, Any]:
+
+    def _map_to_schema(
+        self, input_schema: Dict[str, Any], input_data: Dict[str, Any]
+    ) -> Dict[str, Any]:
         """Map input_data to match the agent's input_schema"""
         # Simple mapping: if schema has properties, try to map them
-        if isinstance(input_schema, dict) and 'properties' in input_schema:
+        if isinstance(input_schema, dict) and "properties" in input_schema:
             mapped = {}
-            for key, schema_def in input_schema['properties'].items():
+            for key, schema_def in input_schema["properties"].items():
                 # Try to find matching data
                 if key in input_data:
                     mapped[key] = input_data[key]
-                elif 'default' in schema_def:
-                    mapped[key] = schema_def['default']
+                elif "default" in schema_def:
+                    mapped[key] = schema_def["default"]
             return mapped if mapped else input_data
-        
+
         # If no properties, return as-is
         return input_data
-    
-    async def _execute_plugin_agent(self, agent: Agent, input_data: Dict[str, Any]) -> Dict[str, Any]:
+
+    async def _execute_plugin_agent(
+        self, agent: Agent, input_data: Dict[str, Any]
+    ) -> Dict[str, Any]:
         """Execute agent via plugin (placeholder - would load and execute plugin)"""
         # TODO: Implement plugin execution
         # This would involve:
@@ -848,26 +1134,28 @@ END DOCUMENT {i+1}: {doc_name}
         # 2. Executing it in a sandboxed environment
         # 3. Returning the result
         raise NotImplementedError("Plugin execution not yet implemented")
-    
-    def _log_communication(self, from_step: WorkflowStep, to_step: WorkflowStep, data: Dict[str, Any]):
+
+    def _log_communication(
+        self, from_step: WorkflowStep, to_step: WorkflowStep, data: Dict[str, Any]
+    ):
         """Log agent-to-agent communication"""
         from_agent = self.db.query(Agent).filter(Agent.id == from_step.agent_id).first()
         to_agent = self.db.query(Agent).filter(Agent.id == to_step.agent_id).first()
-        
+
         if not from_agent or not to_agent:
             return
-        
+
         communication = AgentCommunication(
             from_workflow_step_id=from_step.id,
             to_workflow_step_id=to_step.id,
             from_agent_id=from_agent.id,
             to_agent_id=to_agent.id,
             data_transferred=json.dumps(data),
-            cost=from_agent.price_per_communication + to_agent.price_per_communication
+            cost=from_agent.price_per_communication + to_agent.price_per_communication,
         )
         self.db.add(communication)
         self.db.commit()
-    
+
     def _get_peer_agents_for_step(
         self, workflow_steps: list, current_step: WorkflowStep, current_agent: Agent
     ) -> list:
@@ -885,12 +1173,14 @@ END DOCUMENT {i+1}: {doc_name}
             endpoint = (getattr(peer_agent, "api_endpoint", None) or "").strip()
             if not endpoint:
                 continue
-            peer_list.append({
-                "agent_id": peer_agent.id,
-                "name": peer_agent.name or "",
-                "a2a_endpoint": endpoint,
-                "step_order": s.step_order,
-            })
+            peer_list.append(
+                {
+                    "agent_id": peer_agent.id,
+                    "name": peer_agent.name or "",
+                    "a2a_endpoint": endpoint,
+                    "step_order": s.step_order,
+                }
+            )
         return peer_list
 
     def _get_available_mcp_tools(
@@ -927,10 +1217,16 @@ END DOCUMENT {i+1}: {doc_name}
             MCPToolConfig.is_active == True,
         )
         if platform_tool_ids:
-            platform_query = platform_query.filter(MCPToolConfig.id.in_(platform_tool_ids))
+            platform_query = platform_query.filter(
+                MCPToolConfig.id.in_(platform_tool_ids)
+            )
         platform = platform_query.order_by(MCPToolConfig.name).all()
         for t in platform:
-            name = f"platform_{t.id}_{_safe_slug(t.name)}" if _safe_slug(t.name) else f"platform_{t.id}"
+            name = (
+                f"platform_{t.id}_{_safe_slug(t.name)}"
+                if _safe_slug(t.name)
+                else f"platform_{t.id}"
+            )
             desc = TOOL_TYPE_DESC.get(t.tool_type.value, t.tool_type.value)
             entry = {
                 "name": name,
@@ -952,19 +1248,25 @@ END DOCUMENT {i+1}: {doc_name}
             conn_query = conn_query.filter(MCPServerConnection.id.in_(connection_ids))
         conns = conn_query.all()
         for c in conns:
-            tools.append({
-                "name": c.name,
-                "description": f"External MCP server: {c.base_url}",
-                "source": "external",
-                "connection_id": c.id,
-            })
+            tools.append(
+                {
+                    "name": c.name,
+                    "description": f"External MCP server: {c.base_url}",
+                    "source": "external",
+                    "connection_id": c.id,
+                }
+            )
         return tools
 
     async def _call_platform_mcp_tool(
         self, business_id: int, tool_name: str, arguments: Dict[str, Any]
     ) -> str:
         """Invoke a platform MCP tool by name; returns result content as string for tool result message."""
-        base = (getattr(settings, "PLATFORM_MCP_SERVER_URL", None) or "").strip().rstrip("/")
+        base = (
+            (getattr(settings, "PLATFORM_MCP_SERVER_URL", None) or "")
+            .strip()
+            .rstrip("/")
+        )
         if not base:
             return json.dumps({"error": "Platform MCP server not configured"})
         extra_headers = {"X-MCP-Business-Id": str(business_id)}
@@ -986,13 +1288,15 @@ END DOCUMENT {i+1}: {doc_name}
                 texts.append(part.get("text", ""))
         return "\n".join(texts) if texts else json.dumps(result)
 
-    def _log_action(self, entity_type: str, entity_id: int, action: str, details: Dict[str, Any]):
+    def _log_action(
+        self, entity_type: str, entity_id: int, action: str, details: Dict[str, Any]
+    ):
         """Log an action to the audit log"""
         log_entry = AuditLog(
             entity_type=entity_type,
             entity_id=entity_id,
             action=action,
-            details=json.dumps(details)
+            details=json.dumps(details),
         )
         self.db.add(log_entry)
         self.db.commit()

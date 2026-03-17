@@ -5,6 +5,7 @@ from dotenv import load_dotenv
 # Load environment variables from .env file
 load_dotenv()
 
+
 class Settings(BaseSettings):
     """
     Application settings.
@@ -27,27 +28,39 @@ class Settings(BaseSettings):
     ALGORITHM: str = os.getenv("ALGORITHM", "HS256")
 
     # Token expiration time in minutes
-    ACCESS_TOKEN_EXPIRE_MINUTES: int = int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", "30"))
+    ACCESS_TOKEN_EXPIRE_MINUTES: int = int(
+        os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", "30")
+    )
 
     # Commission rate for the platform
-    PLATFORM_COMMISSION_RATE: float = float(os.getenv("PLATFORM_COMMISSION_RATE", "0.10"))
+    PLATFORM_COMMISSION_RATE: float = float(
+        os.getenv("PLATFORM_COMMISSION_RATE", "0.10")
+    )
 
     # External API settings
     EXTERNAL_API_KEY: str = os.getenv("EXTERNAL_API_KEY", "")
     EXTERNAL_TOKEN_EXPIRE_DAYS: int = int(os.getenv("EXTERNAL_TOKEN_EXPIRE_DAYS", "7"))
-    EXTERNAL_API_BASE_URL: str = os.getenv("EXTERNAL_API_BASE_URL", "http://localhost:8000")
+    EXTERNAL_API_BASE_URL: str = os.getenv(
+        "EXTERNAL_API_BASE_URL", "http://localhost:8000"
+    )
 
     # A2A adapter settings
-    A2A_ADAPTER_URL: str = os.getenv("A2A_ADAPTER_URL", "http://a2a-openai-adapter:8080")
+    A2A_ADAPTER_URL: str = os.getenv(
+        "A2A_ADAPTER_URL", "http://a2a-openai-adapter:8080"
+    )
 
     # Platform MCP server settings
-    PLATFORM_MCP_SERVER_URL: str = os.getenv("PLATFORM_MCP_SERVER_URL", "http://platform-mcp-server:8081")
+    PLATFORM_MCP_SERVER_URL: str = os.getenv(
+        "PLATFORM_MCP_SERVER_URL", "http://platform-mcp-server:8081"
+    )
 
     # Internal secret for platform MCP server and backend-to-MCP-server calls
     MCP_INTERNAL_SECRET: str = os.getenv("MCP_INTERNAL_SECRET", "")
 
     # Allow agent endpoints that resolve to private/loopback IPs
-    ALLOW_PRIVATE_AGENT_ENDPOINTS: bool = os.getenv("ALLOW_PRIVATE_AGENT_ENDPOINTS", "false").lower() in ("true", "1", "yes")
+    ALLOW_PRIVATE_AGENT_ENDPOINTS: bool = os.getenv(
+        "ALLOW_PRIVATE_AGENT_ENDPOINTS", "false"
+    ).lower() in ("true", "1", "yes")
 
     class Config:
         """
@@ -55,6 +68,7 @@ class Settings(BaseSettings):
 
         This class is used to specify the environment file to load settings from.
         """
+
         env_file = ".env"
 
 
