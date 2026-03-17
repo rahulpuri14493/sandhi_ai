@@ -1,5 +1,6 @@
 import { Routes, Route } from 'react-router-dom'
 import { Navbar } from './components/Navbar'
+import { ProtectedRoute } from './components/ProtectedRoute'
 import Home from './pages/Home'
 import Login from './pages/Login'
 import Register from './pages/Register'
@@ -26,13 +27,39 @@ function App() {
           <Route path="/marketplace" element={<Marketplace />} />
           <Route path="/mcp" element={<MCP />} />
           <Route path="/marketplace/agent/:id" element={<AgentDetail />} />
-          <Route path="/jobs/new" element={<NewJob />} />
+          
+          {/* Protected Routes */}
+          <Route path="/jobs/new" element={
+            <ProtectedRoute>
+              <NewJob />
+            </ProtectedRoute>
+          } />
           <Route path="/jobs/:id" element={<JobDetail />} />
-          <Route path="/jobs/edit/:id" element={<EditJob />} />
-          <Route path="/dashboard" element={<Dashboard />} />
-          <Route path="/agents/new" element={<NewAgent />} />
-          <Route path="/agents/edit/:id" element={<EditAgent />} />
-          <Route path="/hirings/new" element={<NewHiringPosition />} />
+          <Route path="/jobs/edit/:id" element={
+            <ProtectedRoute>
+              <EditJob />
+            </ProtectedRoute>
+          } />
+          <Route path="/dashboard" element={
+            <ProtectedRoute>
+              <Dashboard />
+            </ProtectedRoute>
+          } />
+          <Route path="/agents/new" element={
+            <ProtectedRoute>
+              <NewAgent />
+            </ProtectedRoute>
+          } />
+          <Route path="/agents/edit/:id" element={
+            <ProtectedRoute>
+              <EditAgent />
+            </ProtectedRoute>
+          } />
+          <Route path="/hirings/new" element={
+            <ProtectedRoute>
+              <NewHiringPosition />
+            </ProtectedRoute>
+          } />
         </Routes>
       </main>
     </div>
