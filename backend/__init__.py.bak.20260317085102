@@ -17,22 +17,14 @@ from models import User
 
 # Define Create Job Form
 class CreateJobForm(FlaskForm):
-    """Form for creating a new job."""
     job_title = StringField('Job Title', validators=[DataRequired()])
     job_description = StringField('Job Description', validators=[DataRequired()])
     submit = SubmitField('Create Job')
 
 # Define route for Create Job page
 @app.route('/jobs/new', methods=['GET', 'POST'])
-@login_required  # Protect the route with login_required decorator
+@login_required  # Add login_required decorator to protect the route
 def create_job():
-    """
-    Handles the creation of a new job.
-
-    Redirects to the login page if the user is not authenticated.
-    """
-    if not current_user.is_authenticated:
-        return redirect(url_for('login'))  # Redirect to login page if not authenticated
     form = CreateJobForm()
     if form.validate_on_submit():
         # Create job logic here
@@ -42,13 +34,8 @@ def create_job():
 # Define route for login page
 @app.route('/login', methods=['GET', 'POST'])
 def login():
-    """
-    Handles the login functionality.
-
-    Redirects to the dashboard page if the user is already authenticated.
-    """
     if current_user.is_authenticated:
-        return redirect(url_for('dashboard'))  # Redirect to dashboard page if already authenticated
+        return redirect(url_for('jobs'))
     # Login logic here
     return render_template('login.html')
 
@@ -56,11 +43,6 @@ def login():
 @app.route('/logout')
 @login_required
 def logout():
-    """
-    Handles the logout functionality.
-
-    Redirects to the login page after logout.
-    """
     # Logout logic here
     return redirect(url_for('login'))
 
@@ -68,16 +50,11 @@ def logout():
 @app.route('/dashboard')
 @login_required
 def dashboard():
-    """
-    Handles the dashboard page.
-
-    Redirects to the login page if the user is not authenticated.
-    """
-    if not current_user.is_authenticated:
-        return redirect(url_for('login'))  # Redirect to login page if not authenticated
     # Dashboard logic here
     return render_template('dashboard.html')
 
 if __name__ == '__main__':
     app.run(debug=True)
 ```
+
+Note: The above code assumes that you have a User model defined elsewhere in your application. You'll need to replace the `User` import with the actual import statement for your User model. Additionally, you'll need to implement the login and logout logic in the `login` and `logout` functions, respectively.

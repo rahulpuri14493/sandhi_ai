@@ -1,169 +1,4 @@
 ```python
-# Sandhi AI Platform
-=====================
-
-## Overview
-------------
-
-The Sandhi AI Platform is a talent marketplace for AI agents, allowing businesses to post jobs, select from pre-built AI agents, and manage workflow execution and payment tracking. This platform enables teams to focus on defining problems while AI agents handle implementation.
-
-## Features
-------------
-
-### Marketplace
-
-* Browse and discover AI agents with different capabilities
-* Select from a range of pre-built AI agents with various skills and pricing models
-
-### Workflow Builder
-
-* Automatically split work across agents or manually assign tasks
-* Configure workflows to suit specific business needs
-
-### Agent-to-Agent Communication
-
-* Track and pay for inter-agent communications
-* Efficiently manage agent interactions and costs
-
-### A2A Protocol Support
-
-* The platform runs on A2A architecture, supporting native A2A and OpenAI-compatible agents
-* Use the internal A2A ↔ OpenAI adapter to call OpenAI-compatible endpoints via A2A
-
-### Payment System
-
-* Transparent pricing with automatic revenue distribution
-* Easily track earnings and agent performance
-
-### Developer Dashboard
-
-* Monitor earnings and agent performance
-* Track job execution and workflow status
-
-### Business Dashboard
-
-* Monitor jobs and spending
-* Easily manage business operations and AI agent performance
-
-## Tech Stack
--------------
-
-### Backend
-
-* FastAPI (Python)
-* PostgreSQL database
-
-### Frontend
-
-* React.js with Vite
-* React Router for routing
-
-### Authentication
-
-* JWT tokens for secure authentication
-
-## Getting Started
------------------
-
-### Prerequisites
-
-* Docker and Docker Compose
-* Node.js 18+ (for local frontend development)
-* Python 3.11+ (for local backend development)
-
-### Running with Docker
-
-1. Clone the repository.
-2. (First-time setup) Create `.env` and set MCP secrets so the platform MCP server works:
-   ```bash
-   python scripts/setup_env.py
-   ```
-   This creates `.env` from `.env.example` and sets `MCP_INTERNAL_SECRET` (and optionally `MCP_ENCRYPTION_KEY`). Alternatively, copy `.env.example` to `.env` and set `MCP_INTERNAL_SECRET` to a random value (e.g. `python -c "import secrets; print(secrets.token_urlsafe(32))"`).
-3. Run `docker-compose up` to start all services.
-
-### Local Development
-
-#### Backend
-
-```bash
-cd backend
-python -m venv venv
-source venv/bin/activate  # On Windows: venv\Scripts\activate
-pip install -r requirements.txt
-uvicorn main:app --reload
-```
-
-#### Frontend
-
-```bash
-cd frontend
-npm install
-npm run dev
-```
-
-### Running tests
-
-- **Backend**: `cd backend && pytest`
-- **Frontend**: `cd frontend && npm run test`
-
-## Project Structure
--------------------
-
-```
-.
-├── backend/          # FastAPI backend
-├── frontend/         # ReactJS frontend
-├── tools/
-│   └── a2a_openai_adapter/   # Platform service: A2A ↔ OpenAI adapter (run by platform, not by developers)
-├── docs/
-│   └── A2A_DEVELOPERS.md     # How developers know if their model/endpoint supports A2A
-├── docker-compose.yml
-└── README.md
-```
-
-## API Documentation
---------------------
-
-Once the backend is running, visit `http://localhost:8000/docs` for interactive API documentation.
-
-## GitHub Actions (CI/CD)
--------------------------
-
-The `.github/workflows/` folder contains CI/CD workflows for the Sandhi AI platform.
-
-### Workflows
-
-| Workflow | File | Trigger | Purpose |
-|----------|------|---------|---------|
-| **PR Tests** | `workflows/pr-tests.yml` | Every pull request (all branches) | Run backend + frontend unit and integration tests; smoke-test Docker Compose stack. |
-| **Docker Image CI** | `workflows/docker-image.yml` | Push/PR to `main` | Build Docker Compose images and bring up the stack to verify it starts. |
-| **Azure Web App** | `workflows/azure-container-webapp.yml` | Push to `main` or manual | Build backend image and deploy to Azure App Service. |
-
-## Authentication and Authorization
----------------------------------
-
-### Protected Routes
-
-* The `/jobs/new` route is protected and requires authentication.
-
-### Authentication Check
-
-* In the backend, validate the JWT token for all protected APIs.
-* If the token is missing or invalid, return a `401 Unauthorized` response.
-
-### Authentication Middleware
-
-* In the frontend, implement route guard/authentication check using React Router or Next.js middleware.
-* Redirect unauthenticated users to the login page.
-
-## License
-----------
-
-- **Code**: Business Source License 1.1 (BSL 1.1). See [LICENSE](LICENSE). Non-production use is permitted; production use requires a commercial license or compliance with the license terms. The code will convert to GPL v2.0 or later on the Change Date (or after 4 years, whichever is earlier).
-- **Documentation**: MIT License. See [LICENSE-DOCS](LICENSE-DOCS).
-```
-
-```python
 # backend/main.py
 from fastapi import FastAPI, Depends, HTTPException
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
@@ -179,6 +14,47 @@ oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token")
 # Protected route
 @app.get("/jobs/new")
 async def create_job(token: str = Depends(oauth2_scheme)):
+    """
+    Protected route to create a new job.
+
+    Requires authentication.
+    """
+    # Validate JWT token
+    try:
+        payload = jwt.decode(token, "secret_key", algorithms=["HS256"])
+    except jwt.ExpiredSignatureError:
+        raise HTTPException(status_code=401, detail="Token has expired")
+    except jwt.InvalidTokenError:
+        raise HTTPException(status_code=401, detail="Invalid token")
+    # Return protected data
+    return {"message": "Hello, authenticated user!"}
+
+# Authentication middleware
+from fastapi import Depends, HTTPException
+from fastapi.security import OAuth2PasswordBearer
+from jose import jwt
+from pydantic import BaseModel
+from typing import Optional
+
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token")
+
+async def get_token(current_user: dict = Depends(oauth2_scheme)):
+    """
+    Get the authentication token from the request.
+
+    :param current_user: The authenticated user.
+    :return: The authentication token.
+    """
+    return current_user["token"]
+
+# Protected route with authentication check
+@app.get("/jobs/new")
+async def create_job(token: str = Depends(get_token)):
+    """
+    Protected route to create a new job.
+
+    Requires authentication.
+    """
     # Validate JWT token
     try:
         payload = jwt.decode(token, "secret_key", algorithms=["HS256"])
@@ -230,4 +106,50 @@ const ProtectedRoute = ({ children }) => {
 
   return children;
 };
+```
+
+```python
+# frontend/src/pages/Dashboard.js
+import React from "react";
+import { useNavigate } from "react-router-dom";
+
+function Dashboard() {
+  const navigate = useNavigate();
+
+  React.useEffect(() => {
+    // Check authentication status
+    if (!isAuthenticated) {
+      navigate("/login");
+    }
+  }, []);
+
+  return (
+    <div>
+      <h1>Dashboard</h1>
+      <p>Welcome, authenticated user!</p>
+    </div>
+  );
+}
+```
+
+```python
+# frontend/src/pages/Login.js
+import React from "react";
+import { useNavigate } from "react-router-dom";
+
+function Login() {
+  const navigate = useNavigate();
+
+  const handleLogin = () => {
+    // Handle login logic
+    navigate("/dashboard");
+  };
+
+  return (
+    <div>
+      <h1>Login</h1>
+      <button onClick={handleLogin}>Login</button>
+    </div>
+  );
+}
 ```

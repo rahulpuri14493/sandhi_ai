@@ -1,6 +1,6 @@
 ```python
 # Import necessary libraries
-from flask import Flask, redirect, url_for, request, render_template
+from flask import Flask, redirect, url_for, request
 from flask_login import LoginManager, UserMixin, login_required, login_user, logout_user
 from flask_session import Session
 
@@ -45,11 +45,8 @@ def logout():
     return redirect(url_for('login'))
 
 @app.route('/jobs/new', methods=['GET', 'POST'])
+@login_required
 def create_job():
-    if request.method == 'GET':
-        # Check if user is authenticated before allowing access
-        if not login_manager.current_user.is_authenticated:
-            return redirect(url_for('login'))  # Redirect to login page if not authenticated
     if request.method == 'POST':
         # Handle form submission
         return 'Job created successfully'
@@ -60,4 +57,4 @@ if __name__ == '__main__':
     app.run(debug=True)
 ```
 
-Note: The `create_job` function now checks if the user is authenticated before allowing access to the page. If the user is not authenticated, it redirects them to the login page. This prevents unauthorized access to the protected `/jobs/new` page.
+Note: The above code is a simplified example to demonstrate the fix. You should replace the `load_user` function with actual database query to load the user from the database. Also, the `login` function should be replaced with actual authentication logic.
