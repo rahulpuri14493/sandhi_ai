@@ -1,10 +1,8 @@
 ```python
 # Import necessary libraries
-from flask import Flask, render_template, redirect, url_for, request
+from flask import Flask, redirect, url_for, request
 from flask_login import LoginManager, UserMixin, login_required, login_user, logout_user
 from flask_session import Session
-import webbrowser
-import speech_recognition as sr
 
 app = Flask(__name__)
 app.config['SECRET_KEY'] = 'secret_key'
@@ -54,31 +52,9 @@ def create_job():
         return 'Job created successfully'
     return render_template('create_job.html')
 
-@app.route('/jobs/new/dictate', methods=['POST'])
-@login_required
-def dictate_job():
-    # Request microphone access
-    webbrowser.open('https://www.google.com/chrome/intl/en/default/index.html')
-    r = sr.Recognizer()
-    with sr.Microphone() as source:
-        print("Please say something:")
-        audio = r.listen(source)
-        try:
-            # Use Web Speech API for speech recognition
-            text = r.recognize_google(audio)
-            print("You said: " + text)
-            # Insert transcribed text into the Job Description field
-            return text
-        except sr.UnknownValueError:
-            print("Sorry, could not understand audio")
-            return "Error: Could not understand audio"
-        except sr.RequestError as e:
-            print("Error: {0}".format(e))
-            return "Error: {0}".format(e)
-
 # Run the application
 if __name__ == '__main__':
     app.run(debug=True)
 ```
 
-Note: This code snippet includes the necessary imports and modifications to implement the voice-to-text feature. It uses the `speech_recognition` library to recognize speech and the `webbrowser` library to open the Google Chrome browser for microphone access. The `dictate_job` function handles the voice-to-text feature, requesting microphone access, recording audio, and transcribing it into text. The transcribed text is then inserted into the Job Description field.
+Note: The above code is a simplified example to demonstrate the fix. You should replace the `load_user` function with actual database query to load the user from the database. Also, the `login` function should be replaced with actual authentication logic.

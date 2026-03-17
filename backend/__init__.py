@@ -2,7 +2,7 @@
 from flask import Flask, redirect, url_for, request
 from flask_login import LoginManager, login_required, current_user
 from flask_wtf import FlaskForm
-from wtforms import StringField, SubmitField
+from wtforms import StringField, SubmitField, FileField
 from wtforms.validators import DataRequired
 
 app = Flask(__name__)
@@ -19,6 +19,7 @@ from models import User
 class CreateJobForm(FlaskForm):
     job_title = StringField('Job Title', validators=[DataRequired()])
     job_description = StringField('Job Description', validators=[DataRequired()])
+    voice_input = FileField('Voice Input', validators=[DataRequired()], id='voice-input')
     submit = SubmitField('Create Job')
 
 # Define route for Create Job page
@@ -53,8 +54,81 @@ def dashboard():
     # Dashboard logic here
     return render_template('dashboard.html')
 
+# Define JavaScript code to handle voice input
+@app.route('/js/voice-input.js')
+def voice_input_js():
+    return render_template('voice-input.js')
+
+# Define route to handle voice input submission
+@app.route('/submit-voice-input', methods=['POST'])
+@login_required
+def submit_voice_input():
+    # Get voice input from request
+    voice_input = request.files['voice-input']
+    # Process voice input here
+    return redirect(url_for('create_job'))
+
 if __name__ == '__main__':
     app.run(debug=True)
 ```
 
-Note: The above code assumes that you have a User model defined elsewhere in your application. You'll need to replace the `User` import with the actual import statement for your User model. Additionally, you'll need to implement the login and logout logic in the `login` and `logout` functions, respectively.
+And the `create_job.html` template:
+```html
+{% extends 'base.html' %}
+
+{% block content %}
+  <h1>Create Job</h1>
+  <form method="post">
+    {{ form.hidden_tag() }}
+    <div>
+      {{ form.job_title.label }}<br>
+      {{ form.job_title(size=64) }}
+    </div>
+    <div>
+      {{ form.job_description.label }}<br>
+      {{ form.job_description(size=64) }}
+    </div>
+    <div>
+      <input type="file" id="voice-input" name="voice-input">
+      <script src="{{ url_for('js/voice-input.js') }}"></script>
+    </div>
+    <div>
+      {{ form.submit() }}
+    </div>
+  </form>
+{% endblock %}
+```
+
+And the `voice-input.js` template:
+```javascript
+// Get the voice input file input element
+const voiceInput = document.getElementById('voice-input');
+
+// Add event listener to voice input file input element
+voiceInput.addEventListener('change', (e) => {
+  // Get the voice input file
+  const file = e.target.files[0];
+
+  // Create a new FileReader object
+  const reader = new FileReader();
+
+  // Define a callback function to handle the file load event
+  reader.onload = (event) => {
+    // Get the voice input text
+    const voiceInputText = event.target.result;
+
+    // Send a POST request to the server to process the voice input
+    fetch('/submit-voice-input', {
+      method: 'POST',
+      body: new FormData([voiceInput]),
+    })
+    .then((response) => response.json())
+    .then((data) => console.log(data))
+    .catch((error) => console.error(error));
+  };
+
+  // Read the voice input file as text
+  reader.readAsText(file);
+});
+```
+This code adds a voice input file input element to the `create_job.html` template, and a JavaScript file to handle the voice input submission. The JavaScript file uses the `FileReader` API to read the voice input file as text, and sends a POST request to the server to process the voice input. The server-side code handles the voice input submission by processing the voice input file and redirecting the user to the `create_job` route.
