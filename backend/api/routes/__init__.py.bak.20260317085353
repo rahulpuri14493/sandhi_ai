@@ -146,23 +146,5 @@ if __name__ == '__main__':
     }
   </script>
   <div id="transcript"></div>
-  <p id="error-message"></p>
-  <script>
-    recognition.onstart = function() {
-      document.getElementById("error-message").innerHTML = "Recording started. Please speak clearly.";
-    };
-    recognition.onnomatch = function() {
-      document.getElementById("error-message").innerHTML = "Sorry, I could not understand what you said.";
-    };
-    recognition.onaudioend = function() {
-      document.getElementById("error-message").innerHTML = "";
-    };
-  </script>
 {% endblock %}
 ```
-
-Changes made:
-- Added error handling for speech recognition service in `voice_to_text.html`.
-- Added a message to display when recording starts in `voice_to_text.html`.
-- Added a message to display when speech recognition fails in `voice_to_text.html`.
-- Added a script to clear the error message when speech recognition service ends in `voice_to_text.html`.

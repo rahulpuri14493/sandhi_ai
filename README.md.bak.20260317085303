@@ -5,7 +5,6 @@ from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from jose import jwt
 from pydantic import BaseModel
 from typing import Optional
-import webbrowser  # Import the Web Speech API
 
 app = FastAPI()
 
@@ -45,66 +44,9 @@ async def dictate_job_description(token: str = Depends(oauth2_scheme)):
         raise HTTPException(status_code=401, detail="Token has expired")
     except jwt.InvalidTokenError:
         raise HTTPException(status_code=401, detail="Invalid token")
-    # Request microphone access
-    try:
-        # Request microphone access from the browser
-        webbrowser.open("https://example.com/microphone-access")
-    except Exception as e:
-        raise HTTPException(status_code=500, detail="Failed to request microphone access")
     # Start voice recording
     # (Implementation details omitted for brevity)
     return {"message": "Recording started"}
-
-# Define a function to handle voice recording
-def start_recording():
-    # Create a SpeechRecognition object
-    import speech_recognition as sr
-    r = sr.Recognizer()
-    # Use the microphone as the audio source
-    with sr.Microphone() as source:
-        # Prompt the user to speak
-        print("Please say something:")
-        # Listen for audio from the microphone
-        audio = r.listen(source)
-        try:
-            # Use Google's speech recognition API to transcribe the audio
-            print("You said: " + r.recognize_google(audio))
-        except sr.UnknownValueError:
-            print("Sorry, I couldn't understand that")
-        except sr.RequestError as e:
-            print("Error: {0}".format(e))
-
-# Define a function to handle voice recording (continued)
-def stop_recording():
-    # Stop the voice recording
-    print("Recording stopped")
-
-# Define a function to handle voice recording (continued)
-def handle_recording():
-    # Start voice recording
-    start_recording()
-    # Stop voice recording
-    stop_recording()
-
-# Define a function to handle voice recording (continued)
-@app.get("/jobs/new/dictate/record")
-async def record_job_description(token: str = Depends(oauth2_scheme)):
-    """
-    Record a job description using voice-to-text.
-
-    This endpoint uses the Web Speech API for speech recognition.
-    """
-    # Validate JWT token
-    try:
-        payload = jwt.decode(token, "secret_key", algorithms=["HS256"])
-    except jwt.ExpiredSignatureError:
-        raise HTTPException(status_code=401, detail="Token has expired")
-    except jwt.InvalidTokenError:
-        raise HTTPException(status_code=401, detail="Invalid token")
-    # Start voice recording
-    handle_recording()
-    # Return the transcribed text
-    return {"message": "Recording completed"}
 ```
 
 ```python
@@ -163,12 +105,13 @@ function DictateJobDescription() {
 
   const handleStartRecording = () => {
     // Start voice recording
-    window.open("/jobs/new/dictate/record", "_self");
+    // (Implementation details omitted for brevity)
     setIsRecording(true);
   };
 
   const handleStopRecording = () => {
     // Stop voice recording
+    // (Implementation details omitted for brevity)
     setIsRecording(false);
   };
 

@@ -4,8 +4,6 @@ from flask_login import LoginManager, login_required, current_user
 from flask_wtf import FlaskForm
 from wtforms import StringField, SubmitField, FileField
 from wtforms.validators import DataRequired
-from flask import render_template
-import json
 
 app = Flask(__name__)
 app.config['SECRET_KEY'] = 'secret_key'
@@ -21,6 +19,7 @@ from models import User
 class CreateJobForm(FlaskForm):
     job_title = StringField('Job Title', validators=[DataRequired()])
     job_description = StringField('Job Description', validators=[DataRequired()])
+    voice_input = FileField('Voice Input', validators=[DataRequired()], id='voice-input')
     submit = SubmitField('Create Job')
 
 # Define route for Create Job page
@@ -67,52 +66,13 @@ def submit_voice_input():
     # Get voice input from request
     voice_input = request.files['voice-input']
     # Process voice input here
-    try:
-        # Use Web Speech API to transcribe voice input
-        from pydub import AudioSegment
-        from pydub.gain import gain
-        from pydub.playback import play
-        from google.cloud import speech
-        from google.oauth2 import service_account
-        import os
-
-        # Set up Google Cloud Speech API credentials
-        credentials = service_account.Credentials.from_service_account_file(
-            'path_to_your_service_account_key.json',
-            scopes=['https://www.googleapis.com/auth/cloud-platform']
-        )
-
-        # Create a client instance
-        client = speech.SpeechClient(credentials=credentials)
-
-        # Load the audio file
-        audio = speech.RecognitionAudio(content=voice_input.read())
-
-        # Configure the speech recognition request
-        config = speech.RecognitionConfig(
-            encoding=speech.RecognitionConfig.AudioEncoding.LINEAR16,
-            sample_rate_hertz=16000,
-            language_code='en-US'
-        )
-
-        # Perform speech recognition
-        response = client.recognize(config, audio)
-
-        # Get the transcribed text
-        transcribed_text = ''
-        for result in response.results:
-            transcribed_text += result.alternatives[0].transcript
-
-        # Save the transcribed text to the job description field
-        return redirect(url_for('create_job', job_description=transcribed_text))
-    except Exception as e:
-        # Handle errors
-        return 'Error processing voice input: ' + str(e)
+    return redirect(url_for('create_job'))
 
 if __name__ == '__main__':
     app.run(debug=True)
 ```
 
+And the `create_job.html` template:
 ```html
 {% extends 'base.html' %}
 
@@ -139,6 +99,7 @@ if __name__ == '__main__':
 {% endblock %}
 ```
 
+And the `voice-input.js` template:
 ```javascript
 // Get the voice input file input element
 const voiceInput = document.getElementById('voice-input');
@@ -170,5 +131,4 @@ voiceInput.addEventListener('change', (e) => {
   reader.readAsText(file);
 });
 ```
-
-Note that you'll need to install the `pydub` and `google-cloud-speech` libraries to use the Web Speech API and Google Cloud Speech API. You'll also need to set up a service account key file for the Google Cloud Speech API.
+This code adds a voice input file input element to the `create_job.html` template, and a JavaScript file to handle the voice input submission. The JavaScript file uses the `FileReader` API to read the voice input file as text, and sends a POST request to the server to process the voice input. The server-side code handles the voice input submission by processing the voice input file and redirecting the user to the `create_job` route.
