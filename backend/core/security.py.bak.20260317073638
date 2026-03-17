@@ -9,7 +9,7 @@ from fastapi import Depends, HTTPException, status
 from fastapi.security import OAuth2PasswordBearer
 from sqlalchemy.orm import Session
 from db.database import get_db
-from models.user import User, UserRole
+from models.user import User
 
 load_dotenv()
 logger = logging.getLogger(__name__)
@@ -19,34 +19,24 @@ ALGORITHM = os.getenv("ALGORITHM", "HS256")
 ACCESS_TOKEN_EXPIRE_MINUTES = int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", "30"))
 
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="api/auth/login")
+# Optional auth: do not raise 401 when token is missing (for public endpoints)
 oauth2_scheme_optional = OAuth2PasswordBearer(tokenUrl="api/auth/login", auto_error=False)
 
 
 def verify_password(plain_password: str, hashed_password: str) -> bool:
-    """
-    Verify password using bcrypt directly.
-
-    Args:
-        plain_password (str): Plain password to verify.
-        hashed_password (str): Hashed password to verify against.
-
-    Returns:
-        bool: True if password is valid, False otherwise.
-    """
+    """Verify password using bcrypt directly"""
     try:
-        # Ensure password and hashed password are bytes
         password_bytes = plain_password.encode('utf-8') if isinstance(plain_password, str) else plain_password
         hashed_bytes = hashed_password.encode('utf-8') if isinstance(hashed_password, str) else hashed_password
         
-        # Check if hash starts with bcrypt identifier
-        if not hashed_bytes.startswith(b'$2'):
-            logger.warning("Password hash doesn't appear to be bcrypt format: %s...", hashed_bytes[:20])
+        # Check if hash starts with bcrypt identifier ($2a$, $2b$, $2x$, $2y$)
+        if not hashed_password.startswith('$2'):
+            logger.warning("Password hash doesn't appear to be bcrypt format: %s...", hashed_password[:20])
             return False
         
-        # Verify password
         result = bcrypt.checkpw(password_bytes, hashed_bytes)
         if not result:
-            logger.debug("Password verification failed for hash: %s...", hashed_bytes[:20])
+            logger.debug("Password verification failed for hash: %s...", hashed_password[:20])
         return result
     except Exception as e:
         logger.exception("Password verification error: %s", e)
@@ -54,15 +44,7 @@ def verify_password(plain_password: str, hashed_password: str) -> bool:
 
 
 def get_password_hash(password: str) -> str:
-    """
-    Hash password using bcrypt directly.
-
-    Args:
-        password (str): Password to hash.
-
-    Returns:
-        str: Hashed password.
-    """
+    """Hash password using bcrypt directly"""
     password_bytes = password.encode('utf-8') if isinstance(password, str) else password
     if len(password_bytes) > 72:
         password_bytes = password_bytes[:72]
@@ -71,17 +53,7 @@ def get_password_hash(password: str) -> str:
     return hashed.decode('utf-8')
 
 
-def create_access_token(data: dict, expires_delta: Optional[timedelta] = None) -> str:
-    """
-    Create access token.
-
-    Args:
-        data (dict): Data to encode in token.
-        expires_delta (Optional[timedelta]): Expiration delta. Defaults to None.
-
-    Returns:
-        str: Encoded JWT token.
-    """
+def create_access_token(data: dict, expires_delta: Optional[timedelta] = None):
     to_encode = data.copy()
     # Ensure 'sub' (subject) is a string as required by JWT spec
     if 'sub' in to_encode:
@@ -96,19 +68,6 @@ def create_access_token(data: dict, expires_delta: Optional[timedelta] = None) -
 
 
 def get_current_user(token: str = Depends(oauth2_scheme), db: Session = Depends(get_db)) -> User:
-    """
-    Get current user.
-
-    Args:
-        token (str): JWT token. Defaults to Depends(oauth2_scheme).
-        db (Session): Database session. Defaults to Depends(get_db).
-
-    Returns:
-        User: Current user.
-
-    Raises:
-        HTTPException: If token is invalid or missing.
-    """
     credentials_exception = HTTPException(
         status_code=status.HTTP_401_UNAUTHORIZED,
         detail="Could not validate credentials",
@@ -162,16 +121,7 @@ def get_current_user_optional(
     token: Optional[str] = Depends(oauth2_scheme_optional),
     db: Session = Depends(get_db),
 ) -> Optional[User]:
-    """
-    Get current user if valid JWT is present; otherwise return None.
-
-    Args:
-        token (Optional[str]): JWT token. Defaults to Depends(oauth2_scheme_optional).
-        db (Session): Database session. Defaults to Depends(get_db).
-
-    Returns:
-        Optional[User]: Current user if valid JWT is present; otherwise None.
-    """
+    """Return current user if valid JWT is present; otherwise return None. Never raises 401."""
     if not token:
         return None
     try:
@@ -187,18 +137,7 @@ def get_current_user_optional(
 
 
 def get_current_business_user(current_user: User = Depends(get_current_user)) -> User:
-    """
-    Get current business user.
-
-    Args:
-        current_user (User): Current user. Defaults to Depends(get_current_user).
-
-    Returns:
-        User: Current business user.
-
-    Raises:
-        HTTPException: If current user is not a business user.
-    """
+    from models.user import UserRole
     if current_user.role != UserRole.BUSINESS:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
@@ -208,18 +147,7 @@ def get_current_business_user(current_user: User = Depends(get_current_user)) ->
 
 
 def get_current_developer_user(current_user: User = Depends(get_current_user)) -> User:
-    """
-    Get current developer user.
-
-    Args:
-        current_user (User): Current user. Defaults to Depends(get_current_user).
-
-    Returns:
-        User: Current developer user.
-
-    Raises:
-        HTTPException: If current user is not a developer user.
-    """
+    from models.user import UserRole
     if current_user.role != UserRole.DEVELOPER:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
