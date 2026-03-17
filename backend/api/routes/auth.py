@@ -14,11 +14,25 @@ from core.security import (
 )
 
 logger = logging.getLogger(__name__)
+
 router = APIRouter(prefix="/api/auth", tags=["auth"])
 
 
 @router.post("/register", response_model=UserResponse, status_code=status.HTTP_201_CREATED)
-def register(user_data: UserCreate, db: Session = Depends(get_db)):
+def register(
+    user_data: UserCreate, 
+    db: Session = Depends(get_db)
+) -> UserResponse:
+    """
+    Register a new user.
+
+    Args:
+    - user_data (UserCreate): User data to register.
+    - db (Session): Database session.
+
+    Returns:
+    - UserResponse: Registered user data.
+    """
     # Check if user already exists
     existing_user = db.query(User).filter(User.email == user_data.email).first()
     if existing_user:
@@ -41,38 +55,75 @@ def register(user_data: UserCreate, db: Session = Depends(get_db)):
 
 
 @router.post("/login", response_model=Token)
-def login(user_data: UserLogin, db: Session = Depends(get_db)):
-    user = db.query(User).filter(User.email == user_data.email).first()
-    if not user:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Incorrect email or password",
-            headers={"WWW-Authenticate": "Bearer"},
+def login(
+    user_data: UserLogin, 
+    db: Session = Depends(get_db)
+) -> dict:
+    """
+    Login an existing user.
+
+    Args:
+    - user_data (UserLogin): User data to login.
+    - db (Session): Database session.
+
+    Returns:
+    - dict: Login token.
+    """
+    try:
+        user = db.query(User).filter(User.email == user_data.email).first()
+        if not user:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Incorrect email or password",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+        
+        if not verify_password(user_data.password, user.password_hash):
+            logger.warning("Password verification failed for user: %s", user.email)
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Incorrect email or password",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+        
+        access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+        access_token = create_access_token(
+            data={"sub": user.id}, expires_delta=access_token_expires
         )
-    
-    if not verify_password(user_data.password, user.password_hash):
-        logger.warning("Password verification failed for user: %s", user.email)
+        return {"access_token": access_token, "token_type": "bearer"}
+    except Exception as e:
+        logger.error(f"An error occurred during login: {str(e)}")
         raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Incorrect email or password",
-            headers={"WWW-Authenticate": "Bearer"},
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Internal Server Error"
         )
-    
-    access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
-    access_token = create_access_token(
-        data={"sub": user.id}, expires_delta=access_token_expires
-    )
-    return {"access_token": access_token, "token_type": "bearer"}
 
 
 @router.get("/me", response_model=UserResponse)
-def get_current_user_info(current_user: User = Depends(get_current_user)):
+def get_current_user_info(current_user: User = Depends(get_current_user)) -> UserResponse:
+    """
+    Get current user info.
+
+    Args:
+    - current_user (User): Current user.
+
+    Returns:
+    - UserResponse: Current user data.
+    """
     return current_user
 
 
 @router.get("/debug/token")
-def debug_token(request: Request):
-    """Debug endpoint to check token extraction"""
+def debug_token(request: Request) -> dict:
+    """
+    Debug endpoint to check token extraction.
+
+    Args:
+    - request (Request): Request object.
+
+    Returns:
+    - dict: Debug information.
+    """
     auth_header = request.headers.get("Authorization")
     if not auth_header:
         return {"error": "No Authorization header"}
