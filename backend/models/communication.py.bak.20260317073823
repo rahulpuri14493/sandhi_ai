@@ -5,10 +5,6 @@ from db.database import Base
 
 
 class AgentCommunication(Base):
-    """
-    Represents a communication between two workflow steps or agents.
-    """
-
     __tablename__ = "agent_communications"
 
     id = Column(Integer, primary_key=True, index=True)
@@ -21,27 +17,7 @@ class AgentCommunication(Base):
     timestamp = Column(DateTime, default=datetime.utcnow)
 
     # Relationships
-    from_step = relationship(
-        "WorkflowStep",
-        foreign_keys=[from_workflow_step_id],
-        back_populates="communications_from",
-        lazy="joined"
-    )
-    to_step = relationship(
-        "WorkflowStep",
-        foreign_keys=[to_workflow_step_id],
-        back_populates="communications_to",
-        lazy="joined"
-    )
-    from_agent = relationship(
-        "Agent",
-        foreign_keys=[from_agent_id],
-        back_populates="communications_from",
-        lazy="joined"
-    )
-    to_agent = relationship(
-        "Agent",
-        foreign_keys=[to_agent_id],
-        back_populates="communications_to",
-        lazy="joined"
-    )
+    from_step = relationship("WorkflowStep", foreign_keys=[from_workflow_step_id], back_populates="communications_from")
+    to_step = relationship("WorkflowStep", foreign_keys=[to_workflow_step_id], back_populates="communications_to")
+    from_agent = relationship("Agent", foreign_keys=[from_agent_id], back_populates="communications_from")
+    to_agent = relationship("Agent", foreign_keys=[to_agent_id], back_populates="communications_to")
