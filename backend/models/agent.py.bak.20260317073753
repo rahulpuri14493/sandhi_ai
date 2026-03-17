@@ -6,21 +6,18 @@ from db.database import Base
 
 
 class AgentStatus(str, enum.Enum):
-    """Agent status enumeration."""
     ACTIVE = "active"
     INACTIVE = "inactive"
     PENDING = "pending"
 
 
 class PricingModel(str, enum.Enum):
-    """Pricing model enumeration."""
     PAY_PER_USE = "pay_per_use"  # Price per task/communication
     MONTHLY = "monthly"  # Monthly subscription
     QUARTERLY = "quarterly"  # Quarterly subscription
 
 
 class Agent(Base):
-    """Agent model."""
     __tablename__ = "agents"
 
     id = Column(Integer, primary_key=True, index=True)
@@ -52,39 +49,3 @@ class Agent(Base):
     workflow_steps = relationship("WorkflowStep", back_populates="agent")
     communications_from = relationship("AgentCommunication", foreign_keys="AgentCommunication.from_agent_id", back_populates="from_agent")
     communications_to = relationship("AgentCommunication", foreign_keys="AgentCommunication.to_agent_id", back_populates="to_agent")
-
-    def __repr__(self) -> str:
-        """Return a string representation of the agent."""
-        return f"Agent(id={self.id}, name='{self.name}')"
-```
-
-```python
-from typing import List
-
-class AgentService:
-    """Agent service class."""
-
-    def get_agent(self, agent_id: int) -> Agent:
-        """Get an agent by ID."""
-        # TO DO: implement database query to retrieve agent
-        pass
-
-    def get_agents(self) -> List[Agent]:
-        """Get all agents."""
-        # TO DO: implement database query to retrieve agents
-        pass
-
-    def create_agent(self, name: str, description: str, pricing_model: PricingModel, price_per_task: float, price_per_communication: float) -> Agent:
-        """Create a new agent."""
-        # TO DO: implement database query to create agent
-        pass
-
-    def update_agent(self, agent_id: int, name: str, description: str) -> Agent:
-        """Update an existing agent."""
-        # TO DO: implement database query to update agent
-        pass
-
-    def delete_agent(self, agent_id: int) -> None:
-        """Delete an agent."""
-        # TO DO: implement database query to delete agent
-        pass
