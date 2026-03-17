@@ -20,15 +20,7 @@ router = APIRouter(prefix="/api/internal/mcp", tags=["mcp-internal"])
 MCP_SECRET_HEADER = "x-internal-secret"
 
 
-def _verify_internal_secret(
-    x_internal_secret: Optional[str] = Header(None, alias=MCP_SECRET_HEADER),
-) -> str:
-    """
-    Verify the internal secret header.
-
-    Raises:
-        HTTPException: If the internal secret is not configured or invalid.
-    """
+def _verify_internal_secret(x_internal_secret: Optional[str] = Header(None, alias=MCP_SECRET_HEADER)):
     if not settings.MCP_INTERNAL_SECRET:
         raise HTTPException(status_code=503, detail="MCP internal API not configured")
     if x_internal_secret != settings.MCP_INTERNAL_SECRET:
@@ -37,12 +29,6 @@ def _verify_internal_secret(
 
 
 class ToolConfigRequest(BaseModel):
-    """
-    Request model for tool config.
-
-    Attributes:
-        business_id (int): The ID of the business.
-    """
     business_id: int
 
 
@@ -51,14 +37,11 @@ def internal_list_tools(
     business_id: int,
     _: str = Depends(_verify_internal_secret),
     db: Session = Depends(get_db),
-) -> dict:
+):
     """
     List platform MCP tools for a business (tenant).
-
-    Returns:
-        dict: A dictionary containing the list of tools.
+    Returns tool id, name, type, and inputSchema for MCP tools/list.
     """
-    # Filter active tools belonging to the business
     rows = db.query(MCPToolConfig).filter(
         MCPToolConfig.user_id == business_id,
         MCPToolConfig.is_active == True,
@@ -82,33 +65,13 @@ def internal_list_tools(
 
 
 def _tool_name(tool_id: int, name: str) -> str:
-    """
-    Generate a stable tool name for MCP.
-
-    Args:
-        tool_id (int): The ID of the tool.
-        name (str): The name of the tool.
-
-    Returns:
-        str: The stable tool name.
-    """
-    # Remove non-alphanumeric characters and truncate to 50 characters
+    """Stable tool name for MCP (platform prefix + id to avoid collisions)."""
     safe = "".join(c if c.isalnum() or c in "_-" else "_" for c in name.strip())[:50]
     return f"platform_{tool_id}_{safe}" if safe else f"platform_{tool_id}"
 
 
 def _description_for_type(tool_type: MCPToolType, name: str) -> str:
-    """
-    Generate a description for the tool type.
-
-    Args:
-        tool_type (MCPToolType): The type of the tool.
-        name (str): The name of the tool.
-
-    Returns:
-        str: The description of the tool.
-    """
-    descriptions = {
+    d = {
         MCPToolType.VECTOR_DB: "Query vector database",
         MCPToolType.PINECONE: "Query Pinecone vector index",
         MCPToolType.WEAVIATE: "Query Weaviate vector store",
@@ -125,74 +88,31 @@ def _description_for_type(tool_type: MCPToolType, name: str) -> str:
         MCPToolType.NOTION: "Query or search Notion workspace",
         MCPToolType.REST_API: "Call external REST API",
     }
-    return f"{descriptions.get(tool_type, tool_type.value)}: {name}"
+    return f"{d.get(tool_type, tool_type.value)}: {name}"
 
 
 def _input_schema_for_type(tool_type: MCPToolType) -> dict:
-    """
-    Generate the input schema for the tool type.
-
-    Args:
-        tool_type (MCPToolType): The type of the tool.
-
-    Returns:
-        dict: The input schema for the tool type.
-    """
+    vector_schema = {
+        "type": "object",
+        "properties": {
+            "query": {"type": "string", "description": "Search query or embedding query"},
+            "top_k": {"type": "integer", "description": "Max results", "default": 5},
+        },
+        "required": ["query"],
+    }
+    sql_schema = {
+        "type": "object",
+        "properties": {"query": {"type": "string", "description": "SQL SELECT query (read-only)"}},
+        "required": ["query"],
+    }
     schemas = {
-        MCPToolType.VECTOR_DB: {
-            "type": "object",
-            "properties": {
-                "query": {"type": "string", "description": "Search query or embedding query"},
-                "top_k": {"type": "integer", "description": "Max results", "default": 5},
-            },
-            "required": ["query"],
-        },
-        MCPToolType.PINECONE: {
-            "type": "object",
-            "properties": {
-                "query": {"type": "string", "description": "Search query or embedding query"},
-                "top_k": {"type": "integer", "description": "Max results", "default": 5},
-            },
-            "required": ["query"],
-        },
-        MCPToolType.WEAVIATE: {
-            "type": "object",
-            "properties": {
-                "query": {"type": "string", "description": "Search query or embedding query"},
-                "top_k": {"type": "integer", "description": "Max results", "default": 5},
-            },
-            "required": ["query"],
-        },
-        MCPToolType.QDRANT: {
-            "type": "object",
-            "properties": {
-                "query": {"type": "string", "description": "Search query or embedding query"},
-                "top_k": {"type": "integer", "description": "Max results", "default": 5},
-            },
-            "required": ["query"],
-        },
-        MCPToolType.CHROMA: {
-            "type": "object",
-            "properties": {
-                "query": {"type": "string", "description": "Search query or embedding query"},
-                "top_k": {"type": "integer", "description": "Max results", "default": 5},
-            },
-            "required": ["query"],
-        },
-        MCPToolType.POSTGRES: {
-            "type": "object",
-            "properties": {
-                "query": {"type": "string", "description": "SQL SELECT query (read-only)"},
-            },
-            "required": ["query"],
-        },
-        MCPToolType.MYSQL: {
-            "type": "object",
-            "properties": {
-                "query": {"type": "string", "description": "SQL SELECT query (read-only)"},
-            },
-            "required": ["query"],
-        },
+        MCPToolType.VECTOR_DB: vector_schema,
+        MCPToolType.PINECONE: vector_schema,
+        MCPToolType.WEAVIATE: vector_schema,
+        MCPToolType.QDRANT: vector_schema,
+        MCPToolType.CHROMA: vector_schema,
+        MCPToolType.POSTGRES: sql_schema,
+        MCPToolType.MYSQL: sql_schema,
         MCPToolType.ELASTICSEARCH: {
             "type": "object",
             "properties": {
@@ -239,4 +159,61 @@ def _input_schema_for_type(tool_type: MCPToolType) -> dict:
             "type": "object",
             "properties": {
                 "repo": {"type": "string", "description": "owner/repo"},
-                "path":
+                "path": {"type": "string", "description": "File path or 'issues'"},
+                "action": {"type": "string", "enum": ["get_file", "list_issues", "search"], "default": "get_file"},
+            },
+        },
+        MCPToolType.NOTION: {
+            "type": "object",
+            "properties": {
+                "action": {"type": "string", "enum": ["search", "get_page", "get_database"], "default": "search"},
+                "query": {"type": "string", "description": "Search query or page/database ID"},
+            },
+        },
+        MCPToolType.REST_API: {
+            "type": "object",
+            "properties": {
+                "method": {"type": "string", "enum": ["GET", "POST", "PUT", "PATCH", "DELETE"], "default": "GET"},
+                "path": {"type": "string", "description": "Path or full URL"},
+                "body": {"type": "object", "description": "JSON body for POST/PUT/PATCH"},
+            },
+            "required": ["path"],
+        },
+    }
+    return schemas.get(tool_type, {"type": "object", "properties": {}})
+
+
+@router.post("/tools/{tool_id}/config")
+def internal_get_tool_config(
+    tool_id: int,
+    body: ToolConfigRequest,
+    _: str = Depends(_verify_internal_secret),
+    db: Session = Depends(get_db),
+):
+    """
+    Return decrypted config for a platform tool. Caller (platform MCP server) must
+    use this to execute the tool. Only tools belonging to business_id are allowed.
+    """
+    t = db.query(MCPToolConfig).filter(
+        MCPToolConfig.id == tool_id,
+        MCPToolConfig.user_id == body.business_id,
+        MCPToolConfig.is_active == True,
+    ).first()
+    if not t:
+        raise HTTPException(status_code=404, detail="Tool not found or access denied")
+    config = decrypt_json(t.encrypted_config)
+    # Observability: log tool config fetch (tool invocation path)
+    log_entry = AuditLog(
+        entity_type="mcp",
+        entity_id=t.id,
+        action="tool_config_fetched",
+        details=json.dumps({"business_id": body.business_id, "tool_type": t.tool_type.value}),
+    )
+    db.add(log_entry)
+    db.commit()
+    return {
+        "tool_id": t.id,
+        "tool_type": t.tool_type.value,
+        "name": t.name,
+        "config": config,
+    }
