@@ -133,6 +133,13 @@ Builds the **backend** image (from `backend/Dockerfile`), pushes to GitHub Conta
 
 If you see **"connection to server at localhost (127.0.0.1), port 5432 failed: Connection refused"** in the log stream, add the database URL in App settings or Connection strings and restart the app.
 
+**Container timeout / URL not working:** If the instance shows "Blocked" with "ContainerTimeout" (container did not start within 230s):
+
+1. **Check container logs:** In the Web App go to **Monitoring → Log stream** (or **Deployment → Deployment Center → Logs**). Look for Python tracebacks or "Connection refused" / "timeout" to the database.
+2. **Database URL:** Ensure `DATABASE_URL` (or Connection string `DefaultConnection`) is set and correct. For **Azure Database for PostgreSQL**, the URL often needs SSL: append `?sslmode=require` to the URL (e.g. `postgresql://user:pass@host:5432/db?sslmode=require`).
+3. **Firewall:** In Azure PostgreSQL server → **Networking**, allow "Azure services" (or add the Web App's outbound IPs) so the app can reach the database.
+4. **Port:** Ensure **App settings** has `WEBSITES_PORT` = `8000` so Azure routes traffic to your container.
+
 ### Environment and configuration
 
 - **PR Tests / Docker CI:** `.env` is created in the job with `POSTGRES_*`, `SECRET_KEY`, and `POSTGRES_DB` so Compose and backend can start. Backend pytest uses in-memory SQLite and does not need PostgreSQL or `A2A_ADAPTER_URL`.

@@ -21,7 +21,12 @@ if os.getenv("WEBSITES_SITE_NAME") and ("localhost" in DATABASE_URL or "127.0.0.
         "or Connection strings (name 'DefaultConnection', type PostgreSQL). It cannot be localhost."
     )
 
-engine = create_engine(DATABASE_URL)
+# Prefer connection timeout and SSL for cloud Postgres (e.g. Azure) to fail fast instead of hanging
+_connect_args = {"connect_timeout": 10}
+if "postgres.database.azure.com" in DATABASE_URL or "?sslmode=" in DATABASE_URL:
+    if "sslmode=" not in DATABASE_URL:
+        _connect_args["sslmode"] = "require"
+engine = create_engine(DATABASE_URL, connect_args=_connect_args)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
 Base = declarative_base()
