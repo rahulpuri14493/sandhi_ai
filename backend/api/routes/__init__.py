@@ -11,6 +11,7 @@ from pydub.utils import make_chunks
 import speech_recognition as sr
 import webbrowser
 import os
+import requests
 
 # Initialize Flask application
 app = Flask(__name__)
@@ -91,6 +92,33 @@ def voice_to_text():
                 return 'Sorry, I could not request results from the service; {0}'.format(e)
     return render_template('voice_to_text.html')
 
+# Define route for AI-powered job description enhancement
+@app.route('/jobs/new/enhance', methods=['GET', 'POST'])
+@login_required  # Protect the route with login_required decorator
+def enhance_job_description():
+    if request.method == 'POST':
+        job_description = request.form['job_description']
+        # Send job description to AI API for enhancement
+        api_url = 'https://api.example.com/enhance-job-description'
+        headers = {'Content-Type': 'application/json'}
+        data = {'job_description': job_description}
+        response = requests.post(api_url, headers=headers, json=data)
+        if response.status_code == 200:
+            enhanced_description = response.json()['enhanced_description']
+            return render_template('enhance_job_description.html', original_description=job_description, enhanced_description=enhanced_description)
+    return render_template('enhance_job_description.html')
+
+# Define route for previewing enhanced job description
+@app.route('/jobs/new/enhance/preview', methods=['GET', 'POST'])
+@login_required  # Protect the route with login_required decorator
+def preview_enhanced_job_description():
+    if request.method == 'POST':
+        original_description = request.form['original_description']
+        enhanced_description = request.form['enhanced_description']
+        # Save enhanced description to database
+        return redirect(url_for('index'))
+    return render_template('preview_enhanced_job_description.html')
+
 if __name__ == '__main__':
     app.run(debug=True)
 ```
@@ -107,44 +135,87 @@ if __name__ == '__main__':
       {{ form.job_description.label }}<br>
       {{ form.job_description(size=64) }}
     </p>
-    <p>{{ form.submit() }}</p>
+    <p>
+      <button type="submit">Submit</button>
+      <button type="button" onclick="openEnhanceModal()">Enhance with AI</button>
+    </p>
   </form>
+  <div id="enhance-modal" style="display: none;">
+    <h2>Enhance Job Description</h2>
+    <p>Original Description:</p>
+    <p id="original-description"></p>
+    <p>Enhanced Description:</p>
+    <p id="enhanced-description"></p>
+    <button type="button" onclick="saveEnhancedDescription()">Apply</button>
+    <button type="button" onclick="closeEnhanceModal()">Cancel</button>
+  </div>
+
+  <script>
+    function openEnhanceModal() {
+      document.getElementById("enhance-modal").style.display = "block";
+    }
+
+    function closeEnhanceModal() {
+      document.getElementById("enhance-modal").style.display = "none";
+    }
+
+    function saveEnhancedDescription() {
+      var originalDescription = document.getElementById("original-description").innerHTML;
+      var enhancedDescription = document.getElementById("enhanced-description").innerHTML;
+      document.getElementById("original-description").innerHTML = enhancedDescription;
+      document.getElementById("enhanced-description").innerHTML = originalDescription;
+      document.getElementById("enhance-modal").style.display = "none";
+    }
+  </script>
 {% endblock %}
 ```
 
 ```html
-<!-- voice_to_text.html -->
+<!-- enhance_job_description.html -->
 {% extends "base.html" %}
 
 {% block content %}
-  <h1>Dictate your job description</h1>
-  <button onclick="startRecording()">Start Recording</button>
-  <button onclick="stopRecording()">Stop Recording</button>
+  <h1>Enhance Job Description</h1>
+  <p>Original Description:</p>
+  <p id="original-description"></p>
+  <p>Enhanced Description:</p>
+  <p id="enhanced-description"></p>
+  <button type="button" onclick="saveEnhancedDescription()">Apply</button>
+  <button type="button" onclick="closeEnhanceModal()">Cancel</button>
+
   <script>
-    let recognition = new webkitSpeechRecognition();
-    recognition.continuous = true;
-    recognition.interimResults = true;
-    recognition.lang = "en-US";
-    recognition.maxResults = 10;
-    recognition.onresult = function(event) {
-      let transcript = event.results[0][0].transcript;
-      document.getElementById("transcript").innerHTML = transcript;
-    };
-    recognition.onerror = function(event) {
-      console.log("Error occurred in recognition: " + event.error);
-    };
-    recognition.onend = function() {
-      console.log("Speech recognition service ended");
-    };
-
-    function startRecording() {
-      recognition.start();
-    }
-
-    function stopRecording() {
-      recognition.stop();
+    function saveEnhancedDescription() {
+      var originalDescription = document.getElementById("original-description").innerHTML;
+      var enhancedDescription = document.getElementById("enhanced-description").innerHTML;
+      document.getElementById("original-description").innerHTML = enhancedDescription;
+      document.getElementById("enhanced-description").innerHTML = originalDescription;
+      window.location.href = "/jobs/new/enhance/preview";
     }
   </script>
-  <div id="transcript"></div>
+{% endblock %}
+```
+
+```html
+<!-- preview_enhanced_job_description.html -->
+{% extends "base.html" %}
+
+{% block content %}
+  <h1>Preview Enhanced Job Description</h1>
+  <p>Original Description:</p>
+  <p id="original-description"></p>
+  <p>Enhanced Description:</p>
+  <p id="enhanced-description"></p>
+  <button type="button" onclick="saveEnhancedDescription()">Apply</button>
+  <button type="button" onclick="closeEnhanceModal()">Cancel</button>
+
+  <script>
+    function saveEnhancedDescription() {
+      var originalDescription = document.getElementById("original-description").innerHTML;
+      var enhancedDescription = document.getElementById("enhanced-description").innerHTML;
+      document.getElementById("original-description").innerHTML = enhancedDescription;
+      document.getElementById("enhanced-description").innerHTML = originalDescription;
+      window.location.href = "/jobs/new";
+    }
+  </script>
 {% endblock %}
 ```

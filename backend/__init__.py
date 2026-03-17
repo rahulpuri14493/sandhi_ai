@@ -66,13 +66,41 @@ def submit_voice_input():
     # Get voice input from request
     voice_input = request.files['voice-input']
     # Process voice input here
-    return redirect(url_for('create_job'))
+    # Integrate AI Icon for Job Description Grammar Correction & Prompt Recreation
+    # AI icon button adjacent to job description text area
+    # Tooltip: “Enhance with AI”
+    # Clicking the icon triggers AI processing and shows a loading spinner
+    # Results appear in a preview modal with:
+    # - Original description (left side).
+    # - AI-enhanced description (right side).
+    # Include Apply and Cancel buttons for user confirmation
+    # AI agent should:
+    # - Fix grammar, spelling, and sentence structure.
+    # - Improve clarity and professionalism.
+    # - Reframe vague prompts into actionable instructions.
+    # Original text remains unchanged until user confirms
+    # Must work seamlessly with existing document upload functionality
+    # Secure API calls with authentication
+    # Handle edge cases:
+    # - Empty description
+    # - Very short text
+    # - Non-English input
+    # Test with short, medium, and long job descriptions
+    # Test with grammatically incorrect text, vague prompts, and multilingual input
+    # Verify AI suggestions improve clarity without losing meaning
+    # Confirm canceling preserves the original description
+    # Ensure accessibility (keyboard navigation, screen reader compatibility)
+    # Endpoint should return:
+    # - corrected_text → grammar-fixed version.
+    # - recreated_prompts → refined instructions.
+    # AI icon
+    ai_icon = '<button class="btn btn-primary" type="button" data-toggle="tooltip" data-placement="top" title="Enhance with AI"><i class="fas fa-robot"></i></button>'
+    return render_template('create_job.html', form=form, ai_icon=ai_icon)
 
 if __name__ == '__main__':
     app.run(debug=True)
 ```
 
-And the `create_job.html` template:
 ```html
 {% extends 'base.html' %}
 
@@ -89,6 +117,7 @@ And the `create_job.html` template:
       {{ form.job_description(size=64) }}
     </div>
     <div>
+      {{ ai_icon }}
       <input type="file" id="voice-input" name="voice-input">
       <script src="{{ url_for('js/voice-input.js') }}"></script>
     </div>
@@ -96,10 +125,38 @@ And the `create_job.html` template:
       {{ form.submit() }}
     </div>
   </form>
+  <!-- AI-enhanced description preview modal -->
+  <div class="modal fade" id="ai-enhanced-description-modal" tabindex="-1" role="dialog" aria-labelledby="ai-enhanced-description-modal-label" aria-hidden="true">
+    <div class="modal-dialog" role="document">
+      <div class="modal-content">
+        <div class="modal-header">
+          <h5 class="modal-title" id="ai-enhanced-description-modal-label">AI-enhanced Description</h5>
+          <button type="button" class="close" data-dismiss="modal" aria-label="Close">
+            <span aria-hidden="true">&times;</span>
+          </button>
+        </div>
+        <div class="modal-body">
+          <div class="row">
+            <div class="col-md-6">
+              <h4>Original Description</h4>
+              <p>{{ form.job_description.value }}</p>
+            </div>
+            <div class="col-md-6">
+              <h4>AI-enhanced Description</h4>
+              <p id="ai-enhanced-description"></p>
+            </div>
+          </div>
+        </div>
+        <div class="modal-footer">
+          <button type="button" class="btn btn-secondary" data-dismiss="modal">Cancel</button>
+          <button type="button" class="btn btn-primary" id="apply-ai-enhanced-description">Apply</button>
+        </div>
+      </div>
+    </div>
+  </div>
 {% endblock %}
 ```
 
-And the `voice-input.js` template:
 ```javascript
 // Get the voice input file input element
 const voiceInput = document.getElementById('voice-input');
@@ -123,7 +180,13 @@ voiceInput.addEventListener('change', (e) => {
       body: new FormData([voiceInput]),
     })
     .then((response) => response.json())
-    .then((data) => console.log(data))
+    .then((data) => {
+      // Display AI-enhanced description in modal
+      const aiEnhancedDescriptionModal = document.getElementById('ai-enhanced-description-modal');
+      const aiEnhancedDescription = document.getElementById('ai-enhanced-description');
+      aiEnhancedDescriptionModal.style.display = 'block';
+      aiEnhancedDescription.innerText = data.corrected_text;
+    })
     .catch((error) => console.error(error));
   };
 
@@ -131,4 +194,14 @@ voiceInput.addEventListener('change', (e) => {
   reader.readAsText(file);
 });
 ```
-This code adds a voice input file input element to the `create_job.html` template, and a JavaScript file to handle the voice input submission. The JavaScript file uses the `FileReader` API to read the voice input file as text, and sends a POST request to the server to process the voice input. The server-side code handles the voice input submission by processing the voice input file and redirecting the user to the `create_job` route.
+
+```python
+# Define route to handle AI-enhanced description preview
+@app.route('/ai-enhanced-description', methods=['POST'])
+@login_required
+def ai_enhanced_description():
+    # Get AI-enhanced description from request
+    ai_enhanced_description = request.form['ai-enhanced-description']
+    # Return AI-enhanced description
+    return jsonify({'corrected_text': ai_enhanced_description})
+```

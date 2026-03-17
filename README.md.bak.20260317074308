@@ -29,25 +29,6 @@ async def create_job(token: str = Depends(oauth2_scheme)):
     # Return protected data
     return {"message": "Hello, authenticated user!"}
 
-# AI Icon Integration for Job Description Grammar Correction & Prompt Recreation
-@app.get("/jobs/new/ai")
-async def ai_job_description(token: str = Depends(oauth2_scheme)):
-    """
-    Enhance a job description using AI grammar correction and prompt recreation.
-
-    This endpoint uses the MCP Server API for AI processing.
-    """
-    # Validate JWT token
-    try:
-        payload = jwt.decode(token, "secret_key", algorithms=["HS256"])
-    except jwt.ExpiredSignatureError:
-        raise HTTPException(status_code=401, detail="Token has expired")
-    except jwt.InvalidTokenError:
-        raise HTTPException(status_code=401, detail="Invalid token")
-    # Process job description using AI
-    # (Implementation details omitted for brevity)
-    return {"corrected_text": "AI-enhanced job description", "recreated_prompts": "Refined instructions"}
-
 # Voice-to-Text Integration for Job Description Field
 @app.get("/jobs/new/dictate")
 async def dictate_job_description(token: str = Depends(oauth2_scheme)):
@@ -75,7 +56,6 @@ import { BrowserRouter, Route, Routes } from "react-router-dom";
 import Login from "./pages/Login";
 import Dashboard from "./pages/Dashboard";
 import DictateJobDescription from "./pages/DictateJobDescription";
-import AiJobDescription from "./pages/AiJobDescription";
 
 function App() {
   return (
@@ -95,14 +75,6 @@ function App() {
           element={
             <ProtectedRoute>
               <DictateJobDescription />
-            </ProtectedRoute>
-          }
-        />
-        <Route
-          path="/jobs/new/ai"
-          element={
-            <ProtectedRoute>
-              <AiJobDescription />
             </ProtectedRoute>
           }
         />
@@ -150,47 +122,6 @@ function DictateJobDescription() {
         <button onClick={handleStopRecording}>Stop Recording</button>
       ) : (
         <button onClick={handleStartRecording}>Start Recording</button>
-      )}
-    </div>
-  );
-}
-
-// AI Job Description page
-function AiJobDescription() {
-  const [isProcessing, setIsProcessing] = React.useState(false);
-  const [result, setResult] = React.useState(null);
-
-  const handleProcess = () => {
-    // Process job description using AI
-    // (Implementation details omitted for brevity)
-    setIsProcessing(true);
-    // Simulate AI processing
-    setTimeout(() => {
-      setIsProcessing(false);
-      setResult({
-        corrected_text: "AI-enhanced job description",
-        recreated_prompts: "Refined instructions",
-      });
-    }, 2000);
-  };
-
-  return (
-    <div>
-      <h1>AI Job Description</h1>
-      {isProcessing ? (
-        <button disabled>Processing...</button>
-      ) : (
-        <button onClick={handleProcess}>Process</button>
-      )}
-      {result && (
-        <div>
-          <h2>Original Description</h2>
-          <p>Original job description</p>
-          <h2>AI-Enhanced Description</h2>
-          <p>{result.corrected_text}</p>
-          <h2>Refined Prompts</h2>
-          <p>{result.recreated_prompts}</p>
-        </div>
       )}
     </div>
   );
