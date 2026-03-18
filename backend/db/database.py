@@ -1,6 +1,7 @@
 from sqlalchemy import create_engine
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker
+from sqlalchemy.engine.url import make_url
 import os
 from dotenv import load_dotenv
 
@@ -23,8 +24,13 @@ if os.getenv("WEBSITES_SITE_NAME") and ("localhost" in DATABASE_URL or "127.0.0.
 
 # Prefer connection timeout and SSL for cloud Postgres (e.g. Azure) to fail fast instead of hanging
 _connect_args = {"connect_timeout": 10}
-if "postgres.database.azure.com" in DATABASE_URL or "?sslmode=" in DATABASE_URL:
-    if "sslmode=" not in DATABASE_URL:
+parsed_db_url = make_url(DATABASE_URL)
+host = parsed_db_url.host or ""
+query = parsed_db_url.query or ""
+is_azure_postgres_host = host.endswith("postgres.database.azure.com")
+has_sslmode = "sslmode" in query
+if is_azure_postgres_host or has_sslmode:
+    if not has_sslmode:
         _connect_args["sslmode"] = "require"
 engine = create_engine(DATABASE_URL, connect_args=_connect_args)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
