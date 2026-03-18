@@ -27,11 +27,12 @@ _connect_args = {"connect_timeout": 10}
 parsed_db_url = make_url(DATABASE_URL)
 host = parsed_db_url.host or ""
 query = parsed_db_url.query or ""
-is_azure_postgres_host = host.endswith("postgres.database.azure.com")
 has_sslmode = "sslmode" in query
-if is_azure_postgres_host or has_sslmode:
-    if not has_sslmode:
-        _connect_args["sslmode"] = "require"
+# On Azure App Service, enforce SSL unless caller explicitly set sslmode.
+# Avoid hostname substring heuristics so local/dev and Docker (often host "db") keep working.
+is_running_on_azure_app_service = bool(os.getenv("WEBSITES_SITE_NAME"))
+if (is_running_on_azure_app_service or has_sslmode) and not has_sslmode:
+    _connect_args["sslmode"] = "require"
 engine = create_engine(DATABASE_URL, connect_args=_connect_args)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
