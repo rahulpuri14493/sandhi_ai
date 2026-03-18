@@ -1,0 +1,15 @@
+[run]
+source = .
+omit =
+    */migrations/*
+    alembic/*
+    fix_user_passwords.py
+    run.py
+    venv/*
+    .venv/*
+
+[report]
+exclude_lines =
+    pragma: no cover
+    def __repr__
+    raise NotImplementedError

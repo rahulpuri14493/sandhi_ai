@@ -14,7 +14,7 @@ export default function EditJobPage() {
     description: '',
     status: 'draft',
   })
-  const [toolVisibility, setToolVisibility] = useState<'full' | 'names_only' | 'none'>('full')
+  const [toolVisibility, setToolVisibility] = useState<'full' | 'names_only' | 'none'>('none')
   const [existingFiles, setExistingFiles] = useState<Array<{ id: string; name: string; type: string; size: number }>>([])
   const [selectedFiles, setSelectedFiles] = useState<File[]>([])
   const [selectedAgents, setSelectedAgents] = useState<number[]>(selectedAgentsFromState ?? [])
@@ -68,7 +68,7 @@ export default function EditJobPage() {
       setJobOriginalPlatformToolIds(allowedToolIds)
       setSelectedPlatformToolIds(allowedToolIds)
       setSelectedConnectionIds(job.allowed_connection_ids ?? [])
-      if (job.tool_visibility) setToolVisibility(job.tool_visibility)
+      setToolVisibility((job.tool_visibility ?? 'none') as 'full' | 'names_only' | 'none')
       if (
         !selectedAgentsFromState?.length &&
         job.workflow_steps &&

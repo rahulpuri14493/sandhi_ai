@@ -39,6 +39,11 @@ class Job(Base):
     business = relationship("User", back_populates="jobs", foreign_keys=[business_id])
     workflow_steps = relationship("WorkflowStep", back_populates="job", order_by="WorkflowStep.step_order")
     transaction = relationship("Transaction", back_populates="job", uselist=False)
+    questions = relationship(
+        "JobQuestion",
+        back_populates="job",
+        cascade="all, delete-orphan",
+    )
 
 
 class WorkflowStep(Base):

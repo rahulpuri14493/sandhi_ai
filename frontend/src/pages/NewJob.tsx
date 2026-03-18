@@ -13,7 +13,7 @@ export default function NewJobPage() {
   const [connections, setConnections] = useState<MCPServerConnectionRes[]>([])
   const [selectedPlatformToolIds, setSelectedPlatformToolIds] = useState<number[]>([])
   const [selectedConnectionIds, setSelectedConnectionIds] = useState<number[]>([])
-  const [toolVisibility, setToolVisibility] = useState<'full' | 'names_only' | 'none'>('full')
+  const [toolVisibility, setToolVisibility] = useState<'full' | 'names_only' | 'none'>('none')
   const [selectedFiles, setSelectedFiles] = useState<File[]>([])
   const [isLoading, setIsLoading] = useState(false)
   const [error, setError] = useState('')

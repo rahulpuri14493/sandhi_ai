@@ -9,15 +9,15 @@ services:
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
       POSTGRES_DB: ${POSTGRES_DB:-agent_marketplace}
     ports:
-      - "5432:5432"
+      - "5432:5432"   # host 5433 (avoid conflict with local Postgres on 5432)
     volumes:
       - db_data:/var/lib/postgresql/data
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U \"$$POSTGRES_USER\" -d \"$$POSTGRES_DB\""]
-      interval: 3s
-      timeout: 5s
-      retries: 5
-      start_period: 10s
+      interval: 5s
+      timeout: 10s
+      retries: 10
+      start_period: 30s
 
   backend:
     build:
@@ -36,6 +36,8 @@ services:
       PLATFORM_MCP_SERVER_URL: http://platform-mcp-server:8081
       # Use dev default so stack runs without .env; set MCP_INTERNAL_SECRET in .env for production
       MCP_INTERNAL_SECRET: ${MCP_INTERNAL_SECRET:-dev-mcp-internal-secret}
+      # Debug logging (set to 1 to log JSON response previews; avoid in production)
+      LOG_API_RESPONSE_BODY: ${LOG_API_RESPONSE_BODY:-1}
     env_file:
       - .env
     depends_on:
