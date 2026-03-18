@@ -1,6 +1,7 @@
 from .user import User
 from .agent import Agent
 from .agent_review import AgentReview
+from .job_qa import JobQuestion
 from .job import Job, WorkflowStep
 from .communication import AgentCommunication
 from .transaction import Transaction, Earnings
@@ -12,6 +13,7 @@ __all__ = [
     "User",
     "Agent",
     "AgentReview",
+    "JobQuestion",
     "Job",
     "WorkflowStep",
     "AgentCommunication",

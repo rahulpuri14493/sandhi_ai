@@ -19,4 +19,5 @@ odfpy==1.4.1
 docx2txt==0.8
 pytest==7.4.4
 pytest-asyncio==0.23.3
+pytest-cov==4.1.0
 cryptography>=42.0.0
