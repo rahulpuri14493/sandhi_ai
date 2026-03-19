@@ -4,6 +4,7 @@ from pathlib import Path
 import json
 from core.config import settings
 from services.a2a_client import execute_via_a2a
+from services.job_file_storage import materialize_to_temp_path, cleanup_temp_path
 
 
 class DocumentAnalyzer:
@@ -153,6 +154,14 @@ class DocumentAnalyzer:
                 
         except Exception as e:
             return f"[Error reading file {path.name}: {str(e)}]"
+
+    async def read_file_info(self, file_info: Dict[str, Any]) -> str:
+        """Read document content from metadata entry (local path or S3-backed object)."""
+        local_path = await materialize_to_temp_path(file_info)
+        try:
+            return await self.read_document(local_path)
+        finally:
+            cleanup_temp_path(file_info, local_path)
     
     async def _analyze_documents_via_a2a(
         self,
@@ -245,12 +254,12 @@ class DocumentAnalyzer:
         # Extract data from all documents (no inference)
         document_contents = []
         for doc in documents:
-            path = doc.get("path")
             name = doc.get("name", "Unknown")
-            if not path:
-                continue
             try:
-                content = await self.read_document(path)
+                if doc.get("path"):
+                    content = await self.read_document(doc["path"])
+                else:
+                    content = await self.read_file_info(doc)
             except Exception as e:
                 content = f"[Error reading {name}: {str(e)}]"
             document_contents.append(f"=== {name} ===\n{content}\n")

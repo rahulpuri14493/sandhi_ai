@@ -17,6 +17,7 @@ from middleware.error_handler import (
 )
 from core.encryption import ensure_encryption_key_for_production
 from core.logging_config import configure_logging
+from services.job_file_storage import verify_s3_connectivity
 
 configure_logging()
 logger = logging.getLogger(__name__)
@@ -34,6 +35,18 @@ for attempt in range(30):
         logger.warning("Alembic upgrade attempt %s failed: %s; retrying in 1s", attempt + 1, e)
         time.sleep(1)
 ensure_encryption_key_for_production()
+
+# Verify S3 connectivity on startup when object storage is enabled.
+# Retries alongside the Alembic loop above may already have given enough
+# time for the RGW container to become healthy.  We try once more here
+# and log a clear warning rather than crashing, because the RGW may still
+# be starting up (the Compose healthcheck guards the depends_on gate, but
+# direct deploys might not have that).
+_s3_check = verify_s3_connectivity()
+if _s3_check["ok"]:
+    logger.info("S3 storage check passed: %s", _s3_check["detail"])
+else:
+    logger.warning("S3 storage check FAILED: %s — file uploads will fail until resolved", _s3_check["detail"])
 
 app = FastAPI(
     title="Sandhi AI API",
@@ -134,4 +147,8 @@ def root():
 
 @app.get("/health")
 def health_check():
-    return {"status": "healthy"}
+    s3 = verify_s3_connectivity()
+    return {
+        "status": "healthy" if s3["ok"] else "degraded",
+        "storage": s3,
+    }

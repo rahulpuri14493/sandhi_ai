@@ -109,9 +109,12 @@ class JobResponse(BaseModel):
                 files_data = json.loads(obj.files)
                 obj_dict = {k: v for k, v in obj.__dict__.items()}
                 obj_dict['files'] = files_data
-                # Remove file paths from response for security, only return metadata
+                # Remove storage internals from response for security, only return metadata
                 for file_info in files_data:
                     file_info.pop('path', None)
+                    file_info.pop('bucket', None)
+                    file_info.pop('key', None)
+                    file_info.pop('storage', None)
                 obj = type(obj)(**obj_dict)
             except (json.JSONDecodeError, TypeError):
                 pass

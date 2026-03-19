@@ -2,13 +2,11 @@ import logging
 import asyncio
 import io
 import json
-import os
-import uuid
 import zipfile
 from pathlib import Path
 from typing import List, Optional
 from fastapi import APIRouter, Depends, HTTPException, status, BackgroundTasks, UploadFile, File, Form
-from fastapi.responses import FileResponse, Response
+from fastapi.responses import FileResponse, Response, StreamingResponse
 from sqlalchemy.orm import Session
 from pydantic import BaseModel
 from db.database import get_db
@@ -27,6 +25,15 @@ from core.external_token import create_job_token, get_share_url
 from datetime import datetime
 from models.communication import AgentCommunication
 from models.mcp_server import MCPToolConfig, MCPServerConnection
+from services.job_file_storage import (
+    persist_file,
+    delete_file,
+    delete_file_sync,
+    redact_file_metadata,
+    has_readable_source,
+    open_local_download_path,
+    open_s3_download_stream,
+)
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/jobs", tags=["jobs"])
@@ -83,10 +90,6 @@ def _get_first_hired_agent_for_job(db: Session, job_id: int) -> Optional[tuple]:
     )
 
 
-# Create uploads directory if it doesn't exist
-UPLOAD_DIR = Path("uploads/jobs")
-UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
-
 # Allowed file extensions (including .zip; zip contents are extracted and only allowed types kept)
 ALLOWED_EXTENSIONS = {
     '.txt', '.csv', '.doc', '.docx', '.pdf', '.xls', '.xlsx',
@@ -97,13 +100,19 @@ ALLOWED_EXTENSIONS = {
 EXTRACTABLE_EXTENSIONS = ALLOWED_EXTENSIONS - {'.zip'}
 
 
-async def _process_one_upload(file: UploadFile) -> List[dict]:
+async def _process_one_upload(file: UploadFile, *, job_id: Optional[int] = None) -> List[dict]:
     """
     Process one uploaded file. If it's a .zip, extract and return metadata for each
     allowed file inside. Otherwise save the file and return a single metadata dict.
     """
     file_ext = Path(file.filename).suffix.lower()
     content = await file.read()
+    max_file_bytes = max(1, int(getattr(settings, "JOB_UPLOAD_MAX_FILE_BYTES", 104857600)))
+    if len(content) > max_file_bytes:
+        raise HTTPException(
+            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            detail=f"File {file.filename} exceeds max allowed size of {max_file_bytes} bytes",
+        )
 
     if file_ext == '.zip':
         # Extract zip and save each allowed file
@@ -117,19 +126,9 @@ async def _process_one_upload(file: UploadFile) -> List[dict]:
                     if ext not in EXTRACTABLE_EXTENSIONS:
                         continue
                     safe_name = Path(name).name or f"file{ext}"
-                    file_id = str(uuid.uuid4())
-                    out_path = UPLOAD_DIR / f"{file_id}_{safe_name}"
                     with zf.open(name, 'r') as src:
                         data = src.read()
-                    with open(out_path, 'wb') as f:
-                        f.write(data)
-                    entries.append({
-                        "id": file_id,
-                        "name": safe_name,
-                        "path": str(out_path),
-                        "type": "application/octet-stream",
-                        "size": len(data)
-                    })
+                    entries.append(await persist_file(safe_name, data, "application/octet-stream", job_id=job_id))
         except zipfile.BadZipFile as e:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
@@ -138,23 +137,14 @@ async def _process_one_upload(file: UploadFile) -> List[dict]:
         return entries
 
     # Single file (non-zip)
-    file_id = str(uuid.uuid4())
-    file_path = UPLOAD_DIR / f"{file_id}_{file.filename}"
     try:
-        with open(file_path, 'wb') as f:
-            f.write(content)
+        entry = await persist_file(file.filename, content, file.content_type or "application/octet-stream", job_id=job_id)
     except Exception as e:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to save file {file.filename}: {str(e)}"
         ) from e
-    return [{
-        "id": file_id,
-        "name": file.filename,
-        "path": str(file_path),
-        "type": file.content_type or "application/octet-stream",
-        "size": len(content)
-    }]
+    return [entry]
 
 
 class AnalyzeDocumentsRequest(BaseModel):
@@ -198,23 +188,10 @@ async def create_job(
     db: Session = Depends(get_db)
 ):
     """Create a new job with optional file uploads and optional tool scope."""
-    file_metadata = []
-
     platform_ids = _parse_int_list_form(allowed_platform_tool_ids)
     connection_ids = _parse_int_list_form(allowed_connection_ids)
     if (platform_ids and len(platform_ids)) or (connection_ids and len(connection_ids)):
         platform_ids, connection_ids = _validate_allowed_tools(db, current_user.id, platform_ids, connection_ids)
-
-    # Process uploaded files (zips are extracted; their contents become individual files)
-    if files:
-        for file in files:
-            file_ext = Path(file.filename).suffix.lower()
-            if file_ext not in ALLOWED_EXTENSIONS:
-                raise HTTPException(
-                    status_code=status.HTTP_400_BAD_REQUEST,
-                    detail=f"File type {file_ext} not allowed. Allowed types: {', '.join(sorted(ALLOWED_EXTENSIONS))}"
-                )
-            file_metadata.extend(await _process_one_upload(file))
 
     tv = _validate_tool_visibility(tool_visibility) if tool_visibility else None
     new_job = Job(
@@ -222,7 +199,7 @@ async def create_job(
         title=title,
         description=description,
         status=JobStatus.DRAFT,
-        files=json.dumps(file_metadata) if file_metadata else None,
+        files=None,
         conversation=json.dumps([]),  # Initialize empty conversation
         allowed_platform_tool_ids=json.dumps(platform_ids) if platform_ids is not None else None,
         allowed_connection_ids=json.dumps(connection_ids) if connection_ids is not None else None,
@@ -232,16 +209,34 @@ async def create_job(
     db.commit()
     db.refresh(new_job)
 
-    # Build response with parsed files (remove paths for security)
+    file_metadata = []
+    if files:
+        try:
+            for file in files:
+                file_ext = Path(file.filename).suffix.lower()
+                if file_ext not in ALLOWED_EXTENSIONS:
+                    raise HTTPException(
+                        status_code=status.HTTP_400_BAD_REQUEST,
+                        detail=f"File type {file_ext} not allowed. Allowed types: {', '.join(sorted(ALLOWED_EXTENSIONS))}"
+                    )
+                file_metadata.extend(await _process_one_upload(file, job_id=new_job.id))
+            if file_metadata:
+                new_job.files = json.dumps(file_metadata)
+                db.commit()
+                db.refresh(new_job)
+        except Exception:
+            # Cleanup any staged file objects and delete the partially created job
+            for entry in file_metadata:
+                await delete_file(entry)
+            db.delete(new_job)
+            db.commit()
+            raise
+
+    # Build response with parsed files (remove storage internals for security)
     files_for_response = []
     if file_metadata:
         for file_info in file_metadata:
-            files_for_response.append({
-                "id": file_info["id"],
-                "name": file_info["name"],
-                "type": file_info["type"],
-                "size": file_info["size"]
-            })
+            files_for_response.append(redact_file_metadata(file_info))
 
     response_data = {
         "id": new_job.id,
@@ -300,12 +295,12 @@ async def analyze_documents(
         except (json.JSONDecodeError, TypeError):
             pass
     
-    # Prepare documents for analysis (skip entries without path)
-    documents = [{"path": f["path"], "name": f.get("name", "Unknown")} for f in files_data if f.get("path")]
+    # Prepare documents for analysis (supports local path and S3-backed metadata)
+    documents = [f for f in files_data if has_readable_source(f)]
     if not documents:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="No valid document paths found in job files"
+            detail="No valid document sources found in job files"
         )
     hired = _get_first_hired_agent_for_job(db, job.id)
     if hired:
@@ -450,7 +445,7 @@ async def answer_question(
     conversation_history[first_question_idx]["answered_at"] = str(datetime.utcnow())
     
     files_data = json.loads(job.files)
-    documents = [{"path": f["path"], "name": f["name"]} for f in files_data]
+    documents = [f for f in files_data if has_readable_source(f)]
     hired = _get_first_hired_agent_for_job(db, job.id)
     if hired:
         agent_url, agent_key, agent_model, agent_temp, use_a2a = hired
@@ -592,12 +587,11 @@ async def generate_workflow_questions(
             files_data = []
         analyzer = DocumentAnalyzer()
         for f in files_data:
-            path = f.get("path")
             name = f.get("name", "Unknown")
-            if not path:
+            if not has_readable_source(f):
                 continue
             try:
-                content = await analyzer.read_document(path)
+                content = await analyzer.read_file_info(f)
                 documents_content.append({"name": name, "content": content})
             except Exception:
                 documents_content.append({"name": name, "content": f"[Could not read {name}]"})
@@ -679,8 +673,8 @@ def list_jobs(
         if job.files:
             try:
                 files_parsed = json.loads(job.files)
-                # Remove paths for security
-                files_data = [{k: v for k, v in f.items() if k != 'path'} for f in files_parsed]
+                # Remove storage internals for security
+                files_data = [redact_file_metadata(f) for f in files_parsed]
             except (json.JSONDecodeError, TypeError):
                 pass
         
@@ -749,8 +743,8 @@ def get_job(
     if job.files:
         try:
             files_parsed = json.loads(job.files)
-            # Remove paths for security
-            files_data = [{k: v for k, v in f.items() if k != 'path'} for f in files_parsed]
+            # Remove storage internals for security
+            files_data = [redact_file_metadata(f) for f in files_parsed]
         except (json.JSONDecodeError, TypeError):
             pass
     
@@ -893,47 +887,78 @@ async def update_job(
                 detail=f"Invalid status: {status}"
             )
     
-    # Handle file uploads
+    # Handle file uploads (overwrite existing documents with the new upload set)
     new_files_added = False
+    old_files_to_cleanup: List[dict] = []
+    staged_new_files: List[dict] = []
     if files:
-        # Get existing files
-        existing_files = []
+        old_files = []
         if job.files:
             try:
-                existing_files = json.loads(job.files)
+                old_files = json.loads(job.files)
             except (json.JSONDecodeError, TypeError):
-                existing_files = []
-        
-        # Process new uploaded files (zips are extracted; their contents become individual files)
-        for file in files:
-            file_ext = Path(file.filename).suffix.lower()
-            if file_ext not in ALLOWED_EXTENSIONS:
-                raise HTTPException(
-                    status_code=status.HTTP_400_BAD_REQUEST,
-                    detail=f"File type {file_ext} not allowed. Allowed types: {', '.join(sorted(ALLOWED_EXTENSIONS))}"
-                )
-            entries = await _process_one_upload(file)
-            for e in entries:
-                existing_files.append(e)
-            if entries:
-                new_files_added = True
-        
-        # Update job files
-        job.files = json.dumps(existing_files)
-        
+                old_files = []
+        try:
+            for file in files:
+                file_ext = Path(file.filename).suffix.lower()
+                if file_ext not in ALLOWED_EXTENSIONS:
+                    raise HTTPException(
+                        status_code=status.HTTP_400_BAD_REQUEST,
+                        detail=f"File type {file_ext} not allowed. Allowed types: {', '.join(sorted(ALLOWED_EXTENSIONS))}"
+                    )
+                entries = await _process_one_upload(file, job_id=job.id)
+                for e in entries:
+                    staged_new_files.append(e)
+                if entries:
+                    new_files_added = True
+        except Exception:
+            # Best-effort cleanup of newly staged files so failed overwrite keeps existing data intact
+            for staged in staged_new_files:
+                await delete_file(staged)
+            raise
+
+        # Overwrite: keep only the latest upload set
+        job.files = json.dumps(staged_new_files)
+
         # Reset conversation when new files are uploaded to start fresh Q&A
         if new_files_added:
             job.conversation = json.dumps([])
+            old_files_to_cleanup = old_files
+            logger.info(
+                "BRD overwrite staged for job_id=%s business_id=%s old_files=%s new_files=%s",
+                job.id,
+                current_user.id,
+                len(old_files),
+                len(staged_new_files),
+            )
     
-    db.commit()
-    db.refresh(job)
+    try:
+        db.commit()
+        db.refresh(job)
+    except Exception:
+        # If DB commit fails after staging new files, remove staged objects/files.
+        if staged_new_files:
+            for staged in staged_new_files:
+                await delete_file(staged)
+        raise
+
+    # Cleanup old files only after successful DB commit.
+    if old_files_to_cleanup:
+        for old in old_files_to_cleanup:
+            await delete_file(old)
+        logger.info(
+            "BRD overwrite finalized for job_id=%s business_id=%s removed_files=%s",
+            job.id,
+            current_user.id,
+            len(old_files_to_cleanup),
+        )
     
     # If new files were added, automatically trigger document analysis (extraction only or via first hired agent)
     analysis_result = None
     if new_files_added and job.files:
         try:
             files_data = json.loads(job.files)
-            documents = [{"path": f["path"], "name": f["name"]} for f in files_data]
+            documents = [f for f in files_data if has_readable_source(f)]
             hired = _get_first_hired_agent_for_job(db, job.id)
             if hired:
                 agent_url, agent_key = hired[0], hired[1]
@@ -987,7 +1012,7 @@ async def update_job(
     if job.files:
         try:
             files_parsed = json.loads(job.files)
-            files_data = [{k: v for k, v in f.items() if k != 'path'} for f in files_parsed]
+            files_data = [redact_file_metadata(f) for f in files_parsed]
         except (json.JSONDecodeError, TypeError):
             pass
     
@@ -1082,9 +1107,7 @@ def delete_job(
         try:
             files_data = json.loads(job.files)
             for file_info in files_data:
-                file_path = Path(file_info.get("path", ""))
-                if file_path.exists():
-                    file_path.unlink()
+                delete_file_sync(file_info)
         except (json.JSONDecodeError, TypeError, Exception):
             pass  # Continue even if file deletion fails
     
@@ -1275,7 +1298,7 @@ def approve_job(
     if job.files:
         try:
             files_parsed = json.loads(job.files)
-            files_data = [{k: v for k, v in f.items() if k != 'path'} for f in files_parsed]
+            files_data = [redact_file_metadata(f) for f in files_parsed]
         except (json.JSONDecodeError, TypeError):
             pass
     
@@ -1355,7 +1378,7 @@ def execute_job(
     if job.files:
         try:
             files_parsed = json.loads(job.files)
-            files_data = [{k: v for k, v in f.items() if k != 'path'} for f in files_parsed]
+            files_data = [redact_file_metadata(f) for f in files_parsed]
         except (json.JSONDecodeError, TypeError):
             pass
     
@@ -1431,7 +1454,7 @@ def rerun_job(
     if job.files:
         try:
             files_parsed = json.loads(job.files)
-            files_data = [{k: v for k, v in f.items() if k != 'path'} for f in files_parsed]
+            files_data = [redact_file_metadata(f) for f in files_parsed]
         except (json.JSONDecodeError, TypeError):
             pass
     
@@ -1498,7 +1521,7 @@ def get_job_status(
     if job.files:
         try:
             files_parsed = json.loads(job.files)
-            files_data = [{k: v for k, v in f.items() if k != 'path'} for f in files_parsed]
+            files_data = [redact_file_metadata(f) for f in files_parsed]
         except (json.JSONDecodeError, TypeError):
             pass
     
@@ -1615,8 +1638,26 @@ def download_job_file(
             detail="File not found"
         )
     
-    file_path = Path(file_info["path"])
-    if not file_path.exists():
+    if file_info.get("storage") == "s3":
+        try:
+            body, media_type, content_length = open_s3_download_stream(file_info)
+        except Exception:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="File no longer exists on storage"
+            )
+        headers = {"Content-Disposition": f'attachment; filename="{file_info.get("name", "file")}"'}
+        if content_length is not None:
+            headers["Content-Length"] = str(content_length)
+        return StreamingResponse(
+            content=body.iter_chunks(chunk_size=1024 * 1024),
+            media_type=media_type,
+            headers=headers,
+        )
+
+    try:
+        file_path = open_local_download_path(file_info)
+    except FileNotFoundError:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="File no longer exists on server"

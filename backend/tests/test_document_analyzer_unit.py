@@ -89,6 +89,26 @@ async def test_analyze_documents_a2a_json_parse(monkeypatch, tmp_path):
     assert out["workflow_collaboration_hint"] == "sequential"
 
 
+@pytest.mark.asyncio
+async def test_read_file_info_with_local_path_metadata(tmp_path):
+    """read_file_info should accept a metadata dict with a local path and return text content."""
+    da = DocumentAnalyzer()
+    p = tmp_path / "brd.txt"
+    p.write_text("Business requirements document content", encoding="utf-8")
+
+    file_info = {"path": str(p), "name": "brd.txt", "type": "text/plain", "size": p.stat().st_size}
+    content = await da.read_file_info(file_info)
+    assert "Business requirements document content" in content
+
+
+@pytest.mark.asyncio
+async def test_read_file_info_missing_source_raises():
+    """read_file_info should raise for metadata with no readable source."""
+    da = DocumentAnalyzer()
+    with pytest.raises(ValueError, match="no readable source"):
+        await da.read_file_info({"name": "orphan.txt"})
+
+
 def test_extract_helpers():
     da = DocumentAnalyzer()
     qs = da._extract_questions("One? Two? Three? Four?")

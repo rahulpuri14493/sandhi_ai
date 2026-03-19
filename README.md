@@ -95,6 +95,9 @@ Database migrations are applied automatically on backend startup through Alembic
 - Set `A2A_ADAPTER_URL=` in the backend environment if you want to bypass the internal adapter and call OpenAI-compatible endpoints directly.
 - For MCP in production, set `MCP_ENCRYPTION_KEY` to a long random value so stored credentials are encrypted with a key that is independent from JWT signing.
 - Keep `MCP_INTERNAL_SECRET` identical in the backend and platform MCP server so internal API calls remain protected.
+- Job document storage should use Ceph RGW (S3-compatible) for production and production-like local Docker deployments. See [Object Storage](docs/OBJECT_STORAGE.md).
+- Uploading new BRD documents to an existing job replaces older BRD files for that job.
+- For Docker with Ceph S3, set `S3_ACCESS_KEY_ID` and `S3_SECRET_ACCESS_KEY` in `.env` and run `docker compose -f docker-compose.yml -f docker-compose.ceph.yml up -d --build`. The Ceph cluster bootstraps automatically.
 
 ## Local Development
 
@@ -134,14 +137,20 @@ Once the backend is running, open `http://localhost:8000/docs` for interactive A
 
 ```text
 .
-├── backend/                   # FastAPI backend and migrations
-├── frontend/                  # React application
+├── backend/                       # FastAPI backend and migrations
+├── frontend/                      # React application
 ├── tools/
-│   ├── a2a_openai_adapter/    # Platform-managed A2A ↔ OpenAI adapter
-│   └── platform_mcp_server/    # Internal platform MCP server
+│   ├── a2a_openai_adapter/        # Platform-managed A2A ↔ OpenAI adapter
+│   └── platform_mcp_server/       # Internal platform MCP server
+├── infra/
+│   └── ceph/                      # Ceph RGW config templates + .env example
+├── scripts/
+│   └── setup_env.py               # First-time .env setup
 ├── docs/
-│   └── A2A_DEVELOPERS.md      # Developer-facing A2A guidance
-├── docker-compose.yml
+│   ├── A2A_DEVELOPERS.md          # Developer-facing A2A guidance
+│   └── OBJECT_STORAGE.md          # S3 / Ceph RGW setup and tuning
+├── docker-compose.yml             # Core platform services
+├── docker-compose.ceph.yml        # Production Ceph RGW overlay
 └── README.md
 ```
 

@@ -80,11 +80,10 @@ class WorkflowBuilder:
                 
                 # Read content from each document
                 for file_info in files_data:
-                    file_path = file_info.get("path")
-                    if file_path:
+                    if file_info.get("path") or (file_info.get("storage") == "s3" and file_info.get("bucket") and file_info.get("key")):
                         try:
                             # Use asyncio to call async method
-                            content = asyncio.run(analyzer.read_document(file_path))
+                            content = asyncio.run(analyzer.read_file_info(file_info))
                             # Validate content was extracted - skip empty documents (they're optional)
                             if not content or not content.strip():
                                 logger.warning("Document %s has empty content - skipping (documents are optional)", file_info.get('name'))
@@ -101,7 +100,7 @@ class WorkflowBuilder:
                             logger.warning("Failed to read document %s: %s - skipping (documents are optional)", file_info.get('name'), e)
                             continue
                     else:
-                        logger.warning("Document %s has no file path", file_info.get('name'))
+                        logger.warning("Document %s has no readable source metadata", file_info.get('name'))
             except (json.JSONDecodeError, TypeError, Exception) as e:
                 # If document parsing fails, continue without document content (documents are optional)
                 logger.warning("Failed to parse job.files: %s - Continuing without documents (they are optional)", e)
@@ -283,11 +282,10 @@ class WorkflowBuilder:
                 
                 # Read content from each document
                 for file_info in files_data:
-                    file_path = file_info.get("path")
-                    if file_path:
+                    if file_info.get("path") or (file_info.get("storage") == "s3" and file_info.get("bucket") and file_info.get("key")):
                         try:
                             # Use asyncio to call async method
-                            content = asyncio.run(analyzer.read_document(file_path))
+                            content = asyncio.run(analyzer.read_file_info(file_info))
                             # Validate content was extracted - skip empty documents (they're optional)
                             if not content or not content.strip():
                                 logger.warning("Document %s has empty content - skipping (documents are optional)", file_info.get('name'))
@@ -304,7 +302,7 @@ class WorkflowBuilder:
                             logger.warning("Failed to read document %s: %s - skipping (documents are optional)", file_info.get('name'), e)
                             continue
                     else:
-                        logger.warning("Document %s has no file path", file_info.get('name'))
+                        logger.warning("Document %s has no readable source metadata", file_info.get('name'))
             except (json.JSONDecodeError, TypeError, Exception) as e:
                 # If document parsing fails, continue without document content (documents are optional)
                 logger.warning("Failed to parse job.files: %s - Continuing without documents (they are optional)", e)

@@ -17,6 +17,7 @@ pandas==2.2.0
 openpyxl==3.1.2
 odfpy==1.4.1
 docx2txt==0.8
+boto3==1.35.79
 pytest==7.4.4
 pytest-asyncio==0.23.3
 pytest-cov==4.1.0

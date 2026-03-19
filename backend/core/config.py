@@ -28,6 +28,25 @@ class Settings(BaseSettings):
         MCP_INTERNAL_SECRET: str = os.getenv("MCP_INTERNAL_SECRET", "")
         # When True, allow agent endpoints that resolve to private/loopback IPs (dev, Docker, same host). Default False in production.
         ALLOW_PRIVATE_AGENT_ENDPOINTS: bool = os.getenv("ALLOW_PRIVATE_AGENT_ENDPOINTS", "false").lower() in ("true", "1", "yes")
+        # Job document storage backend: local filesystem (default) or S3-compatible object storage (Ceph RGW)
+        OBJECT_STORAGE_BACKEND: str = os.getenv("OBJECT_STORAGE_BACKEND", "local")
+        S3_ENDPOINT_URL: str = os.getenv("S3_ENDPOINT_URL", "")
+        S3_ACCESS_KEY_ID: str = os.getenv("S3_ACCESS_KEY_ID", "")
+        S3_SECRET_ACCESS_KEY: str = os.getenv("S3_SECRET_ACCESS_KEY", "")
+        S3_BUCKET: str = os.getenv("S3_BUCKET", "")
+        S3_REGION: str = os.getenv("S3_REGION", "us-east-1")
+        S3_ADDRESSING_STYLE: str = os.getenv("S3_ADDRESSING_STYLE", "path")
+        S3_CONNECT_TIMEOUT_SECONDS: int = int(os.getenv("S3_CONNECT_TIMEOUT_SECONDS", "5"))
+        S3_READ_TIMEOUT_SECONDS: int = int(os.getenv("S3_READ_TIMEOUT_SECONDS", "60"))
+        S3_MAX_POOL_CONNECTIONS: int = int(os.getenv("S3_MAX_POOL_CONNECTIONS", "100"))
+        S3_RETRY_MODE: str = os.getenv("S3_RETRY_MODE", "standard")
+        S3_MAX_ATTEMPTS: int = int(os.getenv("S3_MAX_ATTEMPTS", "5"))
+        S3_AUTO_CREATE_BUCKET: bool = os.getenv("S3_AUTO_CREATE_BUCKET", "false").lower() in ("true", "1", "yes")
+        # Signature version: s3v4 recommended for Ceph RGW compatibility
+        S3_SIGNATURE_VERSION: str = os.getenv("S3_SIGNATURE_VERSION", "s3v4")
+        # TCP keepalive prevents idle connections from being dropped by firewalls/load balancers
+        S3_TCP_KEEPALIVE: bool = os.getenv("S3_TCP_KEEPALIVE", "true").lower() in ("true", "1", "yes")
+        JOB_UPLOAD_MAX_FILE_BYTES: int = int(os.getenv("JOB_UPLOAD_MAX_FILE_BYTES", "104857600"))  # 100 MB default
 
         class Config:
             env_file = ".env"
