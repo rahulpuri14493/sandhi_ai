@@ -1,6 +1,7 @@
 """API tests for jobs endpoints (create, update, workflow, tool_visibility, allowed tools)."""
 import json
 import uuid
+from types import SimpleNamespace
 import pytest
 from fastapi.testclient import TestClient
 
@@ -70,6 +71,10 @@ def client_with_job(db_session):
     )
     db_session.add(step)
     db_session.commit()
+    step_ref = SimpleNamespace(id=step.id)
+    # Detach fixture step from identity map so auto-split tests that recreate
+    # step rows do not trigger identity replacement warnings in SQLAlchemy.
+    db_session.expunge(step)
 
     def override_get_db():
         try:
@@ -79,7 +84,7 @@ def client_with_job(db_session):
 
     app.dependency_overrides[get_db] = override_get_db
     with TestClient(app) as c:
-        yield c, business, job, agent, step
+        yield c, business, job, agent, step_ref
     app.dependency_overrides.clear()
 
 
