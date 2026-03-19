@@ -1,5 +1,6 @@
 [run]
 source = .
+relative_files = true
 omit =
     */migrations/*
     alembic/*
@@ -7,6 +8,14 @@ omit =
     run.py
     venv/*
     .venv/*
+
+[paths]
+source =
+    .
+    /app
+    */backend
+    D:\sandhi_ai\backend
+    d:\sandhi_ai\backend
 
 [report]
 exclude_lines =

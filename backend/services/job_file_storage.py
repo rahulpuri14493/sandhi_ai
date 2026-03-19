@@ -294,14 +294,18 @@ def verify_s3_connectivity() -> dict:
     try:
         _require_s3_settings()
     except RuntimeError as e:
-        return {"ok": False, "detail": f"config: {e}"}
+        logger.warning("S3 connectivity config error: %s", e)
+        return {"ok": False, "detail": "config error"}
     try:
         bucket = _ensure_bucket_ready()
         return {"ok": True, "detail": f"bucket={bucket} reachable"}
     except RuntimeError as e:
-        return {"ok": False, "detail": str(e)}
-    except Exception as e:
-        return {"ok": False, "detail": f"unexpected: {e}"}
+        # Avoid leaking backend exception strings to public health responses.
+        logger.warning("S3 connectivity check failed: %s", e)
+        return {"ok": False, "detail": "connectivity check failed"}
+    except Exception:
+        logger.exception("Unexpected S3 connectivity probe failure")
+        return {"ok": False, "detail": "unexpected error"}
 
 
 async def persist_file(name: str, data: bytes, content_type: Optional[str], *, job_id: Optional[int] = None) -> Dict[str, Any]:
