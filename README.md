@@ -75,18 +75,90 @@ We're building toward:
 - Node.js 18+ for local frontend development
 - Python 3.11+ for local backend development
 
-### Docker Setup
+### Installation (Step-by-Step)
 
-1. Clone the repository.
-2. Run the environment setup script for first-time configuration:
-   ```bash
-   python scripts/setup_env.py
-   ```
-   This creates `.env` from `.env.example` and sets `MCP_INTERNAL_SECRET` and, optionally, `MCP_ENCRYPTION_KEY`.
-3. Start the stack:
-   ```bash
-   docker-compose up -d --build
-   ```
+#### Step 1: Clone the repository
+
+```bash
+git clone <your-repo-url>
+cd sandhi_ai
+```
+
+#### Step 2: Create `.env` from template
+
+```bash
+python scripts/setup_env.py
+```
+
+This creates `.env` from `.env.example` and generates `MCP_INTERNAL_SECRET`.
+
+#### Step 3: Set required values in `.env`
+
+Use the `.env` file at the **repository root** (same directory as `docker-compose.yml`).
+Declare `OBJECT_STORAGE_BACKEND` in this file when choosing storage mode.
+
+Required for all Docker setups:
+
+- `POSTGRES_USER`
+- `POSTGRES_PASSWORD`
+- `POSTGRES_DB`
+- `SECRET_KEY`
+- `MCP_INTERNAL_SECRET`
+
+#### Step 4: Choose your storage mode
+
+Choose one path only:
+
+**Path A: Local file storage (simplest for first run)**
+
+- In root `.env`, set `OBJECT_STORAGE_BACKEND=local`.
+- Start services:
+
+```bash
+docker compose up -d --build
+```
+
+**Path B: MinIO (S3-compatible storage, recommended for BRD/doc testing)**
+
+1. Set these in `.env`:
+
+```env
+OBJECT_STORAGE_BACKEND=s3
+S3_ACCESS_KEY_ID=sandhi-access-key
+S3_SECRET_ACCESS_KEY=sandhi-secret-key
+S3_BUCKET=sandhi-brd-docs
+S3_ENDPOINT_URL=http://minio:9000
+```
+
+`OBJECT_STORAGE_BACKEND` defaults to `s3` if omitted, but keep it explicit in `.env` for clarity.
+
+2. Start services with MinIO overlay:
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.ceph.yml up -d --build
+```
+
+Note: `docker-compose.ceph.yml` is a legacy filename; it currently starts MinIO.
+
+#### Step 5: Verify services
+
+```bash
+docker compose ps
+```
+
+You should see `sandhi-backend`, `sandhi-db`, `a2a-openai-adapter`, and `platform-mcp-server`.
+If you chose Path B, you should also see `minio`.
+
+#### Step 6: Verify application is up
+
+- Backend API docs: `http://localhost:8000/docs`
+- Frontend: `http://localhost:3000`
+
+If using MinIO:
+
+- MinIO Console: `http://localhost:9001`
+- Login with `S3_ACCESS_KEY_ID` / `S3_SECRET_ACCESS_KEY`
+- Confirm bucket `S3_BUCKET` exists (default: `sandhi-brd-docs`)
 
 Database migrations are applied automatically on backend startup through Alembic. Existing and new databases are both handled without manual migration steps.
 
@@ -95,9 +167,9 @@ Database migrations are applied automatically on backend startup through Alembic
 - Set `A2A_ADAPTER_URL=` in the backend environment if you want to bypass the internal adapter and call OpenAI-compatible endpoints directly.
 - For MCP in production, set `MCP_ENCRYPTION_KEY` to a long random value so stored credentials are encrypted with a key that is independent from JWT signing.
 - Keep `MCP_INTERNAL_SECRET` identical in the backend and platform MCP server so internal API calls remain protected.
-- Job document storage should use Ceph RGW (S3-compatible) for production and production-like local Docker deployments. See [Object Storage](docs/OBJECT_STORAGE.md).
+- Job document storage supports S3-compatible backends (MinIO locally, Ceph/AWS S3 in production). See [Object Storage](docs/OBJECT_STORAGE.md).
 - Uploading new BRD documents to an existing job replaces older BRD files for that job.
-- For Docker with Ceph S3, set `S3_ACCESS_KEY_ID` and `S3_SECRET_ACCESS_KEY` in `.env` and run `docker compose -f docker-compose.yml -f docker-compose.ceph.yml up -d --build`. The Ceph cluster bootstraps automatically.
+- For Docker with MinIO S3, set `S3_ACCESS_KEY_ID` and `S3_SECRET_ACCESS_KEY` in `.env` and run `docker compose -f docker-compose.yml -f docker-compose.ceph.yml up -d --build`.
 
 ## Local Development
 
@@ -143,14 +215,14 @@ Once the backend is running, open `http://localhost:8000/docs` for interactive A
 │   ├── a2a_openai_adapter/        # Platform-managed A2A ↔ OpenAI adapter
 │   └── platform_mcp_server/       # Internal platform MCP server
 ├── infra/
-│   └── ceph/                      # Ceph RGW config templates + .env example
+│   └── ceph/                      # S3/MinIO config templates + .env example
 ├── scripts/
 │   └── setup_env.py               # First-time .env setup
 ├── docs/
 │   ├── A2A_DEVELOPERS.md          # Developer-facing A2A guidance
-│   └── OBJECT_STORAGE.md          # S3 / Ceph RGW setup and tuning
+│   └── OBJECT_STORAGE.md          # S3-compatible storage setup and tuning
 ├── docker-compose.yml             # Core platform services
-├── docker-compose.ceph.yml        # Production Ceph RGW overlay
+├── docker-compose.ceph.yml        # MinIO S3 overlay (legacy filename)
 └── README.md
 ```
 

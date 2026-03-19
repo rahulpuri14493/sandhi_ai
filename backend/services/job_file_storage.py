@@ -3,6 +3,8 @@ import logging
 import tempfile
 import uuid
 import re
+import time
+import random
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 from functools import lru_cache
@@ -18,7 +20,7 @@ PRIVATE_FILE_KEYS = {"path", "bucket", "key", "storage"}
 
 
 def _is_s3_backend() -> bool:
-    return (settings.OBJECT_STORAGE_BACKEND or "local").strip().lower() == "s3"
+    return (settings.OBJECT_STORAGE_BACKEND or "s3").strip().lower() == "s3"
 
 
 def _file_ext(name: str) -> str:
@@ -141,7 +143,7 @@ def _ensure_bucket_ready() -> str:
     bucket = _require_s3_settings()
     client = _s3_client_cached()
     try:
-        client.head_bucket(Bucket=bucket)
+        _call_with_retry("head_bucket", lambda: client.head_bucket(Bucket=bucket))
         return bucket
     except client.exceptions.NoSuchBucket:
         pass  # Bucket genuinely missing — may auto-create below.
@@ -188,6 +190,99 @@ def _extract_error_code(exc: Exception) -> str:
     return str(http_code) if http_code else ""
 
 
+def _is_retryable_s3_exception(exc: Exception) -> bool:
+    """
+    Best-effort classifier for transient S3 errors.
+    Includes transport timeouts/connection issues and common 5xx/throttling codes.
+    """
+    code = _extract_error_code(exc)
+    retry_codes = {
+        "500", "502", "503", "504",
+        "RequestTimeout", "RequestTimeTooSkewed",
+        "InternalError", "ServiceUnavailable", "SlowDown",
+        "Throttling", "ThrottlingException", "TooManyRequestsException", "429",
+    }
+    if code in retry_codes:
+        return True
+    if code.isdigit() and int(code) >= 500:
+        return True
+
+    cls = exc.__class__.__name__
+    if cls in {
+        "EndpointConnectionError",
+        "ConnectTimeoutError",
+        "ReadTimeoutError",
+        "ConnectionClosedError",
+        "SSLError",
+    }:
+        return True
+
+    msg = str(exc).lower()
+    transient_markers = (
+        "timed out",
+        "timeout",
+        "temporarily unavailable",
+        "connection reset",
+        "connection refused",
+        "broken pipe",
+        "eof occurred",
+    )
+    return any(m in msg for m in transient_markers)
+
+
+def _call_with_retry(op_name: str, fn):
+    """
+    Execute an S3 operation with exponential backoff + jitter for transient failures.
+    """
+    attempts = max(1, int(getattr(settings, "S3_OPERATION_RETRY_ATTEMPTS", 4)))
+    base = max(0.01, float(getattr(settings, "S3_OPERATION_RETRY_BASE_DELAY_SECONDS", 0.2)))
+    max_delay = max(base, float(getattr(settings, "S3_OPERATION_RETRY_MAX_DELAY_SECONDS", 2.0)))
+    jitter = max(0.0, float(getattr(settings, "S3_OPERATION_RETRY_JITTER_SECONDS", 0.1)))
+
+    for i in range(attempts):
+        try:
+            return fn()
+        except Exception as exc:
+            should_retry = _is_retryable_s3_exception(exc)
+            if i >= attempts - 1 or not should_retry:
+                raise
+            delay = min(max_delay, base * (2 ** i)) + random.uniform(0, jitter)
+            logger.warning(
+                "Transient S3 error in %s (attempt %s/%s): %s. Retrying in %.2fs",
+                op_name,
+                i + 1,
+                attempts,
+                exc,
+                delay,
+            )
+            time.sleep(delay)
+
+
+def _wait_for_object_visibility(bucket: str, key: str, *, attempts: int = 8, delay_seconds: float = 0.25) -> None:
+    """
+    Ensure a newly uploaded object is visible before continuing.
+
+    Some S3-compatible systems can exhibit short post-write visibility windows
+    under load/replication. This guard prevents immediate follow-up operations
+    (analyze/download/execution) from racing before the object is addressable.
+    """
+    client = _s3_client_cached()
+    last_exc: Optional[Exception] = None
+    for _ in range(max(1, attempts)):
+        try:
+            _call_with_retry(
+                "head_object_visibility",
+                lambda: client.head_object(Bucket=bucket, Key=key),
+            )
+            return
+        except Exception as exc:
+            last_exc = exc
+            time.sleep(max(0.01, delay_seconds))
+    raise RuntimeError(
+        f"S3 object upload acknowledged but not yet visible: bucket='{bucket}', key='{key}'"
+    ) from last_exc
+
+
 def verify_s3_connectivity() -> dict:
     """
     Probe S3 endpoint reachability, authentication, and bucket access.
@@ -219,7 +314,11 @@ async def persist_file(name: str, data: bytes, content_type: Optional[str], *, j
         key = f"jobs/{job_segment}/{file_id}_{safe_name}"
 
         def _upload():
-            _s3_client_cached().put_object(Bucket=bucket, Key=key, Body=data, ContentType=ct)
+            _call_with_retry(
+                "put_object",
+                lambda: _s3_client_cached().put_object(Bucket=bucket, Key=key, Body=data, ContentType=ct),
+            )
+            _wait_for_object_visibility(bucket, key)
 
         await asyncio.to_thread(_upload)
         return _build_metadata(file_id=file_id, name=safe_name, content_type=ct, size=len(data), storage="s3", bucket=bucket, key=key)
@@ -276,8 +375,14 @@ def open_local_download_path(file_info: Dict[str, Any]) -> Path:
 def download_s3_bytes(file_info: Dict[str, Any]) -> bytes:
     if file_info.get("storage") != "s3" or not file_info.get("bucket") or not file_info.get("key"):
         raise ValueError("Invalid S3 file metadata")
-    resp = _s3_client_cached().get_object(Bucket=file_info["bucket"], Key=file_info["key"])
-    return resp["Body"].read()
+    def _download() -> bytes:
+        resp = _call_with_retry(
+            "get_object_bytes",
+            lambda: _s3_client_cached().get_object(Bucket=file_info["bucket"], Key=file_info["key"]),
+        )
+        return resp["Body"].read()
+
+    return _call_with_retry("read_object_body", _download)
 
 
 def open_s3_download_stream(file_info: Dict[str, Any]):
@@ -287,7 +392,10 @@ def open_s3_download_stream(file_info: Dict[str, Any]):
     """
     if file_info.get("storage") != "s3" or not file_info.get("bucket") or not file_info.get("key"):
         raise ValueError("Invalid S3 file metadata")
-    resp = _s3_client_cached().get_object(Bucket=file_info["bucket"], Key=file_info["key"])
+    resp = _call_with_retry(
+        "get_object_stream",
+        lambda: _s3_client_cached().get_object(Bucket=file_info["bucket"], Key=file_info["key"]),
+    )
     return resp["Body"], resp.get("ContentType") or "application/octet-stream", resp.get("ContentLength")
 
 

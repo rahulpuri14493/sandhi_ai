@@ -634,12 +634,14 @@ async def generate_workflow_questions(
     new_conversation = conversation_history.copy()
     existing_questions = {str(item.get("question", "")).strip() for item in new_conversation if item.get("type") == "question" and item.get("question")}
     seen_in_batch = set()
+    added_questions = []
     for q in questions:
         qs = str(q).strip() if q else ""
         if not qs or qs in existing_questions or qs in seen_in_batch:
             continue
         seen_in_batch.add(qs)
         existing_questions.add(qs)
+        added_questions.append(qs)
         new_conversation.append({
             "type": "question",
             "question": qs,
@@ -647,10 +649,30 @@ async def generate_workflow_questions(
             "timestamp": str(datetime.utcnow()),
         })
 
+    removed_unanswered_questions = 0
+    if len(added_questions) == 0:
+        # No clarification needed from workflow context. Drop stale unanswered
+        # questions so the frontend can proceed to the next step cleanly.
+        filtered = []
+        for item in new_conversation:
+            if item.get("type") == "question":
+                ans = str(item.get("answer", "")).strip() if item.get("answer") is not None else ""
+                if not ans:
+                    removed_unanswered_questions += 1
+                    continue
+            filtered.append(item)
+        new_conversation = filtered
+
     job.conversation = json.dumps(new_conversation)
     db.commit()
 
-    return {"questions": questions, "conversation": new_conversation}
+    return {
+        "questions": questions,
+        "added_questions": added_questions,
+        "no_questions_needed": len(added_questions) == 0,
+        "removed_unanswered_questions": removed_unanswered_questions,
+        "conversation": new_conversation,
+    }
 
 
 @router.get("", response_model=List[JobResponse])
@@ -923,13 +945,28 @@ async def update_job(
         # Reset conversation when new files are uploaded to start fresh Q&A
         if new_files_added:
             job.conversation = json.dumps([])
+            # New BRD invalidates existing workflow execution context. Clear old
+            # workflow steps/communications so the user must rebuild workflow
+            # from the latest requirements before executing.
+            existing_steps = db.query(WorkflowStep).filter(WorkflowStep.job_id == job.id).all()
+            for step in existing_steps:
+                db.query(AgentCommunication).filter(
+                    (AgentCommunication.from_workflow_step_id == step.id) |
+                    (AgentCommunication.to_workflow_step_id == step.id)
+                ).delete()
+                db.delete(step)
+            job.status = JobStatus.DRAFT
+            job.total_cost = 0.0
+            job.completed_at = None
+            job.failure_reason = None
             old_files_to_cleanup = old_files
             logger.info(
-                "BRD overwrite staged for job_id=%s business_id=%s old_files=%s new_files=%s",
+                "BRD overwrite staged for job_id=%s business_id=%s old_files=%s new_files=%s cleared_steps=%s",
                 job.id,
                 current_user.id,
                 len(old_files),
                 len(staged_new_files),
+                len(existing_steps),
             )
     
     try:

@@ -3,17 +3,10 @@ from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.engine.url import make_url
 import os
-from dotenv import load_dotenv
+from core.config import settings
 
-load_dotenv()
-
-# Prefer DATABASE_URL; on Azure, also support Connection strings (POSTGRESQLCONNSTR_* or CUSTOMCONNSTR_*)
-DATABASE_URL = (
-    os.getenv("DATABASE_URL")
-    or os.getenv("POSTGRESQLCONNSTR_DefaultConnection")
-    or os.getenv("CUSTOMCONNSTR_DefaultConnection")
-    or "postgresql://postgres:postgres@localhost:5432/agent_marketplace"
-)
+# Centralized settings with env fallbacks is handled in core.config.Settings.
+DATABASE_URL = settings.DATABASE_URL
 
 # On Azure Web App, DATABASE_URL must point to a real PostgreSQL server (not localhost)
 if os.getenv("WEBSITES_SITE_NAME") and ("localhost" in DATABASE_URL or "127.0.0.1" in DATABASE_URL):

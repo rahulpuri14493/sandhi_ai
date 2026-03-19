@@ -1,199 +1,66 @@
 # ---------------------------------------------------------------------------
-# Production Ceph cluster overlay (MON + MGR + OSD + RGW)
+# S3-compatible object storage overlay (MinIO)
 # ---------------------------------------------------------------------------
 # Usage:
 #   docker compose -f docker-compose.yml -f docker-compose.ceph.yml up -d
 #
-# Starts a full single-box Ceph Reef cluster alongside the platform stack.
-# The backend connects to the RGW at http://ceph-rgw:7480 via Docker DNS.
+# Runs a single MinIO container that provides an S3-compatible API on
+# port 9000 (API) and 9001 (web console).  The backend connects to
+# http://minio:9000 via Docker DNS using the standard boto3 S3 client,
+# so the same code paths work against Ceph RGW or AWS S3 in production.
 #
-# On first boot a one-shot init container:
-#   1. Configures pool replication for a single-OSD deployment
-#   2. Applies RGW production tuning
-#   3. Creates the S3 user (from S3_ACCESS_KEY_ID / S3_SECRET_ACCESS_KEY)
-#
-# For an external multi-node Ceph cluster (recommended for HA production),
-# skip this file and point the backend to the external RGW via
-# S3_ENDPOINT_URL in .env.
+# For an external Ceph/S3 cluster (recommended for HA production),
+# skip this file and set S3_ENDPOINT_URL in .env.
 #
 # Works on Windows (Docker Desktop), Linux, and macOS.
 # ---------------------------------------------------------------------------
 
 services:
-  # ---- Ceph Monitor --------------------------------------------------------
-  # Bootstraps the cluster on first run (generates FSID, keyrings, config).
-  ceph-mon:
-    image: quay.io/ceph/daemon:latest-reef
-    container_name: ceph-mon
+  # ---- MinIO (S3-compatible storage) ---------------------------------------
+  minio:
+    image: minio/minio:latest
+    container_name: minio
     restart: unless-stopped
-    command: mon
+    command: server /data --console-address ":9001"
     environment:
-      MON_IP: 172.28.0.10
-      CEPH_PUBLIC_NETWORK: 172.28.0.0/16
+      MINIO_ROOT_USER: ${S3_ACCESS_KEY_ID:?Set S3_ACCESS_KEY_ID in .env}
+      MINIO_ROOT_PASSWORD: ${S3_SECRET_ACCESS_KEY:?Set S3_SECRET_ACCESS_KEY in .env}
+    ports:
+      - "${MINIO_API_PORT:-9000}:9000"
+      - "${MINIO_CONSOLE_PORT:-9001}:9001"
     volumes:
-      - ceph-etc:/etc/ceph
-      - ceph-lib:/var/lib/ceph
-    networks:
-      ceph-net:
-        ipv4_address: 172.28.0.10
-    deploy:
-      resources:
-        limits:
-          cpus: "1"
-          memory: 1G
-        reservations:
-          cpus: "0.25"
-          memory: 256M
+      - minio-data:/data
     healthcheck:
-      test: ["CMD", "ceph", "-s"]
+      test: ["CMD", "mc", "ready", "local"]
       interval: 10s
       timeout: 5s
-      retries: 12
-      start_period: 30s
-
-  # ---- Ceph Manager --------------------------------------------------------
-  ceph-mgr:
-    image: quay.io/ceph/daemon:latest-reef
-    container_name: ceph-mgr
-    restart: unless-stopped
-    command: mgr
-    volumes:
-      - ceph-etc:/etc/ceph
-      - ceph-lib:/var/lib/ceph
-    depends_on:
-      ceph-mon:
-        condition: service_healthy
-    networks:
-      - ceph-net
-    deploy:
-      resources:
-        limits:
-          cpus: "1"
-          memory: 1G
-        reservations:
-          cpus: "0.25"
-          memory: 256M
-
-  # ---- Ceph OSD (directory-backed, single OSD) -----------------------------
-  # Uses a Docker volume instead of a raw block device so it works on every
-  # OS including Docker Desktop on Windows and macOS.
-  ceph-osd:
-    image: quay.io/ceph/daemon:latest-reef
-    container_name: ceph-osd
-    restart: unless-stopped
-    command: osd_directory
-    volumes:
-      - ceph-etc:/etc/ceph
-      - ceph-lib:/var/lib/ceph
-    depends_on:
-      ceph-mon:
-        condition: service_healthy
-    networks:
-      - ceph-net
-    deploy:
-      resources:
-        limits:
-          cpus: "2"
-          memory: 2G
-        reservations:
-          cpus: "0.5"
-          memory: 512M
-
-  # ---- Ceph RGW (S3-compatible gateway) ------------------------------------
-  ceph-rgw:
-    image: quay.io/ceph/daemon:latest-reef
-    container_name: ceph-rgw
-    restart: unless-stopped
-    command: rgw
-    ports:
-      - "${CEPH_RGW_PORT:-7480}:7480"
-    volumes:
-      - ceph-etc:/etc/ceph
-      - ceph-lib:/var/lib/ceph
-    depends_on:
-      ceph-mon:
-        condition: service_healthy
-    networks:
-      - ceph-net
-    deploy:
-      resources:
-        limits:
-          cpus: "2"
-          memory: 2G
-        reservations:
-          cpus: "0.5"
-          memory: 512M
-    healthcheck:
-      test: ["CMD-SHELL", "curl -sf http://127.0.0.1:7480/ || exit 1"]
-      interval: 15s
-      timeout: 5s
       retries: 10
-      start_period: 60s
+      start_period: 10s
 
-  # ---- One-shot cluster initialisation -------------------------------------
-  # Runs once after RGW is healthy: sets pool sizes, applies tuning, and
-  # creates the S3 user.  Exits 0 and does not restart.
-  ceph-init:
-    image: quay.io/ceph/daemon:latest-reef
-    container_name: ceph-init
+  # ---- One-shot bucket creation --------------------------------------------
+  minio-init:
+    image: minio/mc:latest
+    container_name: minio-init
     restart: "no"
-    volumes:
-      - ceph-etc:/etc/ceph
-      - ceph-lib:/var/lib/ceph
     depends_on:
-      ceph-rgw:
+      minio:
         condition: service_healthy
-    networks:
-      - ceph-net
     environment:
       S3_ACCESS_KEY_ID: ${S3_ACCESS_KEY_ID:?Set S3_ACCESS_KEY_ID in .env}
       S3_SECRET_ACCESS_KEY: ${S3_SECRET_ACCESS_KEY:?Set S3_SECRET_ACCESS_KEY in .env}
-    entrypoint: ["/bin/bash", "-c"]
+      S3_BUCKET: ${S3_BUCKET:-sandhi-brd-docs}
+    entrypoint: ["/bin/sh", "-c"]
     command:
       - |
-        set -e
-        echo '=== Ceph cluster init ==='
+        mc alias set local http://minio:9000 "$S3_ACCESS_KEY_ID" "$S3_SECRET_ACCESS_KEY"
+        mc mb --ignore-existing "local/$S3_BUCKET"
+        echo "Bucket '$S3_BUCKET' is ready."
 
-        for i in $$(seq 1 30); do
-          ceph -s >/dev/null 2>&1 && break
-          echo "Waiting for cluster ($$i/30)..."
-          sleep 3
-        done
-
-        # Single-OSD: set default and existing pool replication to 1
-        ceph config set global osd_pool_default_size 1
-        ceph config set global osd_pool_default_min_size 1
-        for pool in $$(ceph osd pool ls 2>/dev/null); do
-          ceph osd pool set "$$pool" size 1 --yes-i-really-mean-it 2>/dev/null || true
-          ceph osd pool set "$$pool" min_size 1 2>/dev/null || true
-        done
-
-        # RGW production tuning (centralised config store)
-        ceph config set client.rgw rgw_thread_pool_size 512
-        ceph config set client.rgw rgw_max_put_size 104857600
-        ceph config set client.rgw rgw_enable_usage_log true
-        ceph config set client.rgw rgw_enable_apis "s3, admin"
-
-        # Create S3 user (idempotent)
-        if radosgw-admin user info --uid=sandhi >/dev/null 2>&1; then
-          echo "S3 user 'sandhi' already exists"
-        else
-          radosgw-admin user create \
-            --uid=sandhi \
-            --display-name="Sandhi AI" \
-            --access-key="$$S3_ACCESS_KEY_ID" \
-            --secret-key="$$S3_SECRET_ACCESS_KEY"
-          echo "Created S3 user 'sandhi'"
-        fi
-
-        echo '=== Ceph cluster init complete ==='
-        ceph -s
-
-  # ---- Backend overrides for Ceph S3 connectivity --------------------------
+  # ---- Backend overrides for S3 connectivity -------------------------------
   backend:
     environment:
       OBJECT_STORAGE_BACKEND: s3
-      S3_ENDPOINT_URL: ${S3_ENDPOINT_URL:-http://ceph-rgw:7480}
+      S3_ENDPOINT_URL: ${S3_ENDPOINT_URL:-http://minio:9000}
       S3_ACCESS_KEY_ID: ${S3_ACCESS_KEY_ID:?Set S3_ACCESS_KEY_ID in .env}
       S3_SECRET_ACCESS_KEY: ${S3_SECRET_ACCESS_KEY:?Set S3_SECRET_ACCESS_KEY in .env}
       S3_BUCKET: ${S3_BUCKET:-sandhi-brd-docs}
@@ -202,20 +69,18 @@ services:
       S3_AUTO_CREATE_BUCKET: "true"
       S3_TCP_KEEPALIVE: "true"
       S3_SIGNATURE_VERSION: s3v4
-    networks:
-      default:
-      ceph-net:
+      S3_CONNECT_TIMEOUT_SECONDS: ${S3_CONNECT_TIMEOUT_SECONDS:-5}
+      S3_READ_TIMEOUT_SECONDS: ${S3_READ_TIMEOUT_SECONDS:-60}
+      S3_MAX_POOL_CONNECTIONS: ${S3_MAX_POOL_CONNECTIONS:-100}
+      S3_RETRY_MODE: ${S3_RETRY_MODE:-standard}
+      S3_MAX_ATTEMPTS: ${S3_MAX_ATTEMPTS:-5}
+      S3_OPERATION_RETRY_ATTEMPTS: ${S3_OPERATION_RETRY_ATTEMPTS:-4}
+      S3_OPERATION_RETRY_BASE_DELAY_SECONDS: ${S3_OPERATION_RETRY_BASE_DELAY_SECONDS:-0.2}
+      S3_OPERATION_RETRY_MAX_DELAY_SECONDS: ${S3_OPERATION_RETRY_MAX_DELAY_SECONDS:-2.0}
+      S3_OPERATION_RETRY_JITTER_SECONDS: ${S3_OPERATION_RETRY_JITTER_SECONDS:-0.1}
     depends_on:
-      ceph-rgw:
+      minio:
         condition: service_healthy
 
-networks:
-  ceph-net:
-    driver: bridge
-    ipam:
-      config:
-        - subnet: 172.28.0.0/16
-
 volumes:
-  ceph-etc:
-  ceph-lib:
+  minio-data:
