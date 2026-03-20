@@ -105,42 +105,44 @@ Required for all Docker setups:
 - `SECRET_KEY`
 - `MCP_INTERNAL_SECRET`
 
-#### Step 4: Choose your storage mode
+#### Step 4: Configure S3 storage in `.env` (default mode)
 
-Choose one path only:
-
-**Path A: Local file storage (simplest for first run)**
-
-- In root `.env`, set `OBJECT_STORAGE_BACKEND=local`.
-- Start services:
-
-```bash
-docker compose up -d --build
-```
-
-**Path B: MinIO (S3-compatible storage, recommended for BRD/doc testing)**
-
-1. Set these in `.env`:
+S3 is the default document storage mode. Set these in root `.env`:
 
 ```env
 OBJECT_STORAGE_BACKEND=s3
 S3_ACCESS_KEY_ID=sandhi-access-key
 S3_SECRET_ACCESS_KEY=sandhi-secret-key
 S3_BUCKET=sandhi-brd-docs
-S3_ENDPOINT_URL=http://minio:9000
 ```
 
-`OBJECT_STORAGE_BACKEND` defaults to `s3` if omitted, but keep it explicit in `.env` for clarity.
+Notes:
 
-2. Start services with MinIO overlay:
+- With MinIO overlay (`docker-compose.s3.yml`), backend endpoint defaults to `http://minio:9000`.
+- For external S3-compatible providers (AWS S3, Ceph RGW, etc.), also set `S3_ENDPOINT_URL=<your-endpoint>`.
+
+#### Step 5: Start services
+
+**Recommended (S3 + MinIO local):**
 
 ```bash
-docker compose -f docker-compose.yml -f docker-compose.ceph.yml up -d --build
+docker compose -f docker-compose.yml -f docker-compose.s3.yml up -d --build
 ```
 
-Note: `docker-compose.ceph.yml` is a legacy filename; it currently starts MinIO.
+Use `docker-compose.s3.yml` for local S3/MinIO.
 
-#### Step 5: Verify services
+**Optional local filesystem mode (no S3):**
+
+```env
+OBJECT_STORAGE_BACKEND=local
+```
+
+Then start only core services:
+
+```bash
+docker compose up -d --build
+```
+#### Step 6: Verify services
 
 ```bash
 docker compose ps
@@ -149,7 +151,7 @@ docker compose ps
 You should see `sandhi-backend`, `sandhi-db`, `a2a-openai-adapter`, and `platform-mcp-server`.
 If you chose Path B, you should also see `minio`.
 
-#### Step 6: Verify application is up
+#### Step 7: Verify application is up
 
 - Backend API docs: `http://localhost:8000/docs`
 - Frontend: `http://localhost:3000`
@@ -167,9 +169,9 @@ Database migrations are applied automatically on backend startup through Alembic
 - Set `A2A_ADAPTER_URL=` in the backend environment if you want to bypass the internal adapter and call OpenAI-compatible endpoints directly.
 - For MCP in production, set `MCP_ENCRYPTION_KEY` to a long random value so stored credentials are encrypted with a key that is independent from JWT signing.
 - Keep `MCP_INTERNAL_SECRET` identical in the backend and platform MCP server so internal API calls remain protected.
-- Job document storage supports S3-compatible backends (MinIO locally, Ceph/AWS S3 in production). See [Object Storage](docs/OBJECT_STORAGE.md).
+- Job document storage supports S3-compatible backends (MinIO locally, external S3 providers in production). See [Object Storage](docs/OBJECT_STORAGE.md).
 - Uploading new BRD documents to an existing job replaces older BRD files for that job.
-- For Docker with MinIO S3, set `S3_ACCESS_KEY_ID` and `S3_SECRET_ACCESS_KEY` in `.env` and run `docker compose -f docker-compose.yml -f docker-compose.ceph.yml up -d --build`.
+- For Docker with MinIO S3, set `S3_ACCESS_KEY_ID` and `S3_SECRET_ACCESS_KEY` in `.env` and run `docker compose -f docker-compose.yml -f docker-compose.s3.yml up -d --build`.
 
 ## Local Development
 
@@ -215,14 +217,14 @@ Once the backend is running, open `http://localhost:8000/docs` for interactive A
 │   ├── a2a_openai_adapter/        # Platform-managed A2A ↔ OpenAI adapter
 │   └── platform_mcp_server/       # Internal platform MCP server
 ├── infra/
-│   └── ceph/                      # S3/MinIO config templates + .env example
+│   └── object-storage/            # S3 config templates + env examples
 ├── scripts/
 │   └── setup_env.py               # First-time .env setup
 ├── docs/
 │   ├── A2A_DEVELOPERS.md          # Developer-facing A2A guidance
 │   └── OBJECT_STORAGE.md          # S3-compatible storage setup and tuning
 ├── docker-compose.yml             # Core platform services
-├── docker-compose.ceph.yml        # MinIO S3 overlay (legacy filename)
+├── docker-compose.s3.yml          # MinIO S3 overlay
 └── README.md
 ```
 

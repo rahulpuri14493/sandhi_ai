@@ -48,7 +48,7 @@ class Settings(BaseSettings):
     S3_RETRY_MODE: str = "standard"
     S3_MAX_ATTEMPTS: int = 5
     S3_AUTO_CREATE_BUCKET: bool = False
-    # Signature version: s3v4 recommended for Ceph RGW compatibility
+    # Signature version: s3v4 recommended for broad S3-compatible compatibility
     S3_SIGNATURE_VERSION: str = "s3v4"
     # TCP keepalive prevents idle connections from being dropped by firewalls/load balancers
     S3_TCP_KEEPALIVE: bool = True

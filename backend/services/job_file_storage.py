@@ -93,11 +93,11 @@ def _require_s3_settings() -> str:
 
 def _s3_client():
     """
-    Build a boto3 S3 client tuned for production Ceph RGW workloads.
+    Build a boto3 S3 client tuned for S3-compatible workloads.
 
     Key hardening knobs (all configurable via env):
       - TCP keepalive — prevents firewall/LB idle-connection resets
-      - Signature v4  — required by modern RGW / S3 implementations
+      - Signature v4  — recommended for modern S3-compatible implementations
       - Connection pooling + retries with exponential back-off
       - Explicit connect & read timeouts
     """

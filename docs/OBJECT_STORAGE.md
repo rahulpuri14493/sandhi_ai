@@ -1,14 +1,56 @@
 # Object Storage (S3-Compatible)
 
-Sandhi AI supports S3-compatible object storage for BRD documents. For production and production-like local deployments, use **Ceph RGW** (or another S3-compatible enterprise endpoint) instead of local filesystem storage.
+Sandhi AI stores BRD/job documents in S3-compatible storage.
 
-Local filesystem storage remains available only as a fallback for basic setups.
+## Current default behavior
+
+- Default backend storage is `s3`.
+- Local Docker onboarding uses **MinIO** (S3-compatible) via `docker-compose.s3.yml`.
+- Local filesystem storage is still supported for testing/basic setups by setting `OBJECT_STORAGE_BACKEND=local`.
 
 ---
 
-## Enabling S3 Storage (Recommended)
+## Recommended local setup (Docker + MinIO)
 
-Set these environment variables on the backend (via `.env` or Compose overrides):
+1. Configure root `.env`:
+
+```env
+OBJECT_STORAGE_BACKEND=s3
+S3_ACCESS_KEY_ID=sandhi-access-key
+S3_SECRET_ACCESS_KEY=sandhi-secret-key
+S3_BUCKET=sandhi-brd-docs
+```
+
+`S3_ENDPOINT_URL` is optional for local MinIO overlay because `docker-compose.s3.yml`
+already injects `http://minio:9000` for backend.
+
+2. Start stack with MinIO overlay:
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.s3.yml up -d --build
+```
+
+3. Verify services:
+
+```bash
+docker compose ps
+```
+
+Expected storage services:
+
+- `minio` (S3 API + console)
+- `minio-init` (one-shot bucket creation)
+
+MinIO endpoints:
+
+- API: `http://localhost:9000`
+- Console: `http://localhost:9001`
+
+---
+
+## Using external S3 in production
+
+Use any S3-compatible endpoint (AWS S3, Ceph RGW, etc.) by setting:
 
 | Variable | Required | Example |
 |----------|----------|---------|
@@ -17,83 +59,70 @@ Set these environment variables on the backend (via `.env` or Compose overrides)
 | `S3_ACCESS_KEY_ID` | Yes | *(your key)* |
 | `S3_SECRET_ACCESS_KEY` | Yes | *(your secret)* |
 | `S3_BUCKET` | Yes | `sandhi-brd-docs` |
-| `S3_ADDRESSING_STYLE` | Recommended | `path` (required for most RGW setups) |
-| `S3_AUTO_CREATE_BUCKET` | Optional | `true` — auto-creates the bucket on startup |
-| `JOB_UPLOAD_MAX_FILE_BYTES` | Optional | Upload size guardrail (default 100 MB) |
+| `S3_REGION` | Optional | `us-east-1` |
+| `S3_ADDRESSING_STYLE` | Recommended | `path` |
+| `S3_AUTO_CREATE_BUCKET` | Optional | `true` |
+| `JOB_UPLOAD_MAX_FILE_BYTES` | Optional | `104857600` (100MB) |
 
-Once set, the backend verifies S3 connectivity on startup. Misconfigured settings produce a clear log warning:
-
-```
-WARNING  S3 storage check FAILED: S3 authentication failed for bucket 'sandhi-brd-docs'. ...
-```
-
-The `/health` endpoint also reports storage status:
-
-```json
-{"status": "healthy", "storage": {"ok": true, "detail": "bucket=sandhi-brd-docs reachable"}}
-```
-
-A `"degraded"` status is returned when S3 is unreachable — useful for load-balancer health probes.
+For external production S3, skip the overlay compose file and run only `docker-compose.yml`.
 
 ---
 
-## Production Ceph RGW Deployment
+## Optional local filesystem mode
 
-### Option A — External Ceph Cluster (recommended for HA)
+If you need to bypass S3 entirely:
 
-Provision Ceph RGW outside Docker and point the backend to it via the S3 environment variables above. No extra Compose file is needed.
+```env
+OBJECT_STORAGE_BACKEND=local
+```
 
-### Option B — Single-Box Ceph Cluster via Docker Compose
-
-For a production-grade single-box deployment (works on Windows, Linux, and macOS):
+Then run:
 
 ```bash
-# 1. Set S3 credentials in .env
-#    S3_ACCESS_KEY_ID=<your-key>
-#    S3_SECRET_ACCESS_KEY=<your-secret>
-
-# 2. Start the full stack with the Ceph overlay
-docker compose -f docker-compose.yml -f docker-compose.ceph.yml up -d
+docker compose up -d --build
 ```
-
-The overlay starts a complete Ceph Reef cluster:
-
-| Service | Role |
-|---------|------|
-| `ceph-mon` | Monitor — bootstraps the cluster, generates FSID and keyrings automatically |
-| `ceph-mgr` | Manager — metrics and cluster orchestration |
-| `ceph-osd` | Object Storage Daemon — directory-backed, works on all OSes |
-| `ceph-rgw` | RADOS Gateway — S3-compatible API at `http://ceph-rgw:7480` |
-| `ceph-init` | One-shot — sets pool sizes, applies RGW tuning, creates S3 user |
-
-No manual `ceph.conf` editing or keying generation is required — the monitor bootstraps everything on first boot.
-
-**Production hardening applied by the overlay:**
-
-| Setting | Why |
-|---------|-----|
-| Bridge networking + dedicated subnet | Service-name DNS (`http://ceph-rgw:7480`) works out of the box |
-| Per-service CPU / memory limits | Prevents runaway resource consumption |
-| Health checks on MON and RGW | Compose-native readiness gates; services wait for dependencies |
-| Single-OSD pool tuning | Replication set to 1 automatically by the init container |
-| Idempotent S3 user creation | Safe to re-run `docker compose up` without errors |
-
-> **Scaling up**: To move from single-box to multi-node, switch to Option A with a real Ceph cluster and point `S3_ENDPOINT_URL` at the external RGW. The backend code does not change.
 
 ---
 
-## S3 Client Tuning
+## Health and failure behavior
 
-These optional variables control the backend's S3 connection pool and retry behaviour:
+- Backend checks storage connectivity and bucket access.
+- `/health` includes storage status:
+
+```json
+{"status":"healthy","storage":{"ok":true,"detail":"bucket=sandhi-brd-docs reachable"}}
+```
+
+If storage config is missing or endpoint is unavailable, health can return `"degraded"` with details.
+
+---
+
+## Reliability hardening in storage layer
+
+The S3 path includes protections for transient failures:
+
+- boto3 retry settings (`S3_RETRY_MODE`, `S3_MAX_ATTEMPTS`)
+- app-level exponential backoff + jitter retries for upload/download/head operations
+- post-upload object visibility wait (`head_object`) before returning metadata
+
+This reduces race conditions where uploads succeed but immediate reads fail.
+
+---
+
+## S3 tuning variables
 
 | Env var | Default | Purpose |
 |---------|---------|---------|
-| `S3_SIGNATURE_VERSION` | `s3v4` | Required by modern Ceph RGW |
-| `S3_TCP_KEEPALIVE` | `true` | Prevents idle-connection resets through firewalls/LBs |
-| `S3_MAX_POOL_CONNECTIONS` | `100` | Connection pool size for concurrent jobs |
-| `S3_CONNECT_TIMEOUT_SECONDS` | `5` | Fast failure on unreachable endpoints |
-| `S3_READ_TIMEOUT_SECONDS` | `60` | Allows large-object downloads |
-| `S3_MAX_ATTEMPTS` | `5` | Retries with exponential back-off |
-| `S3_RETRY_MODE` | `standard` | boto3 standard retry strategy |
+| `S3_SIGNATURE_VERSION` | `s3v4` | Signature algorithm |
+| `S3_TCP_KEEPALIVE` | `true` | Better idle connection stability |
+| `S3_MAX_POOL_CONNECTIONS` | `100` | Connection pool size |
+| `S3_CONNECT_TIMEOUT_SECONDS` | `5` | Connect timeout |
+| `S3_READ_TIMEOUT_SECONDS` | `60` | Read timeout |
+| `S3_MAX_ATTEMPTS` | `5` | boto3 retry attempts |
+| `S3_RETRY_MODE` | `standard` | boto3 retry mode |
+| `S3_OPERATION_RETRY_ATTEMPTS` | `4` | App-level retry attempts |
+| `S3_OPERATION_RETRY_BASE_DELAY_SECONDS` | `0.2` | Backoff base delay |
+| `S3_OPERATION_RETRY_MAX_DELAY_SECONDS` | `2.0` | Backoff cap |
+| `S3_OPERATION_RETRY_JITTER_SECONDS` | `0.1` | Jitter to avoid thundering herd |
 
-See `infra/ceph/.env.ceph.example` for a complete env var template.
+See `infra/object-storage/.env.s3.example` for complete examples.

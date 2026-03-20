@@ -14,7 +14,7 @@ def test_settings_has_required_attributes():
 
 
 def test_settings_has_s3_storage_attributes():
-    """Settings object has all S3/Ceph storage configuration attributes."""
+    """Settings object has all S3/MinIO storage configuration attributes."""
     s3_attrs = [
         "OBJECT_STORAGE_BACKEND",
         "S3_ENDPOINT_URL",

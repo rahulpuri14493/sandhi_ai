@@ -236,7 +236,7 @@ yarn-error.log*
 .DS_Store
 Thumbs.db
 
-# Ceph local data/logs (bind-mount targets)
+# Legacy Ceph local data/logs (deprecated)
 .ceph/
 
 # Database
