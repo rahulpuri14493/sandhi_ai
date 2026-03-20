@@ -1,51 +1,45 @@
-from pydantic import BaseModel, field_validator, model_validator
+from pydantic import BaseModel, field_validator
 from typing import Optional, List, Dict, Any
-from datetime import datetime
+from datetime import datetime, timezone as tz
 import json
-import re
 from zoneinfo import available_timezones
 from models.job import JobStatus, ScheduleStatus
 
 
-_TIME_PATTERN = re.compile(r"^([01]\d|2[0-3]):([0-5]\d)$")
 _VALID_TIMEZONES = available_timezones()
 
 
-def _validate_timezone(tz: str) -> str:
-    if tz not in _VALID_TIMEZONES:
-        raise ValueError(f"Invalid timezone: {tz}")
-    return tz
+def _validate_timezone(v: str) -> str:
+    """Validate that the timezone string is a valid IANA timezone (e.g. 'Asia/Kolkata')."""
+    if v not in _VALID_TIMEZONES:
+        raise ValueError(f"Invalid timezone: {v}")
+    return v
 
 
-def _validate_time_str(t: str) -> str:
-    if not _TIME_PATTERN.match(t):
-        raise ValueError("Time must be in HH:MM format (e.g. 09:00)")
-    return t
+def _is_in_past(v: datetime) -> bool:
+    """Check if a datetime is in the past. Handles both naive and tz-aware inputs.
 
-
-def build_cron_from_schedule(days_of_week: List[int], time: str) -> str:
-    """Convert day list + time to a 5-field cron expression.
-    e.g. [1,3,5] + "09:30" → "30 9 * * 1,3,5"
+    Uses datetime.utcnow() for consistency with the rest of the codebase.
+    Tz-aware inputs are converted to UTC before comparison; naive inputs
+    are assumed to be UTC.
     """
-    parts = time.split(":")
-    hour, minute = parts[0].lstrip("0") or "0", parts[1].lstrip("0") or "0"
-    dow = ",".join(str(d) for d in sorted(days_of_week)) if days_of_week else "*"
-    return f"{minute} {hour} * * {dow}"
-
-
-def build_cron_from_datetime(dt: datetime) -> str:
-    """Convert a datetime to a cron expression matching that exact minute.
-    e.g. Mar 20 14:30 → "30 14 20 3 *"
-    """
-    return f"{dt.minute} {dt.hour} {dt.day} {dt.month} *"
+    now = datetime.utcnow()
+    if v.tzinfo:
+        # Convert tz-aware input to naive UTC for comparison
+        compare = v.astimezone(tz.utc).replace(tzinfo=None)
+    else:
+        compare = v
+    return compare < now
 
 
 class JobScheduleCreate(BaseModel):
-    is_one_time: bool
+    """Schema for creating a one-time job schedule.
+
+    scheduled_at must be a future datetime. timezone is the IANA timezone
+    the user intended (used by APScheduler's DateTrigger).
+    """
+    scheduled_at: datetime
     timezone: str = "UTC"
-    scheduled_at: Optional[datetime] = None  # Required for one-time
-    days_of_week: Optional[List[int]] = None  # Required for recurring (0=Sun, 6=Sat)
-    time: Optional[str] = None  # Required for recurring, "HH:MM"
     status: ScheduleStatus = ScheduleStatus.ACTIVE
 
     @field_validator("timezone")
@@ -53,43 +47,22 @@ class JobScheduleCreate(BaseModel):
     def validate_tz(cls, v: str) -> str:
         return _validate_timezone(v)
 
-    @field_validator("time")
+    @field_validator("scheduled_at")
     @classmethod
-    def validate_time(cls, v: Optional[str]) -> Optional[str]:
-        if v is not None:
-            return _validate_time_str(v)
+    def validate_not_in_past(cls, v: datetime) -> datetime:
+        if _is_in_past(v):
+            raise ValueError("scheduled_at must be in the future")
         return v
-
-    @field_validator("days_of_week")
-    @classmethod
-    def validate_days(cls, v: Optional[List[int]]) -> Optional[List[int]]:
-        if v is not None:
-            for d in v:
-                if d < 0 or d > 6:
-                    raise ValueError("days_of_week values must be 0-6 (Sun=0, Sat=6)")
-            if not v:
-                raise ValueError("days_of_week must not be empty")
-        return v
-
-    @model_validator(mode="after")
-    def check_required_fields(self):
-        if self.is_one_time:
-            if self.scheduled_at is None:
-                raise ValueError("scheduled_at is required for one-time schedules")
-        else:
-            if self.days_of_week is None:
-                raise ValueError("days_of_week is required for recurring schedules")
-            if self.time is None:
-                raise ValueError("time is required for recurring schedules")
-        return self
 
 
 class JobScheduleUpdate(BaseModel):
-    is_one_time: Optional[bool] = None
-    timezone: Optional[str] = None
+    """Schema for updating a schedule. All fields optional.
+
+    Used for both regular updates and "Schedule Again" after job failure
+    (frontend sends a new scheduled_at and optionally status=active).
+    """
     scheduled_at: Optional[datetime] = None
-    days_of_week: Optional[List[int]] = None
-    time: Optional[str] = None
+    timezone: Optional[str] = None
     status: Optional[ScheduleStatus] = None
 
     @field_validator("timezone")
@@ -99,20 +72,11 @@ class JobScheduleUpdate(BaseModel):
             return _validate_timezone(v)
         return v
 
-    @field_validator("time")
+    @field_validator("scheduled_at")
     @classmethod
-    def validate_time(cls, v: Optional[str]) -> Optional[str]:
-        if v is not None:
-            return _validate_time_str(v)
-        return v
-
-    @field_validator("days_of_week")
-    @classmethod
-    def validate_days(cls, v: Optional[List[int]]) -> Optional[List[int]]:
-        if v is not None:
-            for d in v:
-                if d < 0 or d > 6:
-                    raise ValueError("days_of_week values must be 0-6 (Sun=0, Sat=6)")
+    def validate_not_in_past(cls, v: Optional[datetime]) -> Optional[datetime]:
+        if v is not None and _is_in_past(v):
+            raise ValueError("scheduled_at must be in the future")
         return v
 
 
@@ -120,11 +84,8 @@ class JobScheduleResponse(BaseModel):
     id: int
     job_id: int
     status: ScheduleStatus
-    is_one_time: bool
     timezone: str
-    scheduled_at: Optional[datetime] = None
-    days_of_week: Optional[List[int]] = None
-    time: Optional[str] = None
+    scheduled_at: datetime
     last_run_time: Optional[datetime] = None
     next_run_time: Optional[datetime] = None
     created_at: datetime
@@ -132,32 +93,66 @@ class JobScheduleResponse(BaseModel):
     class Config:
         from_attributes = True
 
-    @field_validator("days_of_week", mode="before")
-    @classmethod
-    def parse_days_of_week(cls, v):
-        if v is None:
-            return None
-        if isinstance(v, str) and v.strip():
-            return [int(d) for d in v.split(",") if d.strip()]
-        if isinstance(v, list):
-            return [int(d) for d in v]
-        return None
-
-    @classmethod
-    def model_validate(cls, obj, **kwargs):
-        """Map DB column 'schedule_time' to response field 'time'."""
-        if hasattr(obj, "schedule_time") and not hasattr(obj, "time"):
-            # Create a dict copy to remap the field
-            data = {c.key: getattr(obj, c.key) for c in obj.__table__.columns}
-            data["time"] = data.pop("schedule_time", None)
-            data.pop("cron_expression", None)  # Internal field, not in response
-            return super().model_validate(data, **kwargs)
-        return super().model_validate(obj, **kwargs)
-
 
 class JobScheduleWithJobResponse(JobScheduleResponse):
-    """Schedule response enriched with job title for cross-job listing."""
+    """Schedule response enriched with job title and status for cross-job listing."""
     job_title: str = ""
+    job_status: str = ""
+
+
+class ScheduleListResponse(BaseModel):
+    """Paginated list of schedules."""
+    items: List[JobScheduleWithJobResponse]
+    total: int
+    limit: int
+    offset: int
+
+
+class ScheduleExecutionHistoryResponse(BaseModel):
+    id: int
+    schedule_id: int
+    job_id: int
+    started_at: datetime
+    completed_at: Optional[datetime] = None
+    status: str
+    failure_reason: Optional[str] = None
+    triggered_by: str
+
+    class Config:
+        from_attributes = True
+
+
+class EnumOption(BaseModel):
+    """Single enum value for dynamic filter dropdowns."""
+    value: str
+    label: str
+
+
+class JobFilterOptions(BaseModel):
+    """All available filter values for the job list endpoint."""
+    statuses: List[EnumOption]
+    sort_options: List[EnumOption]
+
+
+class ScheduleFilterOptions(BaseModel):
+    """All available filter values for the schedule list endpoint."""
+    schedule_statuses: List[EnumOption]
+    job_statuses: List[EnumOption]
+    sort_options: List[EnumOption]
+    jobs: List[dict]  # [{id, title}] — user's jobs for the job_id dropdown
+
+
+class ScheduleActionResponse(BaseModel):
+    """Standard response for schedule create/update mutations."""
+    message: str
+    data: JobScheduleResponse
+
+
+class RerunResponse(BaseModel):
+    """Response for job rerun operation."""
+    message: str
+    job_id: int
+    status: str
 
 
 def _parse_int_list(v):

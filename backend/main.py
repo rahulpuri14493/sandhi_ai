@@ -26,7 +26,9 @@ configure_logging()
 logger = logging.getLogger(__name__)
 request_logger = logging.getLogger("uvicorn.error")
 
-# Run Alembic migrations (PostgreSQL only; retry until DB is ready, e.g. Docker)
+# Run Alembic migrations (PostgreSQL only; retry until DB is ready, e.g. Docker).
+# This completes before the scheduler starts (lifespan), so all tables exist when
+# load_all_schedules() runs.
 for attempt in range(30):
     try:
         run_alembic_upgrade()

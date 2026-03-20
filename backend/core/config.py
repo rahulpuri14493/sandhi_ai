@@ -60,5 +60,7 @@ class Settings(BaseSettings):
     JOB_UPLOAD_MAX_FILE_BYTES: int = 104857600  # 100 MB default
     # Job scheduler: set DISABLE_SCHEDULER=true for tests/CI to prevent APScheduler from starting
     DISABLE_SCHEDULER: bool = False
+    # Stuck job watchdog: jobs in IN_PROGRESS/IN_QUEUE longer than this are flagged
+    STUCK_JOB_THRESHOLD_HOURS: int = 6
 
 settings = Settings()

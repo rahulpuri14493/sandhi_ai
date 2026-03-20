@@ -1,10 +1,12 @@
-"""Unit tests for the JobSchedulerService (CronTrigger-based).
+"""Unit tests for the JobSchedulerService (DateTrigger-based, one-time only).
 
 Tests cover:
-- Schedule execution callback triggers job correctly
-- Skips in-progress jobs, jobs without steps, missing jobs
-- One-time schedules deactivate and remove their APScheduler job
-- Recurring schedules update next_run_time
+- Schedule execution callback triggers job correctly (IN_QUEUE → IN_PROGRESS)
+- Only IN_QUEUE jobs are picked up; all other statuses are skipped
+- Skips jobs without workflow steps, missing jobs/schedules
+- Schedules deactivate and remove their APScheduler job after execution
+- Execution history entries are created
+- Thread failure sets job to FAILED (not APPROVED)
 - Scheduler lifecycle (start/stop)
 - add_schedule / update_schedule / remove_schedule wiring
 """
@@ -18,13 +20,15 @@ from sqlalchemy.orm import Session
 
 from core.security import get_password_hash
 from models.agent import Agent
-from models.job import Job, JobSchedule, JobStatus, ScheduleStatus, WorkflowStep
+from models.job import (
+    Job, JobSchedule, JobStatus, ScheduleStatus,
+    WorkflowStep, ScheduleExecutionHistory,
+)
 from models.user import User, UserRole
 from services.job_scheduler import (
     JobSchedulerService,
     _execute_schedule,
-    _reset_job_for_execution,
-    _cron_to_trigger,
+    reset_job_for_execution,
 )
 
 
@@ -91,16 +95,17 @@ def _make_step(db: Session, job: Job, agent: Agent):
 def _make_schedule(
     db: Session,
     job: Job,
-    cron: str = "0 2 * * *",
     status=ScheduleStatus.ACTIVE,
-    is_one_time: bool = False,
+    scheduled_at=None,
 ):
+    if scheduled_at is None:
+        scheduled_at = datetime.utcnow() + timedelta(hours=1)
     schedule = JobSchedule(
         job_id=job.id,
-        cron_expression=cron,
         status=status,
-        is_one_time=is_one_time,
-        next_run_time=datetime.utcnow() - timedelta(minutes=5),
+        timezone="UTC",
+        scheduled_at=scheduled_at,
+        next_run_time=scheduled_at if status == ScheduleStatus.ACTIVE else None,
     )
     db.add(schedule)
     db.commit()
@@ -109,25 +114,15 @@ def _make_schedule(
 
 
 # ---------------------------------------------------------------------------
-# _cron_to_trigger
-# ---------------------------------------------------------------------------
-
-class TestCronToTrigger:
-    def test_parses_standard_cron(self):
-        trigger = _cron_to_trigger("0 9 * * 1-5")
-        assert trigger is not None
-
-    def test_rejects_wrong_field_count(self):
-        with pytest.raises(ValueError):
-            _cron_to_trigger("0 9 * *")
-
-
-# ---------------------------------------------------------------------------
 # _reset_job_for_execution
 # ---------------------------------------------------------------------------
 
 class TestResetJobForExecution:
-    def test_resets_steps_and_job_status(self, db_session):
+    def test_resets_steps_and_job_fields(self, db_session):
+        """reset_job_for_execution clears step data and job metadata.
+
+        Note: it does NOT commit — the caller sets the final status and commits.
+        """
         user = _make_user(db_session)
         dev = _make_user(db_session, UserRole.DEVELOPER)
         agent = _make_agent(db_session, dev)
@@ -137,9 +132,12 @@ class TestResetJobForExecution:
         step.status = "completed"
         db_session.commit()
 
-        _reset_job_for_execution(db_session, job)
+        reset_job_for_execution(db_session, job)
+        # Caller sets final status and commits
+        job.status = JobStatus.IN_QUEUE
+        db_session.commit()
 
-        assert job.status == JobStatus.PENDING_APPROVAL
+        assert job.status == JobStatus.IN_QUEUE
         assert job.failure_reason is None
         db_session.refresh(step)
         assert step.status == "pending"
@@ -148,17 +146,18 @@ class TestResetJobForExecution:
 
 
 # ---------------------------------------------------------------------------
-# _execute_schedule (the CronTrigger callback)
+# _execute_schedule (the DateTrigger callback)
 # ---------------------------------------------------------------------------
 
 class TestExecuteSchedule:
     @patch("services.job_scheduler.threading")
     @patch("services.job_scheduler.SessionLocal")
-    def test_triggers_execution(self, mock_session_local, mock_threading, db_session):
+    def test_triggers_execution_sets_in_progress(self, mock_session_local, mock_threading, db_session):
+        """Schedule fires → IN_QUEUE job set to IN_PROGRESS, thread started."""
         user = _make_user(db_session)
         dev = _make_user(db_session, UserRole.DEVELOPER)
         agent = _make_agent(db_session, dev)
-        job = _make_job(db_session, user, JobStatus.COMPLETED)
+        job = _make_job(db_session, user, JobStatus.IN_QUEUE)
         _make_step(db_session, job, agent)
         schedule = _make_schedule(db_session, job)
 
@@ -171,8 +170,34 @@ class TestExecuteSchedule:
 
         assert job.status == JobStatus.IN_PROGRESS
         assert schedule.last_run_time is not None
-        assert schedule.next_run_time is not None  # Recurring: recomputed
+        assert schedule.status == ScheduleStatus.INACTIVE
+        assert schedule.next_run_time is None
         mock_thread.start.assert_called_once()
+
+    @patch("services.job_scheduler.threading")
+    @patch("services.job_scheduler.SessionLocal")
+    def test_creates_execution_history(self, mock_session_local, mock_threading, db_session):
+        """History entry created when schedule fires."""
+        user = _make_user(db_session)
+        dev = _make_user(db_session, UserRole.DEVELOPER)
+        agent = _make_agent(db_session, dev)
+        job = _make_job(db_session, user, JobStatus.IN_QUEUE)
+        _make_step(db_session, job, agent)
+        schedule = _make_schedule(db_session, job)
+
+        mock_session_local.return_value = db_session
+        db_session.close = lambda: None
+        mock_thread = MagicMock()
+        mock_threading.Thread.return_value = mock_thread
+
+        _execute_schedule(schedule.id)
+
+        history = db_session.query(ScheduleExecutionHistory).filter(
+            ScheduleExecutionHistory.schedule_id == schedule.id
+        ).all()
+        assert len(history) == 1
+        assert history[0].status == "started"
+        assert history[0].triggered_by == "scheduler"
 
     @patch("services.job_scheduler.threading")
     @patch("services.job_scheduler.SessionLocal")
@@ -194,9 +219,13 @@ class TestExecuteSchedule:
 
     @patch("services.job_scheduler.threading")
     @patch("services.job_scheduler.SessionLocal")
-    def test_skips_job_without_steps(self, mock_session_local, mock_threading, db_session):
+    def test_skips_completed_job(self, mock_session_local, mock_threading, db_session):
+        """Only IN_QUEUE jobs are picked up — COMPLETED jobs are skipped."""
         user = _make_user(db_session)
+        dev = _make_user(db_session, UserRole.DEVELOPER)
+        agent = _make_agent(db_session, dev)
         job = _make_job(db_session, user, JobStatus.COMPLETED)
+        _make_step(db_session, job, agent)
         schedule = _make_schedule(db_session, job)
 
         mock_session_local.return_value = db_session
@@ -207,16 +236,56 @@ class TestExecuteSchedule:
         assert job.status == JobStatus.COMPLETED
         mock_threading.Thread.assert_not_called()
 
-    @patch("services.job_scheduler.get_scheduler")
     @patch("services.job_scheduler.threading")
     @patch("services.job_scheduler.SessionLocal")
-    def test_one_time_deactivates_and_removes(self, mock_session_local, mock_threading, mock_get_sched, db_session):
+    def test_skip_records_history(self, mock_session_local, mock_threading, db_session):
+        """Skipped executions should create a history entry with status='skipped'."""
         user = _make_user(db_session)
         dev = _make_user(db_session, UserRole.DEVELOPER)
         agent = _make_agent(db_session, dev)
-        job = _make_job(db_session, user, JobStatus.COMPLETED)
+        job = _make_job(db_session, user, JobStatus.IN_PROGRESS)
         _make_step(db_session, job, agent)
-        schedule = _make_schedule(db_session, job, is_one_time=True)
+        schedule = _make_schedule(db_session, job)
+
+        mock_session_local.return_value = db_session
+        db_session.close = lambda: None
+
+        _execute_schedule(schedule.id)
+
+        history = db_session.query(ScheduleExecutionHistory).filter(
+            ScheduleExecutionHistory.schedule_id == schedule.id
+        ).all()
+        assert len(history) == 1
+        assert history[0].status == "skipped"
+
+    @patch("services.job_scheduler.threading")
+    @patch("services.job_scheduler.SessionLocal")
+    def test_skips_job_without_steps(self, mock_session_local, mock_threading, db_session):
+        """IN_QUEUE job with no workflow steps is skipped."""
+        user = _make_user(db_session)
+        job = _make_job(db_session, user, JobStatus.IN_QUEUE)
+        schedule = _make_schedule(db_session, job)
+
+        mock_session_local.return_value = db_session
+        db_session.close = lambda: None
+
+        _execute_schedule(schedule.id)
+
+        # Job stays IN_QUEUE — not executed because no steps
+        assert job.status == JobStatus.IN_QUEUE
+        mock_threading.Thread.assert_not_called()
+
+    @patch("services.job_scheduler.get_scheduler")
+    @patch("services.job_scheduler.threading")
+    @patch("services.job_scheduler.SessionLocal")
+    def test_deactivates_and_removes(self, mock_session_local, mock_threading, mock_get_sched, db_session):
+        """Schedule deactivates before thread starts, APScheduler job removed."""
+        user = _make_user(db_session)
+        dev = _make_user(db_session, UserRole.DEVELOPER)
+        agent = _make_agent(db_session, dev)
+        job = _make_job(db_session, user, JobStatus.IN_QUEUE)
+        _make_step(db_session, job, agent)
+        schedule = _make_schedule(db_session, job)
 
         mock_session_local.return_value = db_session
         db_session.close = lambda: None
@@ -232,26 +301,36 @@ class TestExecuteSchedule:
         assert schedule.last_run_time is not None
         mock_svc.remove_schedule.assert_called_once_with(schedule.id)
 
+    @patch("services.job_scheduler.get_scheduler")
     @patch("services.job_scheduler.threading")
     @patch("services.job_scheduler.SessionLocal")
-    def test_recurring_advances_next_run(self, mock_session_local, mock_threading, db_session):
+    def test_thread_failure_sets_job_failed(self, mock_session_local, mock_threading, mock_get_sched, db_session):
+        """If the thread fails to start, job should be set to FAILED (not APPROVED)."""
         user = _make_user(db_session)
         dev = _make_user(db_session, UserRole.DEVELOPER)
         agent = _make_agent(db_session, dev)
-        job = _make_job(db_session, user, JobStatus.COMPLETED)
+        job = _make_job(db_session, user, JobStatus.IN_QUEUE)
         _make_step(db_session, job, agent)
-        schedule = _make_schedule(db_session, job, is_one_time=False)
+        schedule = _make_schedule(db_session, job)
 
         mock_session_local.return_value = db_session
         db_session.close = lambda: None
         mock_thread = MagicMock()
+        mock_thread.start.side_effect = RuntimeError("thread pool exhausted")
         mock_threading.Thread.return_value = mock_thread
+        mock_svc = MagicMock()
+        mock_get_sched.return_value = mock_svc
 
         _execute_schedule(schedule.id)
 
-        assert schedule.status == ScheduleStatus.ACTIVE
-        assert schedule.next_run_time is not None
-        assert schedule.next_run_time > datetime.utcnow() - timedelta(minutes=1)
+        assert job.status == JobStatus.FAILED
+        assert "thread" in job.failure_reason.lower() or "failed" in job.failure_reason.lower()
+        # History should also reflect the failure
+        history = db_session.query(ScheduleExecutionHistory).filter(
+            ScheduleExecutionHistory.schedule_id == schedule.id,
+            ScheduleExecutionHistory.status == "failed",
+        ).first()
+        assert history is not None
 
     @patch("services.job_scheduler.get_scheduler")
     @patch("services.job_scheduler.SessionLocal")
@@ -304,7 +383,7 @@ class TestJobSchedulerServiceLifecycle:
 
 
 # ---------------------------------------------------------------------------
-# add / update / remove schedule
+# add / update / remove schedule (DateTrigger-based)
 # ---------------------------------------------------------------------------
 
 class TestScheduleManagement:
@@ -316,7 +395,9 @@ class TestScheduleManagement:
 
         service = JobSchedulerService()
         service.start()
-        service.add_schedule(1, "0 9 * * *")
+
+        future = datetime.utcnow() + timedelta(hours=1)
+        service.add_schedule(1, scheduled_at=future, timezone="UTC")
 
         job = service._scheduler.get_job("schedule_1")
         assert job is not None
@@ -330,8 +411,12 @@ class TestScheduleManagement:
 
         service = JobSchedulerService()
         service.start()
-        service.add_schedule(1, "0 9 * * *")
-        service.update_schedule(1, "30 14 * * *")
+
+        future = datetime.utcnow() + timedelta(hours=1)
+        service.add_schedule(1, scheduled_at=future, timezone="UTC")
+
+        future2 = datetime.utcnow() + timedelta(hours=2)
+        service.update_schedule(1, scheduled_at=future2, timezone="UTC")
 
         job = service._scheduler.get_job("schedule_1")
         assert job is not None
@@ -345,7 +430,9 @@ class TestScheduleManagement:
 
         service = JobSchedulerService()
         service.start()
-        service.add_schedule(1, "0 9 * * *")
+
+        future = datetime.utcnow() + timedelta(hours=1)
+        service.add_schedule(1, scheduled_at=future, timezone="UTC")
         service.remove_schedule(1)
 
         job = service._scheduler.get_job("schedule_1")
@@ -354,7 +441,8 @@ class TestScheduleManagement:
 
     def test_operations_when_not_running_are_safe(self):
         service = JobSchedulerService()
+        future = datetime.utcnow() + timedelta(hours=1)
         # Should not raise even when scheduler is not running
-        service.add_schedule(1, "0 9 * * *")
-        service.update_schedule(1, "30 14 * * *")
+        service.add_schedule(1, scheduled_at=future, timezone="UTC")
+        service.update_schedule(1, scheduled_at=future, timezone="UTC")
         service.remove_schedule(1)

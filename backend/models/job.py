@@ -14,6 +14,7 @@ class JobStatus(str, enum.Enum):
     DRAFT = "draft"
     PENDING_APPROVAL = "pending_approval"
     APPROVED = "approved"
+    IN_QUEUE = "in_queue"
     IN_PROGRESS = "in_progress"
     COMPLETED = "completed"
     FAILED = "failed"
@@ -49,7 +50,9 @@ class Job(Base):
         back_populates="job",
         cascade="all, delete-orphan",
     )
-    schedules = relationship("JobSchedule", back_populates="job", cascade="all, delete-orphan")
+    # One schedule per job (uselist=False enforces singular access).
+    # The DB UNIQUE constraint on job_schedules.job_id prevents duplicates.
+    schedule = relationship("JobSchedule", back_populates="job", uselist=False, cascade="all, delete-orphan")
 
 
 class WorkflowStep(Base):
@@ -80,20 +83,47 @@ class WorkflowStep(Base):
 
 
 class JobSchedule(Base):
+    """One-time schedule for a job. Each job can have at most one schedule (UNIQUE on job_id).
+
+    Workflow:
+      1. User creates a schedule with a future scheduled_at datetime.
+      2. APScheduler fires a DateTrigger at that time → job is reset and executed.
+      3. After execution, the schedule is deactivated (status=INACTIVE, next_run_time=NULL).
+      4. If the job fails, the user can either "Run Now" (POST /rerun) or
+         "Schedule Again" (PUT /schedule with a new scheduled_at).
+    """
     __tablename__ = "job_schedules"
 
     id = Column(Integer, primary_key=True, index=True)
-    job_id = Column(Integer, ForeignKey("jobs.id"), nullable=False)
-    cron_expression = Column(String, nullable=False)  # Generated internally, never shown to users
+    job_id = Column(Integer, ForeignKey("jobs.id"), nullable=False, unique=True)
     status = Column(Enum(ScheduleStatus, name="schedulestatus"), default=ScheduleStatus.ACTIVE, nullable=False)
-    is_one_time = Column(Boolean, default=False, nullable=False)
     timezone = Column(String, nullable=False, default="UTC")  # IANA timezone e.g. "Asia/Kolkata"
-    scheduled_at = Column(DateTime(timezone=True), nullable=True)  # One-time only: when to run
-    days_of_week = Column(String, nullable=True)  # Recurring: comma-separated day numbers "1,3,5"
-    schedule_time = Column(String, nullable=True)  # Recurring: "HH:MM" e.g. "09:00"
+    scheduled_at = Column(DateTime, nullable=False)
     last_run_time = Column(DateTime, nullable=True)
     next_run_time = Column(DateTime, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
 
     # Relationships
-    job = relationship("Job", back_populates="schedules")
+    job = relationship("Job", back_populates="schedule")
+    execution_history = relationship("ScheduleExecutionHistory", back_populates="schedule", cascade="all, delete-orphan")
+
+
+class ScheduleExecutionHistory(Base):
+    """Append-only audit log for every schedule execution attempt.
+
+    Statuses: started, completed, failed, skipped, potentially_stuck.
+    triggered_by: 'scheduler' (automatic) or 'manual_rerun' (user clicked Run Now).
+    """
+    __tablename__ = "schedule_execution_history"
+
+    id = Column(Integer, primary_key=True, index=True)
+    schedule_id = Column(Integer, ForeignKey("job_schedules.id"), nullable=False)
+    job_id = Column(Integer, ForeignKey("jobs.id"), nullable=False)
+    started_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+    completed_at = Column(DateTime, nullable=True)
+    status = Column(String, default="started", nullable=False)  # started, completed, failed, skipped, potentially_stuck
+    failure_reason = Column(Text, nullable=True)
+    triggered_by = Column(String(50), default="scheduler")  # scheduler, manual_rerun, watchdog
+
+    # Relationships
+    schedule = relationship("JobSchedule", back_populates="execution_history")
