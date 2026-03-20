@@ -208,6 +208,80 @@ def test_split_enforces_explicit_job_description_document_mapping(multi_agents):
     assert result[1]["assigned_document_ids"] == ["BRD2"]
 
 
+def test_split_explicit_mapping_handles_filename_extensions_without_breaking(multi_agents):
+    """Doc names with extensions (e.g., .docx) should still map correctly."""
+    splitter = multi_agents[0]
+    splitter.api_endpoint = "https://api.example.com/chat"
+    splitter.api_key = None
+    api_response = [
+        {"agent_index": 0, "task": "Task 1"},
+        {"agent_index": 1, "task": "Task 2"},
+        {"agent_index": 2, "task": "Task 3"},
+    ]
+    with patch("services.task_splitter.httpx.AsyncClient") as mock_client:
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = {
+            "choices": [{"message": {"content": json.dumps(api_response)}}]
+        }
+        mock_client.return_value.__aenter__.return_value.post = AsyncMock(
+            return_value=mock_resp
+        )
+        result = asyncio.run(split_job_for_agents(
+            job_title="Mapping With Extensions",
+            job_description="anova_test.docx handled by Agent1 and chi_square_test.pdf handled by Agent2",
+            documents_content=[
+                {"id": "BRD1", "name": "anova_test.docx", "content": "add"},
+                {"id": "BRD2", "name": "chi_square_test.pdf", "content": "sub"},
+                {"id": "BRD3", "name": "other.txt", "content": "other"},
+            ],
+            conversation_data=None,
+            agents=multi_agents,
+            splitter_agent=splitter,
+        ))
+    assert result[0]["assigned_document_ids"] == ["BRD1"]
+    assert result[1]["assigned_document_ids"] == ["BRD2"]
+
+
+def test_split_explicit_mapping_uses_bounded_token_matching():
+    """BRD1/agent1 should not collide with BRD10/agent10."""
+    agents = []
+    for i in range(10):
+        a = MagicMock(spec=Agent)
+        a.id = i + 1
+        a.name = f"Agent {i + 1}"
+        a.description = f"Expert {i + 1}"
+        agents.append(a)
+
+    splitter = agents[0]
+    splitter.api_endpoint = "https://api.example.com/chat"
+    splitter.api_key = None
+    api_response = [{"agent_index": i, "task": f"Task {i + 1}"} for i in range(10)]
+    with patch("services.task_splitter.httpx.AsyncClient") as mock_client:
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = {
+            "choices": [{"message": {"content": json.dumps(api_response)}}]
+        }
+        mock_client.return_value.__aenter__.return_value.post = AsyncMock(
+            return_value=mock_resp
+        )
+        result = asyncio.run(split_job_for_agents(
+            job_title="Bounded Matching",
+            job_description="BRD10 handled by agent10. BRD1 handled by agent1.",
+            documents_content=[
+                {"id": "BRD1", "name": "a.txt", "content": "one"},
+                {"id": "BRD10", "name": "b.txt", "content": "ten"},
+            ],
+            conversation_data=None,
+            agents=agents,
+            splitter_agent=splitter,
+        ))
+
+    assert result[0]["assigned_document_ids"] == ["BRD1"]
+    assert result[9]["assigned_document_ids"] == ["BRD10"]
+
+
 def test_fallback_tasks_one_per_agent(multi_agents):
     """_fallback_tasks returns one entry per agent."""
     result = _fallback_tasks(

@@ -244,7 +244,7 @@ def _extract_explicit_document_agent_mapping(
     text = (job_description or "").lower()
     if not text or not doc_catalog:
         return {}
-    chunks = [c.strip() for c in re.split(r"[\n\.;]", text) if c.strip()]
+    clauses = [c.strip() for c in re.split(r"[\n;]|\.(?=\s|$)|\band\b", text) if c.strip()]
     mapping: Dict[int, List[str]] = {}
 
     agent_tokens: Dict[int, List[str]] = {}
@@ -255,6 +255,11 @@ def _extract_explicit_document_agent_mapping(
             tokens.append(name)
         agent_tokens[idx] = tokens
 
+    agent_patterns: Dict[int, List[str]] = {
+        idx: [_bounded_token_regex(t) for t in toks if t]
+        for idx, toks in agent_tokens.items()
+    }
+
     for d_idx, doc in enumerate(doc_catalog):
         doc_id = str(doc.get("id", f"BRD{d_idx + 1}"))
         doc_name = str(doc.get("name", "")).lower()
@@ -264,14 +269,38 @@ def _extract_explicit_document_agent_mapping(
             aliases.add(stem)
         if doc_name:
             aliases.add(doc_name)
-        doc_mentioned_chunks = [c for c in chunks if any(a in c for a in aliases)]
-        for chunk in doc_mentioned_chunks:
-            for agent_idx, tokens in agent_tokens.items():
-                if any(t in chunk for t in tokens):
+        doc_patterns = [_bounded_token_regex(a) for a in aliases if a]
+
+        for clause in clauses:
+            for agent_idx, a_patterns in agent_patterns.items():
+                if _has_explicit_pair_match(clause, doc_patterns, a_patterns):
                     mapping.setdefault(agent_idx, [])
                     if doc_id not in mapping[agent_idx]:
                         mapping[agent_idx].append(doc_id)
     return mapping
+
+
+def _bounded_token_regex(token: str) -> str:
+    # Word boundaries avoid collisions like BRD1 vs BRD10 and agent1 vs agent10.
+    return rf"(?<![a-z0-9]){re.escape(token.lower())}(?![a-z0-9])"
+
+
+def _has_explicit_pair_match(text: str, doc_patterns: List[str], agent_patterns: List[str]) -> bool:
+    if not text or not doc_patterns or not agent_patterns:
+        return False
+    connectors = r"(?:handled\s+by|handle\s+by|handled|handle|assigned\s+to|owned\s+by|by|->|to)"
+    window = r".{0,60}?"
+    for d in doc_patterns:
+        for a in agent_patterns:
+            # document -> connector -> agent
+            p1 = rf"{d}{window}{connectors}{window}{a}"
+            # agent -> connector -> document
+            p2 = rf"{a}{window}{connectors}{window}{d}"
+            if re.search(p1, text, flags=re.IGNORECASE | re.DOTALL) or re.search(
+                p2, text, flags=re.IGNORECASE | re.DOTALL
+            ):
+                return True
+    return False
 
 
 def _normalize_agent_document_scope(

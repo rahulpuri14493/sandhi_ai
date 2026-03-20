@@ -150,7 +150,6 @@ async def _process_one_upload(file: UploadFile, *, job_id: Optional[int] = None)
         for attempt in range(attempts):
             staged_entries: List[dict] = []
             try:
-                extracted_items: List[tuple[str, bytes]] = []
                 with zipfile.ZipFile(io.BytesIO(extract_source), 'r') as zf:
                     for name in zf.namelist():
                         if name.endswith('/'):
@@ -161,11 +160,9 @@ async def _process_one_upload(file: UploadFile, *, job_id: Optional[int] = None)
                         safe_name = Path(name).name or f"file{ext}"
                         with zf.open(name, 'r') as src:
                             data = src.read()
-                        extracted_items.append((safe_name, data))
-                for safe_name, data in extracted_items:
-                    staged_entries.append(
-                        await persist_file(safe_name, data, "application/octet-stream", job_id=job_id)
-                    )
+                        staged_entries.append(
+                            await persist_file(safe_name, data, "application/octet-stream", job_id=job_id)
+                        )
                 if raw_zip_entry:
                     await delete_file(raw_zip_entry)
                 return staged_entries
