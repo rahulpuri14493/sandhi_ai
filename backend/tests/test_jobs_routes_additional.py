@@ -1,10 +1,12 @@
 """Additional coverage tests for api/routes/jobs.py (mocked analyzer)."""
 
+import asyncio
 import io
 import json
 import uuid
 
 import pytest
+from fastapi import UploadFile
 from fastapi.testclient import TestClient
 
 from core.security import create_access_token, get_password_hash
@@ -54,6 +56,177 @@ def test_create_job_rejects_bad_zip(client: TestClient, db_session):
     )
     assert r.status_code == 400
     assert "zip" in r.text.lower()
+
+
+def test_process_one_upload_zip_s3_stages_raw_zip_then_deletes(monkeypatch):
+    """In S3 mode, zip is staged first, extracted, then raw zip object is removed."""
+    import api.routes.jobs as jobs_mod
+
+    monkeypatch.setattr(jobs_mod.settings, "OBJECT_STORAGE_BACKEND", "s3")
+    monkeypatch.setattr(jobs_mod.settings, "ZIP_EXTRACT_RETRY_ATTEMPTS", 1)
+
+    # Build an in-memory zip with one allowed file.
+    buf = io.BytesIO()
+    with jobs_mod.zipfile.ZipFile(buf, "w") as zf:
+        zf.writestr("ok.txt", "hello")
+    zip_bytes = buf.getvalue()
+
+    calls = {"persisted": [], "deleted": [], "downloaded": 0}
+
+    async def fake_persist(name, data, content_type, *, job_id=None):
+        calls["persisted"].append(name)
+        if name.endswith(".zip"):
+            return {
+                "id": "zip-meta",
+                "name": name,
+                "storage": "s3",
+                "bucket": "b",
+                "key": "jobs/1/raw.zip",
+                "type": content_type,
+                "size": len(data),
+            }
+        return {
+            "id": f"doc-{name}",
+            "name": name,
+            "storage": "s3",
+            "bucket": "b",
+            "key": f"jobs/1/{name}",
+            "type": content_type,
+            "size": len(data),
+        }
+
+    async def fake_delete(file_info):
+        calls["deleted"].append(file_info.get("id"))
+
+    def fake_download(file_info):
+        calls["downloaded"] += 1
+        assert file_info.get("id") == "zip-meta"
+        return zip_bytes
+
+    monkeypatch.setattr(jobs_mod, "persist_file", fake_persist)
+    monkeypatch.setattr(jobs_mod, "delete_file", fake_delete)
+    monkeypatch.setattr(jobs_mod, "download_s3_bytes", fake_download)
+
+    upload = UploadFile(filename="bundle.zip", file=io.BytesIO(zip_bytes))
+    out = asyncio.run(jobs_mod._process_one_upload(upload, job_id=1))
+
+    assert len(out) == 1
+    assert out[0]["name"] == "ok.txt"
+    assert calls["persisted"][0] == "bundle.zip"  # raw zip staged first
+    assert calls["downloaded"] == 1  # extraction source is MinIO object bytes
+    assert "zip-meta" in calls["deleted"]  # raw zip removed after extraction
+
+
+def test_process_one_upload_zip_s3_cleans_up_raw_zip_when_download_fails(monkeypatch):
+    """If staged zip cannot be downloaded from S3, staged raw zip is deleted."""
+    import api.routes.jobs as jobs_mod
+
+    monkeypatch.setattr(jobs_mod.settings, "OBJECT_STORAGE_BACKEND", "s3")
+    calls = {"deleted": []}
+
+    async def fake_persist(name, data, content_type, *, job_id=None):
+        return {
+            "id": "zip-meta",
+            "name": name,
+            "storage": "s3",
+            "bucket": "b",
+            "key": "jobs/1/raw.zip",
+            "type": content_type,
+            "size": len(data),
+        }
+
+    async def fake_delete(file_info):
+        calls["deleted"].append(file_info.get("id"))
+
+    def fake_download(_file_info):
+        raise RuntimeError("download failed")
+
+    monkeypatch.setattr(jobs_mod, "persist_file", fake_persist)
+    monkeypatch.setattr(jobs_mod, "delete_file", fake_delete)
+    monkeypatch.setattr(jobs_mod, "download_s3_bytes", fake_download)
+
+    upload = UploadFile(filename="bundle.zip", file=io.BytesIO(b"dummy"))
+    with pytest.raises(jobs_mod.HTTPException) as exc:
+        asyncio.run(jobs_mod._process_one_upload(upload, job_id=1))
+
+    assert exc.value.status_code == 500
+    assert "Failed to stage zip file" in exc.value.detail
+    assert calls["deleted"] == ["zip-meta"]
+
+
+def test_process_one_upload_zip_s3_retries_and_cleans_staged_entries(monkeypatch):
+    """On transient extract failure, staged extracted files are cleaned before retry."""
+    import api.routes.jobs as jobs_mod
+
+    monkeypatch.setattr(jobs_mod.settings, "OBJECT_STORAGE_BACKEND", "s3")
+    monkeypatch.setattr(jobs_mod.settings, "ZIP_EXTRACT_RETRY_ATTEMPTS", 2)
+    monkeypatch.setattr(jobs_mod.settings, "ZIP_EXTRACT_RETRY_BASE_DELAY_SECONDS", 0.0)
+    monkeypatch.setattr(jobs_mod.settings, "ZIP_EXTRACT_RETRY_MAX_DELAY_SECONDS", 0.0)
+    monkeypatch.setattr(jobs_mod.settings, "ZIP_EXTRACT_RETRY_JITTER_SECONDS", 0.0)
+
+    # Build zip with two extractable files so one can stage before failure.
+    buf = io.BytesIO()
+    with jobs_mod.zipfile.ZipFile(buf, "w") as zf:
+        zf.writestr("a.txt", "A")
+        zf.writestr("b.txt", "B")
+    zip_bytes = buf.getvalue()
+
+    state = {"attempt": 1}
+    calls = {"deleted": []}
+
+    async def fake_persist(name, data, content_type, *, job_id=None):
+        if name.endswith(".zip"):
+            return {
+                "id": "zip-meta",
+                "name": name,
+                "storage": "s3",
+                "bucket": "b",
+                "key": "jobs/1/raw.zip",
+                "type": content_type,
+                "size": len(data),
+            }
+        if name == "a.txt" and state["attempt"] == 1:
+            return {
+                "id": "doc-a-attempt1",
+                "name": name,
+                "storage": "s3",
+                "bucket": "b",
+                "key": "jobs/1/a.txt",
+                "type": content_type,
+                "size": len(data),
+            }
+        if name == "b.txt" and state["attempt"] == 1:
+            state["attempt"] = 2
+            raise RuntimeError("transient persist failure")
+        return {
+            "id": f"doc-{name}-attempt2",
+            "name": name,
+            "storage": "s3",
+            "bucket": "b",
+            "key": f"jobs/1/{name}",
+            "type": content_type,
+            "size": len(data),
+        }
+
+    async def fake_delete(file_info):
+        calls["deleted"].append(file_info.get("id"))
+
+    def fake_download(file_info):
+        assert file_info.get("id") == "zip-meta"
+        return zip_bytes
+
+    monkeypatch.setattr(jobs_mod, "persist_file", fake_persist)
+    monkeypatch.setattr(jobs_mod, "delete_file", fake_delete)
+    monkeypatch.setattr(jobs_mod, "download_s3_bytes", fake_download)
+
+    upload = UploadFile(filename="bundle.zip", file=io.BytesIO(zip_bytes))
+    out = asyncio.run(jobs_mod._process_one_upload(upload, job_id=1))
+
+    assert sorted([x["name"] for x in out]) == ["a.txt", "b.txt"]
+    # Failed first attempt should clean staged extracted file.
+    assert "doc-a-attempt1" in calls["deleted"]
+    # Raw zip should be removed only after overall success.
+    assert "zip-meta" in calls["deleted"]
 
 
 def test_analyze_documents_success_adds_completion(monkeypatch, client: TestClient, db_session, tmp_path):
