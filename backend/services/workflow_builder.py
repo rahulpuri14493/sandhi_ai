@@ -90,7 +90,9 @@ class WorkflowBuilder:
                                 continue
                             
                             logger.debug("Successfully read document: %s - Content length: %s chars", file_info.get('name'), len(content))
+                            doc_id = str(file_info.get("id") or f"BRD{len(documents_content) + 1}")
                             documents_content.append({
+                                "id": doc_id,
                                 "name": file_info.get("name", "Unknown"),
                                 "type": file_info.get("type", "unknown"),
                                 "content": content
@@ -194,9 +196,13 @@ class WorkflowBuilder:
         steps = []
         for idx, agent in enumerate(agents):
             assigned_task = ""
+            assigned_document_ids = None
             for ta in task_assignments:
                 if ta.get("agent_index") == idx:
                     assigned_task = ta.get("task", "")
+                    ad = ta.get("assigned_document_ids")
+                    if isinstance(ad, list):
+                        assigned_document_ids = [str(x) for x in ad if str(x).strip()]
                     break
             if not assigned_task:
                 assigned_task = f"Execute the job. You are agent {idx+1} of {len(agents)}. {job.description or job.title}"
@@ -205,6 +211,17 @@ class WorkflowBuilder:
             depends_on_previous = False if idx == 0 else (not steps_independent)
             
             # Each agent gets base context + their specific task assignment
+            docs_for_step = documents_content
+            document_scope_restricted = False
+            assigned_document_names = []
+            if assigned_document_ids:
+                allowed_set = set(assigned_document_ids)
+                filtered_docs = [d for d in documents_content if str(d.get("id")) in allowed_set]
+                if filtered_docs:
+                    docs_for_step = filtered_docs
+                    document_scope_restricted = True
+                    assigned_document_names = [str(d.get("name", "")) for d in filtered_docs if d.get("name")]
+
             step_input_data = {
                 **base_input_data,
                 "step_order": idx + 1,
@@ -212,6 +229,10 @@ class WorkflowBuilder:
                 "agent_name": agent.name,
                 "agent_description": agent.description,
                 "assigned_task": assigned_task,
+                "documents": docs_for_step,
+                "allowed_document_ids": assigned_document_ids,
+                "assigned_document_names": assigned_document_names,
+                "document_scope_restricted": document_scope_restricted,
                 "previous_agents_outputs": []  # Filled by executor when passing previous outputs
             }
             
@@ -292,7 +313,9 @@ class WorkflowBuilder:
                                 continue
                             
                             logger.debug("Successfully read document: %s - Content length: %s chars", file_info.get('name'), len(content))
+                            doc_id = str(file_info.get("id") or f"BRD{len(documents_content) + 1}")
                             documents_content.append({
+                                "id": doc_id,
                                 "name": file_info.get("name", "Unknown"),
                                 "type": file_info.get("type", "unknown"),
                                 "content": content

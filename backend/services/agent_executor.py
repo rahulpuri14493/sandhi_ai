@@ -254,6 +254,20 @@ class AgentExecutor:
                     # First step or independent step - use step's input data only (no previous output)
                     input_data = json.loads(step.input_data) if step.input_data else {}
 
+                # Strict BRD scope guard: if step is document-restricted, ensure only allowed docs are present.
+                if input_data.get("document_scope_restricted"):
+                    allowed_ids_raw = input_data.get("allowed_document_ids") or []
+                    allowed_ids = {str(x) for x in allowed_ids_raw if str(x).strip()}
+                    docs_in_payload = input_data.get("documents") or []
+                    payload_doc_ids = {str((d or {}).get("id")) for d in docs_in_payload if isinstance(d, dict) and (d or {}).get("id")}
+                    if not allowed_ids:
+                        raise ValueError("Document scope restricted but allowed_document_ids is empty")
+                    if payload_doc_ids and not payload_doc_ids.issubset(allowed_ids):
+                        raise ValueError(
+                            f"Policy violation: step {step.step_order} received out-of-scope BRDs. "
+                            f"allowed={sorted(allowed_ids)} payload={sorted(payload_doc_ids)}"
+                        )
+
                 # Resolve which tools this step (agent) can use: step-level overrides; else job-level; else all business tools
                 job_platform_ids = _parse_allowed_ids(getattr(job, "allowed_platform_tool_ids", None))
                 job_conn_ids = _parse_allowed_ids(getattr(job, "allowed_connection_ids", None))
@@ -642,6 +656,9 @@ class AgentExecutor:
         
         # Use assigned_task when present (multi-agent workflow)
         assigned_task = input_data.get('assigned_task', '')
+        assigned_doc_ids = input_data.get("allowed_document_ids") or []
+        assigned_doc_names = input_data.get("assigned_document_names") or []
+        doc_scope_restricted = bool(input_data.get("document_scope_restricted"))
         step_order = input_data.get('step_order')
         total_steps = input_data.get('total_steps')
         has_previous_output = input_data.get('previous_step_output') is not None
@@ -656,6 +673,13 @@ class AgentExecutor:
             system_content += "Perform ONLY your assigned subtask below. Do NOT perform work assigned to other agents.\n"
             system_content += "If the documents describe the full workflow, IGNORE the parts that are not your assignment.\n\n"
             system_content += f"YOUR TASK:\n{assigned_task.strip()}\n\n"
+            if doc_scope_restricted:
+                system_content += "DOCUMENT SCOPE POLICY (strict):\n"
+                if assigned_doc_ids:
+                    system_content += f"- You are allowed to use ONLY these BRD IDs: {', '.join([str(x) for x in assigned_doc_ids])}\n"
+                if assigned_doc_names:
+                    system_content += f"- Allowed BRD names: {', '.join([str(x) for x in assigned_doc_names])}\n"
+                system_content += "- Do NOT use requirements from any other BRD.\n\n"
         else:
             if has_previous_output and step_order is not None and total_steps is not None and total_steps > 1:
                 system_content += "SEQUENTIAL WORKFLOW: You receive the previous agent's output below. Use it as your input and continue the pipeline.\n\n"

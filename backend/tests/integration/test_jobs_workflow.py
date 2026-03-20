@@ -6,10 +6,15 @@ Mocks external analysis/execution so no real network calls.
 """
 
 import io
+import json
 import zipfile
-from unittest.mock import AsyncMock, patch
+from pathlib import Path
+from unittest.mock import AsyncMock, MagicMock, patch
 
 from fastapi.testclient import TestClient
+import pytest
+
+from models.agent import Agent, AgentStatus
 
 
 def _auth_headers(user) -> dict:
@@ -65,6 +70,108 @@ class TestJobsWorkflow:
         # Only ok.txt should appear
         assert job["files"] is not None
         assert all(f["name"].endswith(".txt") for f in job["files"])
+
+    def test_create_job_zip_sanitizes_nested_entry_paths(self, integration_client: TestClient, business_user):
+        # Nested paths should be flattened to safe base names in persisted metadata.
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w") as zf:
+            zf.writestr("nested/folder/spec.txt", "hello")
+            zf.writestr("../escape/unsafe.csv", "a,b\n1,2")
+        buf.seek(0)
+
+        r = integration_client.post(
+            "/api/jobs",
+            data={"title": "Zip Path Sanitization Job"},
+            files={"files": ("bundle.zip", buf, "application/zip")},
+            headers=_auth_headers(business_user),
+        )
+        assert r.status_code == 201, r.text
+        files = r.json().get("files") or []
+        names = sorted([f["name"] for f in files])
+        assert names == ["spec.txt", "unsafe.csv"]
+        assert all("/" not in n and "\\" not in n for n in names)
+
+    def test_create_job_with_empty_zip_creates_job_without_documents(self, integration_client: TestClient, business_user):
+        # Empty ZIP should create a job but no extracted files/documents.
+        empty_zip = io.BytesIO()
+        with zipfile.ZipFile(empty_zip, "w"):
+            pass
+        empty_zip.seek(0)
+
+        create_resp = integration_client.post(
+            "/api/jobs",
+            data={"title": "Empty Zip Job"},
+            files={"files": ("empty.zip", empty_zip, "application/zip")},
+            headers=_auth_headers(business_user),
+        )
+        assert create_resp.status_code == 201, create_resp.text
+        body = create_resp.json()
+        assert body.get("files") is None
+        job_id = body["id"]
+
+        # Since no docs were extracted, analysis should fail with "no docs" validation.
+        analyze_resp = integration_client.post(
+            f"/api/jobs/{job_id}/analyze-documents",
+            headers=_auth_headers(business_user),
+        )
+        assert analyze_resp.status_code == 400
+
+    def test_create_job_zip_retries_on_transient_extract_error(self, integration_client: TestClient, business_user, monkeypatch):
+        from core.config import settings
+        import api.routes.jobs as jobs_routes
+
+        monkeypatch.setattr(settings, "ZIP_EXTRACT_RETRY_ATTEMPTS", 2)
+        monkeypatch.setattr(settings, "ZIP_EXTRACT_RETRY_BASE_DELAY_SECONDS", 0.0)
+        monkeypatch.setattr(settings, "ZIP_EXTRACT_RETRY_MAX_DELAY_SECONDS", 0.0)
+        monkeypatch.setattr(settings, "ZIP_EXTRACT_RETRY_JITTER_SECONDS", 0.0)
+
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w") as zf:
+            zf.writestr("ok.txt", "hello")
+        buf.seek(0)
+
+        real_zip = zipfile.ZipFile
+        state = {"calls": 0}
+
+        def flaky_zip(*args, **kwargs):
+            state["calls"] += 1
+            if state["calls"] == 1:
+                raise OSError("transient zip read error")
+            return real_zip(*args, **kwargs)
+
+        with patch.object(jobs_routes.zipfile, "ZipFile", side_effect=flaky_zip):
+            r = integration_client.post(
+                "/api/jobs",
+                data={"title": "Zip Retry Job"},
+                files={"files": ("bundle.zip", buf, "application/zip")},
+                headers=_auth_headers(business_user),
+            )
+        assert r.status_code == 201, r.text
+        assert state["calls"] == 2
+
+    def test_create_job_zip_fails_after_retry_exhaustion(self, integration_client: TestClient, business_user, monkeypatch):
+        from core.config import settings
+        import api.routes.jobs as jobs_routes
+
+        monkeypatch.setattr(settings, "ZIP_EXTRACT_RETRY_ATTEMPTS", 2)
+        monkeypatch.setattr(settings, "ZIP_EXTRACT_RETRY_BASE_DELAY_SECONDS", 0.0)
+        monkeypatch.setattr(settings, "ZIP_EXTRACT_RETRY_MAX_DELAY_SECONDS", 0.0)
+        monkeypatch.setattr(settings, "ZIP_EXTRACT_RETRY_JITTER_SECONDS", 0.0)
+
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w") as zf:
+            zf.writestr("ok.txt", "hello")
+        buf.seek(0)
+
+        with patch.object(jobs_routes.zipfile, "ZipFile", side_effect=OSError("persistent zip read error")):
+            r = integration_client.post(
+                "/api/jobs",
+                data={"title": "Zip Retry Exhausted Job"},
+                files={"files": ("bundle.zip", buf, "application/zip")},
+                headers=_auth_headers(business_user),
+            )
+        assert r.status_code == 500
+        assert "after 2 attempts" in r.text
 
     def test_analyze_documents_adds_questions(self, integration_client: TestClient, business_user):
         # Create job without files first
@@ -348,4 +455,314 @@ class TestJobsWorkflow:
             headers=_auth_headers(business_user),
         )
         assert r.status_code == 413, r.text
+
+    def test_auto_split_strict_scope_with_external_brd_zip(
+        self,
+        integration_client: TestClient,
+        integration_db_session,
+        business_user,
+        developer_user,
+    ):
+        """
+        Strict integration test using external d:\\BRD.zip:
+        - Upload ZIP and verify extracted BRDs are present
+        - Auto-split with mapping in job description:
+          anova_test -> OpenAI agent, chi_square_test -> Groq agent
+        - Assert each workflow step receives only its assigned BRD scope
+        """
+        zip_path = Path(__file__).resolve().parents[1] / "fixtures" / "BRD.zip"
+        if not zip_path.exists():
+            pytest.skip("Requires test fixture: backend/tests/fixtures/BRD.zip")
+
+        # Create two active hired agents (OpenAI/Groq) for deterministic step order.
+        dev = developer_user["user"]
+        openai_agent = Agent(
+            developer_id=dev.id,
+            name="OpenAI Agent",
+            description="Specialized in anova_test BRD requirements",
+            status=AgentStatus.ACTIVE,
+            price_per_task=10.0,
+            price_per_communication=1.0,
+            api_endpoint="https://example.com/v1/chat/completions",
+            api_key="sk-openai-test",
+            llm_model="gpt-4o-mini",
+            a2a_enabled=False,
+        )
+        groq_agent = Agent(
+            developer_id=dev.id,
+            name="Groq Agent",
+            description="Specialized in chi_square_test BRD requirements",
+            status=AgentStatus.ACTIVE,
+            price_per_task=10.0,
+            price_per_communication=1.0,
+            api_endpoint="https://example.com/v1/chat/completions",
+            api_key="sk-groq-test",
+            llm_model="gpt-4o-mini",
+            a2a_enabled=False,
+        )
+        integration_db_session.add(openai_agent)
+        integration_db_session.add(groq_agent)
+        integration_db_session.commit()
+        integration_db_session.refresh(openai_agent)
+        integration_db_session.refresh(groq_agent)
+
+        description = (
+            "The multi agents are specialized in solving arithmetic problems. "
+            "Attach the zip file. "
+            "anova_test document handled by OpenAI Agent. "
+            "chi_square_test document handled by Groq Agent. "
+            "Give the output only and do not provide approach explanation."
+        )
+
+        with zip_path.open("rb") as f:
+            create_resp = integration_client.post(
+                "/api/jobs",
+                data={"title": "Strict BRD Agent Mapping", "description": description},
+                files={"files": ("BRD.zip", f.read(), "application/zip")},
+                headers=_auth_headers(business_user),
+            )
+        assert create_resp.status_code == 201, create_resp.text
+        job_payload = create_resp.json()
+        job_id = job_payload["id"]
+        files = job_payload.get("files") or []
+        assert len(files) >= 2, "Expected at least two BRDs extracted from BRD.zip"
+
+        anova_meta = next((x for x in files if "anova_test" in (x.get("name", "").lower())), None)
+        chi_meta = next((x for x in files if "chi_square_test" in (x.get("name", "").lower())), None)
+        assert anova_meta is not None, "Expected anova_test BRD file in extracted ZIP content"
+        assert chi_meta is not None, "Expected chi_square_test BRD file in extracted ZIP content"
+
+        # Mock splitter API response without assigned_document_ids so explicit mapping
+        # in description is used by strict scoping logic.
+        llm_assignments = [
+            {"agent_index": 0, "task": "Handle ANOVA calculations only."},
+            {"agent_index": 1, "task": "Handle chi-square calculations only."},
+        ]
+        with patch("services.task_splitter.httpx.AsyncClient") as mock_client:
+            mock_resp = MagicMock()
+            mock_resp.status_code = 200
+            mock_resp.json.return_value = {
+                "choices": [{"message": {"content": json.dumps(llm_assignments)}}]
+            }
+            mock_client.return_value.__aenter__.return_value.post = AsyncMock(return_value=mock_resp)
+
+            split_resp = integration_client.post(
+                f"/api/jobs/{job_id}/workflow/auto-split",
+                json={"agent_ids": [openai_agent.id, groq_agent.id], "workflow_mode": "independent"},
+                headers=_auth_headers(business_user),
+            )
+        assert split_resp.status_code == 200, split_resp.text
+        # Ensure splitter AI interaction is mocked and no real network call is made.
+        mock_client.return_value.__aenter__.return_value.post.assert_awaited_once()
+        called_url = mock_client.return_value.__aenter__.return_value.post.await_args.args[0]
+        assert called_url == openai_agent.api_endpoint
+
+        job_resp = integration_client.get(
+            f"/api/jobs/{job_id}",
+            headers=_auth_headers(business_user),
+        )
+        assert job_resp.status_code == 200, job_resp.text
+        workflow_steps = sorted(job_resp.json().get("workflow_steps") or [], key=lambda s: s["step_order"])
+        assert len(workflow_steps) == 2
+
+        step1_input = json.loads(workflow_steps[0]["input_data"])
+        step2_input = json.loads(workflow_steps[1]["input_data"])
+
+        # Strict document scope must be enabled on both steps.
+        assert step1_input.get("document_scope_restricted") is True
+        assert step2_input.get("document_scope_restricted") is True
+
+        step1_docs = step1_input.get("documents") or []
+        step2_docs = step2_input.get("documents") or []
+        assert len(step1_docs) == 1
+        assert len(step2_docs) == 1
+
+        step1_doc_name = (step1_docs[0].get("name") or "").lower()
+        step2_doc_name = (step2_docs[0].get("name") or "").lower()
+        assert "anova_test" in step1_doc_name
+        assert "chi_square_test" in step2_doc_name
+        assert "chi_square_test" not in step1_doc_name
+        assert "anova_test" not in step2_doc_name
+
+    def test_auto_split_single_agent_zip_keeps_all_brd_scope_without_network_splitter_call(
+        self,
+        integration_client: TestClient,
+        integration_db_session,
+        business_user,
+        developer_user,
+    ):
+        """
+        Complex single-agent scenario using BRD.zip:
+        - uploads multi-BRD zip
+        - auto-split with exactly one agent
+        - no outbound splitter LLM call is made
+        - single step keeps full BRD scope (all extracted docs)
+        """
+        zip_path = Path(__file__).resolve().parents[1] / "fixtures" / "BRD.zip"
+        if not zip_path.exists():
+            pytest.skip("Requires test fixture: backend/tests/fixtures/BRD.zip")
+
+        dev = developer_user["user"]
+        solo_agent = Agent(
+            developer_id=dev.id,
+            name="Solo OpenAI Agent",
+            description="Handles full BRD workload end-to-end",
+            status=AgentStatus.ACTIVE,
+            price_per_task=10.0,
+            price_per_communication=1.0,
+            api_endpoint="https://example.com/v1/chat/completions",
+            api_key="sk-solo-test",
+            llm_model="gpt-4o-mini",
+            a2a_enabled=False,
+        )
+        integration_db_session.add(solo_agent)
+        integration_db_session.commit()
+        integration_db_session.refresh(solo_agent)
+
+        with zip_path.open("rb") as f:
+            create_resp = integration_client.post(
+                "/api/jobs",
+                data={"title": "Single Agent BRD Zip", "description": "One agent should handle all BRDs in this zip."},
+                files={"files": ("BRD.zip", f.read(), "application/zip")},
+                headers=_auth_headers(business_user),
+            )
+        assert create_resp.status_code == 201, create_resp.text
+        job_id = create_resp.json()["id"]
+
+        with patch("services.task_splitter.httpx.AsyncClient") as mock_client:
+            split_resp = integration_client.post(
+                f"/api/jobs/{job_id}/workflow/auto-split",
+                json={"agent_ids": [solo_agent.id], "workflow_mode": "independent"},
+                headers=_auth_headers(business_user),
+            )
+        assert split_resp.status_code == 200, split_resp.text
+        # Single-agent split should not call external splitter endpoint at all.
+        assert mock_client.call_count == 0
+
+        job_resp = integration_client.get(
+            f"/api/jobs/{job_id}",
+            headers=_auth_headers(business_user),
+        )
+        assert job_resp.status_code == 200, job_resp.text
+        workflow_steps = sorted(job_resp.json().get("workflow_steps") or [], key=lambda s: s["step_order"])
+        assert len(workflow_steps) == 1
+        step_input = json.loads(workflow_steps[0]["input_data"])
+        assert step_input.get("document_scope_restricted") is True
+        step_docs = step_input.get("documents") or []
+        doc_names = [(d.get("name") or "").lower() for d in step_docs]
+        assert any("anova_test" in n for n in doc_names)
+        assert any("chi_square_test" in n for n in doc_names)
+        allowed_ids = step_input.get("allowed_document_ids") or []
+        assert len(allowed_ids) == len(step_docs)
+
+    def test_auto_split_multi_agent_uses_mocked_llm_document_ids_from_zip(
+        self,
+        integration_client: TestClient,
+        integration_db_session,
+        business_user,
+        developer_user,
+    ):
+        """
+        Complex multi-agent scenario where mocked splitter explicitly returns assigned_document_ids.
+        Ensures strict per-agent BRD filtering is enforced based on mocked AI output.
+        """
+        zip_path = Path(__file__).resolve().parents[1] / "fixtures" / "BRD.zip"
+        if not zip_path.exists():
+            pytest.skip("Requires test fixture: backend/tests/fixtures/BRD.zip")
+
+        dev = developer_user["user"]
+        openai_agent = Agent(
+            developer_id=dev.id,
+            name="OpenAI Agent",
+            description="Math and ANOVA specialist",
+            status=AgentStatus.ACTIVE,
+            price_per_task=10.0,
+            price_per_communication=1.0,
+            api_endpoint="https://example.com/v1/chat/completions",
+            api_key="sk-openai-test",
+            llm_model="gpt-4o-mini",
+            a2a_enabled=False,
+        )
+        groq_agent = Agent(
+            developer_id=dev.id,
+            name="Groq Agent",
+            description="Chi-square specialist",
+            status=AgentStatus.ACTIVE,
+            price_per_task=10.0,
+            price_per_communication=1.0,
+            api_endpoint="https://example.com/v1/chat/completions",
+            api_key="sk-groq-test",
+            llm_model="gpt-4o-mini",
+            a2a_enabled=False,
+        )
+        integration_db_session.add(openai_agent)
+        integration_db_session.add(groq_agent)
+        integration_db_session.commit()
+        integration_db_session.refresh(openai_agent)
+        integration_db_session.refresh(groq_agent)
+
+        with zip_path.open("rb") as f:
+            create_resp = integration_client.post(
+                "/api/jobs",
+                data={
+                    "title": "Mocked AI BRD Assignment",
+                    "description": "Split the two BRDs between two AI agents and return concise outputs.",
+                },
+                files={"files": ("BRD.zip", f.read(), "application/zip")},
+                headers=_auth_headers(business_user),
+            )
+        assert create_resp.status_code == 201, create_resp.text
+        job_payload = create_resp.json()
+        job_id = job_payload["id"]
+        files = job_payload.get("files") or []
+        anova_meta = next((x for x in files if "anova_test" in (x.get("name", "").lower())), None)
+        chi_meta = next((x for x in files if "chi_square_test" in (x.get("name", "").lower())), None)
+        assert anova_meta is not None
+        assert chi_meta is not None
+
+        llm_assignments = [
+            {
+                "agent_index": 0,
+                "task": "Handle only ANOVA BRD and produce final ANOVA answer only.",
+                "assigned_document_ids": [anova_meta["id"]],
+            },
+            {
+                "agent_index": 1,
+                "task": "Handle only chi-square BRD and produce final chi-square answer only.",
+                "assigned_document_ids": [chi_meta["id"]],
+            },
+        ]
+        with patch("services.task_splitter.httpx.AsyncClient") as mock_client:
+            mock_resp = MagicMock()
+            mock_resp.status_code = 200
+            mock_resp.json.return_value = {
+                "choices": [{"message": {"content": json.dumps(llm_assignments)}}]
+            }
+            mock_client.return_value.__aenter__.return_value.post = AsyncMock(return_value=mock_resp)
+            split_resp = integration_client.post(
+                f"/api/jobs/{job_id}/workflow/auto-split",
+                json={"agent_ids": [openai_agent.id, groq_agent.id], "workflow_mode": "independent"},
+                headers=_auth_headers(business_user),
+            )
+        assert split_resp.status_code == 200, split_resp.text
+        mock_client.return_value.__aenter__.return_value.post.assert_awaited_once()
+
+        job_resp = integration_client.get(
+            f"/api/jobs/{job_id}",
+            headers=_auth_headers(business_user),
+        )
+        assert job_resp.status_code == 200, job_resp.text
+        workflow_steps = sorted(job_resp.json().get("workflow_steps") or [], key=lambda s: s["step_order"])
+        assert len(workflow_steps) == 2
+
+        step1_input = json.loads(workflow_steps[0]["input_data"])
+        step2_input = json.loads(workflow_steps[1]["input_data"])
+        assert step1_input.get("document_scope_restricted") is True
+        assert step2_input.get("document_scope_restricted") is True
+        assert step1_input.get("allowed_document_ids") == [anova_meta["id"]]
+        assert step2_input.get("allowed_document_ids") == [chi_meta["id"]]
+        assert len(step1_input.get("documents") or []) == 1
+        assert len(step2_input.get("documents") or []) == 1
+        assert (step1_input["documents"][0].get("name") or "").lower().find("anova_test") >= 0
+        assert (step2_input["documents"][0].get("name") or "").lower().find("chi_square_test") >= 0
 

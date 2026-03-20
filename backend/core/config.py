@@ -62,5 +62,10 @@ class Settings(BaseSettings):
     DISABLE_SCHEDULER: bool = False
     # Stuck job watchdog: jobs in IN_PROGRESS/IN_QUEUE longer than this are flagged
     STUCK_JOB_THRESHOLD_HOURS: int = 6
+    # Retry settings for ZIP extraction/transient read failures during upload.
+    ZIP_EXTRACT_RETRY_ATTEMPTS: int = 3
+    ZIP_EXTRACT_RETRY_BASE_DELAY_SECONDS: float = 0.1
+    ZIP_EXTRACT_RETRY_MAX_DELAY_SECONDS: float = 0.5
+    ZIP_EXTRACT_RETRY_JITTER_SECONDS: float = 0.05
 
 settings = Settings()
