@@ -89,6 +89,26 @@ async def test_analyze_documents_a2a_json_parse(monkeypatch, tmp_path):
     assert out["workflow_collaboration_hint"] == "sequential"
 
 
+@pytest.mark.asyncio
+async def test_read_file_info_with_local_path_metadata(tmp_path):
+    """read_file_info should accept a metadata dict with a local path and return text content."""
+    da = DocumentAnalyzer()
+    p = tmp_path / "brd.txt"
+    p.write_text("Business requirements document content", encoding="utf-8")
+
+    file_info = {"path": str(p), "name": "brd.txt", "type": "text/plain", "size": p.stat().st_size}
+    content = await da.read_file_info(file_info)
+    assert "Business requirements document content" in content
+
+
+@pytest.mark.asyncio
+async def test_read_file_info_missing_source_raises():
+    """read_file_info should raise for metadata with no readable source."""
+    da = DocumentAnalyzer()
+    with pytest.raises(ValueError, match="no readable source"):
+        await da.read_file_info({"name": "orphan.txt"})
+
+
 def test_extract_helpers():
     da = DocumentAnalyzer()
     qs = da._extract_questions("One? Two? Three? Four?")
@@ -96,6 +116,49 @@ def test_extract_helpers():
     # Lines must have len(cleaned) > 10 to be included
     recs = da._extract_recommendations("- First recommendation here\n1) Second recommendation here\nignore\n")
     assert len(recs) >= 2
+
+
+def test_filter_critical_questions_removes_silly_and_limits_to_three():
+    da = DocumentAnalyzer()
+    questions = [
+        "[Step 1 - Math Agent] Do you want integer or float output?",
+        "[Step 1 - Math Agent] Any specific method/tool preference?",
+        "[Step 1 - Math Agent] Can you provide context for this result?",
+        "[Step 2 - Pricing Agent] Which tax jurisdiction should be used for VAT?",
+        "[Step 3 - Data Agent] When CRM and ERP conflict, which source is authoritative?",
+        "[Step 4 - Security Agent] Is there a mandatory data-retention period?",
+        "[Step 5 - Extra Agent] Additional operation needed after result?",
+    ]
+
+    out = da._filter_critical_questions(questions)
+    # Trivial/silly ones are filtered out.
+    assert all("integer or float" not in q.lower() for q in out)
+    assert all("specific method" not in q.lower() for q in out)
+    assert all("context for this result" not in q.lower() for q in out)
+    # Keep only top 3 critical questions.
+    assert len(out) == 3
+    assert any("tax jurisdiction" in q.lower() for q in out)
+    assert any("source is authoritative" in q.lower() for q in out)
+    assert any("data-retention period" in q.lower() for q in out)
+
+
+def test_filter_critical_questions_deduplicates_case_insensitive():
+    da = DocumentAnalyzer()
+    questions = [
+        "[Step 2 - Agent] Which tax jurisdiction should be used?",
+        "[Step 2 - Agent] Which tax jurisdiction should be used?",
+        "[step 2 - agent] which tax jurisdiction should be used?",
+        "[Step 3 - Agent] Which SLA response time is contractually required?",
+    ]
+    out = da._filter_critical_questions(questions)
+    assert len(out) == 2
+    assert out[0] == "[Step 2 - Agent] Which tax jurisdiction should be used?"
+    assert "sla response time" in out[1].lower()
+
+
+def test_filter_critical_questions_empty_input():
+    da = DocumentAnalyzer()
+    assert da._filter_critical_questions([]) == []
 
 
 @pytest.mark.asyncio

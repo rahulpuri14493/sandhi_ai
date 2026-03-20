@@ -75,18 +75,92 @@ We're building toward:
 - Node.js 18+ for local frontend development
 - Python 3.11+ for local backend development
 
-### Docker Setup
+### Installation (Step-by-Step)
 
-1. Clone the repository.
-2. Run the environment setup script for first-time configuration:
-   ```bash
-   python scripts/setup_env.py
-   ```
-   This creates `.env` from `.env.example` and sets `MCP_INTERNAL_SECRET` and, optionally, `MCP_ENCRYPTION_KEY`.
-3. Start the stack:
-   ```bash
-   docker-compose up -d --build
-   ```
+#### Step 1: Clone the repository
+
+```bash
+git clone <your-repo-url>
+cd sandhi_ai
+```
+
+#### Step 2: Create `.env` from template
+
+```bash
+python scripts/setup_env.py
+```
+
+This creates `.env` from `.env.example` and generates `MCP_INTERNAL_SECRET`.
+
+#### Step 3: Set required values in `.env`
+
+Use the `.env` file at the **repository root** (same directory as `docker-compose.yml`).
+Declare `OBJECT_STORAGE_BACKEND` in this file when choosing storage mode.
+
+Required for all Docker setups:
+
+- `POSTGRES_USER`
+- `POSTGRES_PASSWORD`
+- `POSTGRES_DB`
+- `SECRET_KEY`
+- `MCP_INTERNAL_SECRET`
+
+#### Step 4: Configure S3 storage in `.env` (default mode)
+
+S3 is the default document storage mode. Set these in root `.env`:
+
+```env
+OBJECT_STORAGE_BACKEND=s3
+S3_ACCESS_KEY_ID=sandhi-access-key
+S3_SECRET_ACCESS_KEY=sandhi-secret-key
+S3_BUCKET=sandhi-brd-docs
+```
+
+Notes:
+
+- With MinIO overlay (`docker-compose.s3.yml`), backend endpoint defaults to `http://minio:9000`.
+- For external S3-compatible providers (AWS S3, Ceph RGW, etc.), also set `S3_ENDPOINT_URL=<your-endpoint>`.
+
+#### Step 5: Start services
+
+**Recommended (S3 + MinIO local):**
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.s3.yml up -d --build
+```
+
+Use `docker-compose.s3.yml` for local S3/MinIO.
+
+**Optional local filesystem mode (no S3):**
+
+```env
+OBJECT_STORAGE_BACKEND=local
+```
+
+Then start only core services:
+
+```bash
+docker compose up -d --build
+```
+#### Step 6: Verify services
+
+```bash
+docker compose ps
+```
+
+You should see `sandhi-backend`, `sandhi-db`, `a2a-openai-adapter`, and `platform-mcp-server`.
+If you chose Path B, you should also see `minio`.
+
+#### Step 7: Verify application is up
+
+- Backend API docs: `http://localhost:8000/docs`
+- Frontend: `http://localhost:3000`
+
+If using MinIO:
+
+- MinIO Console: `http://localhost:9001`
+- Login with `S3_ACCESS_KEY_ID` / `S3_SECRET_ACCESS_KEY`
+- Confirm bucket `S3_BUCKET` exists (default: `sandhi-brd-docs`)
 
 Database migrations are applied automatically on backend startup through Alembic. Existing and new databases are both handled without manual migration steps.
 
@@ -95,6 +169,9 @@ Database migrations are applied automatically on backend startup through Alembic
 - Set `A2A_ADAPTER_URL=` in the backend environment if you want to bypass the internal adapter and call OpenAI-compatible endpoints directly.
 - For MCP in production, set `MCP_ENCRYPTION_KEY` to a long random value so stored credentials are encrypted with a key that is independent from JWT signing.
 - Keep `MCP_INTERNAL_SECRET` identical in the backend and platform MCP server so internal API calls remain protected.
+- Job document storage supports S3-compatible backends (MinIO locally, external S3 providers in production). See [Object Storage](docs/OBJECT_STORAGE.md).
+- Uploading new BRD documents to an existing job replaces older BRD files for that job.
+- For Docker with MinIO S3, set `S3_ACCESS_KEY_ID` and `S3_SECRET_ACCESS_KEY` in `.env` and run `docker compose -f docker-compose.yml -f docker-compose.s3.yml up -d --build`.
 
 ## Local Development
 
@@ -134,14 +211,20 @@ Once the backend is running, open `http://localhost:8000/docs` for interactive A
 
 ```text
 .
-├── backend/                   # FastAPI backend and migrations
-├── frontend/                  # React application
+├── backend/                       # FastAPI backend and migrations
+├── frontend/                      # React application
 ├── tools/
-│   ├── a2a_openai_adapter/    # Platform-managed A2A ↔ OpenAI adapter
-│   └── platform_mcp_server/    # Internal platform MCP server
+│   ├── a2a_openai_adapter/        # Platform-managed A2A ↔ OpenAI adapter
+│   └── platform_mcp_server/       # Internal platform MCP server
+├── infra/
+│   └── object-storage/            # S3 config templates + env examples
+├── scripts/
+│   └── setup_env.py               # First-time .env setup
 ├── docs/
-│   └── A2A_DEVELOPERS.md      # Developer-facing A2A guidance
-├── docker-compose.yml
+│   ├── A2A_DEVELOPERS.md          # Developer-facing A2A guidance
+│   └── OBJECT_STORAGE.md          # S3-compatible storage setup and tuning
+├── docker-compose.yml             # Core platform services
+├── docker-compose.s3.yml          # MinIO S3 overlay
 └── README.md
 ```
 

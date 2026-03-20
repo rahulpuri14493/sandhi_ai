@@ -88,7 +88,10 @@ def ensure_env():
 
     if not modified and not created:
         print(".env already exists; MCP_INTERNAL_SECRET already set or not present.")
-    print("Done. Start the stack with: docker-compose up")
+    print("Done. Start the stack with:")
+    print("  docker compose -f docker-compose.yml -f docker-compose.s3.yml up -d --build")
+    print("If you want local filesystem storage instead, set OBJECT_STORAGE_BACKEND=local and run:")
+    print("  docker compose up -d --build")
 
 
 if __name__ == "__main__":

@@ -26,7 +26,6 @@ vi.mock('../../src/lib/api', () => ({
     proxy: vi.fn(),
     refreshToolSchema: vi.fn(),
     validateConnection: vi.fn(),
-    validateToolConfig: vi.fn(),
   },
 }))
 vi.mock('../../src/lib/store', () => ({

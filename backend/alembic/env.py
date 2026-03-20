@@ -2,29 +2,18 @@
 Alembic migration environment. Uses the app's DATABASE_URL and Base.metadata.
 Run from backend/ or with prepend_sys_path so db.* and models are importable.
 """
-import os
 from logging.config import fileConfig
 
-from dotenv import load_dotenv
 from sqlalchemy import engine_from_config
 from sqlalchemy import pool
 from alembic import context
-
-# Load .env from project root or backend/
-load_dotenv()
-load_dotenv(os.path.join(os.path.dirname(__file__), "..", "..", ".env"))
+from core.config import settings
 
 # Alembic Config object
 config = context.config
 
-# Set sqlalchemy.url from environment (same as db.database)
-database_url = (
-    os.getenv("DATABASE_URL")
-    or os.getenv("POSTGRESQLCONNSTR_DefaultConnection")
-    or os.getenv("CUSTOMCONNSTR_DefaultConnection")
-    or "postgresql://postgres:postgres@localhost:5432/agent_marketplace"
-)
-config.set_main_option("sqlalchemy.url", database_url)
+# Set sqlalchemy.url from centralized app settings (same as db.database)
+config.set_main_option("sqlalchemy.url", settings.DATABASE_URL)
 
 if config.config_file_name is not None:
     fileConfig(config.config_file_name)

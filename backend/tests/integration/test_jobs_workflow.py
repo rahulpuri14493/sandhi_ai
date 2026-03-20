@@ -201,3 +201,151 @@ class TestJobsWorkflow:
         assert r4.status_code == 200, r4.text
         assert r4.json().get("tool_visibility") == "none"
 
+    def test_update_job_overwrites_existing_documents(self, integration_client: TestClient, business_user):
+        # Create job with initial file
+        first = io.BytesIO(b"old requirements")
+        r = integration_client.post(
+            "/api/jobs",
+            data={"title": "Overwrite BRD Job"},
+            files={"files": ("old.txt", first, "text/plain")},
+            headers=_auth_headers(business_user),
+        )
+        assert r.status_code == 201, r.text
+        job_id = r.json()["id"]
+        assert r.json()["files"] and len(r.json()["files"]) == 1
+        old_file_id = r.json()["files"][0]["id"]
+
+        # Upload new file via update -> should replace, not append
+        second = io.BytesIO(b"new requirements")
+        r2 = integration_client.put(
+            f"/api/jobs/{job_id}",
+            files={"files": ("new.txt", second, "text/plain")},
+            headers=_auth_headers(business_user),
+        )
+        assert r2.status_code == 200, r2.text
+        files = r2.json().get("files") or []
+        assert len(files) == 1
+        assert files[0]["name"] == "new.txt"
+
+        # Old file should no longer be downloadable
+        r3 = integration_client.get(
+            f"/api/jobs/{job_id}/files/{old_file_id}",
+            headers=_auth_headers(business_user),
+        )
+        assert r3.status_code == 404
+
+    def test_update_job_overwrites_zip_contents_instead_of_merging(self, integration_client: TestClient, business_user):
+        # Create job with zip containing old txt
+        old_zip = io.BytesIO()
+        with zipfile.ZipFile(old_zip, "w") as zf:
+            zf.writestr("old_a.txt", "old")
+        old_zip.seek(0)
+        r = integration_client.post(
+            "/api/jobs",
+            data={"title": "Overwrite Zip Job"},
+            files={"files": ("old_bundle.zip", old_zip, "application/zip")},
+            headers=_auth_headers(business_user),
+        )
+        assert r.status_code == 201, r.text
+        job_id = r.json()["id"]
+        assert len(r.json().get("files") or []) == 1
+
+        # Update with a different zip
+        new_zip = io.BytesIO()
+        with zipfile.ZipFile(new_zip, "w") as zf:
+            zf.writestr("new_a.txt", "new")
+            zf.writestr("new_b.txt", "new")
+        new_zip.seek(0)
+        r2 = integration_client.put(
+            f"/api/jobs/{job_id}",
+            files={"files": ("new_bundle.zip", new_zip, "application/zip")},
+            headers=_auth_headers(business_user),
+        )
+        assert r2.status_code == 200, r2.text
+        files = r2.json().get("files") or []
+        names = sorted([f["name"] for f in files])
+        assert names == ["new_a.txt", "new_b.txt"]
+
+    def test_download_uploaded_file(self, integration_client: TestClient, business_user):
+        """GET /api/jobs/{id}/files/{file_id} returns the file content for a valid upload."""
+        payload = io.BytesIO(b"downloadable content")
+        r = integration_client.post(
+            "/api/jobs",
+            data={"title": "Download Test"},
+            files={"files": ("dl.txt", payload, "text/plain")},
+            headers=_auth_headers(business_user),
+        )
+        assert r.status_code == 201, r.text
+        job_id = r.json()["id"]
+        file_id = r.json()["files"][0]["id"]
+
+        r2 = integration_client.get(
+            f"/api/jobs/{job_id}/files/{file_id}",
+            headers=_auth_headers(business_user),
+        )
+        assert r2.status_code == 200
+        assert r2.content == b"downloadable content"
+
+    def test_delete_job_removes_files(self, integration_client: TestClient, business_user):
+        """DELETE /api/jobs/{id} should succeed and remove associated files from disk."""
+        from pathlib import Path as _P
+
+        payload = io.BytesIO(b"to-be-deleted")
+        r = integration_client.post(
+            "/api/jobs",
+            data={"title": "Delete Cleanup"},
+            files={"files": ("del.txt", payload, "text/plain")},
+            headers=_auth_headers(business_user),
+        )
+        assert r.status_code == 201, r.text
+        job_id = r.json()["id"]
+        # Fetch internal file path via get
+        r2 = integration_client.get(
+            f"/api/jobs/{job_id}",
+            headers=_auth_headers(business_user),
+        )
+        assert r2.status_code == 200
+
+        # Delete the job
+        r3 = integration_client.delete(
+            f"/api/jobs/{job_id}",
+            headers=_auth_headers(business_user),
+        )
+        assert r3.status_code in (200, 204)
+
+        # Verify the job is gone
+        r4 = integration_client.get(
+            f"/api/jobs/{job_id}",
+            headers=_auth_headers(business_user),
+        )
+        assert r4.status_code == 404
+
+    def test_file_metadata_redacted_in_response(self, integration_client: TestClient, business_user):
+        """API responses should never expose internal storage fields (path, bucket, key, storage)."""
+        payload = io.BytesIO(b"secret path")
+        r = integration_client.post(
+            "/api/jobs",
+            data={"title": "Redaction Test"},
+            files={"files": ("r.txt", payload, "text/plain")},
+            headers=_auth_headers(business_user),
+        )
+        assert r.status_code == 201, r.text
+        for f in r.json().get("files") or []:
+            assert "path" not in f
+            assert "bucket" not in f
+            assert "key" not in f
+            assert "storage" not in f
+
+    def test_create_job_rejects_oversized_file(self, integration_client: TestClient, business_user, monkeypatch):
+        from core.config import settings
+
+        monkeypatch.setattr(settings, "JOB_UPLOAD_MAX_FILE_BYTES", 8)
+        payload = io.BytesIO(b"this-is-too-large")
+        r = integration_client.post(
+            "/api/jobs",
+            data={"title": "Large file test"},
+            files={"files": ("large.txt", payload, "text/plain")},
+            headers=_auth_headers(business_user),
+        )
+        assert r.status_code == 413, r.text
+

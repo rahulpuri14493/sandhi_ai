@@ -8,23 +8,20 @@ Generate a key: python -c "import secrets; print(secrets.token_urlsafe(32))"
 import base64
 import hashlib
 import logging
-import os
 from typing import Optional
 
-from dotenv import load_dotenv
-
-load_dotenv()
+from core.config import settings
 
 logger = logging.getLogger(__name__)
 
 # Production: set MCP_ENCRYPTION_KEY (long random string). If unset, key is derived from SECRET_KEY.
 MCP_ENCRYPTION_KEY_ENV = "MCP_ENCRYPTION_KEY"
 SECRET_KEY_DEFAULT = "your-secret-key-change-in-production"
-SECRET_KEY = os.getenv("SECRET_KEY", SECRET_KEY_DEFAULT)
+SECRET_KEY = settings.SECRET_KEY or SECRET_KEY_DEFAULT
 
 
 def _get_fernet_key() -> bytes:
-    key_env = os.getenv(MCP_ENCRYPTION_KEY_ENV)
+    key_env = settings.MCP_ENCRYPTION_KEY
     if key_env and len(key_env) >= 16:
         try:
             return base64.urlsafe_b64encode(
@@ -73,8 +70,8 @@ def ensure_encryption_key_for_production() -> None:
       recommends setting MCP_ENCRYPTION_KEY for production so MCP credentials use
       a key independent of JWT signing.
     """
-    mcp_key = os.getenv(MCP_ENCRYPTION_KEY_ENV)
-    secret = os.getenv("SECRET_KEY", SECRET_KEY_DEFAULT)
+    mcp_key = settings.MCP_ENCRYPTION_KEY
+    secret = settings.SECRET_KEY or SECRET_KEY_DEFAULT
     if mcp_key and len(mcp_key) >= 32:
         return
     if secret == SECRET_KEY_DEFAULT and not mcp_key:
