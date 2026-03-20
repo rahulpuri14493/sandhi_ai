@@ -3,6 +3,7 @@ import asyncio
 import io
 import json
 import zipfile
+import random
 from pathlib import Path
 from typing import List, Optional
 from fastapi import APIRouter, Depends, HTTPException, status, BackgroundTasks, UploadFile, File, Form
@@ -29,6 +30,7 @@ from services.job_file_storage import (
     persist_file,
     delete_file,
     delete_file_sync,
+    download_s3_bytes,
     redact_file_metadata,
     has_readable_source,
     open_local_download_path,
@@ -100,6 +102,13 @@ ALLOWED_EXTENSIONS = {
 EXTRACTABLE_EXTENSIONS = ALLOWED_EXTENSIONS - {'.zip'}
 
 
+def _zip_extract_backoff(attempt_idx: int) -> float:
+    base = max(0.0, float(getattr(settings, "ZIP_EXTRACT_RETRY_BASE_DELAY_SECONDS", 0.1)))
+    cap = max(base, float(getattr(settings, "ZIP_EXTRACT_RETRY_MAX_DELAY_SECONDS", 0.5)))
+    jitter = max(0.0, float(getattr(settings, "ZIP_EXTRACT_RETRY_JITTER_SECONDS", 0.05)))
+    return min(cap, base * (2 ** max(0, attempt_idx))) + random.uniform(0, jitter)
+
+
 async def _process_one_upload(file: UploadFile, *, job_id: Optional[int] = None) -> List[dict]:
     """
     Process one uploaded file. If it's a .zip, extract and return metadata for each
@@ -115,26 +124,78 @@ async def _process_one_upload(file: UploadFile, *, job_id: Optional[int] = None)
         )
 
     if file_ext == '.zip':
-        # Extract zip and save each allowed file
-        entries = []
-        try:
-            with zipfile.ZipFile(io.BytesIO(content), 'r') as zf:
-                for name in zf.namelist():
-                    if name.endswith('/'):
-                        continue
-                    ext = Path(name).suffix.lower()
-                    if ext not in EXTRACTABLE_EXTENSIONS:
-                        continue
-                    safe_name = Path(name).name or f"file{ext}"
-                    with zf.open(name, 'r') as src:
-                        data = src.read()
-                    entries.append(await persist_file(safe_name, data, "application/octet-stream", job_id=job_id))
-        except zipfile.BadZipFile as e:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail=f"Invalid or corrupted zip file: {file.filename}"
-            ) from e
-        return entries
+        # S3 flow: persist raw zip in object storage first, then extract from stored object bytes.
+        s3_backend = (getattr(settings, "OBJECT_STORAGE_BACKEND", "s3") or "s3").strip().lower() == "s3"
+        raw_zip_entry: Optional[dict] = None
+        extract_source = content
+        if s3_backend:
+            try:
+                raw_zip_entry = await persist_file(
+                    file.filename,
+                    content,
+                    file.content_type or "application/zip",
+                    job_id=job_id,
+                )
+                extract_source = await asyncio.to_thread(download_s3_bytes, raw_zip_entry)
+            except Exception as e:
+                if raw_zip_entry:
+                    await delete_file(raw_zip_entry)
+                raise HTTPException(
+                    status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                    detail=f"Failed to stage zip file {file.filename} in object storage: {str(e)}",
+                ) from e
+
+        # Extract zip and save each allowed file (with transient retry + cleanup)
+        attempts = max(1, int(getattr(settings, "ZIP_EXTRACT_RETRY_ATTEMPTS", 3)))
+        for attempt in range(attempts):
+            staged_entries: List[dict] = []
+            try:
+                with zipfile.ZipFile(io.BytesIO(extract_source), 'r') as zf:
+                    for name in zf.namelist():
+                        if name.endswith('/'):
+                            continue
+                        ext = Path(name).suffix.lower()
+                        if ext not in EXTRACTABLE_EXTENSIONS:
+                            continue
+                        safe_name = Path(name).name or f"file{ext}"
+                        with zf.open(name, 'r') as src:
+                            data = src.read()
+                        staged_entries.append(
+                            await persist_file(safe_name, data, "application/octet-stream", job_id=job_id)
+                        )
+                if raw_zip_entry:
+                    await delete_file(raw_zip_entry)
+                return staged_entries
+            except zipfile.BadZipFile as e:
+                for staged in staged_entries:
+                    await delete_file(staged)
+                if raw_zip_entry:
+                    await delete_file(raw_zip_entry)
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=f"Invalid or corrupted zip file: {file.filename}"
+                ) from e
+            except Exception as e:
+                for staged in staged_entries:
+                    await delete_file(staged)
+                if attempt >= attempts - 1:
+                    if raw_zip_entry:
+                        await delete_file(raw_zip_entry)
+                    raise HTTPException(
+                        status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                        detail=f"Failed to process zip file {file.filename} after {attempts} attempts: {str(e)}"
+                    ) from e
+                delay = _zip_extract_backoff(attempt)
+                logger.warning(
+                    "Transient ZIP extraction error for %s (attempt %s/%s): %s. Retrying in %.2fs",
+                    file.filename,
+                    attempt + 1,
+                    attempts,
+                    e,
+                    delay,
+                )
+                await asyncio.sleep(delay)
+        return []
 
     # Single file (non-zip)
     try:

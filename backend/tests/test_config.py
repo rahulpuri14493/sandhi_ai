@@ -32,6 +32,10 @@ def test_settings_has_s3_storage_attributes():
         "S3_SIGNATURE_VERSION",
         "S3_TCP_KEEPALIVE",
         "JOB_UPLOAD_MAX_FILE_BYTES",
+        "ZIP_EXTRACT_RETRY_ATTEMPTS",
+        "ZIP_EXTRACT_RETRY_BASE_DELAY_SECONDS",
+        "ZIP_EXTRACT_RETRY_MAX_DELAY_SECONDS",
+        "ZIP_EXTRACT_RETRY_JITTER_SECONDS",
     ]
     for attr in s3_attrs:
         assert hasattr(settings, attr), f"Missing config attribute: {attr}"
@@ -49,6 +53,9 @@ def test_settings_s3_defaults():
     assert settings.S3_MAX_POOL_CONNECTIONS >= 10
     assert settings.S3_MAX_ATTEMPTS >= 1
     assert settings.JOB_UPLOAD_MAX_FILE_BYTES > 0
+    assert settings.ZIP_EXTRACT_RETRY_ATTEMPTS >= 1
+    assert settings.ZIP_EXTRACT_RETRY_BASE_DELAY_SECONDS >= 0
+    assert settings.ZIP_EXTRACT_RETRY_MAX_DELAY_SECONDS >= settings.ZIP_EXTRACT_RETRY_BASE_DELAY_SECONDS
 
 
 def test_settings_sensible_defaults():

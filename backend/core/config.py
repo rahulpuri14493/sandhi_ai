@@ -58,5 +58,10 @@ class Settings(BaseSettings):
     S3_OPERATION_RETRY_MAX_DELAY_SECONDS: float = 2.0
     S3_OPERATION_RETRY_JITTER_SECONDS: float = 0.1
     JOB_UPLOAD_MAX_FILE_BYTES: int = 104857600  # 100 MB default
+    # Retry settings for ZIP extraction/transient read failures during upload.
+    ZIP_EXTRACT_RETRY_ATTEMPTS: int = 3
+    ZIP_EXTRACT_RETRY_BASE_DELAY_SECONDS: float = 0.1
+    ZIP_EXTRACT_RETRY_MAX_DELAY_SECONDS: float = 0.5
+    ZIP_EXTRACT_RETRY_JITTER_SECONDS: float = 0.05
 
 settings = Settings()
