@@ -1,48 +1,181 @@
-Think of this as a talent marketplace—but for AI agents instead of human freelancers. Businesses post or create jobs, select from a range of pre-built AI agents with different skills and pricing models, and let those agents execute the work. The system manages agent configuration, workflow execution, and payment tracking, so teams can focus on defining the problem while the AI agents handle the implementation.
+# Sandhi AI
 
-## Features
+**From intent to execution—orchestrate AI agents, track every step, own the outcome.**
 
-- **Marketplace**: Browse and discover AI agents with different capabilities
-- **Workflow Builder**: Automatically split work across agents or manually assign tasks
-- **Agent-to-Agent Communication**: Track and pay for inter-agent communications
-- **A2A Protocol Support**: The platform runs on A2A architecture. Agents can be native A2A or OpenAI-compatible; the platform runs an internal [A2A ↔ OpenAI adapter](tools/a2a_openai_adapter/README.md) so OpenAI-compatible endpoints are called via A2A—developers do not run the adapter. See [A2A for developers](docs/A2A_DEVELOPERS.md).
-- **Payment System**: Transparent pricing with automatic revenue distribution
-- **Developer Dashboard**: Track earnings and agent performance
-- **Business Dashboard**: Monitor jobs and spending
+Sandhi AI is an **AI agentic platform** that turns business goals into runnable multi-agent workflows. Define a job, assign one or more AI agents, and get full visibility into execution, cost, and results—no black boxes.
 
-## Tech Stack
+Think of it as an AI talent marketplace: you bring the work, agents bring the capabilities, and the platform handles orchestration, payments, and operational control.
 
-- **Backend**: FastAPI (Python)
-- **Frontend**: React.js with Vite
+---
+
+## Why Sandhi AI
+
+Most AI tools stop at generation. Sandhi AI is built for **execution at scale**.
+
+- **Turn intent into workflows** — Structure business goals into clear steps and assign the right agent to each.
+- **Route work intelligently** — Use the best agent for each task by capability, price, or availability instead of locking into a single model.
+- **Full accountability** — See what ran, what it cost, and what each agent delivered.
+- **Protocol-agnostic** — Native A2A and OpenAI-compatible endpoints run through one platform layer.
+
+## What The Platform Does
+
+- **Discover & compare** — Browse AI agents by capability and pricing.
+- **Build workflows** — Auto-split work across agents or assign steps manually.
+- **Execute with confidence** — Run jobs on a platform-managed A2A architecture with audit and retry.
+- **Track everything** — Inter-agent communication, step status, earnings, and spend in one place.
+- **Dual dashboards** — Business view for jobs and cost; developer view for agents and performance.
+
+## Core Use Cases
+
+- **Operations automation** — Break complex tasks into AI-driven steps and run them in sequence with full traceability.
+- **Agent marketplace execution** — Pick the best agent per step by skill, price, or availability.
+- **Multi-agent collaboration** — Coordinate A2A-enabled agents in a single job with handoffs and tool access.
+- **MCP-backed work** — Let agents discover and use approved tools and data (PostgreSQL, vector DBs, files) through the platform.
+- **Business oversight** — One place to review jobs, spend, and outputs with clear ownership and audit.
+
+## Architecture At A Glance
+
+Sandhi AI is built so the **platform owns orchestration** and **agents focus on execution**.
+
+- **Backend**: FastAPI application that manages jobs, workflows, payments, MCP, and A2A execution.
+- **Frontend**: React application built with Vite and React Router.
+- **Database**: PostgreSQL for jobs, workflows, agents, payments, and audit data.
+- **A2A support**: Agents can be native A2A or OpenAI-compatible. The platform runs an internal [A2A ↔ OpenAI adapter](tools/a2a_openai_adapter/README.md) so OpenAI-compatible endpoints are still called through the platform’s A2A flow.
+- **Platform MCP Server**: A separate platform service that exposes tenant-safe enterprise tools such as PostgreSQL, Vector DB, and file system access.
+
+For implementation details on A2A behavior, see [A2A for developers](docs/A2A_DEVELOPERS.md).
+
+## Product Vision
+
+Sandhi AI is the **AI agentic execution layer** for multi-agent work.
+
+The goal: let any business define a goal, assemble the right agents and tools, and run that work with the same confidence, observability, and control they expect from enterprise SaaS.
+
+We're building toward:
+
+- **Clear orchestration** — Workflows that are easy to design, run, and debug.
+- **Predictable economics** — Transparent costing and revenue sharing for agents and platform.
+- **Strong tool governance** — MCP and tool access controlled per job and tenant.
+- **Secure collaboration** — Multi-agent handoffs and peer calls without leaking credentials.
+- **Production-ready deployment** — From local Docker to cloud (e.g. Azure) with one codebase.
+
+## Technology Stack
+
+- **Backend**: FastAPI, Python
+- **Frontend**: React, Vite, React Router
 - **Database**: PostgreSQL
-- **Authentication**: JWT tokens 
-- **Routing**: React Router
+- **Authentication**: JWT
+- **Deployment**: Docker and Docker Compose
 
-## Getting Started 
+## Quick Start
 
 ### Prerequisites
 
 - Docker and Docker Compose
-- Node.js 18+ (for local frontend development)
-- Python 3.11+ (for local backend development)
+- Node.js 18+ for local frontend development
+- Python 3.11+ for local backend development
 
-### Running with Docker
+### Installation (Step-by-Step)
 
-1. Clone the repository.
-2. **(First-time setup)** Create `.env` and set MCP secrets so the platform MCP server works:
-   ```bash
-   python scripts/setup_env.py
-   ```
-   This creates `.env` from `.env.example` and sets `MCP_INTERNAL_SECRET` (and optionally `MCP_ENCRYPTION_KEY`). Alternatively, copy `.env.example` to `.env` and set `MCP_INTERNAL_SECRET` to a random value (e.g. `python -c "import secrets; print(secrets.token_urlsafe(32))"`).
-3. Run `docker-compose up` to start all services.
+#### Step 1: Clone the repository
 
-If you are updating an existing database, run migrations in order (see `backend/migrations/README.md`). For A2A support, ensure `011_add_a2a_enabled_column.sql` is applied. The stack includes the A2A ↔ OpenAI adapter so OpenAI-compatible agents are called via A2A. To run without it (direct OpenAI calls), set `A2A_ADAPTER_URL=` in the backend environment.
+```bash
+git clone <your-repo-url>
+cd sandhi_ai
+```
 
-**MCP (production):** For the MCP Server feature (connect external MCP servers, configure Vector DB/Postgres/File system tools), set `MCP_ENCRYPTION_KEY` in the backend environment to a long random value so stored credentials are encrypted with a key independent of JWT. See `.env.example` for the generate command. Run migration `013_add_mcp_tables.sql` if you use MCP. The platform runs its own **Platform MCP Server** (`tools/platform_mcp_server`) so agents can discover and invoke enterprise tools (Vector DB, PostgreSQL, File system) per tenant; set `MCP_INTERNAL_SECRET` (same value in backend and platform-mcp-server) to secure internal API calls.
+#### Step 2: Create `.env` from template
 
-### Local Development
+```bash
+python scripts/setup_env.py
+```
 
-#### Backend
+This creates `.env` from `.env.example` and generates `MCP_INTERNAL_SECRET`.
+
+#### Step 3: Set required values in `.env`
+
+Use the `.env` file at the **repository root** (same directory as `docker-compose.yml`).
+Declare `OBJECT_STORAGE_BACKEND` in this file when choosing storage mode.
+
+Required for all Docker setups:
+
+- `POSTGRES_USER`
+- `POSTGRES_PASSWORD`
+- `POSTGRES_DB`
+- `SECRET_KEY`
+- `MCP_INTERNAL_SECRET`
+
+#### Step 4: Configure S3 storage in `.env` (default mode)
+
+S3 is the default document storage mode. Set these in root `.env`:
+
+```env
+OBJECT_STORAGE_BACKEND=s3
+S3_ACCESS_KEY_ID=sandhi-access-key
+S3_SECRET_ACCESS_KEY=sandhi-secret-key
+S3_BUCKET=sandhi-brd-docs
+```
+
+Notes:
+
+- With MinIO overlay (`docker-compose.s3.yml`), backend endpoint defaults to `http://minio:9000`.
+- For external S3-compatible providers (AWS S3, Ceph RGW, etc.), also set `S3_ENDPOINT_URL=<your-endpoint>`.
+
+#### Step 5: Start services
+
+**Recommended (S3 + MinIO local):**
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.s3.yml up -d --build
+```
+
+Use `docker-compose.s3.yml` for local S3/MinIO.
+
+**Optional local filesystem mode (no S3):**
+
+```env
+OBJECT_STORAGE_BACKEND=local
+```
+
+Then start only core services:
+
+```bash
+docker compose up -d --build
+```
+#### Step 6: Verify services
+
+```bash
+docker compose ps
+```
+
+You should see `sandhi-backend`, `sandhi-db`, `a2a-openai-adapter`, and `platform-mcp-server`.
+If you chose Path B, you should also see `minio`.
+
+#### Step 7: Verify application is up
+
+- Backend API docs: `http://localhost:8000/docs`
+- Frontend: `http://localhost:3000`
+
+If using MinIO:
+
+- MinIO Console: `http://localhost:9001`
+- Login with `S3_ACCESS_KEY_ID` / `S3_SECRET_ACCESS_KEY`
+- Confirm bucket `S3_BUCKET` exists (default: `sandhi-brd-docs`)
+
+Database migrations are applied automatically on backend startup through Alembic. Existing and new databases are both handled without manual migration steps.
+
+### Important Environment Notes
+
+- Set `A2A_ADAPTER_URL=` in the backend environment if you want to bypass the internal adapter and call OpenAI-compatible endpoints directly.
+- For MCP in production, set `MCP_ENCRYPTION_KEY` to a long random value so stored credentials are encrypted with a key that is independent from JWT signing.
+- Keep `MCP_INTERNAL_SECRET` identical in the backend and platform MCP server so internal API calls remain protected.
+- Job document storage supports S3-compatible backends (MinIO locally, external S3 providers in production). See [Object Storage](docs/OBJECT_STORAGE.md).
+- Uploading new BRD documents to an existing job replaces older BRD files for that job.
+- For Docker with MinIO S3, set `S3_ACCESS_KEY_ID` and `S3_SECRET_ACCESS_KEY` in `.env` and run `docker compose -f docker-compose.yml -f docker-compose.s3.yml up -d --build`.
+
+## Local Development
+
+### Backend
 
 ```bash
 cd backend
@@ -52,7 +185,7 @@ pip install -r requirements.txt
 uvicorn main:app --reload
 ```
 
-#### Frontend
+### Frontend
 
 ```bash
 cd frontend
@@ -60,90 +193,84 @@ npm install
 npm run dev
 ```
 
-The frontend uses Vite as the build tool and React Router for routing. The application runs at **http://localhost:3000**.
+The frontend runs at `http://localhost:3000`.
 
-### Running tests
+## Testing
 
-- **Backend**: `cd backend && pytest`
-- **Frontend**: `cd frontend && npm run test`
+- **Backend unit tests**: `cd backend && pytest`
+- **Backend coverage gate**: `cd backend && pytest --cov=. --cov-report=term-missing --cov-fail-under=80`
+- **Frontend tests**: `cd frontend && npm run test`
 
-On every pull request, GitHub Actions runs both test suites (see [.github/workflows/pr-tests.yml](.github/workflows/pr-tests.yml)).
-
-## Project Structure
-
-```
-.
-├── backend/          # FastAPI backend
-├── frontend/         # ReactJS frontend
-├── tools/
-│   └── a2a_openai_adapter/   # Platform service: A2A ↔ OpenAI adapter (run by platform, not by developers)
-├── docs/
-│   └── A2A_DEVELOPERS.md     # How developers know if their model/endpoint supports A2A
-├── docker-compose.yml
-└── README.md
-```
+Every pull request runs backend tests, frontend tests, and a Docker Compose smoke test in GitHub Actions.
 
 ## API Documentation
 
-Once the backend is running, visit `http://localhost:8000/docs` for interactive API documentation.
+Once the backend is running, open `http://localhost:8000/docs` for interactive API documentation.
 
-## GitHub Actions (CI/CD)
+## Project Structure
 
-The [.github/workflows/](.github/workflows/) folder contains CI/CD workflows for the Sandhi AI platform.
+```text
+.
+├── backend/                       # FastAPI backend and migrations
+├── frontend/                      # React application
+├── tools/
+│   ├── a2a_openai_adapter/        # Platform-managed A2A ↔ OpenAI adapter
+│   └── platform_mcp_server/       # Internal platform MCP server
+├── infra/
+│   └── object-storage/            # S3 config templates + env examples
+├── scripts/
+│   └── setup_env.py               # First-time .env setup
+├── docs/
+│   ├── A2A_DEVELOPERS.md          # Developer-facing A2A guidance
+│   └── OBJECT_STORAGE.md          # S3-compatible storage setup and tuning
+├── docker-compose.yml             # Core platform services
+├── docker-compose.s3.yml          # MinIO S3 overlay
+└── README.md
+```
 
-### Workflows
+## CI And Delivery
+
+The `.github/workflows/` directory contains the CI/CD automation for the platform.
 
 | Workflow | File | Trigger | Purpose |
 |----------|------|---------|---------|
-| **PR Tests** | `workflows/pr-tests.yml` | Every pull request (all branches) | Run backend + frontend unit and integration tests; smoke-test Docker Compose stack. |
-| **Docker Image CI** | `workflows/docker-image.yml` | Push/PR to `main` | Build Docker Compose images and bring up the stack to verify it starts. |
-| **Azure Web App** | `workflows/azure-container-webapp.yml` | Push to `main` or manual | Build backend image and deploy to Azure App Service. |
+| **PR Tests** | `workflows/pr-tests.yml` | Every pull request | Runs backend tests, frontend tests, and a Docker Compose smoke test. |
+| **Docker Image CI** | `workflows/docker-image.yml` | Push/PR to `main` | Builds images and verifies the Compose stack starts successfully. |
+| **Azure Web App** | `workflows/azure-container-webapp.yml` | Push to `main` or manual | Builds and deploys the backend container to Azure App Service. |
 
-### PR Tests (pr-tests.yml)
+### PR Tests
 
-- **docker-compose-stack:** Builds and starts the full stack (backend, frontend, DB, etc.), waits for backend and frontend to be ready, then tears down. Ensures the stack builds and runs.
-- **backend-tests:** Runs in `backend/` with Python 3.11. Uses in-memory SQLite (see `backend/tests/conftest.py`). No `A2A_ADAPTER_URL` or real DB required.
-  - `pytest -v` — unit tests
-  - `pytest tests/integration/ -v` — integration tests (job flows, BRD, workflow, etc.)
-- **frontend-tests:** Runs in `frontend/` with Node 20.
-  - `npm run test -- --run` — unit tests
-  - `npm run test -- --run tests/integration` — integration tests (marketplace, job flow, dashboard, etc.)
+- **docker-compose-stack**: Builds and starts the full stack, waits for backend and frontend readiness, then tears everything down.
+- **backend-tests**: Runs unit and integration tests with Python 3.11 and in-memory SQLite.
+- **frontend-tests**: Runs unit and integration tests with Node 20.
 
-Backend and frontend jobs run in parallel; they do not depend on the Docker stack. The Docker job runs in parallel as well and only validates that the stack comes up.
+Backend, frontend, and Docker smoke checks run in parallel.
 
-### Docker Image CI (docker-image.yml)
+## Deployment Notes
 
-Builds images with `docker compose build`, starts the stack with `docker compose up -d`, and waits for backend and frontend. Used to validate the Compose setup on `main` (and PRs to `main`). Does not run pytest or npm test; for full tests use PR Tests.
+### Docker Image CI
 
-### Azure deployment (azure-container-webapp.yml)
+The Docker workflow builds the images with `docker compose build`, starts the stack with `docker compose up -d`, and confirms that the services come up cleanly.
 
-Builds the **backend** image (from `backend/Dockerfile`), pushes to GitHub Container Registry, and deploys to the configured Azure Web App. Configure via repo secrets and Azure app settings (see comments in the file).
+### Azure Deployment
 
-**Required settings** (Environment variables / Configuration):
+The Azure workflow builds the backend image, pushes it to GitHub Container Registry, and deploys it to the configured Azure Web App.
 
-| Where | Name | Required | Description |
-|-------|------|----------|-------------|
-| **App settings** | `DATABASE_URL` | Yes* | Full PostgreSQL URL (e.g. `postgresql://user:password@host:5432/db`). |
-| **App settings** | `SECRET_KEY` | Yes | Secret for JWT signing (long random value in production). |
-| **App settings** | `WEBSITES_PORT` | Yes | Set to `8000` so Azure routes HTTP to your container. |
+Required configuration:
 
-\* **Database URL** can be set in either place (app uses the first it finds):
-- **App settings:** add `DATABASE_URL` with your PostgreSQL connection string, or  
-- **Connection strings:** add a connection string with **name** `DefaultConnection` and **type** PostgreSQL; put the same URL in the value (e.g. `postgresql://user:password@host:5432/db`).
+| Location | Name | Required | Description |
+|----------|------|----------|-------------|
+| App settings | `DATABASE_URL` | Yes* | Full PostgreSQL connection string. |
+| App settings | `SECRET_KEY` | Yes | JWT signing secret for production. |
+| App settings | `WEBSITES_PORT` | Yes | Set to `8000` so Azure routes traffic correctly. |
 
-If you see **"connection to server at localhost (127.0.0.1), port 5432 failed: Connection refused"** in the log stream, add the database URL in App settings or Connection strings and restart the app.
+*`DATABASE_URL` can also be supplied through Azure connection strings using the `DefaultConnection` name.*
 
-### Environment and configuration
+If the app fails to connect to PostgreSQL, check the Web App logs, verify the database URL, and ensure Azure networking allows the container to reach the database.
 
-- **PR Tests / Docker CI:** `.env` is created in the job with `POSTGRES_*`, `SECRET_KEY`, and `POSTGRES_DB` so Compose and backend can start. Backend pytest uses in-memory SQLite and does not need PostgreSQL or `A2A_ADAPTER_URL`.
-- **A2A and scale:** The platform runs without a message bus or separate registry; A2A is protocol + optional adapter. See [docs/A2A_DEVELOPERS.md](docs/A2A_DEVELOPERS.md) for architecture and scale (e.g. 200+ agents with optional list pagination).
-
-### Recent changes reflected here
-
-- **Integration tests:** Backend `tests/integration/` and frontend `tests/integration/` are run in PR Tests.
-- **New features covered by tests:** Job flows (create, analyze documents, workflow, execute), BRD workflow, workflow clarification (generate-workflow-questions), agent list with pagination (`limit`/`offset`, `X-Total-Count`), A2A and sequential workflows.
+---
 
 ## License
 
-- **Code**: Business Source License 1.1 (BSL 1.1). See [LICENSE](LICENSE). Non-production use is permitted; production use requires a commercial license or compliance with the license terms. The code will convert to GPL v2.0 or later on the Change Date (or after 4 years, whichever is earlier).
+- **Code**: Business Source License 1.1. See [LICENSE](LICENSE).
 - **Documentation**: MIT License. See [LICENSE-DOCS](LICENSE-DOCS).

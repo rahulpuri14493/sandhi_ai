@@ -16,11 +16,16 @@ def test_root(client: TestClient):
 
 
 def test_health(client: TestClient):
-    """Health check returns healthy status."""
+    """Health check returns healthy status and includes storage probe."""
     response = client.get("/health")
     assert response.status_code == 200
     data = response.json()
-    assert data.get("status") == "healthy"
+    assert data.get("status") in ("healthy", "degraded")
+    # Storage section is always present
+    storage = data.get("storage")
+    assert storage is not None
+    assert "ok" in storage
+    assert "detail" in storage
 
 
 def test_protected_endpoints_require_auth(client: TestClient):

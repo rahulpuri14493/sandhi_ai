@@ -18,7 +18,10 @@ export default function JobDetailPage() {
   const [job, setJob] = useState<Job | null>(null)
   const [workflowPreview, setWorkflowPreview] = useState<WorkflowPreview | null>(null)
   const [isLoading, setIsLoading] = useState(true)
+  const [isLoadingPreview, setIsLoadingPreview] = useState(false)
+  const [previewError, setPreviewError] = useState('')
   const [isAnalyzingDocuments, setIsAnalyzingDocuments] = useState(false)
+  const [analyzeFeedback, setAnalyzeFeedback] = useState<string>('')
   const [mode, setMode] = useState<'workflow' | 'preview' | 'status' | 'qa'>('workflow')
   const [editingStepTools, setEditingStepTools] = useState<WorkflowStep | null>(null)
   const [stepToolsModalPlatform, setStepToolsModalPlatform] = useState<{ id: number; name: string; tool_type: string }[]>([])
@@ -53,11 +56,11 @@ export default function JobDetailPage() {
   }, [jobId, searchParams])
 
   useEffect(() => {
-    if (job && job.status !== 'draft') {
+    if (job && mode === 'preview') {
       loadWorkflowPreview()
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [job])
+  }, [job, mode])
 
   useEffect(() => {
     if (job?.workflow_steps?.length && job.status !== 'draft') {
@@ -92,11 +95,17 @@ export default function JobDetailPage() {
   }
 
   const loadWorkflowPreview = async () => {
+    setIsLoadingPreview(true)
+    setPreviewError('')
     try {
       const preview = await jobsAPI.previewWorkflow(jobId)
       setWorkflowPreview(preview)
     } catch (error) {
       console.error('Failed to load workflow preview:', error)
+      setPreviewError((error as any)?.response?.data?.detail || 'Failed to load preview cost')
+      setWorkflowPreview(null)
+    } finally {
+      setIsLoadingPreview(false)
     }
   }
 
@@ -127,10 +136,18 @@ export default function JobDetailPage() {
   const handleAnalyzeDocuments = async () => {
     if (!job?.files?.length) return
     setIsAnalyzingDocuments(true)
+    setAnalyzeFeedback('')
     try {
       const result = await jobsAPI.analyzeDocuments(jobId)
+      const questionCount = Array.isArray(result?.questions) ? result.questions.length : 0
+      if (questionCount > 0) {
+        setAnalyzeFeedback(`Document analysis complete. ${questionCount} clarification question${questionCount > 1 ? 's' : ''} generated.`)
+      } else {
+        setAnalyzeFeedback('Document analysis complete. No clarification questions needed; requirements look complete.')
+      }
       await loadJob()
-      if (result.conversation?.length) setMode('qa')
+      // Always move user to Q&A/analysis panel so they can see outcomes.
+      setMode('qa')
     } catch (error) {
       console.error('Failed to analyze documents:', error)
       alert((error as any)?.response?.data?.detail || 'Failed to analyze documents')
@@ -376,6 +393,11 @@ export default function JobDetailPage() {
                   </button>
                 )}
               </div>
+              {analyzeFeedback && (
+                <div className="mb-4 p-4 bg-blue-500/15 border border-blue-500/40 rounded-xl text-blue-300 font-semibold">
+                  {analyzeFeedback}
+                </div>
+              )}
               <div className="grid gap-4">
                 {job.files.map((file) => (
                   <div
@@ -458,7 +480,11 @@ export default function JobDetailPage() {
                 </button>
               )}
               <button
-                onClick={() => setMode('preview')}
+                onClick={() => {
+                  setMode('preview')
+                  // Trigger fetch immediately for better UX.
+                  loadWorkflowPreview()
+                }}
                 className={`px-6 py-3.5 rounded-xl font-bold transition-all duration-200 flex items-center gap-2 ${
                   mode === 'preview'
                     ? 'bg-gradient-to-r from-primary-500 to-primary-700 text-white shadow-2xl shadow-primary-500/50 scale-105'
@@ -481,6 +507,9 @@ export default function JobDetailPage() {
             initialConversation={job.conversation || []}
             onConversationUpdate={(conversation) => {
               if (job) setJob({ ...job, conversation })
+            }}
+            onNoClarificationNeeded={() => {
+              setMode('preview')
             }}
             workflowSteps={job.workflow_steps}
           />
@@ -596,17 +625,37 @@ export default function JobDetailPage() {
           </div>
         )}
 
-        {mode === 'preview' && workflowPreview && (
+        {mode === 'preview' && (
           <div className="bg-dark-100/50 backdrop-blur-xl rounded-2xl shadow-2xl p-8 border border-dark-200/50">
-            <CostCalculator preview={workflowPreview} />
-            <div className="mt-8 flex gap-4">
-              <button
-                onClick={handleApprove}
-                className="bg-gradient-to-r from-primary-500 to-primary-700 text-white px-8 py-4 rounded-xl font-bold hover:shadow-2xl hover:shadow-primary-500/50 hover:scale-105 transition-all duration-200"
-              >
-                Approve & Pay
-              </button>
-            </div>
+            {isLoadingPreview ? (
+              <div className="py-10 text-center text-white/70 font-semibold">Loading preview cost...</div>
+            ) : previewError ? (
+              <div className="py-10 text-center">
+                <p className="text-red-400 font-semibold mb-3">{previewError}</p>
+                <button
+                  onClick={loadWorkflowPreview}
+                  className="px-5 py-2.5 bg-dark-200/70 text-white rounded-lg border border-dark-300 hover:bg-dark-200"
+                >
+                  Retry
+                </button>
+              </div>
+            ) : workflowPreview ? (
+              <>
+                <CostCalculator preview={workflowPreview} />
+                <div className="mt-8 flex gap-4">
+                  <button
+                    onClick={handleApprove}
+                    className="bg-gradient-to-r from-primary-500 to-primary-700 text-white px-8 py-4 rounded-xl font-bold hover:shadow-2xl hover:shadow-primary-500/50 hover:scale-105 transition-all duration-200"
+                  >
+                    Approve & Pay
+                  </button>
+                </div>
+              </>
+            ) : (
+              <div className="py-10 text-center text-white/70 font-semibold">
+                No workflow cost preview available yet. Build workflow first.
+              </div>
+            )}
           </div>
         )}
 

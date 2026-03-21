@@ -534,6 +534,15 @@ async def get_registry(
     }
 
 
+# Backward-compatible alias: some clients may POST to /registry
+@router.post("/registry")
+async def post_registry(
+    current_user: User = Depends(get_current_business_user),
+    db: Session = Depends(get_db),
+):
+    return await get_registry(current_user=current_user, db=db)
+
+
 def _registry_tool_name(tool_id: int, name: str) -> str:
     safe = "".join(c if c.isalnum() or c in "_-" else "_" for c in (name or "").strip())[:50]
     return f"platform_{tool_id}_{safe}" if safe else f"platform_{tool_id}"

@@ -174,5 +174,48 @@ def test_auto_split_workflow_step_tool_visibility_override(mock_db, sample_job, 
     assert step2 is not None and getattr(step2, "tool_visibility", None) == "names_only"
 
 
+def test_auto_split_workflow_filters_documents_per_agent_scope(mock_db, sample_job, sample_agents):
+    """When splitter returns assigned_document_ids, each step gets only its scoped BRDs."""
+    sample_job.files = json.dumps([
+        {"id": "BRD1", "name": "addition.docx", "type": "application/vnd.openxmlformats-officedocument.wordprocessingml.document", "path": "/tmp/addition.docx"},
+        {"id": "BRD2", "name": "subtraction.pdf", "type": "application/pdf", "path": "/tmp/subtraction.pdf"},
+    ])
+    mock_db.query.return_value.filter.return_value.first.side_effect = [sample_job] + sample_agents
+    mock_db.query.return_value.filter.return_value.all.side_effect = [
+        sample_agents,
+        [], [], [], [],
+    ]
+    mock_db.query.return_value.filter.return_value.order_by.return_value.all.return_value = []
+    mock_db.commit = MagicMock()
+
+    async def _split_with_scope(*args, **kwargs):
+        return [
+            {"agent_index": 0, "task": "Do addition", "assigned_document_ids": ["BRD1"]},
+            {"agent_index": 1, "task": "Do subtraction", "assigned_document_ids": ["BRD2"]},
+        ]
+
+    with patch.object(WorkflowBuilder, "_get_workflow_collaboration_hint", return_value="sequential"):
+        with patch("services.workflow_builder.split_job_for_agents", new_callable=AsyncMock, side_effect=_split_with_scope):
+            with patch("services.document_analyzer.DocumentAnalyzer") as mock_analyzer_cls:
+                analyzer = MagicMock()
+                analyzer.read_file_info = AsyncMock(side_effect=["addition content", "subtraction content"])
+                mock_analyzer_cls.return_value = analyzer
+                builder = WorkflowBuilder(mock_db)
+                with patch.object(builder.payment_processor, "calculate_job_cost", return_value=MagicMock()):
+                    builder.auto_split_workflow(1, [1, 2], workflow_mode="independent")
+
+    steps_added = [c[0][0] for c in mock_db.add.call_args_list if c[0] and isinstance(c[0][0], WorkflowStep)]
+    step1 = next((s for s in steps_added if s.step_order == 1), None)
+    step2 = next((s for s in steps_added if s.step_order == 2), None)
+    assert step1 is not None
+    assert step2 is not None
+    step1_data = json.loads(step1.input_data)
+    step2_data = json.loads(step2.input_data)
+    assert step1_data.get("document_scope_restricted") is True
+    assert step2_data.get("document_scope_restricted") is True
+    assert [d["id"] for d in step1_data.get("documents", [])] == ["BRD1"]
+    assert [d["id"] for d in step2_data.get("documents", [])] == ["BRD2"]
+
+
 # ---------- Negative test cases (invalid inputs, expect ValueError) ----------
 # See also test_auto_split_workflow_job_not_found and test_auto_split_workflow_agents_not_found above.

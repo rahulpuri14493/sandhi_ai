@@ -15,7 +15,14 @@ export default defineConfig({
     host: '0.0.0.0',
     proxy: {
       '/api': {
-        target: process.env.VITE_PROXY_TARGET || 'http://localhost:8000',
+        target: (() => {
+          const envTarget = process.env.VITE_PROXY_TARGET
+          // If running Vite locally on Windows, Docker DNS names like "backend" won't resolve.
+          if (process.platform === 'win32' && envTarget && /\/\/backend(?::|\/|$)/.test(envTarget)) {
+            return 'http://localhost:8000'
+          }
+          return envTarget || 'http://localhost:8000'
+        })(),
         changeOrigin: true,
       },
     },

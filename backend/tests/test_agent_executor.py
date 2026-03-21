@@ -109,6 +109,29 @@ def test_format_for_openai_includes_assigned_task_multi_agent():
     assert "Analyze the output from Agent 1" in content_str
 
 
+def test_format_for_openai_includes_document_scope_policy_when_restricted():
+    """When document scope is restricted, policy section with allowed docs is included."""
+    agent = MagicMock(spec=Agent)
+    agent.name = "Agent 1"
+    input_data = {
+        "job_title": "Scoped Job",
+        "job_description": "Do assigned BRD only",
+        "documents": [
+            {"id": "BRD1", "name": "addition.docx", "type": "docx", "content": "add reqs"},
+        ],
+        "conversation": [],
+        "assigned_task": "Handle BRD1 requirements",
+        "document_scope_restricted": True,
+        "allowed_document_ids": ["BRD1"],
+        "assigned_document_names": ["addition.docx"],
+    }
+    payload = _get_executor_format_input(agent, input_data)
+    content_str = json.dumps([m.get("content", "") for m in payload["messages"]])
+    assert "DOCUMENT SCOPE POLICY" in content_str
+    assert "BRD1" in content_str
+    assert "addition.docx" in content_str
+
+
 def test_format_for_openai_includes_previous_step_output():
     """Multi-agent workflow: previous_step_output appears in messages."""
     agent = MagicMock(spec=Agent)

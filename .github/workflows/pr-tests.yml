@@ -70,6 +70,7 @@ jobs:
     runs-on: ubuntu-latest
     env:
       SECRET_KEY: ci-secret-key
+      OBJECT_STORAGE_BACKEND: local
     defaults:
       run:
         working-directory: backend
@@ -95,11 +96,16 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Run pytest
-        run: pytest -v
+      - name: Clean stale test/coverage artifacts
+        run: |
+          python -m coverage erase || true
+          rm -f .coverage || true
+          rm -rf .pytest_cache || true
+          find . -type d -name "__pycache__" -prune -exec rm -rf {} +
 
-      - name: Run integration tests
-        run: pytest tests/integration/ -v
+      - name: Run pytest with coverage gate (>=80%)
+        run: |
+          pytest --cov=. --cov-report=term-missing --cov-fail-under=80 -v
 
   platform-mcp-tests:
     name: Platform MCP server tests
@@ -153,12 +159,7 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
-      - name: Run tests
-        run: npm run test -- --run
-        env:
-          CI: true
-
-      - name: Run integration tests
-        run: npm run test -- --run tests/integration
+      - name: Run tests with coverage (fail if <80%)
+        run: npm run test -- --run --coverage
         env:
           CI: true
