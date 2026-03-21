@@ -275,7 +275,7 @@ export function BusinessDashboard() {
                           </svg>
                           Edit
                         </button>
-                        {(job.status === 'completed' || job.status === 'failed') && (
+                        {(job.status === 'failed' || job.status === 'cancelled') && (
                           <button
                             onClick={async () => {
                               if (window.confirm('Are you sure you want to rerun this job? This will reset the workflow and execute it again.')) {

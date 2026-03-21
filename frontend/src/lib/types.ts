@@ -92,7 +92,7 @@ export interface Job {
   business_id: number;
   title: string;
   description?: string;
-  status: "draft" | "pending_approval" | "approved" | "in_progress" | "completed" | "failed" | "cancelled";
+  status: "draft" | "pending_approval" | "approved" | "in_queue" | "in_progress" | "completed" | "failed" | "cancelled";
   total_cost: number;
   created_at: string;
   completed_at?: string;
@@ -106,6 +106,10 @@ export interface Job {
   allowed_connection_ids?: number[] | null;
   /** Restrict what tool info agents see: full | names_only | none. Credentials never shared. */
   tool_visibility?: 'full' | 'names_only' | 'none' | null;
+  /** True when in-progress job exceeds stuck threshold — frontend shows cancel button. */
+  show_cancel_option?: boolean;
+  /** From job's schedule, used for countdown timer on in_queue jobs. */
+  scheduled_at?: string | null;
 }
 
 export interface WorkflowStep {
@@ -200,11 +204,8 @@ export interface JobSchedule {
   id: number
   job_id: number
   status: ScheduleStatus
-  is_one_time: boolean
   timezone: string
-  scheduled_at: string | null
-  days_of_week: number[] | null
-  time: string | null
+  scheduled_at: string
   last_run_time: string | null
   next_run_time: string | null
   created_at: string
@@ -212,4 +213,5 @@ export interface JobSchedule {
 
 export interface JobScheduleWithJob extends JobSchedule {
   job_title: string
+  job_status: string
 }

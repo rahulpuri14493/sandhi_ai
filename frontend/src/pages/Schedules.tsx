@@ -18,41 +18,13 @@ export default function SchedulesPage() {
     setIsLoading(true)
     try {
       const data = await jobsAPI.listAllSchedules()
-      setSchedules(data)
+      setSchedules(data.items ?? [])
     } catch (error) {
       console.error('Failed to load schedules:', error)
     } finally {
       setIsLoading(false)
     }
   }
-
-  const handleToggle = async (s: JobScheduleWithJob) => {
-    try {
-      const updated = await jobsAPI.updateSchedule(s.job_id, s.id, {
-        status: s.status === 'active' ? 'inactive' : 'active',
-      })
-      setSchedules((prev) =>
-        prev.map((x) => (x.id === s.id ? { ...x, ...updated } : x))
-      )
-    } catch (error) {
-      console.error('Failed to toggle schedule:', error)
-    }
-  }
-
-  const handleDelete = async (s: JobScheduleWithJob) => {
-    if (!window.confirm('Delete this schedule?')) return
-    try {
-      await jobsAPI.deleteSchedule(s.job_id, s.id)
-      setSchedules((prev) => prev.filter((x) => x.id !== s.id))
-    } catch (error) {
-      console.error('Failed to delete schedule:', error)
-    }
-  }
-
-  const filtered = schedules.filter((s) => {
-    if (filter === 'all') return true
-    return s.status === filter
-  })
 
   if (isLoading) {
     return (
@@ -114,9 +86,9 @@ export default function SchedulesPage() {
         )}
 
         {/* Schedule cards */}
-        {filtered.length > 0 && (
+        {schedules.filter((s) => filter === 'all' || s.status === filter).length > 0 && (
           <div className="space-y-3">
-            {filtered.map((s) => (
+            {schedules.filter((s) => filter === 'all' || s.status === filter).map((s) => (
               <div
                 key={s.id}
                 className="bg-dark-100/50 backdrop-blur-xl rounded-2xl shadow-lg p-5 border border-dark-200/50 hover:border-primary-500/30 transition-all duration-200"
@@ -142,22 +114,19 @@ export default function SchedulesPage() {
                     {/* Schedule description */}
                     <p className="text-primary-300 text-sm font-semibold mt-1">
                       {humanReadableSchedule({
-                        isOneTime: s.is_one_time,
-                        scheduledAt: s.scheduled_at ?? undefined,
-                        daysOfWeek: s.days_of_week ?? undefined,
-                        time: s.time ?? undefined,
+                        scheduledAt: s.scheduled_at,
                         timezone: s.timezone,
                       })}
                     </p>
 
                     {/* Badges */}
                     <div className="flex items-center gap-2 mt-2">
-                      <span className={`text-xs font-bold px-2 py-0.5 rounded-full ${
-                        s.is_one_time ? 'bg-amber-500/20 text-amber-400' : 'bg-blue-500/20 text-blue-400'
-                      }`}>
-                        {s.is_one_time ? 'One-time' : 'Recurring'}
-                      </span>
                       <span className="text-xs text-white/30">{s.timezone}</span>
+                      {s.job_status && (
+                        <span className="text-xs font-bold px-2 py-0.5 rounded-full bg-dark-200/50 text-white/50">
+                          {s.job_status.replace('_', ' ')}
+                        </span>
+                      )}
                     </div>
 
                     {/* Timestamps */}
@@ -172,27 +141,17 @@ export default function SchedulesPage() {
                     </div>
                   </div>
 
-                  {/* Actions */}
-                  <div className="flex items-center gap-2 shrink-0">
-                    <button
-                      onClick={() => handleToggle(s)}
-                      className={`px-3 py-1.5 rounded-lg text-xs font-bold transition-all duration-200 ${
+                  {/* Status badge (read-only) */}
+                  <div className="shrink-0">
+                    <span
+                      className={`px-3 py-1.5 rounded-lg text-xs font-bold ${
                         s.status === 'active'
-                          ? 'bg-green-500/20 text-green-400 border border-green-500/50 hover:bg-green-500/30'
-                          : 'bg-dark-200/50 text-white/40 border border-dark-300 hover:text-white/70'
+                          ? 'bg-green-500/20 text-green-400 border border-green-500/50'
+                          : 'bg-dark-200/50 text-white/40 border border-dark-300'
                       }`}
                     >
                       {s.status === 'active' ? 'Active' : 'Inactive'}
-                    </button>
-                    <button
-                      onClick={() => handleDelete(s)}
-                      className="p-2 text-red-400/60 hover:text-red-400 hover:bg-red-500/20 rounded-lg transition-all duration-200"
-                      title="Delete schedule"
-                    >
-                      <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" />
-                      </svg>
-                    </button>
+                    </span>
                   </div>
                 </div>
               </div>
@@ -201,7 +160,7 @@ export default function SchedulesPage() {
         )}
 
         {/* No results for filter */}
-        {schedules.length > 0 && filtered.length === 0 && (
+        {schedules.length > 0 && schedules.filter((s) => filter === 'all' || s.status === filter).length === 0 && (
           <div className="text-center py-12">
             <p className="text-white/40 font-medium">No {filter} schedules found.</p>
           </div>

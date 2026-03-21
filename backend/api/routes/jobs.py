@@ -32,7 +32,7 @@ from services.document_analyzer import DocumentAnalyzer
 from models.transaction import Transaction, Earnings
 from core.external_token import create_job_token, get_share_url
 import threading
-from datetime import datetime
+from datetime import datetime, timedelta
 from models.communication import AgentCommunication
 from models.mcp_server import MCPToolConfig, MCPServerConnection
 from services.job_file_storage import (
@@ -1694,6 +1694,16 @@ def get_job_status(
         "allowed_connection_ids": job_conn,
         "tool_visibility": getattr(job, "tool_visibility", None),
     }
+
+    # Compute schedule-aware fields for frontend UX
+    schedule = db.query(JobSchedule).filter(JobSchedule.job_id == job.id).first()
+    if schedule:
+        job_dict["scheduled_at"] = schedule.scheduled_at
+        if job.status == JobStatus.IN_PROGRESS and schedule.last_run_time:
+            elapsed = datetime.utcnow() - schedule.last_run_time
+            if elapsed > timedelta(hours=settings.STUCK_JOB_THRESHOLD_HOURS):
+                job_dict["show_cancel_option"] = True
+
     return JobResponse(**job_dict)
 
 
@@ -2076,6 +2086,42 @@ def rerun_job(
 
     return RerunResponse(
         message="Job re-execution started",
+        job_id=job.id,
+        status=job.status.value,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Job Cancel (cancel a long-running in-progress job)
+# ---------------------------------------------------------------------------
+
+@router.post("/{job_id}/cancel", response_model=RerunResponse)
+def cancel_job(
+    job_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Cancel a job that is currently in progress.
+
+    Only available when job status is IN_PROGRESS. Sets the job to CANCELLED
+    with a failure reason. The frontend shows this option when the job has
+    been running longer than STUCK_JOB_THRESHOLD_HOURS.
+    """
+    job = db.query(Job).filter(Job.id == job_id, Job.business_id == current_user.id).first()
+    if not job:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Job not found or you do not have access")
+    if job.status != JobStatus.IN_PROGRESS:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Can only cancel in-progress jobs. Current status: {job.status.value}",
+        )
+
+    job.status = JobStatus.CANCELLED
+    job.failure_reason = "Cancelled by user"
+    db.commit()
+
+    return RerunResponse(
+        message="Job cancelled",
         job_id=job.id,
         status=job.status.value,
     )

@@ -30,23 +30,20 @@ export default function JobDetailPage() {
   const [savingStepTools, setSavingStepTools] = useState(false)
   /** Loaded for showing tool names on completed job "Tools per step" */
   const [platformToolsList, setPlatformToolsList] = useState<{ id: number; name: string; tool_type: string }[]>([])
-  const [schedules, setSchedules] = useState<JobSchedule[]>([])
+  const [schedule, setSchedule] = useState<JobSchedule | null>(null)
   const [showScheduleLater, setShowScheduleLater] = useState(false)
   const [scheduleData, setScheduleData] = useState({
-    isOneTime: true,
     timezone: Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC',
     scheduledAt: null as string | null,
-    daysOfWeek: [] as number[],
-    time: '',
     status: 'active' as 'active' | 'inactive',
   })
   const [isSavingSchedule, setIsSavingSchedule] = useState(false)
-  const [editingScheduleId, setEditingScheduleId] = useState<number | null>(null)
+  const [countdown, setCountdown] = useState<number | null>(null)
 
   useEffect(() => {
     if (jobId) {
       loadJob()
-      loadSchedules()
+      loadSchedule()
     }
     // Check if Q&A mode should be shown from URL params
     if (searchParams.get('qa') === 'true') {
@@ -192,12 +189,13 @@ export default function JobDetailPage() {
 
       }
     }
-  const loadSchedules = async () => {
+  const loadSchedule = async () => {
     try {
-      const data = await jobsAPI.listSchedules(jobId)
-      setSchedules(data)
+      const data = await jobsAPI.getSchedule(jobId)
+      setSchedule(data)
     } catch {
-      // no schedules yet — not an error
+      // 404 = no schedule yet — not an error
+      setSchedule(null)
     }
   }
 
@@ -205,25 +203,20 @@ export default function JobDetailPage() {
     setIsSavingSchedule(true)
     try {
       const payload = {
-        is_one_time: scheduleData.isOneTime,
-        timezone: scheduleData.timezone,
         scheduled_at: scheduleData.scheduledAt || undefined,
-        days_of_week: scheduleData.daysOfWeek.length > 0 ? scheduleData.daysOfWeek : undefined,
-        time: scheduleData.time || undefined,
+        timezone: scheduleData.timezone,
         status: scheduleData.status,
       }
 
-      if (editingScheduleId) {
-        // Update existing schedule
-        const updated = await jobsAPI.updateSchedule(jobId, editingScheduleId, payload)
-        setSchedules((prev) => prev.map((s) => (s.id === editingScheduleId ? updated : s)))
-        setEditingScheduleId(null)
+      if (schedule) {
+        const result = await jobsAPI.updateSchedule(jobId, payload)
+        setSchedule(result.data)
       } else {
-        // Create new schedule
-        const created = await jobsAPI.createSchedule(jobId, payload)
-        setSchedules((prev) => [...prev, created])
+        const result = await jobsAPI.createSchedule(jobId, { ...payload, scheduled_at: payload.scheduled_at! })
+        setSchedule(result.data)
       }
       setShowScheduleLater(false)
+      await loadJob()
     } catch (error) {
       console.error('Failed to save schedule:', error)
     } finally {
@@ -239,13 +232,47 @@ export default function JobDetailPage() {
     try {
       await jobsAPI.rerun(jobId)
       await loadJob()
-      // After rerun, job status will be pending_approval, so show execute button
       setMode('status')
     } catch (error) {
       console.error('Failed to rerun job:', error)
-      alert('Failed to rerun job. Only completed or failed jobs can be rerun.')
+      alert('Failed to rerun job. Only failed or cancelled jobs can be rerun.')
     }
   }
+
+  const handleCancel = async () => {
+    if (!job) return
+    if (!window.confirm('Are you sure you want to cancel this job? This will stop execution.')) {
+      return
+    }
+    try {
+      await jobsAPI.cancel(jobId)
+      await loadJob()
+    } catch (error) {
+      console.error('Failed to cancel job:', error)
+      alert('Failed to cancel job.')
+    }
+  }
+
+  // Countdown timer for in_queue jobs
+  useEffect(() => {
+    if (job?.status !== 'in_queue' || !job.scheduled_at) {
+      setCountdown(null)
+      return
+    }
+    const targetTime = new Date(job.scheduled_at).getTime()
+    const tick = () => {
+      const remaining = Math.max(0, Math.floor((targetTime - Date.now()) / 1000))
+      setCountdown(remaining)
+      if (remaining <= 0) {
+        // Schedule passed — start polling for status change
+        loadJob()
+      }
+    }
+    tick()
+    const timer = setInterval(tick, 1000)
+    return () => clearInterval(timer)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [job?.status, job?.scheduled_at])
 
   if (isLoading) {
     return (
@@ -278,9 +305,11 @@ export default function JobDetailPage() {
       draft: { bg: 'bg-dark-200/50', text: 'text-white/80', border: 'border-dark-300', icon: '📝' },
       pending_approval: { bg: 'bg-yellow-500/20', text: 'text-yellow-400', border: 'border-yellow-500/50', icon: '⏳' },
       approved: { bg: 'bg-blue-500/20', text: 'text-blue-400', border: 'border-blue-500/50', icon: '✅' },
+      in_queue: { bg: 'bg-cyan-500/20', text: 'text-cyan-400', border: 'border-cyan-500/50', icon: '🕐' },
       in_progress: { bg: 'bg-primary-500/20', text: 'text-primary-400', border: 'border-primary-500/50', icon: '⚙️' },
       completed: { bg: 'bg-green-500/20', text: 'text-green-400', border: 'border-green-500/50', icon: '✓' },
       failed: { bg: 'bg-red-500/20', text: 'text-red-400', border: 'border-red-500/50', icon: '✗' },
+      cancelled: { bg: 'bg-orange-500/20', text: 'text-orange-400', border: 'border-orange-500/50', icon: '⊘' },
     }
     const statusInfo = statusMap[status] || statusMap.draft
     return (
@@ -707,11 +736,10 @@ export default function JobDetailPage() {
           </div>
         )}
 
+        {/* ── PENDING APPROVAL: Execute Now or Schedule for Later ── */}
         {job.status === 'pending_approval' && (
           <div className="mt-8 bg-dark-100/50 backdrop-blur-xl rounded-2xl shadow-2xl p-8 border border-dark-200/50">
-
-            {/* ── STATE 1: No schedules yet ── */}
-            {schedules.length === 0 && (
+            {!schedule && (
               <>
                 <h2 className="text-3xl font-black text-white mb-2">Ready to Execute</h2>
                 <p className="text-white/50 font-medium mb-6">Run the job now, or set a schedule to auto-trigger it.</p>
@@ -746,52 +774,34 @@ export default function JobDetailPage() {
                   </button>
                 </div>
 
-                {/* Execute Now confirmation */}
                 {showExecuteConfirm && (
                   <div className="mt-6 p-5 bg-dark-200/30 rounded-xl border border-dark-300">
                     <p className="text-white font-semibold mb-1">Execute this job now?</p>
-                    <p className="text-white/50 text-sm mb-4">The workflow will start immediately and agents will begin processing. This action cannot be undone.</p>
+                    <p className="text-white/50 text-sm mb-4">The workflow will start immediately and agents will begin processing.</p>
                     <div className="flex gap-3">
-                      <button
-                        onClick={handleExecute}
-                        className="px-6 py-2.5 bg-gradient-to-r from-primary-500 to-primary-700 text-white rounded-xl font-bold hover:shadow-xl hover:shadow-primary-500/40 transition-all duration-200"
-                      >
+                      <button onClick={handleExecute} className="px-6 py-2.5 bg-gradient-to-r from-primary-500 to-primary-700 text-white rounded-xl font-bold hover:shadow-xl hover:shadow-primary-500/40 transition-all duration-200">
                         Yes, Execute
                       </button>
-                      <button
-                        onClick={() => setShowExecuteConfirm(false)}
-                        className="px-6 py-2.5 bg-dark-200/50 text-white/70 rounded-xl font-bold border border-dark-300 hover:text-white transition-all duration-200"
-                      >
+                      <button onClick={() => setShowExecuteConfirm(false)} className="px-6 py-2.5 bg-dark-200/50 text-white/70 rounded-xl font-bold border border-dark-300 hover:text-white transition-all duration-200">
                         Cancel
                       </button>
                     </div>
                   </div>
                 )}
 
-                {/* Schedule for Later form */}
                 {showScheduleLater && (
                   <div className="mt-6 space-y-4">
                     <SchedulePicker
-                      isOneTime={scheduleData.isOneTime}
                       timezone={scheduleData.timezone}
                       scheduledAt={scheduleData.scheduledAt}
-                      daysOfWeek={scheduleData.daysOfWeek}
-                      time={scheduleData.time}
                       status={scheduleData.status}
                       onChange={setScheduleData}
                     />
                     <div className="flex gap-3">
-                      <button
-                        onClick={handleScheduleLater}
-                        disabled={isSavingSchedule}
-                        className="px-6 py-3 bg-gradient-to-r from-primary-500 to-primary-700 text-white rounded-xl font-bold hover:shadow-xl hover:shadow-primary-500/40 transition-all duration-200 disabled:opacity-50"
-                      >
+                      <button onClick={handleScheduleLater} disabled={isSavingSchedule} className="px-6 py-3 bg-gradient-to-r from-primary-500 to-primary-700 text-white rounded-xl font-bold hover:shadow-xl hover:shadow-primary-500/40 transition-all duration-200 disabled:opacity-50">
                         {isSavingSchedule ? 'Saving...' : 'Save Schedule'}
                       </button>
-                      <button
-                        onClick={() => setShowScheduleLater(false)}
-                        className="px-6 py-3 bg-dark-200/50 text-white/70 rounded-xl font-bold border border-dark-300 hover:text-white transition-all duration-200"
-                      >
+                      <button onClick={() => setShowScheduleLater(false)} className="px-6 py-3 bg-dark-200/50 text-white/70 rounded-xl font-bold border border-dark-300 hover:text-white transition-all duration-200">
                         Cancel
                       </button>
                     </div>
@@ -800,120 +810,56 @@ export default function JobDetailPage() {
               </>
             )}
 
-            {/* ── STATE 2: Schedule exists ── */}
-            {schedules.length > 0 && (
+            {schedule && (
               <>
                 <div className="flex items-center justify-between mb-4">
                   <h2 className="text-3xl font-black text-white">Scheduled</h2>
                 </div>
 
-                <div className="space-y-3 mb-6">
-                  {schedules.map((s) => (
-                    <div key={s.id} className="flex items-center gap-3 p-4 bg-dark-200/40 rounded-xl border border-dark-300">
-                      <svg className="w-5 h-5 text-primary-400 shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M8 7V3m8 4V3m-9 8h10M5 21h14a2 2 0 002-2V7a2 2 0 00-2-2H5a2 2 0 00-2 2v12a2 2 0 002 2z" />
-                      </svg>
-                      <div className="flex-1 min-w-0">
-                        <p className="text-white font-semibold text-sm">{humanReadableSchedule({
-                          isOneTime: s.is_one_time,
-                          scheduledAt: s.scheduled_at ?? undefined,
-                          daysOfWeek: s.days_of_week ?? undefined,
-                          time: s.time ?? undefined,
-                          timezone: s.timezone,
-                        })}</p>
-                        <div className="flex items-center gap-2 mt-1">
-                          <span className={`text-xs font-bold px-2 py-0.5 rounded-full ${s.is_one_time ? 'bg-amber-500/20 text-amber-400' : 'bg-blue-500/20 text-blue-400'}`}>
-                            {s.is_one_time ? 'One-time' : 'Recurring'}
-                          </span>
-                          <span className={`text-xs font-bold px-2 py-0.5 rounded-full ${
-                            s.status === 'active'
-                              ? 'bg-green-500/20 text-green-400'
-                              : 'bg-dark-200/50 text-white/40'
-                          }`}>{s.status}</span>
-                        </div>
-                        {s.next_run_time && (
-                          <p className="text-white/40 text-xs mt-1">Next run: {new Date(s.next_run_time).toLocaleString()}</p>
-                        )}
-                      </div>
-                      <button
-                        onClick={() => {
-                          // Pre-fill picker with this schedule's values — no API call yet
-                          setEditingScheduleId(s.id)
-                          setScheduleData({
-                            isOneTime: s.is_one_time,
-                            timezone: s.timezone,
-                            scheduledAt: s.scheduled_at,
-                            daysOfWeek: s.days_of_week ?? [],
-                            time: s.time ?? '',
-                            status: s.status,
-                          })
-                          setShowScheduleLater(true)
-                        }}
-                        className="p-2 text-primary-400/60 hover:text-primary-400 hover:bg-primary-500/20 rounded-lg transition-all duration-200"
-                        title="Edit schedule"
-                      >
-                        <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15.232 5.232l3.536 3.536m-2.036-5.036a2.5 2.5 0 113.536 3.536L6.5 21.036H3v-3.572L16.732 3.732z" />
-                        </svg>
-                      </button>
-                      <button
-                        onClick={async () => {
-                          if (!window.confirm('Delete this schedule?')) return
-                          try {
-                            await jobsAPI.deleteSchedule(jobId, s.id)
-                            setSchedules((prev) => prev.filter((x) => x.id !== s.id))
-                          } catch (error) {
-                            console.error('Failed to delete schedule:', error)
-                          }
-                        }}
-                        className="p-2 text-red-400/60 hover:text-red-400 hover:bg-red-500/20 rounded-lg transition-all duration-200"
-                        title="Delete schedule"
-                      >
-                        <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" />
-                        </svg>
-                      </button>
+                <div className="flex items-center gap-3 p-4 bg-dark-200/40 rounded-xl border border-dark-300 mb-6">
+                  <svg className="w-5 h-5 text-primary-400 shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M8 7V3m8 4V3m-9 8h10M5 21h14a2 2 0 002-2V7a2 2 0 00-2-2H5a2 2 0 00-2 2v12a2 2 0 002 2z" />
+                  </svg>
+                  <div className="flex-1 min-w-0">
+                    <p className="text-white font-semibold text-sm">{humanReadableSchedule({ scheduledAt: schedule.scheduled_at, timezone: schedule.timezone })}</p>
+                    <div className="flex items-center gap-2 mt-1">
+                      <span className={`text-xs font-bold px-2 py-0.5 rounded-full ${schedule.status === 'active' ? 'bg-green-500/20 text-green-400' : 'bg-dark-200/50 text-white/40'}`}>{schedule.status}</span>
                     </div>
-                  ))}
+                    {schedule.next_run_time && (
+                      <p className="text-white/40 text-xs mt-1">Next run: {new Date(schedule.next_run_time).toLocaleString()}</p>
+                    )}
+                  </div>
+                  <button
+                    onClick={() => {
+                      setScheduleData({ timezone: schedule.timezone, scheduledAt: schedule.scheduled_at, status: schedule.status })
+                      setShowScheduleLater(true)
+                    }}
+                    className="p-2 text-primary-400/60 hover:text-primary-400 hover:bg-primary-500/20 rounded-lg transition-all duration-200"
+                    title="Edit schedule"
+                  >
+                    <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15.232 5.232l3.536 3.536m-2.036-5.036a2.5 2.5 0 113.536 3.536L6.5 21.036H3v-3.572L16.732 3.732z" />
+                    </svg>
+                  </button>
                 </div>
 
-                {/* Edit existing schedule */}
                 {showScheduleLater && (
                   <div className="mb-6 space-y-4">
-                    <SchedulePicker
-                      isOneTime={scheduleData.isOneTime}
-                      timezone={scheduleData.timezone}
-                      scheduledAt={scheduleData.scheduledAt}
-                      daysOfWeek={scheduleData.daysOfWeek}
-                      time={scheduleData.time}
-                      status={scheduleData.status}
-                      onChange={setScheduleData}
-                    />
+                    <SchedulePicker timezone={scheduleData.timezone} scheduledAt={scheduleData.scheduledAt} status={scheduleData.status} onChange={setScheduleData} />
                     <div className="flex gap-3">
-                      <button
-                        onClick={handleScheduleLater}
-                        disabled={isSavingSchedule}
-                        className="px-6 py-2.5 bg-gradient-to-r from-primary-500 to-primary-700 text-white rounded-xl font-bold text-sm hover:shadow-xl hover:shadow-primary-500/40 transition-all duration-200 disabled:opacity-50"
-                      >
-                        {isSavingSchedule ? 'Saving...' : editingScheduleId ? 'Update Schedule' : 'Save Schedule'}
+                      <button onClick={handleScheduleLater} disabled={isSavingSchedule} className="px-6 py-2.5 bg-gradient-to-r from-primary-500 to-primary-700 text-white rounded-xl font-bold text-sm hover:shadow-xl hover:shadow-primary-500/40 transition-all duration-200 disabled:opacity-50">
+                        {isSavingSchedule ? 'Saving...' : 'Update Schedule'}
                       </button>
-                      <button
-                        onClick={() => { setShowScheduleLater(false); setEditingScheduleId(null) }}
-                        className="px-6 py-2.5 bg-dark-200/50 text-white/70 rounded-xl font-bold text-sm border border-dark-300 hover:text-white transition-all duration-200"
-                      >
+                      <button onClick={() => setShowScheduleLater(false)} className="px-6 py-2.5 bg-dark-200/50 text-white/70 rounded-xl font-bold text-sm border border-dark-300 hover:text-white transition-all duration-200">
                         Cancel
                       </button>
                     </div>
                   </div>
                 )}
 
-                {/* Secondary: Execute Now option */}
                 <div className="pt-4 border-t border-dark-300/50">
                   {!showExecuteConfirm ? (
-                    <button
-                      onClick={() => setShowExecuteConfirm(true)}
-                      className="text-sm font-semibold text-white/50 hover:text-white transition-colors flex items-center gap-1.5"
-                    >
+                    <button onClick={() => setShowExecuteConfirm(true)} className="text-sm font-semibold text-white/50 hover:text-white transition-colors flex items-center gap-1.5">
                       <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                         <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M14.752 11.168l-3.197-2.132A1 1 0 0010 9.87v4.263a1 1 0 001.555.832l3.197-2.132a1 1 0 000-1.664z" />
                         <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
@@ -925,18 +871,8 @@ export default function JobDetailPage() {
                       <p className="text-white font-semibold text-sm mb-1">Execute this job now?</p>
                       <p className="text-white/50 text-xs mb-3">This will run the job immediately, independent of the schedule.</p>
                       <div className="flex gap-3">
-                        <button
-                          onClick={handleExecute}
-                          className="px-5 py-2 bg-gradient-to-r from-primary-500 to-primary-700 text-white rounded-xl font-bold text-sm hover:shadow-xl hover:shadow-primary-500/40 transition-all duration-200"
-                        >
-                          Yes, Execute
-                        </button>
-                        <button
-                          onClick={() => setShowExecuteConfirm(false)}
-                          className="px-5 py-2 bg-dark-200/50 text-white/70 rounded-xl font-bold text-sm border border-dark-300 hover:text-white transition-all duration-200"
-                        >
-                          Cancel
-                        </button>
+                        <button onClick={handleExecute} className="px-5 py-2 bg-gradient-to-r from-primary-500 to-primary-700 text-white rounded-xl font-bold text-sm hover:shadow-xl hover:shadow-primary-500/40 transition-all duration-200">Yes, Execute</button>
+                        <button onClick={() => setShowExecuteConfirm(false)} className="px-5 py-2 bg-dark-200/50 text-white/70 rounded-xl font-bold text-sm border border-dark-300 hover:text-white transition-all duration-200">Cancel</button>
                       </div>
                     </div>
                   )}
@@ -946,17 +882,126 @@ export default function JobDetailPage() {
           </div>
         )}
 
-        {(job.status === 'completed' || job.status === 'failed') && (
+        {/* ── IN_QUEUE: Show schedule info, countdown, and update option ── */}
+        {job.status === 'in_queue' && (
           <div className="mt-8 bg-dark-100/50 backdrop-blur-xl rounded-2xl shadow-2xl p-8 border border-dark-200/50">
-            <h2 className="text-3xl font-black text-white mb-6">
-              {job.status === 'completed' ? 'Job Completed' : 'Job Failed'}
-            </h2>
+            <h2 className="text-3xl font-black text-white mb-2">Scheduled</h2>
+            {schedule && (
+              <p className="text-primary-300 font-semibold mb-4">{humanReadableSchedule({ scheduledAt: schedule.scheduled_at, timezone: schedule.timezone })}</p>
+            )}
+            {countdown !== null && countdown > 0 && (
+              <div className="mb-6 p-4 bg-cyan-500/10 border border-cyan-500/30 rounded-xl">
+                <p className="text-cyan-400 font-bold text-lg">
+                  {countdown <= 60
+                    ? `Starting in ${countdown} second${countdown !== 1 ? 's' : ''}...`
+                    : countdown < 3600
+                      ? `Starting in ${Math.floor(countdown / 60)} minute${Math.floor(countdown / 60) !== 1 ? 's' : ''}`
+                      : `Starting in ${Math.floor(countdown / 3600)}h ${Math.floor((countdown % 3600) / 60)}m`
+                  }
+                </p>
+              </div>
+            )}
+            {countdown === 0 && (
+              <div className="mb-6 p-4 bg-primary-500/10 border border-primary-500/30 rounded-xl">
+                <p className="text-primary-400 font-bold flex items-center gap-2">
+                  <span className="inline-block animate-spin rounded-full h-4 w-4 border-2 border-primary-400 border-t-transparent"></span>
+                  Starting execution...
+                </p>
+              </div>
+            )}
             <button
-              onClick={handleRerun}
-              className="bg-gradient-to-r from-primary-500 to-primary-700 text-white px-8 py-4 rounded-xl font-bold hover:shadow-2xl hover:shadow-primary-500/50 hover:scale-105 transition-all duration-200"
+              onClick={() => {
+                if (schedule) {
+                  setScheduleData({ timezone: schedule.timezone, scheduledAt: schedule.scheduled_at, status: schedule.status })
+                }
+                setShowScheduleLater((v) => !v)
+              }}
+              className="px-6 py-3 bg-dark-200/50 border border-dark-300 text-white/80 hover:text-white hover:bg-dark-200 rounded-xl font-bold transition-all duration-200 flex items-center gap-2"
             >
-              Rerun Job
+              <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15.232 5.232l3.536 3.536m-2.036-5.036a2.5 2.5 0 113.536 3.536L6.5 21.036H3v-3.572L16.732 3.732z" />
+              </svg>
+              Update Schedule
             </button>
+
+            {showScheduleLater && (
+              <div className="mt-6 space-y-4">
+                <SchedulePicker timezone={scheduleData.timezone} scheduledAt={scheduleData.scheduledAt} status={scheduleData.status} onChange={setScheduleData} />
+                <div className="flex gap-3">
+                  <button onClick={handleScheduleLater} disabled={isSavingSchedule} className="px-6 py-3 bg-gradient-to-r from-primary-500 to-primary-700 text-white rounded-xl font-bold hover:shadow-xl hover:shadow-primary-500/40 transition-all duration-200 disabled:opacity-50">
+                    {isSavingSchedule ? 'Saving...' : 'Update Schedule'}
+                  </button>
+                  <button onClick={() => setShowScheduleLater(false)} className="px-6 py-3 bg-dark-200/50 text-white/70 rounded-xl font-bold border border-dark-300 hover:text-white transition-all duration-200">
+                    Cancel
+                  </button>
+                </div>
+              </div>
+            )}
+          </div>
+        )}
+
+        {/* ── IN_PROGRESS: Show cancel if stuck ── */}
+        {job.status === 'in_progress' && job.show_cancel_option && (
+          <div className="mt-8 bg-dark-100/50 backdrop-blur-xl rounded-2xl shadow-2xl p-8 border border-orange-500/30">
+            <h2 className="text-2xl font-black text-orange-400 mb-2">Job Running Too Long</h2>
+            <p className="text-white/50 font-medium mb-4">This job has been running longer than expected. You can cancel it if it appears stuck.</p>
+            <button
+              onClick={handleCancel}
+              className="px-8 py-4 bg-orange-500/20 border border-orange-500/50 text-orange-400 rounded-xl font-bold hover:bg-orange-500/30 transition-all duration-200"
+            >
+              Cancel Job
+            </button>
+          </div>
+        )}
+
+        {/* ── FAILED / CANCELLED: Rerun or Reschedule ── */}
+        {(job.status === 'failed' || job.status === 'cancelled') && (
+          <div className="mt-8 bg-dark-100/50 backdrop-blur-xl rounded-2xl shadow-2xl p-8 border border-dark-200/50">
+            <h2 className="text-3xl font-black text-white mb-2">
+              {job.status === 'failed' ? 'Job Failed' : 'Job Cancelled'}
+            </h2>
+            {job.failure_reason && (
+              <p className="text-red-400/80 text-sm mb-4">{job.failure_reason}</p>
+            )}
+            <div className="flex flex-wrap gap-3">
+              <button
+                onClick={handleRerun}
+                className="px-8 py-4 bg-gradient-to-r from-primary-500 to-primary-700 text-white rounded-xl font-bold hover:shadow-2xl hover:shadow-primary-500/50 hover:scale-105 transition-all duration-200 flex items-center gap-2"
+              >
+                <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
+                </svg>
+                Rerun Now
+              </button>
+              <button
+                onClick={() => {
+                  if (schedule) {
+                    setScheduleData({ timezone: schedule.timezone, scheduledAt: null, status: 'active' })
+                  }
+                  setShowScheduleLater((v) => !v)
+                }}
+                className="px-8 py-4 bg-dark-200/50 border border-dark-300 text-white/80 hover:text-white hover:bg-dark-200 rounded-xl font-bold transition-all duration-200 flex items-center gap-2"
+              >
+                <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M8 7V3m8 4V3m-9 8h10M5 21h14a2 2 0 002-2V7a2 2 0 00-2-2H5a2 2 0 00-2 2v12a2 2 0 002 2z" />
+                </svg>
+                Reschedule
+              </button>
+            </div>
+
+            {showScheduleLater && (
+              <div className="mt-6 space-y-4">
+                <SchedulePicker timezone={scheduleData.timezone} scheduledAt={scheduleData.scheduledAt} status={scheduleData.status} onChange={setScheduleData} />
+                <div className="flex gap-3">
+                  <button onClick={handleScheduleLater} disabled={isSavingSchedule} className="px-6 py-3 bg-gradient-to-r from-primary-500 to-primary-700 text-white rounded-xl font-bold hover:shadow-xl hover:shadow-primary-500/40 transition-all duration-200 disabled:opacity-50">
+                    {isSavingSchedule ? 'Saving...' : 'Save Schedule'}
+                  </button>
+                  <button onClick={() => setShowScheduleLater(false)} className="px-6 py-3 bg-dark-200/50 text-white/70 rounded-xl font-bold border border-dark-300 hover:text-white transition-all duration-200">
+                    Cancel
+                  </button>
+                </div>
+              </div>
+            )}
           </div>
         )}
       </div>

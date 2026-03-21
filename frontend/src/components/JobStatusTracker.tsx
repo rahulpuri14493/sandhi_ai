@@ -21,14 +21,15 @@ export function JobStatusTracker({ jobId, job: initialJob, onJobUpdate }: JobSta
         try {
           const updatedJob = await jobsAPI.getStatus(jobId)
           setJob(updatedJob)
-          if (updatedJob.status === 'completed' || updatedJob.status === 'failed') {
+          if (updatedJob.status === 'completed' || updatedJob.status === 'failed' || updatedJob.status === 'cancelled') {
             setIsPolling(false)
             clearInterval(interval)
+            onJobUpdate?.()
           }
         } catch (error) {
           console.error('Failed to poll job status:', error)
         }
-      }, 2000)
+      }, 5000)
 
       return () => clearInterval(interval)
     }
@@ -40,9 +41,11 @@ export function JobStatusTracker({ jobId, job: initialJob, onJobUpdate }: JobSta
       draft: { bg: 'bg-dark-200/50', text: 'text-white/80', border: 'border-dark-300', icon: '📝' },
       pending_approval: { bg: 'bg-yellow-500/20', text: 'text-yellow-400', border: 'border-yellow-500/50', icon: '⏳' },
       approved: { bg: 'bg-blue-500/20', text: 'text-blue-400', border: 'border-blue-500/50', icon: '✅' },
+      in_queue: { bg: 'bg-cyan-500/20', text: 'text-cyan-400', border: 'border-cyan-500/50', icon: '🕐' },
       in_progress: { bg: 'bg-primary-500/20', text: 'text-primary-400', border: 'border-primary-500/50', icon: '⚙️' },
       completed: { bg: 'bg-green-500/20', text: 'text-green-400', border: 'border-green-500/50', icon: '✓' },
       failed: { bg: 'bg-red-500/20', text: 'text-red-400', border: 'border-red-500/50', icon: '✗' },
+      cancelled: { bg: 'bg-orange-500/20', text: 'text-orange-400', border: 'border-orange-500/50', icon: '⊘' },
     }
     const statusInfo = statusMap[status] || statusMap.draft
     return (
@@ -269,7 +272,28 @@ export function JobStatusTracker({ jobId, job: initialJob, onJobUpdate }: JobSta
         </div>
       )}
 
-      {(job.status === 'completed' || job.status === 'failed') && (
+      {job.status === 'in_progress' && job.show_cancel_option && (
+        <div className="mt-8 pt-8 border-t border-orange-500/30">
+          <p className="text-orange-400 font-semibold text-sm mb-3">This job has been running longer than expected.</p>
+          <button
+            onClick={async () => {
+              if (!window.confirm('Cancel this job?')) return
+              try {
+                await jobsAPI.cancel(jobId)
+                onJobUpdate?.()
+              } catch (error) {
+                console.error('Failed to cancel job:', error)
+                alert('Failed to cancel job.')
+              }
+            }}
+            className="px-6 py-3 bg-orange-500/20 border border-orange-500/50 text-orange-400 rounded-xl font-bold hover:bg-orange-500/30 transition-all duration-200"
+          >
+            Cancel Job
+          </button>
+        </div>
+      )}
+
+      {(job.status === 'failed' || job.status === 'cancelled') && (
         <div className="mt-8 pt-8 border-t border-dark-200/50">
           <button
             onClick={async () => {
@@ -279,15 +303,10 @@ export function JobStatusTracker({ jobId, job: initialJob, onJobUpdate }: JobSta
               setIsRerunning(true)
               try {
                 await jobsAPI.rerun(jobId)
-                if (onJobUpdate) {
-                  onJobUpdate()
-                } else {
-                  const updatedJob = await jobsAPI.getStatus(jobId)
-                  setJob(updatedJob)
-                }
+                onJobUpdate?.()
               } catch (error) {
                 console.error('Failed to rerun job:', error)
-                alert('Failed to rerun job. Only completed or failed jobs can be rerun.')
+                alert('Failed to rerun job. Only failed or cancelled jobs can be rerun.')
               } finally {
                 setIsRerunning(false)
               }
