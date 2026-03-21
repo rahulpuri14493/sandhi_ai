@@ -6,6 +6,28 @@
   --foreground-rgb: 255, 255, 255;
   --background-start-rgb: 24, 24, 27;
   --background-end-rgb: 39, 39, 42;
+
+  /* shadcn/ui dark theme variables (HSL) */
+  --background: 240 10% 3.9%;
+  --foreground: 0 0% 98%;
+  --card: 240 10% 3.9%;
+  --card-foreground: 0 0% 98%;
+  --popover: 240 5.9% 10%;
+  --popover-foreground: 0 0% 98%;
+  --primary: 270 70% 55%;
+  --primary-foreground: 0 0% 98%;
+  --secondary: 240 3.7% 15.9%;
+  --secondary-foreground: 0 0% 98%;
+  --muted: 240 3.7% 15.9%;
+  --muted-foreground: 240 5% 64.9%;
+  --accent: 270 70% 55%;
+  --accent-foreground: 0 0% 98%;
+  --destructive: 0 62.8% 30.6%;
+  --destructive-foreground: 0 0% 98%;
+  --border: 240 3.7% 15.9%;
+  --input: 240 3.7% 15.9%;
+  --ring: 270 70% 55%;
+  --radius: 0.75rem;
 }
 
 body {
@@ -124,4 +146,19 @@ body {
 .card-hover:hover {
   transform: translateY(-4px);
   box-shadow: 0 20px 25px -5px rgba(0, 0, 0, 0.1), 0 10px 10px -5px rgba(0, 0, 0, 0.04);
+}
+
+/* shadcn/ui base layer */
+@layer base {
+  * {
+    @apply border-dark-200;
+  }
+}
+
+/* Hide native time picker indicator */
+input[type="time"]::-webkit-calendar-picker-indicator {
+  display: none;
+}
+input[type="time"]::-webkit-datetime-edit {
+  color: inherit;
 }

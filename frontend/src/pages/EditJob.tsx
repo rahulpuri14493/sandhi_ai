@@ -4,6 +4,7 @@ import { jobsAPI, agentsAPI, mcpAPI } from '../lib/api'
 import type { Job, Agent, WorkflowStep } from '../lib/types'
 import type { MCPToolConfigRes, MCPServerConnectionRes } from '../lib/api'
 
+
 export default function EditJobPage() {
   const { id } = useParams<{ id: string }>()
   const navigate = useNavigate()
@@ -111,8 +112,7 @@ export default function EditJobPage() {
     setSelectedConnectionIds((prev) =>
       prev.includes(id) ? prev.filter((x) => x !== id) : [...prev, id]
     )
-  }
-
+  }  
   const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     if (e.target.files) {
       const files = Array.from(e.target.files)
