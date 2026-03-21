@@ -25,6 +25,8 @@ from models import (  # noqa: F401
     Agent,
     Job,
     WorkflowStep,
+    JobSchedule,
+    ScheduleExecutionHistory,
     AgentReview,
     AgentCommunication,
     Transaction,

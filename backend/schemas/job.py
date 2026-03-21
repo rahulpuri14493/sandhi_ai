@@ -1,8 +1,158 @@
 from pydantic import BaseModel, field_validator
 from typing import Optional, List, Dict, Any
-from datetime import datetime
+from datetime import datetime, timezone as tz
 import json
-from models.job import JobStatus
+from zoneinfo import available_timezones
+from models.job import JobStatus, ScheduleStatus
+
+
+_VALID_TIMEZONES = available_timezones()
+
+
+def _validate_timezone(v: str) -> str:
+    """Validate that the timezone string is a valid IANA timezone (e.g. 'Asia/Kolkata')."""
+    if v not in _VALID_TIMEZONES:
+        raise ValueError(f"Invalid timezone: {v}")
+    return v
+
+
+def _is_in_past(v: datetime) -> bool:
+    """Check if a datetime is in the past. Handles both naive and tz-aware inputs.
+
+    Uses datetime.utcnow() for consistency with the rest of the codebase.
+    Tz-aware inputs are converted to UTC before comparison; naive inputs
+    are assumed to be UTC.
+    """
+    now = datetime.utcnow()
+    if v.tzinfo:
+        # Convert tz-aware input to naive UTC for comparison
+        compare = v.astimezone(tz.utc).replace(tzinfo=None)
+    else:
+        compare = v
+    return compare < now
+
+
+class JobScheduleCreate(BaseModel):
+    """Schema for creating a one-time job schedule.
+
+    scheduled_at must be a future datetime. timezone is the IANA timezone
+    the user intended (used by APScheduler's DateTrigger).
+    """
+    scheduled_at: datetime
+    timezone: str = "UTC"
+    status: ScheduleStatus = ScheduleStatus.ACTIVE
+
+    @field_validator("timezone")
+    @classmethod
+    def validate_tz(cls, v: str) -> str:
+        return _validate_timezone(v)
+
+    @field_validator("scheduled_at")
+    @classmethod
+    def validate_not_in_past(cls, v: datetime) -> datetime:
+        if _is_in_past(v):
+            raise ValueError("scheduled_at must be in the future")
+        return v
+
+
+class JobScheduleUpdate(BaseModel):
+    """Schema for updating a schedule. All fields optional.
+
+    Used for both regular updates and "Schedule Again" after job failure
+    (frontend sends a new scheduled_at and optionally status=active).
+    """
+    scheduled_at: Optional[datetime] = None
+    timezone: Optional[str] = None
+    status: Optional[ScheduleStatus] = None
+
+    @field_validator("timezone")
+    @classmethod
+    def validate_tz(cls, v: Optional[str]) -> Optional[str]:
+        if v is not None:
+            return _validate_timezone(v)
+        return v
+
+    @field_validator("scheduled_at")
+    @classmethod
+    def validate_not_in_past(cls, v: Optional[datetime]) -> Optional[datetime]:
+        if v is not None and _is_in_past(v):
+            raise ValueError("scheduled_at must be in the future")
+        return v
+
+
+class JobScheduleResponse(BaseModel):
+    id: int
+    job_id: int
+    status: ScheduleStatus
+    timezone: str
+    scheduled_at: datetime
+    last_run_time: Optional[datetime] = None
+    next_run_time: Optional[datetime] = None
+    created_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+class JobScheduleWithJobResponse(JobScheduleResponse):
+    """Schedule response enriched with job title and status for cross-job listing."""
+    job_title: str = ""
+    job_status: str = ""
+
+
+class ScheduleListResponse(BaseModel):
+    """Paginated list of schedules."""
+    items: List[JobScheduleWithJobResponse]
+    total: int
+    limit: int
+    offset: int
+
+
+class ScheduleExecutionHistoryResponse(BaseModel):
+    id: int
+    schedule_id: int
+    job_id: int
+    started_at: datetime
+    completed_at: Optional[datetime] = None
+    status: str
+    failure_reason: Optional[str] = None
+    triggered_by: str
+
+    class Config:
+        from_attributes = True
+
+
+class EnumOption(BaseModel):
+    """Single enum value for dynamic filter dropdowns."""
+    value: str
+    label: str
+
+
+class JobFilterOptions(BaseModel):
+    """All available filter values for the job list endpoint."""
+    statuses: List[EnumOption]
+    sort_options: List[EnumOption]
+
+
+class ScheduleFilterOptions(BaseModel):
+    """All available filter values for the schedule list endpoint."""
+    schedule_statuses: List[EnumOption]
+    job_statuses: List[EnumOption]
+    sort_options: List[EnumOption]
+    jobs: List[dict]  # [{id, title}] — user's jobs for the job_id dropdown
+
+
+class ScheduleActionResponse(BaseModel):
+    """Standard response for schedule create/update mutations."""
+    message: str
+    data: JobScheduleResponse
+
+
+class RerunResponse(BaseModel):
+    """Response for job rerun operation."""
+    message: str
+    job_id: int
+    status: str
 
 
 def _parse_int_list(v):
@@ -156,3 +306,4 @@ class WorkflowPreview(BaseModel):
 # Update forward references
 JobResponse.model_rebuild()
 WorkflowStepResponse.model_rebuild()
+JobScheduleResponse.model_rebuild()

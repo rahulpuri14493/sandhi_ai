@@ -6,23 +6,32 @@ import zipfile
 import random
 from pathlib import Path
 from typing import List, Optional
-from fastapi import APIRouter, Depends, HTTPException, status, BackgroundTasks, UploadFile, File, Form
+from fastapi import APIRouter, Depends, HTTPException, status, BackgroundTasks, UploadFile, File, Form, Query
 from fastapi.responses import FileResponse, Response, StreamingResponse
 from sqlalchemy.orm import Session
 from pydantic import BaseModel
 from db.database import get_db
-from models.job import Job, JobStatus, WorkflowStep
+from models.job import Job, JobStatus, WorkflowStep, JobSchedule, ScheduleStatus, ScheduleExecutionHistory
 from models.agent import Agent
 from models.user import User, UserRole
-from schemas.job import JobCreate, JobUpdate, JobResponse, WorkflowStepResponse, WorkflowPreview, AutoSplitBody, AnswerQuestionBody
+from schemas.job import (
+    JobCreate, JobUpdate, JobResponse, WorkflowStepResponse, WorkflowPreview,
+    AutoSplitBody, AnswerQuestionBody,
+    JobScheduleCreate, JobScheduleUpdate, JobScheduleResponse,
+    JobScheduleWithJobResponse, ScheduleExecutionHistoryResponse,
+    ScheduleListResponse, ScheduleActionResponse, RerunResponse,
+    JobFilterOptions, ScheduleFilterOptions, EnumOption,
+)
 from core.security import get_current_user, get_current_business_user
 from core.config import settings
+from services.job_scheduler import get_scheduler, reset_job_for_execution, run_job_in_thread
 from services.workflow_builder import WorkflowBuilder
 from services.payment_processor import PaymentProcessor
 from services.agent_executor import AgentExecutor
 from services.document_analyzer import DocumentAnalyzer
 from models.transaction import Transaction, Earnings
 from core.external_token import create_job_token, get_share_url
+import threading
 from datetime import datetime
 from models.communication import AgentCommunication
 from models.mcp_server import MCPToolConfig, MCPServerConnection
@@ -241,6 +250,8 @@ def _validate_tool_visibility(v: Optional[str]) -> Optional[str]:
 async def create_job(
     title: str = Form(...),
     description: Optional[str] = Form(None),
+    schedule_timezone: Optional[str] = Form(None),
+    schedule_scheduled_at: Optional[str] = Form(None),
     files: Optional[List[UploadFile]] = File(None),
     allowed_platform_tool_ids: Optional[str] = Form(None),
     allowed_connection_ids: Optional[str] = Form(None),
@@ -248,7 +259,9 @@ async def create_job(
     current_user: User = Depends(get_current_business_user),
     db: Session = Depends(get_db)
 ):
-    """Create a new job with optional file uploads and optional tool scope."""
+    """Create a new job with optional file uploads and an optional schedule."""
+    file_metadata = []
+
     platform_ids = _parse_int_list_form(allowed_platform_tool_ids)
     connection_ids = _parse_int_list_form(allowed_connection_ids)
     if (platform_ids and len(platform_ids)) or (connection_ids and len(connection_ids)):
@@ -293,7 +306,37 @@ async def create_job(
             db.commit()
             raise
 
-    # Build response with parsed files (remove storage internals for security)
+    # Optionally attach a one-time schedule at job creation time.
+    # Wrapped in try/except so a schedule validation error (e.g. past date)
+    # doesn't prevent the job itself from being created.
+    if schedule_scheduled_at is not None:
+        try:
+            schedule_payload = JobScheduleCreate(
+                scheduled_at=schedule_scheduled_at,
+                timezone=schedule_timezone or "UTC",
+            )
+            schedule = JobSchedule(
+                job_id=new_job.id,
+                status=schedule_payload.status,
+                timezone=schedule_payload.timezone,
+                scheduled_at=schedule_payload.scheduled_at,
+                next_run_time=schedule_payload.scheduled_at if schedule_payload.status == ScheduleStatus.ACTIVE else None,
+            )
+            db.add(schedule)
+            # Creating a schedule puts the job in queue
+            new_job.status = JobStatus.IN_QUEUE
+            db.commit()
+            db.refresh(schedule)
+
+            svc = get_scheduler()
+            if svc and schedule.status == ScheduleStatus.ACTIVE:
+                svc.add_schedule(schedule.id, scheduled_at=schedule.scheduled_at, timezone=schedule.timezone)
+        except Exception as exc:
+            db.rollback()
+            db.refresh(new_job)  # Restore actual DB state (status stays DRAFT)
+            logger.warning("Failed to create inline schedule for job %s: %s", new_job.id, exc)
+
+    # Build response with parsed files (remove paths for security)
     files_for_response = []
     if file_metadata:
         for file_info in file_metadata:
@@ -736,18 +779,50 @@ async def generate_workflow_questions(
     }
 
 
+@router.get("/filter-options", response_model=JobFilterOptions)
+def get_job_filter_options(
+    current_user: User = Depends(get_current_user),
+):
+    """Return all available filter/sort values for the job list endpoint.
+
+    Frontend uses this to populate filter dropdowns dynamically — no
+    hard-coded enum values needed on the client side.
+    """
+    statuses = [
+        EnumOption(value=s.value, label=s.value.replace("_", " ").title())
+        for s in JobStatus
+    ]
+    sort_options = [
+        EnumOption(value="newest", label="Newest First"),
+        EnumOption(value="oldest", label="Oldest First"),
+    ]
+    return JobFilterOptions(statuses=statuses, sort_options=sort_options)
+
+
 @router.get("", response_model=List[JobResponse])
 def list_jobs(
     current_user: User = Depends(get_current_user),
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
+    job_status: Optional[str] = None,
+    sort: Optional[str] = "newest",
 ):
     if current_user.role == UserRole.BUSINESS:
-        jobs = db.query(Job).filter(Job.business_id == current_user.id).all()
+        query = db.query(Job).filter(Job.business_id == current_user.id)
     else:
         # Developers can see jobs where their agents are used
-        jobs = db.query(Job).join(WorkflowStep).join(Agent).filter(
+        query = db.query(Job).join(WorkflowStep).join(Agent).filter(
             Agent.developer_id == current_user.id
-        ).distinct().all()
+        )
+
+    if job_status is not None:
+        query = query.filter(Job.status == job_status)
+
+    if sort == "oldest":
+        query = query.order_by(Job.created_at.asc())
+    else:
+        query = query.order_by(Job.created_at.desc())
+
+    jobs = query.distinct().all()
     
     # Parse files for each job
     result = []
@@ -1504,82 +1579,6 @@ def execute_job(
     return JobResponse(**job_dict)
 
 
-@router.post("/{job_id}/rerun", response_model=JobResponse)
-def rerun_job(
-    job_id: int,
-    current_user: User = Depends(get_current_business_user),
-    db: Session = Depends(get_db)
-):
-    """Rerun a completed or failed job"""
-    job = db.query(Job).filter(Job.id == job_id).first()
-    if not job:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Job not found"
-        )
-    
-    if job.business_id != current_user.id:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Not authorized"
-        )
-    
-    # Only allow rerunning completed or failed jobs
-    if job.status not in [JobStatus.COMPLETED, JobStatus.FAILED]:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Only completed or failed jobs can be rerun"
-        )
-    
-    # Reset workflow steps - clear output data and reset status
-    workflow_steps = db.query(WorkflowStep).filter(WorkflowStep.job_id == job_id).all()
-    for step in workflow_steps:
-        step.output_data = None
-        step.status = "pending"
-        step.started_at = None
-        step.completed_at = None
-        step.cost = 0.0
-    
-        # Reset job status to pending_approval so it can be executed again
-        job.status = JobStatus.PENDING_APPROVAL
-        job.completed_at = None
-        job.failure_reason = None  # Clear previous failure reason
-        db.commit()
-    db.refresh(job)
-    
-    # Parse files and conversation for response
-    files_data = None
-    if job.files:
-        try:
-            files_parsed = json.loads(job.files)
-            files_data = [redact_file_metadata(f) for f in files_parsed]
-        except (json.JSONDecodeError, TypeError):
-            pass
-    
-    conversation_data = None
-    if job.conversation:
-        try:
-            conversation_data = json.loads(job.conversation)
-        except (json.JSONDecodeError, TypeError):
-            pass
-    
-    job_dict = {
-        "id": job.id,
-        "business_id": job.business_id,
-        "title": job.title,
-        "description": job.description,
-        "status": job.status,
-        "total_cost": job.total_cost,
-        "created_at": job.created_at,
-        "completed_at": job.completed_at,
-        "workflow_steps": [],
-        "files": files_data,
-        "conversation": conversation_data,
-        "failure_reason": job.failure_reason
-    }
-    return JobResponse(**job_dict)
-
-
 @router.get("/{job_id}/share-link", response_model=dict)
 def get_job_share_link(
     job_id: int,
@@ -1766,3 +1765,347 @@ def download_job_file(
         filename=file_info["name"],
         media_type=file_info["type"]
     )
+
+
+# ---------------------------------------------------------------------------
+# Job Schedule — one schedule per job (singular endpoints)
+#
+# Workflow:
+#   1. User creates a schedule → job status moves to IN_QUEUE.
+#   2. Before scheduled time (IN_QUEUE): user can edit the schedule.
+#   3. At scheduled time: job moves to IN_PROGRESS. No user actions.
+#   4. After the job runs:
+#      (a) Success (COMPLETED): no further action items.
+#      (b) Failure (FAILED) or cancellation (CANCELLED): frontend shows
+#          "Schedule Again" (PUT /schedule) or "Run Now" (POST /rerun).
+# ---------------------------------------------------------------------------
+
+@router.get("/schedules/filter-options", response_model=ScheduleFilterOptions)
+def get_schedule_filter_options(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Return all available filter/sort values for the schedule list endpoint.
+
+    Requires authentication. Results are scoped to jobs owned by the current
+    user. Includes the user's jobs (id + title) for the job dropdown, schedule
+    statuses, job statuses, and sort options — so the frontend never
+    hard-codes enum values.
+    """
+    schedule_statuses = [
+        EnumOption(value=s.value, label=s.value.replace("_", " ").title())
+        for s in ScheduleStatus
+    ]
+    job_statuses = [
+        EnumOption(value=s.value, label=s.value.replace("_", " ").title())
+        for s in JobStatus
+    ]
+    sort_options = [
+        EnumOption(value="newest", label="Newest First"),
+        EnumOption(value="oldest", label="Oldest First"),
+    ]
+    # User's jobs for the job_id filter dropdown
+    user_jobs = (
+        db.query(Job.id, Job.title)
+        .filter(Job.business_id == current_user.id)
+        .order_by(Job.created_at.desc())
+        .all()
+    )
+    jobs = [{"id": j.id, "title": j.title} for j in user_jobs]
+
+    return ScheduleFilterOptions(
+        schedule_statuses=schedule_statuses,
+        job_statuses=job_statuses,
+        sort_options=sort_options,
+        jobs=jobs,
+    )
+
+
+@router.get("/schedules/all", response_model=ScheduleListResponse)
+def list_all_schedules(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+    job_id: Optional[int] = None,
+    sort: Optional[str] = "newest",
+    schedule_status: Optional[str] = None,
+    job_status: Optional[str] = None,
+    limit: int = Query(10, ge=1, le=100, description="Records per page"),
+    offset: int = Query(0, ge=0, description="Pagination offset"),
+):
+    """List all schedules across all jobs owned by the current user.
+
+    Supports filtering by job_id, schedule_status, job_status, and sorting
+    by scheduled_at (newest/oldest). Paginated — default 10 per page.
+    """
+    query = (
+        db.query(JobSchedule, Job.title, Job.status)
+        .join(Job, Job.id == JobSchedule.job_id)
+        .filter(Job.business_id == current_user.id)
+    )
+    if job_id is not None:
+        query = query.filter(JobSchedule.job_id == job_id)
+    if schedule_status is not None:
+        query = query.filter(JobSchedule.status == schedule_status)
+    if job_status is not None:
+        query = query.filter(Job.status == job_status)
+
+    if sort == "oldest":
+        query = query.order_by(JobSchedule.scheduled_at.asc())
+    else:
+        query = query.order_by(JobSchedule.scheduled_at.desc())
+
+    total = query.count()
+    rows = query.offset(offset).limit(limit).all()
+    results = []
+    for schedule, job_title, js in rows:
+        resp = JobScheduleResponse.model_validate(schedule, from_attributes=True)
+        data = resp.model_dump()
+        data["job_title"] = job_title
+        data["job_status"] = js.value if hasattr(js, "value") else str(js)
+        results.append(JobScheduleWithJobResponse(**data))
+    return ScheduleListResponse(items=results, total=total, limit=limit, offset=offset)
+
+
+@router.post("/{job_id}/schedule", response_model=ScheduleActionResponse, status_code=status.HTTP_201_CREATED)
+def create_job_schedule(
+    job_id: int,
+    payload: JobScheduleCreate,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Create a one-time schedule for a job. One schedule per job — returns 400 if one already exists.
+
+    The schedule fires at scheduled_at (in the given timezone). After execution,
+    the schedule is deactivated. If the job fails, the user can reschedule via PUT.
+    Creating a schedule transitions the job to IN_QUEUE.
+    """
+    job = db.query(Job).filter(Job.id == job_id, Job.business_id == current_user.id).first()
+    if not job:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Job not found or you do not have access")
+
+    # Block schedule creation while job is actively executing
+    if job.status == JobStatus.IN_PROGRESS:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Cannot create schedule while job is in progress — wait for execution to complete",
+        )
+
+    existing = db.query(JobSchedule).filter(JobSchedule.job_id == job_id).first()
+    if existing:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Schedule already exists for this job — use PUT to update it",
+        )
+
+    schedule = JobSchedule(
+        job_id=job_id,
+        status=payload.status,
+        timezone=payload.timezone,
+        scheduled_at=payload.scheduled_at,
+        next_run_time=payload.scheduled_at if payload.status == ScheduleStatus.ACTIVE else None,
+    )
+    db.add(schedule)
+    # Creating a schedule puts the job in queue (waiting for scheduled time)
+    job.status = JobStatus.IN_QUEUE
+    db.commit()
+    db.refresh(schedule)
+
+    if schedule.status == ScheduleStatus.ACTIVE:
+        svc = get_scheduler()
+        if svc:
+            svc.add_schedule(schedule.id, scheduled_at=schedule.scheduled_at, timezone=schedule.timezone)
+
+    return ScheduleActionResponse(
+        message="Schedule created successfully",
+        data=JobScheduleResponse.model_validate(schedule),
+    )
+
+
+@router.get("/{job_id}/schedule", response_model=JobScheduleResponse)
+def get_job_schedule(
+    job_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Get the schedule for a job. Only the job owner can view it."""
+    job = db.query(Job).filter(Job.id == job_id).first()
+    if not job:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Job not found")
+    if job.business_id != current_user.id:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Not authorized")
+
+    schedule = db.query(JobSchedule).filter(JobSchedule.job_id == job_id).first()
+    if not schedule:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="No schedule found for this job")
+
+    return schedule
+
+
+@router.put("/{job_id}/schedule", response_model=ScheduleActionResponse)
+def update_job_schedule(
+    job_id: int,
+    payload: JobScheduleUpdate,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Update the schedule for a job.
+
+    Also used as "Schedule Again" after a job failure or cancellation — the frontend
+    sends a new scheduled_at and optionally re-enables the schedule (status=active).
+    Rescheduling a failed/cancelled job transitions it back to IN_QUEUE.
+    """
+    schedule = db.query(JobSchedule).join(Job).filter(
+        JobSchedule.job_id == job_id,
+        Job.business_id == current_user.id,
+    ).first()
+    if not schedule:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Schedule not found for this job")
+
+    # Block modifications while job is actively executing
+    job = db.query(Job).filter(Job.id == job_id).first()
+    if job and job.status == JobStatus.IN_PROGRESS:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Cannot modify schedule while job is in progress — wait for execution to complete",
+        )
+
+    if payload.timezone is not None:
+        schedule.timezone = payload.timezone
+    if payload.scheduled_at is not None:
+        schedule.scheduled_at = payload.scheduled_at
+    if payload.status is not None:
+        schedule.status = payload.status
+
+    # Recompute next_run_time
+    effective_status = payload.status if payload.status is not None else schedule.status
+    if effective_status == ScheduleStatus.ACTIVE:
+        schedule.next_run_time = schedule.scheduled_at
+    else:
+        schedule.next_run_time = None
+
+    # Rescheduling a failed/cancelled job puts it back in queue
+    if job and effective_status == ScheduleStatus.ACTIVE and job.status in (JobStatus.FAILED, JobStatus.CANCELLED):
+        job.status = JobStatus.IN_QUEUE
+
+    db.commit()
+    db.refresh(schedule)
+
+    # Sync with APScheduler
+    svc = get_scheduler()
+    if svc:
+        if schedule.status == ScheduleStatus.ACTIVE:
+            svc.update_schedule(schedule.id, scheduled_at=schedule.scheduled_at, timezone=schedule.timezone)
+        else:
+            svc.remove_schedule(schedule.id)
+
+    return ScheduleActionResponse(
+        message="Schedule updated successfully",
+        data=JobScheduleResponse.model_validate(schedule),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Job Rerun (immediate re-execution of a failed or cancelled job)
+# ---------------------------------------------------------------------------
+
+@router.post("/{job_id}/rerun", response_model=RerunResponse)
+def rerun_job(
+    job_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Immediately re-execute a failed or cancelled job ("Run Now" button).
+
+    Only available when job status is FAILED or CANCELLED. Resets all workflow
+    steps, transitions to IN_PROGRESS, and triggers execution in a background thread.
+    For "Schedule Again", the frontend uses PUT /schedule with a new scheduled_at.
+    """
+    job = db.query(Job).filter(Job.id == job_id, Job.business_id == current_user.id).first()
+    if not job:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Job not found or you do not have access")
+    if job.status not in (JobStatus.FAILED, JobStatus.CANCELLED):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Can only rerun failed or cancelled jobs. Current status: {job.status.value}",
+        )
+
+    step_count = db.query(WorkflowStep).filter(WorkflowStep.job_id == job.id).count()
+    if step_count == 0:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Job has no workflow steps — add a workflow before rerunning",
+        )
+
+    # Create execution history entry if a schedule exists (audit trail)
+    history_id = None
+    schedule = db.query(JobSchedule).filter(JobSchedule.job_id == job_id).first()
+    if schedule:
+        history = ScheduleExecutionHistory(
+            schedule_id=schedule.id,
+            job_id=job.id,
+            status="started",
+            triggered_by="manual_rerun",
+        )
+        db.add(history)
+        db.flush()
+        history_id = history.id
+
+    # Reset steps and set IN_PROGRESS directly (execution starts now)
+    reset_job_for_execution(db, job)
+    job.status = JobStatus.IN_PROGRESS
+    db.commit()
+
+    # Spawn execution thread — job is already IN_PROGRESS
+    try:
+        thread = threading.Thread(target=run_job_in_thread, args=(job.id, history_id), daemon=True)
+        thread.start()
+    except Exception as exc:
+        logger.exception("Failed to start execution thread for job %s", job.id)
+        job.status = JobStatus.FAILED
+        job.failure_reason = f"Failed to start execution: {str(exc)[:200]}"
+        if history_id:
+            hist = db.query(ScheduleExecutionHistory).filter(ScheduleExecutionHistory.id == history_id).first()
+            if hist:
+                hist.status = "failed"
+                hist.failure_reason = job.failure_reason
+        db.commit()
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to start job execution: {str(exc)[:200]}",
+        )
+
+    return RerunResponse(
+        message="Job re-execution started",
+        job_id=job.id,
+        status=job.status.value,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Schedule Execution History
+# ---------------------------------------------------------------------------
+
+@router.get("/{job_id}/schedule/history", response_model=List[ScheduleExecutionHistoryResponse])
+def get_schedule_history(
+    job_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Get execution history for a job's schedule (audit log).
+
+    Returns all execution attempts ordered by most recent first.
+    Includes started, completed, failed, skipped, and potentially_stuck entries.
+    """
+    job = db.query(Job).filter(Job.id == job_id).first()
+    if not job:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Job not found")
+    if job.business_id != current_user.id:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Not authorized")
+
+    history = (
+        db.query(ScheduleExecutionHistory)
+        .filter(ScheduleExecutionHistory.job_id == job_id)
+        .order_by(ScheduleExecutionHistory.started_at.desc())
+        .all()
+    )
+    return history
