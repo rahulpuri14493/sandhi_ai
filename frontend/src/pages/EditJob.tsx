@@ -4,6 +4,7 @@ import { jobsAPI, agentsAPI, mcpAPI } from '../lib/api'
 import type { Job, Agent, WorkflowStep } from '../lib/types'
 import type { MCPToolConfigRes, MCPServerConnectionRes } from '../lib/api'
 
+
 export default function EditJobPage() {
   const { id } = useParams<{ id: string }>()
   const navigate = useNavigate()
@@ -14,7 +15,7 @@ export default function EditJobPage() {
     description: '',
     status: 'draft',
   })
-  const [toolVisibility, setToolVisibility] = useState<'full' | 'names_only' | 'none'>('full')
+  const [toolVisibility, setToolVisibility] = useState<'full' | 'names_only' | 'none'>('none')
   const [existingFiles, setExistingFiles] = useState<Array<{ id: string; name: string; type: string; size: number }>>([])
   const [selectedFiles, setSelectedFiles] = useState<File[]>([])
   const [selectedAgents, setSelectedAgents] = useState<number[]>(selectedAgentsFromState ?? [])
@@ -68,7 +69,7 @@ export default function EditJobPage() {
       setJobOriginalPlatformToolIds(allowedToolIds)
       setSelectedPlatformToolIds(allowedToolIds)
       setSelectedConnectionIds(job.allowed_connection_ids ?? [])
-      if (job.tool_visibility) setToolVisibility(job.tool_visibility)
+      setToolVisibility((job.tool_visibility ?? 'none') as 'full' | 'names_only' | 'none')
       if (
         !selectedAgentsFromState?.length &&
         job.workflow_steps &&
@@ -111,8 +112,7 @@ export default function EditJobPage() {
     setSelectedConnectionIds((prev) =>
       prev.includes(id) ? prev.filter((x) => x !== id) : [...prev, id]
     )
-  }
-
+  }  
   const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     if (e.target.files) {
       const files = Array.from(e.target.files)
@@ -352,10 +352,10 @@ export default function EditJobPage() {
               </div>
             )}
             <label className="block text-white font-bold mb-3 text-lg" htmlFor="files">
-              Upload Additional Documents (optional)
+              Upload New Documents (overwrite existing)
             </label>
             <p className="text-sm text-white/50 mb-4 font-medium">
-              Supported formats: CSV, TXT, DOC, DOCX, PDF, XLS, XLSX, JSON, XML, MD, RTF, ODT, ODS
+              Supported formats: CSV, TXT, DOC, DOCX, PDF, XLS, XLSX, JSON, XML, MD, RTF, ODT, ODS. Uploading new files will replace existing BRD documents for this job.
             </p>
             <input
               id="files"
@@ -398,7 +398,7 @@ export default function EditJobPage() {
             )}
             {selectedFiles.length > 0 && (
               <p className="text-sm text-primary-400 mt-4 font-semibold">
-                ℹ️ New documents will trigger automatic analysis and questions after update.
+                ℹ️ New documents will overwrite previous BRDs and trigger automatic analysis/questions.
               </p>
             )}
           </div>

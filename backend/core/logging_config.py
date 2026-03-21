@@ -19,4 +19,6 @@ def configure_logging(level: str = "INFO") -> None:
     # Reduce noise from third-party libs
     logging.getLogger("httpx").setLevel(logging.WARNING)
     logging.getLogger("httpcore").setLevel(logging.WARNING)
-    logging.getLogger("uvicorn.access").setLevel(logging.WARNING)
+    # Keep request logs visible in Docker/production too.
+    logging.getLogger("uvicorn.access").setLevel(logging.INFO)
+    logging.getLogger("uvicorn.error").setLevel(logging.INFO)

@@ -2,31 +2,49 @@ import logging
 import asyncio
 import io
 import json
-import os
-import uuid
 import zipfile
+import random
 from pathlib import Path
 from typing import List, Optional
-from fastapi import APIRouter, Depends, HTTPException, status, BackgroundTasks, UploadFile, File, Form
-from fastapi.responses import FileResponse, Response
+from fastapi import APIRouter, Depends, HTTPException, status, BackgroundTasks, UploadFile, File, Form, Query
+from fastapi.responses import FileResponse, Response, StreamingResponse
 from sqlalchemy.orm import Session
 from pydantic import BaseModel
 from db.database import get_db
-from models.job import Job, JobStatus, WorkflowStep
+from models.job import Job, JobStatus, WorkflowStep, JobSchedule, ScheduleStatus, ScheduleExecutionHistory
 from models.agent import Agent
 from models.user import User, UserRole
-from schemas.job import JobCreate, JobUpdate, JobResponse, WorkflowStepResponse, WorkflowPreview, AutoSplitBody, AnswerQuestionBody
+from schemas.job import (
+    JobCreate, JobUpdate, JobResponse, WorkflowStepResponse, WorkflowPreview,
+    AutoSplitBody, AnswerQuestionBody,
+    JobScheduleCreate, JobScheduleUpdate, JobScheduleResponse,
+    JobScheduleWithJobResponse, ScheduleExecutionHistoryResponse,
+    ScheduleListResponse, ScheduleActionResponse, RerunResponse,
+    JobFilterOptions, ScheduleFilterOptions, EnumOption,
+)
 from core.security import get_current_user, get_current_business_user
 from core.config import settings
+from services.job_scheduler import get_scheduler, reset_job_for_execution, run_job_in_thread
 from services.workflow_builder import WorkflowBuilder
 from services.payment_processor import PaymentProcessor
 from services.agent_executor import AgentExecutor
 from services.document_analyzer import DocumentAnalyzer
 from models.transaction import Transaction, Earnings
 from core.external_token import create_job_token, get_share_url
+import threading
 from datetime import datetime
 from models.communication import AgentCommunication
 from models.mcp_server import MCPToolConfig, MCPServerConnection
+from services.job_file_storage import (
+    persist_file,
+    delete_file,
+    delete_file_sync,
+    download_s3_bytes,
+    redact_file_metadata,
+    has_readable_source,
+    open_local_download_path,
+    open_s3_download_stream,
+)
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/jobs", tags=["jobs"])
@@ -83,10 +101,6 @@ def _get_first_hired_agent_for_job(db: Session, job_id: int) -> Optional[tuple]:
     )
 
 
-# Create uploads directory if it doesn't exist
-UPLOAD_DIR = Path("uploads/jobs")
-UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
-
 # Allowed file extensions (including .zip; zip contents are extracted and only allowed types kept)
 ALLOWED_EXTENSIONS = {
     '.txt', '.csv', '.doc', '.docx', '.pdf', '.xls', '.xlsx',
@@ -97,64 +111,110 @@ ALLOWED_EXTENSIONS = {
 EXTRACTABLE_EXTENSIONS = ALLOWED_EXTENSIONS - {'.zip'}
 
 
-async def _process_one_upload(file: UploadFile) -> List[dict]:
+def _zip_extract_backoff(attempt_idx: int) -> float:
+    base = max(0.0, float(getattr(settings, "ZIP_EXTRACT_RETRY_BASE_DELAY_SECONDS", 0.1)))
+    cap = max(base, float(getattr(settings, "ZIP_EXTRACT_RETRY_MAX_DELAY_SECONDS", 0.5)))
+    jitter = max(0.0, float(getattr(settings, "ZIP_EXTRACT_RETRY_JITTER_SECONDS", 0.05)))
+    return min(cap, base * (2 ** max(0, attempt_idx))) + random.uniform(0, jitter)
+
+
+async def _process_one_upload(file: UploadFile, *, job_id: Optional[int] = None) -> List[dict]:
     """
     Process one uploaded file. If it's a .zip, extract and return metadata for each
     allowed file inside. Otherwise save the file and return a single metadata dict.
     """
     file_ext = Path(file.filename).suffix.lower()
     content = await file.read()
+    max_file_bytes = max(1, int(getattr(settings, "JOB_UPLOAD_MAX_FILE_BYTES", 104857600)))
+    if len(content) > max_file_bytes:
+        raise HTTPException(
+            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            detail=f"File {file.filename} exceeds max allowed size of {max_file_bytes} bytes",
+        )
 
     if file_ext == '.zip':
-        # Extract zip and save each allowed file
-        entries = []
-        try:
-            with zipfile.ZipFile(io.BytesIO(content), 'r') as zf:
-                for name in zf.namelist():
-                    if name.endswith('/'):
-                        continue
-                    ext = Path(name).suffix.lower()
-                    if ext not in EXTRACTABLE_EXTENSIONS:
-                        continue
-                    safe_name = Path(name).name or f"file{ext}"
-                    file_id = str(uuid.uuid4())
-                    out_path = UPLOAD_DIR / f"{file_id}_{safe_name}"
-                    with zf.open(name, 'r') as src:
-                        data = src.read()
-                    with open(out_path, 'wb') as f:
-                        f.write(data)
-                    entries.append({
-                        "id": file_id,
-                        "name": safe_name,
-                        "path": str(out_path),
-                        "type": "application/octet-stream",
-                        "size": len(data)
-                    })
-        except zipfile.BadZipFile as e:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail=f"Invalid or corrupted zip file: {file.filename}"
-            ) from e
-        return entries
+        # S3 flow: persist raw zip in object storage first, then extract from stored object bytes.
+        s3_backend = (getattr(settings, "OBJECT_STORAGE_BACKEND", "s3") or "s3").strip().lower() == "s3"
+        raw_zip_entry: Optional[dict] = None
+        extract_source = content
+        if s3_backend:
+            try:
+                raw_zip_entry = await persist_file(
+                    file.filename,
+                    content,
+                    file.content_type or "application/zip",
+                    job_id=job_id,
+                )
+                extract_source = await asyncio.to_thread(download_s3_bytes, raw_zip_entry)
+            except Exception as e:
+                if raw_zip_entry:
+                    await delete_file(raw_zip_entry)
+                raise HTTPException(
+                    status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                    detail=f"Failed to stage zip file {file.filename} in object storage: {str(e)}",
+                ) from e
+
+        # Extract zip and save each allowed file (with transient retry + cleanup)
+        attempts = max(1, int(getattr(settings, "ZIP_EXTRACT_RETRY_ATTEMPTS", 3)))
+        for attempt in range(attempts):
+            staged_entries: List[dict] = []
+            try:
+                with zipfile.ZipFile(io.BytesIO(extract_source), 'r') as zf:
+                    for name in zf.namelist():
+                        if name.endswith('/'):
+                            continue
+                        ext = Path(name).suffix.lower()
+                        if ext not in EXTRACTABLE_EXTENSIONS:
+                            continue
+                        safe_name = Path(name).name or f"file{ext}"
+                        with zf.open(name, 'r') as src:
+                            data = src.read()
+                        staged_entries.append(
+                            await persist_file(safe_name, data, "application/octet-stream", job_id=job_id)
+                        )
+                if raw_zip_entry:
+                    await delete_file(raw_zip_entry)
+                return staged_entries
+            except zipfile.BadZipFile as e:
+                for staged in staged_entries:
+                    await delete_file(staged)
+                if raw_zip_entry:
+                    await delete_file(raw_zip_entry)
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail=f"Invalid or corrupted zip file: {file.filename}"
+                ) from e
+            except Exception as e:
+                for staged in staged_entries:
+                    await delete_file(staged)
+                if attempt >= attempts - 1:
+                    if raw_zip_entry:
+                        await delete_file(raw_zip_entry)
+                    raise HTTPException(
+                        status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                        detail=f"Failed to process zip file {file.filename} after {attempts} attempts: {str(e)}"
+                    ) from e
+                delay = _zip_extract_backoff(attempt)
+                logger.warning(
+                    "Transient ZIP extraction error for %s (attempt %s/%s): %s. Retrying in %.2fs",
+                    file.filename,
+                    attempt + 1,
+                    attempts,
+                    e,
+                    delay,
+                )
+                await asyncio.sleep(delay)
+        return []
 
     # Single file (non-zip)
-    file_id = str(uuid.uuid4())
-    file_path = UPLOAD_DIR / f"{file_id}_{file.filename}"
     try:
-        with open(file_path, 'wb') as f:
-            f.write(content)
+        entry = await persist_file(file.filename, content, file.content_type or "application/octet-stream", job_id=job_id)
     except Exception as e:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to save file {file.filename}: {str(e)}"
         ) from e
-    return [{
-        "id": file_id,
-        "name": file.filename,
-        "path": str(file_path),
-        "type": file.content_type or "application/octet-stream",
-        "size": len(content)
-    }]
+    return [entry]
 
 
 class AnalyzeDocumentsRequest(BaseModel):
@@ -190,6 +250,8 @@ def _validate_tool_visibility(v: Optional[str]) -> Optional[str]:
 async def create_job(
     title: str = Form(...),
     description: Optional[str] = Form(None),
+    schedule_timezone: Optional[str] = Form(None),
+    schedule_scheduled_at: Optional[str] = Form(None),
     files: Optional[List[UploadFile]] = File(None),
     allowed_platform_tool_ids: Optional[str] = Form(None),
     allowed_connection_ids: Optional[str] = Form(None),
@@ -197,7 +259,7 @@ async def create_job(
     current_user: User = Depends(get_current_business_user),
     db: Session = Depends(get_db)
 ):
-    """Create a new job with optional file uploads and optional tool scope."""
+    """Create a new job with optional file uploads and an optional schedule."""
     file_metadata = []
 
     platform_ids = _parse_int_list_form(allowed_platform_tool_ids)
@@ -205,24 +267,13 @@ async def create_job(
     if (platform_ids and len(platform_ids)) or (connection_ids and len(connection_ids)):
         platform_ids, connection_ids = _validate_allowed_tools(db, current_user.id, platform_ids, connection_ids)
 
-    # Process uploaded files (zips are extracted; their contents become individual files)
-    if files:
-        for file in files:
-            file_ext = Path(file.filename).suffix.lower()
-            if file_ext not in ALLOWED_EXTENSIONS:
-                raise HTTPException(
-                    status_code=status.HTTP_400_BAD_REQUEST,
-                    detail=f"File type {file_ext} not allowed. Allowed types: {', '.join(sorted(ALLOWED_EXTENSIONS))}"
-                )
-            file_metadata.extend(await _process_one_upload(file))
-
     tv = _validate_tool_visibility(tool_visibility) if tool_visibility else None
     new_job = Job(
         business_id=current_user.id,
         title=title,
         description=description,
         status=JobStatus.DRAFT,
-        files=json.dumps(file_metadata) if file_metadata else None,
+        files=None,
         conversation=json.dumps([]),  # Initialize empty conversation
         allowed_platform_tool_ids=json.dumps(platform_ids) if platform_ids is not None else None,
         allowed_connection_ids=json.dumps(connection_ids) if connection_ids is not None else None,
@@ -232,16 +283,64 @@ async def create_job(
     db.commit()
     db.refresh(new_job)
 
+    file_metadata = []
+    if files:
+        try:
+            for file in files:
+                file_ext = Path(file.filename).suffix.lower()
+                if file_ext not in ALLOWED_EXTENSIONS:
+                    raise HTTPException(
+                        status_code=status.HTTP_400_BAD_REQUEST,
+                        detail=f"File type {file_ext} not allowed. Allowed types: {', '.join(sorted(ALLOWED_EXTENSIONS))}"
+                    )
+                file_metadata.extend(await _process_one_upload(file, job_id=new_job.id))
+            if file_metadata:
+                new_job.files = json.dumps(file_metadata)
+                db.commit()
+                db.refresh(new_job)
+        except Exception:
+            # Cleanup any staged file objects and delete the partially created job
+            for entry in file_metadata:
+                await delete_file(entry)
+            db.delete(new_job)
+            db.commit()
+            raise
+
+    # Optionally attach a one-time schedule at job creation time.
+    # Wrapped in try/except so a schedule validation error (e.g. past date)
+    # doesn't prevent the job itself from being created.
+    if schedule_scheduled_at is not None:
+        try:
+            schedule_payload = JobScheduleCreate(
+                scheduled_at=schedule_scheduled_at,
+                timezone=schedule_timezone or "UTC",
+            )
+            schedule = JobSchedule(
+                job_id=new_job.id,
+                status=schedule_payload.status,
+                timezone=schedule_payload.timezone,
+                scheduled_at=schedule_payload.scheduled_at,
+                next_run_time=schedule_payload.scheduled_at if schedule_payload.status == ScheduleStatus.ACTIVE else None,
+            )
+            db.add(schedule)
+            # Creating a schedule puts the job in queue
+            new_job.status = JobStatus.IN_QUEUE
+            db.commit()
+            db.refresh(schedule)
+
+            svc = get_scheduler()
+            if svc and schedule.status == ScheduleStatus.ACTIVE:
+                svc.add_schedule(schedule.id, scheduled_at=schedule.scheduled_at, timezone=schedule.timezone)
+        except Exception as exc:
+            db.rollback()
+            db.refresh(new_job)  # Restore actual DB state (status stays DRAFT)
+            logger.warning("Failed to create inline schedule for job %s: %s", new_job.id, exc)
+
     # Build response with parsed files (remove paths for security)
     files_for_response = []
     if file_metadata:
         for file_info in file_metadata:
-            files_for_response.append({
-                "id": file_info["id"],
-                "name": file_info["name"],
-                "type": file_info["type"],
-                "size": file_info["size"]
-            })
+            files_for_response.append(redact_file_metadata(file_info))
 
     response_data = {
         "id": new_job.id,
@@ -300,12 +399,12 @@ async def analyze_documents(
         except (json.JSONDecodeError, TypeError):
             pass
     
-    # Prepare documents for analysis (skip entries without path)
-    documents = [{"path": f["path"], "name": f.get("name", "Unknown")} for f in files_data if f.get("path")]
+    # Prepare documents for analysis (supports local path and S3-backed metadata)
+    documents = [f for f in files_data if has_readable_source(f)]
     if not documents:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="No valid document paths found in job files"
+            detail="No valid document sources found in job files"
         )
     hired = _get_first_hired_agent_for_job(db, job.id)
     if hired:
@@ -450,7 +549,7 @@ async def answer_question(
     conversation_history[first_question_idx]["answered_at"] = str(datetime.utcnow())
     
     files_data = json.loads(job.files)
-    documents = [{"path": f["path"], "name": f["name"]} for f in files_data]
+    documents = [f for f in files_data if has_readable_source(f)]
     hired = _get_first_hired_agent_for_job(db, job.id)
     if hired:
         agent_url, agent_key, agent_model, agent_temp, use_a2a = hired
@@ -592,12 +691,11 @@ async def generate_workflow_questions(
             files_data = []
         analyzer = DocumentAnalyzer()
         for f in files_data:
-            path = f.get("path")
             name = f.get("name", "Unknown")
-            if not path:
+            if not has_readable_source(f):
                 continue
             try:
-                content = await analyzer.read_document(path)
+                content = await analyzer.read_file_info(f)
                 documents_content.append({"name": name, "content": content})
             except Exception:
                 documents_content.append({"name": name, "content": f"[Could not read {name}]"})
@@ -640,12 +738,14 @@ async def generate_workflow_questions(
     new_conversation = conversation_history.copy()
     existing_questions = {str(item.get("question", "")).strip() for item in new_conversation if item.get("type") == "question" and item.get("question")}
     seen_in_batch = set()
+    added_questions = []
     for q in questions:
         qs = str(q).strip() if q else ""
         if not qs or qs in existing_questions or qs in seen_in_batch:
             continue
         seen_in_batch.add(qs)
         existing_questions.add(qs)
+        added_questions.append(qs)
         new_conversation.append({
             "type": "question",
             "question": qs,
@@ -653,24 +753,76 @@ async def generate_workflow_questions(
             "timestamp": str(datetime.utcnow()),
         })
 
+    removed_unanswered_questions = 0
+    if len(added_questions) == 0:
+        # No clarification needed from workflow context. Drop stale unanswered
+        # questions so the frontend can proceed to the next step cleanly.
+        filtered = []
+        for item in new_conversation:
+            if item.get("type") == "question":
+                ans = str(item.get("answer", "")).strip() if item.get("answer") is not None else ""
+                if not ans:
+                    removed_unanswered_questions += 1
+                    continue
+            filtered.append(item)
+        new_conversation = filtered
+
     job.conversation = json.dumps(new_conversation)
     db.commit()
 
-    return {"questions": questions, "conversation": new_conversation}
+    return {
+        "questions": questions,
+        "added_questions": added_questions,
+        "no_questions_needed": len(added_questions) == 0,
+        "removed_unanswered_questions": removed_unanswered_questions,
+        "conversation": new_conversation,
+    }
+
+
+@router.get("/filter-options", response_model=JobFilterOptions)
+def get_job_filter_options(
+    current_user: User = Depends(get_current_user),
+):
+    """Return all available filter/sort values for the job list endpoint.
+
+    Frontend uses this to populate filter dropdowns dynamically — no
+    hard-coded enum values needed on the client side.
+    """
+    statuses = [
+        EnumOption(value=s.value, label=s.value.replace("_", " ").title())
+        for s in JobStatus
+    ]
+    sort_options = [
+        EnumOption(value="newest", label="Newest First"),
+        EnumOption(value="oldest", label="Oldest First"),
+    ]
+    return JobFilterOptions(statuses=statuses, sort_options=sort_options)
 
 
 @router.get("", response_model=List[JobResponse])
 def list_jobs(
     current_user: User = Depends(get_current_user),
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
+    job_status: Optional[str] = None,
+    sort: Optional[str] = "newest",
 ):
     if current_user.role == UserRole.BUSINESS:
-        jobs = db.query(Job).filter(Job.business_id == current_user.id).all()
+        query = db.query(Job).filter(Job.business_id == current_user.id)
     else:
         # Developers can see jobs where their agents are used
-        jobs = db.query(Job).join(WorkflowStep).join(Agent).filter(
+        query = db.query(Job).join(WorkflowStep).join(Agent).filter(
             Agent.developer_id == current_user.id
-        ).distinct().all()
+        )
+
+    if job_status is not None:
+        query = query.filter(Job.status == job_status)
+
+    if sort == "oldest":
+        query = query.order_by(Job.created_at.asc())
+    else:
+        query = query.order_by(Job.created_at.desc())
+
+    jobs = query.distinct().all()
     
     # Parse files for each job
     result = []
@@ -679,8 +831,8 @@ def list_jobs(
         if job.files:
             try:
                 files_parsed = json.loads(job.files)
-                # Remove paths for security
-                files_data = [{k: v for k, v in f.items() if k != 'path'} for f in files_parsed]
+                # Remove storage internals for security
+                files_data = [redact_file_metadata(f) for f in files_parsed]
             except (json.JSONDecodeError, TypeError):
                 pass
         
@@ -749,8 +901,8 @@ def get_job(
     if job.files:
         try:
             files_parsed = json.loads(job.files)
-            # Remove paths for security
-            files_data = [{k: v for k, v in f.items() if k != 'path'} for f in files_parsed]
+            # Remove storage internals for security
+            files_data = [redact_file_metadata(f) for f in files_parsed]
         except (json.JSONDecodeError, TypeError):
             pass
     
@@ -893,47 +1045,93 @@ async def update_job(
                 detail=f"Invalid status: {status}"
             )
     
-    # Handle file uploads
+    # Handle file uploads (overwrite existing documents with the new upload set)
     new_files_added = False
+    old_files_to_cleanup: List[dict] = []
+    staged_new_files: List[dict] = []
     if files:
-        # Get existing files
-        existing_files = []
+        old_files = []
         if job.files:
             try:
-                existing_files = json.loads(job.files)
+                old_files = json.loads(job.files)
             except (json.JSONDecodeError, TypeError):
-                existing_files = []
-        
-        # Process new uploaded files (zips are extracted; their contents become individual files)
-        for file in files:
-            file_ext = Path(file.filename).suffix.lower()
-            if file_ext not in ALLOWED_EXTENSIONS:
-                raise HTTPException(
-                    status_code=status.HTTP_400_BAD_REQUEST,
-                    detail=f"File type {file_ext} not allowed. Allowed types: {', '.join(sorted(ALLOWED_EXTENSIONS))}"
-                )
-            entries = await _process_one_upload(file)
-            for e in entries:
-                existing_files.append(e)
-            if entries:
-                new_files_added = True
-        
-        # Update job files
-        job.files = json.dumps(existing_files)
-        
+                old_files = []
+        try:
+            for file in files:
+                file_ext = Path(file.filename).suffix.lower()
+                if file_ext not in ALLOWED_EXTENSIONS:
+                    raise HTTPException(
+                        status_code=status.HTTP_400_BAD_REQUEST,
+                        detail=f"File type {file_ext} not allowed. Allowed types: {', '.join(sorted(ALLOWED_EXTENSIONS))}"
+                    )
+                entries = await _process_one_upload(file, job_id=job.id)
+                for e in entries:
+                    staged_new_files.append(e)
+                if entries:
+                    new_files_added = True
+        except Exception:
+            # Best-effort cleanup of newly staged files so failed overwrite keeps existing data intact
+            for staged in staged_new_files:
+                await delete_file(staged)
+            raise
+
+        # Overwrite: keep only the latest upload set
+        job.files = json.dumps(staged_new_files)
+
         # Reset conversation when new files are uploaded to start fresh Q&A
         if new_files_added:
             job.conversation = json.dumps([])
+            # New BRD invalidates existing workflow execution context. Clear old
+            # workflow steps/communications so the user must rebuild workflow
+            # from the latest requirements before executing.
+            existing_steps = db.query(WorkflowStep).filter(WorkflowStep.job_id == job.id).all()
+            for step in existing_steps:
+                db.query(AgentCommunication).filter(
+                    (AgentCommunication.from_workflow_step_id == step.id) |
+                    (AgentCommunication.to_workflow_step_id == step.id)
+                ).delete()
+                db.delete(step)
+            job.status = JobStatus.DRAFT
+            job.total_cost = 0.0
+            job.completed_at = None
+            job.failure_reason = None
+            old_files_to_cleanup = old_files
+            logger.info(
+                "BRD overwrite staged for job_id=%s business_id=%s old_files=%s new_files=%s cleared_steps=%s",
+                job.id,
+                current_user.id,
+                len(old_files),
+                len(staged_new_files),
+                len(existing_steps),
+            )
     
-    db.commit()
-    db.refresh(job)
+    try:
+        db.commit()
+        db.refresh(job)
+    except Exception:
+        # If DB commit fails after staging new files, remove staged objects/files.
+        if staged_new_files:
+            for staged in staged_new_files:
+                await delete_file(staged)
+        raise
+
+    # Cleanup old files only after successful DB commit.
+    if old_files_to_cleanup:
+        for old in old_files_to_cleanup:
+            await delete_file(old)
+        logger.info(
+            "BRD overwrite finalized for job_id=%s business_id=%s removed_files=%s",
+            job.id,
+            current_user.id,
+            len(old_files_to_cleanup),
+        )
     
     # If new files were added, automatically trigger document analysis (extraction only or via first hired agent)
     analysis_result = None
     if new_files_added and job.files:
         try:
             files_data = json.loads(job.files)
-            documents = [{"path": f["path"], "name": f["name"]} for f in files_data]
+            documents = [f for f in files_data if has_readable_source(f)]
             hired = _get_first_hired_agent_for_job(db, job.id)
             if hired:
                 agent_url, agent_key = hired[0], hired[1]
@@ -987,7 +1185,7 @@ async def update_job(
     if job.files:
         try:
             files_parsed = json.loads(job.files)
-            files_data = [{k: v for k, v in f.items() if k != 'path'} for f in files_parsed]
+            files_data = [redact_file_metadata(f) for f in files_parsed]
         except (json.JSONDecodeError, TypeError):
             pass
     
@@ -1082,9 +1280,7 @@ def delete_job(
         try:
             files_data = json.loads(job.files)
             for file_info in files_data:
-                file_path = Path(file_info.get("path", ""))
-                if file_path.exists():
-                    file_path.unlink()
+                delete_file_sync(file_info)
         except (json.JSONDecodeError, TypeError, Exception):
             pass  # Continue even if file deletion fails
     
@@ -1275,7 +1471,7 @@ def approve_job(
     if job.files:
         try:
             files_parsed = json.loads(job.files)
-            files_data = [{k: v for k, v in f.items() if k != 'path'} for f in files_parsed]
+            files_data = [redact_file_metadata(f) for f in files_parsed]
         except (json.JSONDecodeError, TypeError):
             pass
     
@@ -1355,83 +1551,7 @@ def execute_job(
     if job.files:
         try:
             files_parsed = json.loads(job.files)
-            files_data = [{k: v for k, v in f.items() if k != 'path'} for f in files_parsed]
-        except (json.JSONDecodeError, TypeError):
-            pass
-    
-    conversation_data = None
-    if job.conversation:
-        try:
-            conversation_data = json.loads(job.conversation)
-        except (json.JSONDecodeError, TypeError):
-            pass
-    
-    job_dict = {
-        "id": job.id,
-        "business_id": job.business_id,
-        "title": job.title,
-        "description": job.description,
-        "status": job.status,
-        "total_cost": job.total_cost,
-        "created_at": job.created_at,
-        "completed_at": job.completed_at,
-        "workflow_steps": [],
-        "files": files_data,
-        "conversation": conversation_data,
-        "failure_reason": job.failure_reason
-    }
-    return JobResponse(**job_dict)
-
-
-@router.post("/{job_id}/rerun", response_model=JobResponse)
-def rerun_job(
-    job_id: int,
-    current_user: User = Depends(get_current_business_user),
-    db: Session = Depends(get_db)
-):
-    """Rerun a completed or failed job"""
-    job = db.query(Job).filter(Job.id == job_id).first()
-    if not job:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Job not found"
-        )
-    
-    if job.business_id != current_user.id:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Not authorized"
-        )
-    
-    # Only allow rerunning completed or failed jobs
-    if job.status not in [JobStatus.COMPLETED, JobStatus.FAILED]:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Only completed or failed jobs can be rerun"
-        )
-    
-    # Reset workflow steps - clear output data and reset status
-    workflow_steps = db.query(WorkflowStep).filter(WorkflowStep.job_id == job_id).all()
-    for step in workflow_steps:
-        step.output_data = None
-        step.status = "pending"
-        step.started_at = None
-        step.completed_at = None
-        step.cost = 0.0
-    
-        # Reset job status to pending_approval so it can be executed again
-        job.status = JobStatus.PENDING_APPROVAL
-        job.completed_at = None
-        job.failure_reason = None  # Clear previous failure reason
-        db.commit()
-    db.refresh(job)
-    
-    # Parse files and conversation for response
-    files_data = None
-    if job.files:
-        try:
-            files_parsed = json.loads(job.files)
-            files_data = [{k: v for k, v in f.items() if k != 'path'} for f in files_parsed]
+            files_data = [redact_file_metadata(f) for f in files_parsed]
         except (json.JSONDecodeError, TypeError):
             pass
     
@@ -1498,7 +1618,7 @@ def get_job_status(
     if job.files:
         try:
             files_parsed = json.loads(job.files)
-            files_data = [{k: v for k, v in f.items() if k != 'path'} for f in files_parsed]
+            files_data = [redact_file_metadata(f) for f in files_parsed]
         except (json.JSONDecodeError, TypeError):
             pass
     
@@ -1615,8 +1735,26 @@ def download_job_file(
             detail="File not found"
         )
     
-    file_path = Path(file_info["path"])
-    if not file_path.exists():
+    if file_info.get("storage") == "s3":
+        try:
+            body, media_type, content_length = open_s3_download_stream(file_info)
+        except Exception:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="File no longer exists on storage"
+            )
+        headers = {"Content-Disposition": f'attachment; filename="{file_info.get("name", "file")}"'}
+        if content_length is not None:
+            headers["Content-Length"] = str(content_length)
+        return StreamingResponse(
+            content=body.iter_chunks(chunk_size=1024 * 1024),
+            media_type=media_type,
+            headers=headers,
+        )
+
+    try:
+        file_path = open_local_download_path(file_info)
+    except FileNotFoundError:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="File no longer exists on server"
@@ -1627,3 +1765,347 @@ def download_job_file(
         filename=file_info["name"],
         media_type=file_info["type"]
     )
+
+
+# ---------------------------------------------------------------------------
+# Job Schedule — one schedule per job (singular endpoints)
+#
+# Workflow:
+#   1. User creates a schedule → job status moves to IN_QUEUE.
+#   2. Before scheduled time (IN_QUEUE): user can edit the schedule.
+#   3. At scheduled time: job moves to IN_PROGRESS. No user actions.
+#   4. After the job runs:
+#      (a) Success (COMPLETED): no further action items.
+#      (b) Failure (FAILED) or cancellation (CANCELLED): frontend shows
+#          "Schedule Again" (PUT /schedule) or "Run Now" (POST /rerun).
+# ---------------------------------------------------------------------------
+
+@router.get("/schedules/filter-options", response_model=ScheduleFilterOptions)
+def get_schedule_filter_options(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Return all available filter/sort values for the schedule list endpoint.
+
+    Requires authentication. Results are scoped to jobs owned by the current
+    user. Includes the user's jobs (id + title) for the job dropdown, schedule
+    statuses, job statuses, and sort options — so the frontend never
+    hard-codes enum values.
+    """
+    schedule_statuses = [
+        EnumOption(value=s.value, label=s.value.replace("_", " ").title())
+        for s in ScheduleStatus
+    ]
+    job_statuses = [
+        EnumOption(value=s.value, label=s.value.replace("_", " ").title())
+        for s in JobStatus
+    ]
+    sort_options = [
+        EnumOption(value="newest", label="Newest First"),
+        EnumOption(value="oldest", label="Oldest First"),
+    ]
+    # User's jobs for the job_id filter dropdown
+    user_jobs = (
+        db.query(Job.id, Job.title)
+        .filter(Job.business_id == current_user.id)
+        .order_by(Job.created_at.desc())
+        .all()
+    )
+    jobs = [{"id": j.id, "title": j.title} for j in user_jobs]
+
+    return ScheduleFilterOptions(
+        schedule_statuses=schedule_statuses,
+        job_statuses=job_statuses,
+        sort_options=sort_options,
+        jobs=jobs,
+    )
+
+
+@router.get("/schedules/all", response_model=ScheduleListResponse)
+def list_all_schedules(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+    job_id: Optional[int] = None,
+    sort: Optional[str] = "newest",
+    schedule_status: Optional[str] = None,
+    job_status: Optional[str] = None,
+    limit: int = Query(10, ge=1, le=100, description="Records per page"),
+    offset: int = Query(0, ge=0, description="Pagination offset"),
+):
+    """List all schedules across all jobs owned by the current user.
+
+    Supports filtering by job_id, schedule_status, job_status, and sorting
+    by scheduled_at (newest/oldest). Paginated — default 10 per page.
+    """
+    query = (
+        db.query(JobSchedule, Job.title, Job.status)
+        .join(Job, Job.id == JobSchedule.job_id)
+        .filter(Job.business_id == current_user.id)
+    )
+    if job_id is not None:
+        query = query.filter(JobSchedule.job_id == job_id)
+    if schedule_status is not None:
+        query = query.filter(JobSchedule.status == schedule_status)
+    if job_status is not None:
+        query = query.filter(Job.status == job_status)
+
+    if sort == "oldest":
+        query = query.order_by(JobSchedule.scheduled_at.asc())
+    else:
+        query = query.order_by(JobSchedule.scheduled_at.desc())
+
+    total = query.count()
+    rows = query.offset(offset).limit(limit).all()
+    results = []
+    for schedule, job_title, js in rows:
+        resp = JobScheduleResponse.model_validate(schedule, from_attributes=True)
+        data = resp.model_dump()
+        data["job_title"] = job_title
+        data["job_status"] = js.value if hasattr(js, "value") else str(js)
+        results.append(JobScheduleWithJobResponse(**data))
+    return ScheduleListResponse(items=results, total=total, limit=limit, offset=offset)
+
+
+@router.post("/{job_id}/schedule", response_model=ScheduleActionResponse, status_code=status.HTTP_201_CREATED)
+def create_job_schedule(
+    job_id: int,
+    payload: JobScheduleCreate,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Create a one-time schedule for a job. One schedule per job — returns 400 if one already exists.
+
+    The schedule fires at scheduled_at (in the given timezone). After execution,
+    the schedule is deactivated. If the job fails, the user can reschedule via PUT.
+    Creating a schedule transitions the job to IN_QUEUE.
+    """
+    job = db.query(Job).filter(Job.id == job_id, Job.business_id == current_user.id).first()
+    if not job:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Job not found or you do not have access")
+
+    # Block schedule creation while job is actively executing
+    if job.status == JobStatus.IN_PROGRESS:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Cannot create schedule while job is in progress — wait for execution to complete",
+        )
+
+    existing = db.query(JobSchedule).filter(JobSchedule.job_id == job_id).first()
+    if existing:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Schedule already exists for this job — use PUT to update it",
+        )
+
+    schedule = JobSchedule(
+        job_id=job_id,
+        status=payload.status,
+        timezone=payload.timezone,
+        scheduled_at=payload.scheduled_at,
+        next_run_time=payload.scheduled_at if payload.status == ScheduleStatus.ACTIVE else None,
+    )
+    db.add(schedule)
+    # Creating a schedule puts the job in queue (waiting for scheduled time)
+    job.status = JobStatus.IN_QUEUE
+    db.commit()
+    db.refresh(schedule)
+
+    if schedule.status == ScheduleStatus.ACTIVE:
+        svc = get_scheduler()
+        if svc:
+            svc.add_schedule(schedule.id, scheduled_at=schedule.scheduled_at, timezone=schedule.timezone)
+
+    return ScheduleActionResponse(
+        message="Schedule created successfully",
+        data=JobScheduleResponse.model_validate(schedule),
+    )
+
+
+@router.get("/{job_id}/schedule", response_model=JobScheduleResponse)
+def get_job_schedule(
+    job_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Get the schedule for a job. Only the job owner can view it."""
+    job = db.query(Job).filter(Job.id == job_id).first()
+    if not job:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Job not found")
+    if job.business_id != current_user.id:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Not authorized")
+
+    schedule = db.query(JobSchedule).filter(JobSchedule.job_id == job_id).first()
+    if not schedule:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="No schedule found for this job")
+
+    return schedule
+
+
+@router.put("/{job_id}/schedule", response_model=ScheduleActionResponse)
+def update_job_schedule(
+    job_id: int,
+    payload: JobScheduleUpdate,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Update the schedule for a job.
+
+    Also used as "Schedule Again" after a job failure or cancellation — the frontend
+    sends a new scheduled_at and optionally re-enables the schedule (status=active).
+    Rescheduling a failed/cancelled job transitions it back to IN_QUEUE.
+    """
+    schedule = db.query(JobSchedule).join(Job).filter(
+        JobSchedule.job_id == job_id,
+        Job.business_id == current_user.id,
+    ).first()
+    if not schedule:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Schedule not found for this job")
+
+    # Block modifications while job is actively executing
+    job = db.query(Job).filter(Job.id == job_id).first()
+    if job and job.status == JobStatus.IN_PROGRESS:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Cannot modify schedule while job is in progress — wait for execution to complete",
+        )
+
+    if payload.timezone is not None:
+        schedule.timezone = payload.timezone
+    if payload.scheduled_at is not None:
+        schedule.scheduled_at = payload.scheduled_at
+    if payload.status is not None:
+        schedule.status = payload.status
+
+    # Recompute next_run_time
+    effective_status = payload.status if payload.status is not None else schedule.status
+    if effective_status == ScheduleStatus.ACTIVE:
+        schedule.next_run_time = schedule.scheduled_at
+    else:
+        schedule.next_run_time = None
+
+    # Rescheduling a failed/cancelled job puts it back in queue
+    if job and effective_status == ScheduleStatus.ACTIVE and job.status in (JobStatus.FAILED, JobStatus.CANCELLED):
+        job.status = JobStatus.IN_QUEUE
+
+    db.commit()
+    db.refresh(schedule)
+
+    # Sync with APScheduler
+    svc = get_scheduler()
+    if svc:
+        if schedule.status == ScheduleStatus.ACTIVE:
+            svc.update_schedule(schedule.id, scheduled_at=schedule.scheduled_at, timezone=schedule.timezone)
+        else:
+            svc.remove_schedule(schedule.id)
+
+    return ScheduleActionResponse(
+        message="Schedule updated successfully",
+        data=JobScheduleResponse.model_validate(schedule),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Job Rerun (immediate re-execution of a failed or cancelled job)
+# ---------------------------------------------------------------------------
+
+@router.post("/{job_id}/rerun", response_model=RerunResponse)
+def rerun_job(
+    job_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Immediately re-execute a failed or cancelled job ("Run Now" button).
+
+    Only available when job status is FAILED or CANCELLED. Resets all workflow
+    steps, transitions to IN_PROGRESS, and triggers execution in a background thread.
+    For "Schedule Again", the frontend uses PUT /schedule with a new scheduled_at.
+    """
+    job = db.query(Job).filter(Job.id == job_id, Job.business_id == current_user.id).first()
+    if not job:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Job not found or you do not have access")
+    if job.status not in (JobStatus.FAILED, JobStatus.CANCELLED):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Can only rerun failed or cancelled jobs. Current status: {job.status.value}",
+        )
+
+    step_count = db.query(WorkflowStep).filter(WorkflowStep.job_id == job.id).count()
+    if step_count == 0:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Job has no workflow steps — add a workflow before rerunning",
+        )
+
+    # Create execution history entry if a schedule exists (audit trail)
+    history_id = None
+    schedule = db.query(JobSchedule).filter(JobSchedule.job_id == job_id).first()
+    if schedule:
+        history = ScheduleExecutionHistory(
+            schedule_id=schedule.id,
+            job_id=job.id,
+            status="started",
+            triggered_by="manual_rerun",
+        )
+        db.add(history)
+        db.flush()
+        history_id = history.id
+
+    # Reset steps and set IN_PROGRESS directly (execution starts now)
+    reset_job_for_execution(db, job)
+    job.status = JobStatus.IN_PROGRESS
+    db.commit()
+
+    # Spawn execution thread — job is already IN_PROGRESS
+    try:
+        thread = threading.Thread(target=run_job_in_thread, args=(job.id, history_id), daemon=True)
+        thread.start()
+    except Exception as exc:
+        logger.exception("Failed to start execution thread for job %s", job.id)
+        job.status = JobStatus.FAILED
+        job.failure_reason = f"Failed to start execution: {str(exc)[:200]}"
+        if history_id:
+            hist = db.query(ScheduleExecutionHistory).filter(ScheduleExecutionHistory.id == history_id).first()
+            if hist:
+                hist.status = "failed"
+                hist.failure_reason = job.failure_reason
+        db.commit()
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to start job execution: {str(exc)[:200]}",
+        )
+
+    return RerunResponse(
+        message="Job re-execution started",
+        job_id=job.id,
+        status=job.status.value,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Schedule Execution History
+# ---------------------------------------------------------------------------
+
+@router.get("/{job_id}/schedule/history", response_model=List[ScheduleExecutionHistoryResponse])
+def get_schedule_history(
+    job_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """Get execution history for a job's schedule (audit log).
+
+    Returns all execution attempts ordered by most recent first.
+    Includes started, completed, failed, skipped, and potentially_stuck entries.
+    """
+    job = db.query(Job).filter(Job.id == job_id).first()
+    if not job:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Job not found")
+    if job.business_id != current_user.id:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Not authorized")
+
+    history = (
+        db.query(ScheduleExecutionHistory)
+        .filter(ScheduleExecutionHistory.job_id == job_id)
+        .order_by(ScheduleExecutionHistory.started_at.desc())
+        .all()
+    )
+    return history

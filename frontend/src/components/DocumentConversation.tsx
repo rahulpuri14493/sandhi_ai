@@ -7,16 +7,42 @@ interface DocumentConversationProps {
   files?: Array<{ id: string; name: string }>
   initialConversation?: ConversationItem[]
   onConversationUpdate?: (conversation: ConversationItem[]) => void
+  /** Called when workflow clarification returned no new questions so UI can advance */
+  onNoClarificationNeeded?: () => void
   /** When present (workflow already built), show "Generate clarification questions from workflow & BRD" */
   workflowSteps?: Array<{ step_order: number; agent_name?: string }>
 }
 
-export function DocumentConversation({ jobId, files, initialConversation = [], onConversationUpdate, workflowSteps }: DocumentConversationProps) {
+export function DocumentConversation({
+  jobId,
+  files,
+  initialConversation = [],
+  onConversationUpdate,
+  onNoClarificationNeeded,
+  workflowSteps,
+}: DocumentConversationProps) {
   const [conversation, setConversation] = useState<ConversationItem[]>(initialConversation)
   const [currentAnswer, setCurrentAnswer] = useState('')
   const [isSubmitting, setIsSubmitting] = useState(false)
   const [isGeneratingWorkflowQuestions, setIsGeneratingWorkflowQuestions] = useState(false)
   const [error, setError] = useState('')
+  const [info, setInfo] = useState('')
+
+  const firstUnansweredQuestion = (items: ConversationItem[]): ConversationItem | null => {
+    const answeredTexts = new Set(
+      items
+        .filter(item => item.type === 'question' && item.answer && String(item.answer).trim())
+        .map(item => String(item.question || '').trim())
+    )
+    return (
+      items.find(item => {
+        if (item.type !== 'question' || !item.question) return false
+        if (item.answer && String(item.answer).trim()) return false
+        const text = String(item.question).trim()
+        return !answeredTexts.has(text)
+      }) as ConversationItem | undefined
+    ) || null
+  }
 
   useEffect(() => {
     setConversation(initialConversation)
@@ -66,11 +92,22 @@ export function DocumentConversation({ jobId, files, initialConversation = [], o
   const handleGenerateWorkflowQuestions = async () => {
     setIsGeneratingWorkflowQuestions(true)
     setError('')
+    setInfo('')
     try {
       const result = await jobsAPI.generateWorkflowQuestions(jobId)
       const updated = result.conversation || []
       setConversation(updated)
       if (onConversationUpdate) onConversationUpdate(updated)
+      const addedQuestions = Array.isArray(result.added_questions)
+        ? result.added_questions
+        : (Array.isArray(result.questions) ? result.questions : [])
+      const hasUnanswered = !!firstUnansweredQuestion(updated)
+      if (!hasUnanswered || addedQuestions.length === 0 || result.no_questions_needed) {
+        setInfo('No clarification questions needed. Moving to the next step.')
+        if (onNoClarificationNeeded) onNoClarificationNeeded()
+      } else {
+        setInfo(`${addedQuestions.length} clarification question${addedQuestions.length > 1 ? 's' : ''} generated.`)
+      }
     } catch (err: any) {
       setError(err.response?.data?.detail || 'Failed to generate workflow questions')
     } finally {
@@ -133,6 +170,11 @@ export function DocumentConversation({ jobId, files, initialConversation = [], o
       {error && (
         <div className="mb-6 p-4 bg-red-500/20 border-2 border-red-500/50 text-red-400 rounded-xl font-semibold">
           {error}
+        </div>
+      )}
+      {info && (
+        <div className="mb-6 p-4 bg-blue-500/20 border-2 border-blue-500/40 text-blue-300 rounded-xl font-semibold">
+          {info}
         </div>
       )}
 

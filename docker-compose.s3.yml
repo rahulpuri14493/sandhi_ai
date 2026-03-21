@@ -1,0 +1,84 @@
+# ---------------------------------------------------------------------------
+# S3-compatible object storage overlay (MinIO)
+# ---------------------------------------------------------------------------
+# Usage:
+#   docker compose -f docker-compose.yml -f docker-compose.s3.yml up -d
+#
+# Runs a single MinIO container that provides an S3-compatible API on
+# port 9000 (API) and 9001 (web console). The backend connects to
+# http://minio:9000 via Docker DNS using boto3, so the same code paths
+# work against MinIO locally and external S3-compatible providers in production.
+#
+# For external S3 (AWS S3, Ceph RGW, etc.), skip this file and set
+# S3_ENDPOINT_URL in .env.
+# ---------------------------------------------------------------------------
+
+services:
+  # ---- MinIO (S3-compatible storage) ---------------------------------------
+  minio:
+    image: minio/minio:latest
+    container_name: minio
+    restart: unless-stopped
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${S3_ACCESS_KEY_ID:?Set S3_ACCESS_KEY_ID in .env}
+      MINIO_ROOT_PASSWORD: ${S3_SECRET_ACCESS_KEY:?Set S3_SECRET_ACCESS_KEY in .env}
+    ports:
+      - "${MINIO_API_PORT:-9000}:9000"
+      - "${MINIO_CONSOLE_PORT:-9001}:9001"
+    volumes:
+      - minio-data:/data
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+
+  # ---- One-shot bucket creation --------------------------------------------
+  minio-init:
+    image: minio/mc:latest
+    container_name: minio-init
+    restart: "no"
+    depends_on:
+      minio:
+        condition: service_healthy
+    environment:
+      S3_ACCESS_KEY_ID: ${S3_ACCESS_KEY_ID:?Set S3_ACCESS_KEY_ID in .env}
+      S3_SECRET_ACCESS_KEY: ${S3_SECRET_ACCESS_KEY:?Set S3_SECRET_ACCESS_KEY in .env}
+      S3_BUCKET: ${S3_BUCKET:-sandhi-brd-docs}
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        mc alias set local http://minio:9000 "$S3_ACCESS_KEY_ID" "$S3_SECRET_ACCESS_KEY"
+        mc mb --ignore-existing "local/$S3_BUCKET"
+        echo "Bucket '$S3_BUCKET' is ready."
+
+  # ---- Backend overrides for S3 connectivity -------------------------------
+  backend:
+    environment:
+      OBJECT_STORAGE_BACKEND: s3
+      S3_ENDPOINT_URL: ${S3_ENDPOINT_URL:-http://minio:9000}
+      S3_ACCESS_KEY_ID: ${S3_ACCESS_KEY_ID:?Set S3_ACCESS_KEY_ID in .env}
+      S3_SECRET_ACCESS_KEY: ${S3_SECRET_ACCESS_KEY:?Set S3_SECRET_ACCESS_KEY in .env}
+      S3_BUCKET: ${S3_BUCKET:-sandhi-brd-docs}
+      S3_REGION: ${S3_REGION:-us-east-1}
+      S3_ADDRESSING_STYLE: path
+      S3_AUTO_CREATE_BUCKET: "true"
+      S3_TCP_KEEPALIVE: "true"
+      S3_SIGNATURE_VERSION: s3v4
+      S3_CONNECT_TIMEOUT_SECONDS: ${S3_CONNECT_TIMEOUT_SECONDS:-5}
+      S3_READ_TIMEOUT_SECONDS: ${S3_READ_TIMEOUT_SECONDS:-60}
+      S3_MAX_POOL_CONNECTIONS: ${S3_MAX_POOL_CONNECTIONS:-100}
+      S3_RETRY_MODE: ${S3_RETRY_MODE:-standard}
+      S3_MAX_ATTEMPTS: ${S3_MAX_ATTEMPTS:-5}
+      S3_OPERATION_RETRY_ATTEMPTS: ${S3_OPERATION_RETRY_ATTEMPTS:-4}
+      S3_OPERATION_RETRY_BASE_DELAY_SECONDS: ${S3_OPERATION_RETRY_BASE_DELAY_SECONDS:-0.2}
+      S3_OPERATION_RETRY_MAX_DELAY_SECONDS: ${S3_OPERATION_RETRY_MAX_DELAY_SECONDS:-2.0}
+      S3_OPERATION_RETRY_JITTER_SECONDS: ${S3_OPERATION_RETRY_JITTER_SECONDS:-0.1}
+    depends_on:
+      minio:
+        condition: service_healthy
+
+volumes:
+  minio-data:

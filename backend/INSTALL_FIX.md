@@ -45,7 +45,6 @@ If bulk install fails, try installing in this order:
 
 ```bash
 pip install --upgrade pip setuptools wheel
-pip install python-dotenv
 pip install pydantic pydantic-settings
 pip install fastapi uvicorn[standard]
 pip install sqlalchemy alembic

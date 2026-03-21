@@ -4,6 +4,7 @@ from pathlib import Path
 import json
 from core.config import settings
 from services.a2a_client import execute_via_a2a
+from services.job_file_storage import materialize_to_temp_path, cleanup_temp_path
 
 
 class DocumentAnalyzer:
@@ -153,6 +154,14 @@ class DocumentAnalyzer:
                 
         except Exception as e:
             return f"[Error reading file {path.name}: {str(e)}]"
+
+    async def read_file_info(self, file_info: Dict[str, Any]) -> str:
+        """Read document content from metadata entry (local path or S3-backed object)."""
+        local_path = await materialize_to_temp_path(file_info)
+        try:
+            return await self.read_document(local_path)
+        finally:
+            cleanup_temp_path(file_info, local_path)
     
     async def _analyze_documents_via_a2a(
         self,
@@ -245,12 +254,12 @@ class DocumentAnalyzer:
         # Extract data from all documents (no inference)
         document_contents = []
         for doc in documents:
-            path = doc.get("path")
             name = doc.get("name", "Unknown")
-            if not path:
-                continue
             try:
-                content = await self.read_document(path)
+                if doc.get("path"):
+                    content = await self.read_document(doc["path"])
+                else:
+                    content = await self.read_file_info(doc)
             except Exception as e:
                 content = f"[Error reading {name}: {str(e)}]"
             document_contents.append(f"=== {name} ===\n{content}\n")
@@ -579,13 +588,47 @@ WORKFLOW (assigned task per agent):
 EXISTING Q&A:
 {conv_text}
 
-TASK: Generate 0 to 3 clarifying questions for the end user. End users get frustrated by minor or obvious questions—ask ONLY when something is truly critical to execute correctly.
+TASK: Generate clarification questions ONLY (no answers, no analysis summary, no solutions).
+Your goal is to help each assigned agent execute its own task correctly by asking targeted requirement questions.
 
-ASK only when: (1) a required input is missing and cannot be inferred (e.g. which two numbers, when the job says \"add two numbers\" but does not specify them), (2) there is a real conflict or ambiguity that would change the result, or (3) a hard constraint is missing (e.g. compliance, security).
+RULES:
+1) Questions must be tied to specific workflow steps/agents (based on assigned tasks above).
+2) Ask ONLY critical execution questions:
+   - missing required input that cannot be inferred,
+   - real ambiguity/conflict that changes execution/result,
+   - missing hard constraint (security/compliance/SLA/limits/format that is mandatory).
+3) Do NOT provide answers, computed results, recommendations, or implementation steps in this stage.
+4) If and only if all assigned tasks are executable with clear requirements, return an empty array.
+5) Prefer concise, actionable questions. Avoid generic or conversational filler.
+6) Maximum 3 questions total. If more than 3 are possible, keep only the highest-impact blockers.
+7) Before returning each question, apply this quality gate:
+   - Would the answer materially change implementation/scope for a workflow step?
+   - Is this information truly unavailable from BRD + job + existing Q&A?
+   - Is this blocking execution now?
+   If any answer is "no", DO NOT ask that question.
 
-DO NOT ask: output format (integer/float), display format, \"any specific method or tool?\", \"context or application for the result?\", \"additional operations required after?\", precision, or anything that can be assumed with a sensible default. For simple tasks (e.g. add two numbers), if the task is clear enough or the only gap is already asked, return empty array.
+DO NOT ask:
+- output format (integer/float) unless explicitly required by a downstream step,
+- display/wording preferences,
+- \"which method/tool do you prefer?\",
+- context/background questions that do not affect execution,
+- additional nice-to-have requests unrelated to assigned steps.
+- questions already answered in EXISTING Q&A.
 
-Return ONLY valid JSON: {{"questions": ["Question 1?"]}} or {{"questions": []}}. No markdown, no explanation."""
+GOOD (critical) examples:
+- "[Step 2 - Pricing Agent] What tax jurisdiction should be applied for VAT calculation?"
+- "[Step 1 - Data Agent] Which source-of-truth table should be used when CRM and ERP values conflict?"
+
+BAD (silly/non-critical) examples:
+- "Do you want the output as integer or float?"
+- "Any preferred method/tool?"
+- "Can you provide context for this result?"
+
+Return ONLY valid JSON with this exact shape:
+{{"questions": ["[Step 1 - Agent Name] ...?", "[Step 2 - Agent Name] ...?"]}}
+or
+{{"questions": []}}
+No markdown. No extra keys. No explanation text."""
 
         if not (agent_api_url and (agent_api_url or "").strip()):
             return {"questions": []}
@@ -624,7 +667,7 @@ Return ONLY valid JSON: {{"questions": ["Question 1?"]}} or {{"questions": []}}.
             payload = {
                 "model": model,
                 "messages": [
-                    {"role": "system", "content": "You generate 0–3 clarifying questions for an end user. End users get frustrated by minor questions. Ask ONLY when critical: missing required input that cannot be inferred, real conflict/ambiguity, or missing hard constraint. Do NOT ask: output format, display format, method/tool preference, context for result, additional operations, precision, or anything with a sensible default. For simple tasks (e.g. add two numbers), return empty array unless a required input is genuinely missing. Return only valid JSON: {\"questions\": [\"...?\"]} or {\"questions\": []}. No markdown."},
+                    {"role": "system", "content": "You are in CLARIFICATION mode for workflow execution. Generate ONLY execution-critical questions mapped to workflow steps/agents. NEVER provide answers, calculations, solutions, recommendations, summaries, or next steps. Ask only when a required input/constraint/ambiguity blocks correct execution for a step. Enforce strict quality gate: each question must materially change implementation/scope and be currently blocking and not already answered. MAX 3 questions. Reject trivial questions (format preference, method preference, generic context). If all steps are executable, return empty array. Return only valid JSON: {\"questions\": [\"[Step N - Agent Name] ...?\"]} or {\"questions\": []}. No markdown. No extra keys."},
                     {"role": "user", "content": user_prompt[:50000]},
                 ],
                 "temperature": agent_temperature if agent_temperature is not None else 0.5,
@@ -656,10 +699,10 @@ Return ONLY valid JSON: {{"questions": ["Question 1?"]}} or {{"questions": []}}.
             parsed = json.loads(content)
             questions = parsed.get("questions")
             if isinstance(questions, list):
-                return {"questions": [str(q).strip() for q in questions if str(q).strip()][:10]}
+                return {"questions": self._filter_critical_questions([str(q).strip() for q in questions if str(q).strip()])}
         except (json.JSONDecodeError, TypeError):
             pass
-        return {"questions": self._extract_questions(content)}
+        return {"questions": self._filter_critical_questions(self._extract_questions(content))}
 
     def _format_conversation(self, history: List[Dict[str, Any]]) -> str:
         """Format conversation history for the prompt"""
@@ -700,3 +743,41 @@ Return ONLY valid JSON: {{"questions": ["Question 1?"]}} or {{"questions": []}}.
                 if cleaned and len(cleaned) > 10:  # Only include substantial recommendations
                     recommendations.append(cleaned)
         return recommendations[:5]  # Limit to 5 recommendations
+
+    def _filter_critical_questions(self, questions: List[str]) -> List[str]:
+        """
+        Keep only high-signal clarification questions.
+        Filters out common trivial/silly prompt artifacts and limits to top 3.
+        """
+        if not questions:
+            return []
+
+        blocked_phrases = (
+            "integer or float",
+            "int or float",
+            "output format",
+            "display format",
+            "preferred method",
+            "preferred tool",
+            "any specific method",
+            "context for this result",
+            "additional operations",
+            "precision level",
+            "anything else",
+        )
+        keep: List[str] = []
+        seen = set()
+        for q in questions:
+            clean = (q or "").strip()
+            if not clean:
+                continue
+            low = clean.lower()
+            if any(p in low for p in blocked_phrases):
+                continue
+            if low in seen:
+                continue
+            seen.add(low)
+            keep.append(clean)
+            if len(keep) >= 3:
+                break
+        return keep

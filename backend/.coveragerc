@@ -1,0 +1,24 @@
+[run]
+source = .
+relative_files = true
+omit =
+    */migrations/*
+    alembic/*
+    fix_user_passwords.py
+    run.py
+    venv/*
+    .venv/*
+
+[paths]
+source =
+    .
+    /app
+    */backend
+    D:\sandhi_ai\backend
+    d:\sandhi_ai\backend
+
+[report]
+exclude_lines =
+    pragma: no cover
+    def __repr__
+    raise NotImplementedError
