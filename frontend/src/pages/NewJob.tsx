@@ -14,6 +14,9 @@ export default function NewJobPage() {
   const [selectedPlatformToolIds, setSelectedPlatformToolIds] = useState<number[]>([])
   const [selectedConnectionIds, setSelectedConnectionIds] = useState<number[]>([])
   const [toolVisibility, setToolVisibility] = useState<'full' | 'names_only' | 'none'>('none')
+  const [writeExecutionMode, setWriteExecutionMode] = useState<'platform' | 'agent'>('platform')
+  const [outputArtifactFormat, setOutputArtifactFormat] = useState<'jsonl' | 'json'>('jsonl')
+  const [outputContractText, setOutputContractText] = useState('{\n  "version": "1.0",\n  "write_targets": []\n}')
   const [selectedFiles, setSelectedFiles] = useState<File[]>([])
   const [isLoading, setIsLoading] = useState(false)
   const [error, setError] = useState('')
@@ -93,6 +96,10 @@ export default function NewJobPage() {
     setIsLoading(true)
     setError('')
     try {
+      let outputContract: Record<string, unknown> | undefined = undefined
+      if (outputContractText.trim()) {
+        outputContract = JSON.parse(outputContractText)
+      }
       const hasPlatform = selectedPlatformToolIds.length > 0
       const hasConn = selectedConnectionIds.length > 0
       const job = await jobsAPI.create({ 
@@ -102,6 +109,9 @@ export default function NewJobPage() {
         allowed_platform_tool_ids: hasPlatform ? selectedPlatformToolIds : (hasConn ? [] : undefined),
         allowed_connection_ids: hasConn ? selectedConnectionIds : (hasPlatform ? [] : undefined),
         tool_visibility: toolVisibility,
+        write_execution_mode: writeExecutionMode,
+        output_artifact_format: outputArtifactFormat,
+        output_contract: outputContract,
       })
       navigate(`/jobs/${job.id}`, { state: { selectedAgents } })
     } catch (err: any) {
@@ -252,6 +262,41 @@ export default function NewJobPage() {
                 ))}
               </div>
             )}
+          </div>
+          <div className="mb-8">
+            <label className="block text-white font-bold mb-2 text-lg">Output contract and write mode</label>
+            <p className="text-sm text-white/50 mb-3 font-medium">Define universal output contract. Agent output is persisted to object storage and referenced for write tools.</p>
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-4 mb-3">
+              <div>
+                <label className="block text-white/80 text-sm font-semibold mb-1">Write execution mode</label>
+                <select
+                  value={writeExecutionMode}
+                  onChange={(e) => setWriteExecutionMode(e.target.value as 'platform' | 'agent')}
+                  className="px-4 py-2.5 bg-white border-2 border-gray-300 rounded-xl text-gray-900 focus:outline-none focus:ring-2 focus:ring-primary-500 w-full"
+                >
+                  <option value="platform">Platform triggers write tools from DB artifact reference</option>
+                  <option value="agent">AI agent triggers write tools using artifact reference</option>
+                </select>
+              </div>
+              <div>
+                <label className="block text-white/80 text-sm font-semibold mb-1">Output artifact format</label>
+                <select
+                  value={outputArtifactFormat}
+                  onChange={(e) => setOutputArtifactFormat(e.target.value as 'jsonl' | 'json')}
+                  className="px-4 py-2.5 bg-white border-2 border-gray-300 rounded-xl text-gray-900 focus:outline-none focus:ring-2 focus:ring-primary-500 w-full"
+                >
+                  <option value="jsonl">JSONL (best for bulk, streaming, high volume)</option>
+                  <option value="json">JSON (single structured payload)</option>
+                </select>
+              </div>
+            </div>
+            <textarea
+              value={outputContractText}
+              onChange={(e) => setOutputContractText(e.target.value)}
+              rows={8}
+              className="w-full px-5 py-4 bg-white border-2 border-gray-300 rounded-xl text-gray-900 placeholder-gray-500 focus:outline-none focus:ring-2 focus:ring-primary-500 focus:border-primary-500 text-sm font-mono"
+              placeholder="Paste output contract JSON"
+            />
           </div>
           <div className="mb-8">
             <label className="block text-white font-bold mb-3 text-lg">

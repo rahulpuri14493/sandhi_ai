@@ -344,6 +344,36 @@ class TestExecuteSchedule:
         mock_svc.remove_schedule.assert_called_once_with(99999)
 
 
+class TestRunJobInThreadGuards:
+    @patch("services.job_scheduler.SessionLocal")
+    @patch("services.job_scheduler.AgentExecutor")
+    def test_skips_when_job_not_in_progress(self, mock_executor_cls, mock_session_local, db_session):
+        user = _make_user(db_session)
+        job = _make_job(db_session, user, JobStatus.COMPLETED)
+        mock_session_local.return_value = db_session
+        db_session.close = lambda: None
+
+        from services.job_scheduler import run_job_in_thread
+
+        run_job_in_thread(job.id, history_id=None)
+        mock_executor_cls.assert_not_called()
+
+    @patch("services.job_scheduler.SessionLocal")
+    @patch("services.job_scheduler.AgentExecutor")
+    def test_skips_when_execution_token_mismatch(self, mock_executor_cls, mock_session_local, db_session):
+        user = _make_user(db_session)
+        job = _make_job(db_session, user, JobStatus.IN_PROGRESS)
+        job.execution_token = "current-token-abc"
+        db_session.commit()
+        mock_session_local.return_value = db_session
+        db_session.close = lambda: None
+
+        from services.job_scheduler import run_job_in_thread
+
+        run_job_in_thread(job.id, history_id=None, execution_token="stale-token-xyz")
+        mock_executor_cls.assert_not_called()
+
+
 # ---------------------------------------------------------------------------
 # JobSchedulerService lifecycle
 # ---------------------------------------------------------------------------

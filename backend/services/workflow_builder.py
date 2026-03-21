@@ -15,6 +15,21 @@ from services.task_splitter import split_job_for_agents
 logger = logging.getLogger(__name__)
 
 
+def _normalized_job_output_settings(job: Job) -> tuple[str, str]:
+    write_mode_raw = getattr(job, "write_execution_mode", "platform")
+    write_mode = write_mode_raw if isinstance(write_mode_raw, str) else "platform"
+    write_mode = (write_mode or "platform").strip().lower()
+    if write_mode not in ("platform", "agent"):
+        write_mode = "platform"
+
+    artifact_format_raw = getattr(job, "output_artifact_format", "jsonl")
+    artifact_format = artifact_format_raw if isinstance(artifact_format_raw, str) else "jsonl"
+    artifact_format = (artifact_format or "jsonl").strip().lower()
+    if artifact_format not in ("jsonl", "json"):
+        artifact_format = "jsonl"
+    return write_mode, artifact_format
+
+
 class WorkflowBuilder:
     def __init__(self, db: Session):
         self.db = db
@@ -114,11 +129,14 @@ class WorkflowBuilder:
             logger.debug("No documents provided - agent will work with job title and description only")
         
         # Prepare base input data with job context, Q&A conversation, and documents
+        write_mode, artifact_format = _normalized_job_output_settings(job)
         base_input_data = {
             "job_title": job.title,
             "job_description": job.description,
             "conversation": conversation_data or [],  # Include Q&A conversation
-            "documents": documents_content  # Include document content
+            "documents": documents_content,  # Include document content
+            "write_execution_mode": write_mode,
+            "output_artifact_format": artifact_format,
         }
         
         # Split job into subtasks per agent (generalized, uses first agent's API when available)
@@ -339,11 +357,14 @@ class WorkflowBuilder:
         # Prepare base input data with job context, Q&A conversation, and documents
         logger.debug("Building manual workflow for job %s title=%s conversation_items=%s documents=%s", job_id, job.title, len(conversation_data) if conversation_data else 0, len(documents_content))
         
+        write_mode, artifact_format = _normalized_job_output_settings(job)
         base_input_data = {
             "job_title": job.title,
             "job_description": job.description,
             "conversation": conversation_data or [],  # Include Q&A conversation
-            "documents": documents_content  # Include document content
+            "documents": documents_content,  # Include document content
+            "write_execution_mode": write_mode,
+            "output_artifact_format": artifact_format,
         }
         
         # Validate that documents and conversation are included

@@ -4,9 +4,10 @@ import io
 import json
 import zipfile
 import random
+import uuid
 from pathlib import Path
 from typing import List, Optional
-from fastapi import APIRouter, Depends, HTTPException, status, BackgroundTasks, UploadFile, File, Form, Query
+from fastapi import APIRouter, Depends, HTTPException, status, UploadFile, File, Form, Query
 from fastapi.responses import FileResponse, Response, StreamingResponse
 from sqlalchemy.orm import Session
 from pydantic import BaseModel
@@ -24,14 +25,13 @@ from schemas.job import (
 )
 from core.security import get_current_user, get_current_business_user
 from core.config import settings
-from services.job_scheduler import get_scheduler, reset_job_for_execution, run_job_in_thread
+from services.job_scheduler import get_scheduler, reset_job_for_execution, queue_job_execution
+from services.task_queue import get_queue_stats
 from services.workflow_builder import WorkflowBuilder
 from services.payment_processor import PaymentProcessor
-from services.agent_executor import AgentExecutor
 from services.document_analyzer import DocumentAnalyzer
 from models.transaction import Transaction, Earnings
 from core.external_token import create_job_token, get_share_url
-import threading
 from datetime import datetime, timedelta
 from models.communication import AgentCommunication
 from models.mcp_server import MCPToolConfig, MCPServerConnection
@@ -226,6 +226,42 @@ class UserResponseRequest(BaseModel):
     answer: str
 
 
+@router.get("/output-contract/template", status_code=status.HTTP_200_OK)
+def get_output_contract_template():
+    """Universal output contract template for artifact-first write execution."""
+    return {
+        "version": "1.0",
+        "record_schema": {
+            "customer_id": "string",
+            "decision": "string",
+            "confidence": "number",
+            "reason_codes": ["string"],
+            "evidence_refs": ["string"],
+            "processed_at": "datetime",
+        },
+        "write_policy": {
+            "on_write_error": "fail_job",
+            "min_successful_targets": 1,
+        },
+        "write_targets": [
+            {
+                "tool_name": "platform_1_snowflake_kyc_results",
+                "operation_type": "upsert",
+                "write_mode": "upsert",
+                "merge_keys": ["customer_id"],
+                "target": {
+                    "database": "BANK",
+                    "schema": "RISK",
+                    "table": "KYC_AML_DECISIONS",
+                },
+                "options": {
+                    "on_conflict": "update",
+                },
+            }
+        ],
+    }
+
+
 def _parse_int_list_form(value: Optional[str]) -> Optional[List[int]]:
     """Parse Form JSON string to list of ints."""
     if not value or not value.strip():
@@ -246,6 +282,103 @@ def _validate_tool_visibility(v: Optional[str]) -> Optional[str]:
     raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="tool_visibility must be 'full', 'names_only', or 'none'")
 
 
+def _validate_write_execution_mode(v: Optional[str]) -> str:
+    s = (v or "platform").strip().lower()
+    if s in ("platform", "agent"):
+        return s
+    raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="write_execution_mode must be 'platform' or 'agent'")
+
+
+def _validate_output_artifact_format(v: Optional[str]) -> str:
+    s = (v or "jsonl").strip().lower()
+    if s in ("jsonl", "json"):
+        return s
+    raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="output_artifact_format must be 'jsonl' or 'json'")
+
+
+def _parse_json_form(value: Optional[str]) -> Optional[dict]:
+    if value is None:
+        return None
+    raw = value.strip()
+    if not raw:
+        return None
+    try:
+        obj = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid JSON provided in output_contract") from exc
+    if not isinstance(obj, dict):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="output_contract must be a JSON object")
+    return obj
+
+
+def _validate_output_contract_policy(contract: Optional[dict]) -> Optional[dict]:
+    if contract is None:
+        return None
+    if not isinstance(contract, dict):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="output_contract must be a JSON object")
+    policy = contract.get("write_policy")
+    if policy is None:
+        return contract
+    if not isinstance(policy, dict):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="output_contract.write_policy must be an object")
+    on_write_error = policy.get("on_write_error")
+    if on_write_error is not None and str(on_write_error).strip().lower() not in ("fail_job", "continue"):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="output_contract.write_policy.on_write_error must be 'fail_job' or 'continue'",
+        )
+    min_successful_targets = policy.get("min_successful_targets")
+    if min_successful_targets is not None:
+        try:
+            v = int(min_successful_targets)
+        except (TypeError, ValueError):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="output_contract.write_policy.min_successful_targets must be an integer >= 0",
+            )
+        if v < 0:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="output_contract.write_policy.min_successful_targets must be an integer >= 0",
+            )
+    return contract
+
+
+def _parse_contract_json(raw: Optional[str]) -> Optional[dict]:
+    if not raw:
+        return None
+    try:
+        data = json.loads(raw)
+    except (json.JSONDecodeError, TypeError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _transition_job_status_if_current(
+    db: Session,
+    *,
+    job_id: int,
+    business_id: int,
+    from_statuses: List[JobStatus],
+    to_status: JobStatus,
+    extra_updates: Optional[dict] = None,
+) -> bool:
+    updates = {"status": to_status}
+    if extra_updates:
+        updates.update(extra_updates)
+    updated = (
+        db.query(Job)
+        .filter(
+            Job.id == job_id,
+            Job.business_id == business_id,
+            Job.status.in_(from_statuses),
+        )
+        .update(updates, synchronize_session=False)
+    )
+    db.commit()
+    return bool(updated)
+
+
 @router.post("", response_model=JobResponse, status_code=status.HTTP_201_CREATED)
 async def create_job(
     title: str = Form(...),
@@ -256,6 +389,9 @@ async def create_job(
     allowed_platform_tool_ids: Optional[str] = Form(None),
     allowed_connection_ids: Optional[str] = Form(None),
     tool_visibility: Optional[str] = Form(None),
+    write_execution_mode: Optional[str] = Form("platform"),
+    output_artifact_format: Optional[str] = Form("jsonl"),
+    output_contract: Optional[str] = Form(None),
     current_user: User = Depends(get_current_business_user),
     db: Session = Depends(get_db)
 ):
@@ -268,6 +404,9 @@ async def create_job(
         platform_ids, connection_ids = _validate_allowed_tools(db, current_user.id, platform_ids, connection_ids)
 
     tv = _validate_tool_visibility(tool_visibility) if tool_visibility else None
+    write_mode = _validate_write_execution_mode(write_execution_mode)
+    artifact_format = _validate_output_artifact_format(output_artifact_format)
+    output_contract_obj = _validate_output_contract_policy(_parse_json_form(output_contract))
     new_job = Job(
         business_id=current_user.id,
         title=title,
@@ -278,6 +417,9 @@ async def create_job(
         allowed_platform_tool_ids=json.dumps(platform_ids) if platform_ids is not None else None,
         allowed_connection_ids=json.dumps(connection_ids) if connection_ids is not None else None,
         tool_visibility=tv,
+        write_execution_mode=write_mode,
+        output_artifact_format=artifact_format,
+        output_contract=json.dumps(output_contract_obj) if output_contract_obj is not None else None,
     )
     db.add(new_job)
     db.commit()
@@ -357,6 +499,9 @@ async def create_job(
         "allowed_platform_tool_ids": platform_ids,
         "allowed_connection_ids": connection_ids,
         "tool_visibility": new_job.tool_visibility,
+        "write_execution_mode": new_job.write_execution_mode,
+        "output_artifact_format": new_job.output_artifact_format,
+        "output_contract": output_contract_obj,
     }
     return JobResponse(**response_data)
 
@@ -799,6 +944,17 @@ def get_job_filter_options(
     return JobFilterOptions(statuses=statuses, sort_options=sort_options)
 
 
+@router.get("/queue/stats", status_code=status.HTTP_200_OK)
+def get_runtime_queue_stats(
+    current_user: User = Depends(get_current_user),
+):
+    """
+    Queue runtime stats for production operations.
+    Useful to validate Redis/Celery usage and parallel processing behavior.
+    """
+    return get_queue_stats()
+
+
 @router.get("", response_model=List[JobResponse])
 def list_jobs(
     current_user: User = Depends(get_current_user),
@@ -871,6 +1027,9 @@ def list_jobs(
             "allowed_platform_tool_ids": job_platform,
             "allowed_connection_ids": job_conn,
             "tool_visibility": getattr(job, "tool_visibility", None),
+            "write_execution_mode": getattr(job, "write_execution_mode", "platform"),
+            "output_artifact_format": getattr(job, "output_artifact_format", "jsonl"),
+            "output_contract": _parse_contract_json(getattr(job, "output_contract", None)),
         }
         result.append(JobResponse(**job_dict))
     return result
@@ -978,6 +1137,9 @@ def get_job(
         "allowed_platform_tool_ids": job_platform,
         "allowed_connection_ids": job_conn,
         "tool_visibility": getattr(job, "tool_visibility", None),
+        "write_execution_mode": getattr(job, "write_execution_mode", "platform"),
+        "output_artifact_format": getattr(job, "output_artifact_format", "jsonl"),
+        "output_contract": _parse_contract_json(getattr(job, "output_contract", None)),
     }
     return JobResponse(**job_dict)
 
@@ -992,6 +1154,9 @@ async def update_job(
     allowed_platform_tool_ids: Optional[str] = Form(None),
     allowed_connection_ids: Optional[str] = Form(None),
     tool_visibility: Optional[str] = Form(None),
+    write_execution_mode: Optional[str] = Form(None),
+    output_artifact_format: Optional[str] = Form(None),
+    output_contract: Optional[str] = Form(None),
     current_user: User = Depends(get_current_business_user),
     db: Session = Depends(get_db)
 ):
@@ -1030,6 +1195,13 @@ async def update_job(
         job.allowed_connection_ids = json.dumps(cids) if cids is not None else None
     if tool_visibility is not None:
         job.tool_visibility = _validate_tool_visibility(tool_visibility)
+    if write_execution_mode is not None:
+        job.write_execution_mode = _validate_write_execution_mode(write_execution_mode)
+    if output_artifact_format is not None:
+        job.output_artifact_format = _validate_output_artifact_format(output_artifact_format)
+    if output_contract is not None:
+        contract_obj = _validate_output_contract_policy(_parse_json_form(output_contract))
+        job.output_contract = json.dumps(contract_obj) if contract_obj is not None else None
 
     # Update basic fields
     if title is not None:
@@ -1224,6 +1396,9 @@ async def update_job(
         "allowed_platform_tool_ids": job_platform,
         "allowed_connection_ids": job_conn,
         "tool_visibility": getattr(job, "tool_visibility", None),
+        "write_execution_mode": getattr(job, "write_execution_mode", "platform"),
+        "output_artifact_format": getattr(job, "output_artifact_format", "jsonl"),
+        "output_contract": _parse_contract_json(getattr(job, "output_contract", None)),
     }
 
     return JobResponse(**job_dict)
@@ -1494,7 +1669,10 @@ def approve_job(
         "workflow_steps": [],
         "files": files_data,
         "conversation": conversation_data,
-        "failure_reason": job.failure_reason
+        "failure_reason": job.failure_reason,
+        "write_execution_mode": getattr(job, "write_execution_mode", "platform"),
+        "output_artifact_format": getattr(job, "output_artifact_format", "jsonl"),
+        "output_contract": _parse_contract_json(getattr(job, "output_contract", None)),
     }
     return JobResponse(**job_dict)
 
@@ -1502,7 +1680,6 @@ def approve_job(
 @router.post("/{job_id}/execute", response_model=JobResponse)
 def execute_job(
     job_id: int,
-    background_tasks: BackgroundTasks,
     current_user: User = Depends(get_current_business_user),
     db: Session = Depends(get_db)
 ):
@@ -1525,26 +1702,40 @@ def execute_job(
             detail="Job must be approved before execution"
         )
     
-    # Mark job as in progress
-    job.status = JobStatus.IN_PROGRESS
-    db.commit()
+    execution_token = uuid.uuid4().hex
+    transitioned = _transition_job_status_if_current(
+        db,
+        job_id=job.id,
+        business_id=current_user.id,
+        from_statuses=[JobStatus.PENDING_APPROVAL],
+        to_status=JobStatus.IN_PROGRESS,
+        extra_updates={"execution_token": execution_token},
+    )
+    if not transitioned:
+        db.refresh(job)
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Job must be approved before execution",
+        )
     db.refresh(job)
     
-    # Trigger async job execution
-    def run_job():
-        # Create a new event loop for the background task
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        try:
-            executor = AgentExecutor(db)
-            loop.run_until_complete(executor.execute_job(job_id))
-        except Exception as e:
-            # Job status will be updated to failed by executor
-            logger.exception("Job execution failed: %s", e)
-        finally:
-            loop.close()
-    
-    background_tasks.add_task(run_job)
+    # Queue async execution (Redis/Celery) with strict mode option.
+    try:
+        queue_job_execution(
+            job_id=job_id,
+            history_id=None,
+            execution_token=execution_token,
+            strict=bool(getattr(settings, "JOB_EXECUTION_STRICT_QUEUE", False)),
+        )
+    except Exception as exc:
+        job.status = JobStatus.PENDING_APPROVAL
+        job.execution_token = None
+        job.failure_reason = f"Failed to enqueue execution: {str(exc)[:200]}"
+        db.commit()
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Failed to enqueue job execution. Please try again.",
+        )
     
     # Parse files and conversation for response
     files_data = None
@@ -1574,7 +1765,10 @@ def execute_job(
         "workflow_steps": [],
         "files": files_data,
         "conversation": conversation_data,
-        "failure_reason": job.failure_reason
+        "failure_reason": job.failure_reason,
+        "write_execution_mode": getattr(job, "write_execution_mode", "platform"),
+        "output_artifact_format": getattr(job, "output_artifact_format", "jsonl"),
+        "output_contract": _parse_contract_json(getattr(job, "output_contract", None)),
     }
     return JobResponse(**job_dict)
 
@@ -1693,6 +1887,9 @@ def get_job_status(
         "allowed_platform_tool_ids": job_platform,
         "allowed_connection_ids": job_conn,
         "tool_visibility": getattr(job, "tool_visibility", None),
+        "write_execution_mode": getattr(job, "write_execution_mode", "platform"),
+        "output_artifact_format": getattr(job, "output_artifact_format", "jsonl"),
+        "output_contract": _parse_contract_json(getattr(job, "output_contract", None)),
     }
 
     # Compute schedule-aware fields for frontend UX
@@ -2060,18 +2257,39 @@ def rerun_job(
         db.flush()
         history_id = history.id
 
-    # Reset steps and set IN_PROGRESS directly (execution starts now)
+    # Acquire execution claim atomically, then reset steps for a clean run.
+    execution_token = uuid.uuid4().hex
+    transitioned = _transition_job_status_if_current(
+        db,
+        job_id=job.id,
+        business_id=current_user.id,
+        from_statuses=[JobStatus.FAILED, JobStatus.CANCELLED],
+        to_status=JobStatus.IN_PROGRESS,
+        extra_updates={"execution_token": execution_token},
+    )
+    if not transitioned:
+        db.refresh(job)
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Can only rerun failed or cancelled jobs. Current status: {job.status.value}",
+        )
+
+    db.refresh(job)
     reset_job_for_execution(db, job)
-    job.status = JobStatus.IN_PROGRESS
     db.commit()
 
     # Spawn execution thread — job is already IN_PROGRESS
     try:
-        thread = threading.Thread(target=run_job_in_thread, args=(job.id, history_id), daemon=True)
-        thread.start()
+        queue_job_execution(
+            job_id=job.id,
+            history_id=history_id,
+            execution_token=execution_token,
+            strict=bool(getattr(settings, "JOB_EXECUTION_STRICT_QUEUE", False)),
+        )
     except Exception as exc:
-        logger.exception("Failed to start execution thread for job %s", job.id)
+        logger.exception("Failed to enqueue execution for job %s", job.id)
         job.status = JobStatus.FAILED
+        job.execution_token = None
         job.failure_reason = f"Failed to start execution: {str(exc)[:200]}"
         if history_id:
             hist = db.query(ScheduleExecutionHistory).filter(ScheduleExecutionHistory.id == history_id).first()
@@ -2080,8 +2298,8 @@ def rerun_job(
                 hist.failure_reason = job.failure_reason
         db.commit()
         raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to start job execution: {str(exc)[:200]}",
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=f"Failed to enqueue job execution: {str(exc)[:200]}",
         )
 
     return RerunResponse(
@@ -2117,6 +2335,7 @@ def cancel_job(
         )
 
     job.status = JobStatus.CANCELLED
+    job.execution_token = None
     job.failure_reason = "Cancelled by user"
     db.commit()
 

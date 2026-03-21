@@ -32,6 +32,144 @@ def test_create_job_rejects_invalid_tool_visibility(client: TestClient, db_sessi
     assert r.status_code == 400
 
 
+def test_create_job_rejects_invalid_write_execution_mode(client: TestClient, db_session):
+    _, headers = _make_business(db_session)
+    r = client.post("/api/jobs", data={"title": "T", "write_execution_mode": "bad"}, headers=headers)
+    assert r.status_code == 400
+    assert "write_execution_mode" in r.text
+
+
+def test_create_job_accepts_output_contract(client: TestClient, db_session):
+    _, headers = _make_business(db_session)
+    contract = {
+        "version": "1.0",
+        "write_targets": [
+            {
+                "tool_name": "platform_1_snowflake",
+                "operation_type": "upsert",
+                "write_mode": "upsert",
+                "merge_keys": ["customer_id"],
+                "target": {"database": "DB", "schema": "S", "table": "T"},
+            }
+        ],
+    }
+    r = client.post(
+        "/api/jobs",
+        data={
+            "title": "T",
+            "write_execution_mode": "platform",
+            "output_artifact_format": "jsonl",
+            "output_contract": json.dumps(contract),
+        },
+        headers=headers,
+    )
+    assert r.status_code == 201
+    body = r.json()
+    assert body["write_execution_mode"] == "platform"
+    assert body["output_artifact_format"] == "jsonl"
+    assert body["output_contract"]["version"] == "1.0"
+
+
+def test_create_job_rejects_invalid_output_contract_policy_on_write_error(client: TestClient, db_session):
+    _, headers = _make_business(db_session)
+    contract = {
+        "version": "1.0",
+        "write_policy": {"on_write_error": "invalid_mode"},
+        "write_targets": [],
+    }
+    r = client.post(
+        "/api/jobs",
+        data={
+            "title": "T",
+            "output_contract": json.dumps(contract),
+        },
+        headers=headers,
+    )
+    assert r.status_code == 400
+    assert "on_write_error" in r.text
+
+
+def test_update_job_rejects_invalid_output_contract_policy_min_success(client: TestClient, db_session):
+    user, headers = _make_business(db_session)
+    job = Job(business_id=user.id, title="Policy Update", status=JobStatus.DRAFT)
+    db_session.add(job)
+    db_session.commit()
+    db_session.refresh(job)
+    contract = {
+        "version": "1.0",
+        "write_policy": {"min_successful_targets": -1},
+        "write_targets": [],
+    }
+    r = client.put(
+        f"/api/jobs/{job.id}",
+        data={"output_contract": json.dumps(contract)},
+        headers=headers,
+    )
+    assert r.status_code == 400
+    assert "min_successful_targets" in r.text
+
+
+def test_get_output_contract_template(client: TestClient):
+    r = client.get("/api/jobs/output-contract/template")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["version"] == "1.0"
+    assert isinstance(body.get("write_policy"), dict)
+    assert body["write_policy"]["on_write_error"] in ("fail_job", "continue")
+    assert isinstance(body.get("write_targets"), list)
+
+
+def test_queue_stats_requires_auth(client: TestClient):
+    r = client.get("/api/jobs/queue/stats")
+    assert r.status_code == 401
+
+
+def test_queue_stats_returns_shape(client: TestClient, db_session, monkeypatch):
+    import api.routes.jobs as jobs_mod
+
+    _, headers = _make_business(db_session)
+    monkeypatch.setattr(
+        jobs_mod,
+        "get_queue_stats",
+        lambda: {
+            "execution_backend": "celery",
+            "queue_name": "celery",
+            "pending_jobs": 3,
+            "workers": {"online": 2, "active": 4, "reserved": 1},
+        },
+    )
+    r = client.get("/api/jobs/queue/stats", headers=headers)
+    assert r.status_code == 200
+    body = r.json()
+    assert body["execution_backend"] == "celery"
+    assert body["queue_name"] == "celery"
+    assert isinstance(body["workers"], dict)
+
+
+def test_execute_job_strict_queue_returns_503_when_enqueue_fails(client: TestClient, db_session, monkeypatch):
+    import api.routes.jobs as jobs_mod
+
+    user, headers = _make_business(db_session)
+    job = Job(
+        business_id=user.id,
+        title="Queue strict test",
+        status=JobStatus.PENDING_APPROVAL,
+    )
+    db_session.add(job)
+    db_session.commit()
+    db_session.refresh(job)
+
+    monkeypatch.setattr(jobs_mod.settings, "JOB_EXECUTION_STRICT_QUEUE", True)
+
+    def _raise_enqueue(*args, **kwargs):
+        raise RuntimeError("broker down")
+
+    monkeypatch.setattr(jobs_mod, "queue_job_execution", _raise_enqueue)
+
+    r = client.post(f"/api/jobs/{job.id}/execute", headers=headers)
+    assert r.status_code == 503
+
+
 def test_create_job_rejects_invalid_file_extension(client: TestClient, db_session):
     _, headers = _make_business(db_session)
     f = io.BytesIO(b"hello")

@@ -19,6 +19,7 @@ Covers:
 """
 import uuid
 from datetime import datetime, timedelta
+from unittest.mock import patch
 
 import pytest
 from fastapi.testclient import TestClient
@@ -1037,3 +1038,34 @@ class TestRerunCancelledJob:
             headers=_auth_headers(user),
         )
         assert resp.status_code == 400
+
+    def test_rerun_queues_execution(self, schedule_client, db_session):
+        client, user, job = schedule_client
+        dev = _make_user(db_session, UserRole.DEVELOPER)
+        agent = _make_agent(db_session, dev)
+        _make_step(db_session, job, agent)
+        job.status = JobStatus.FAILED
+        db_session.commit()
+        with patch("api.routes.jobs.queue_job_execution") as mock_queue:
+            resp = client.post(
+                f"/api/jobs/{job.id}/rerun",
+                headers=_auth_headers(user),
+            )
+        assert resp.status_code == 200
+        mock_queue.assert_called_once()
+
+    def test_rerun_strict_queue_failure_returns_503(self, schedule_client, db_session):
+        client, user, job = schedule_client
+        dev = _make_user(db_session, UserRole.DEVELOPER)
+        agent = _make_agent(db_session, dev)
+        _make_step(db_session, job, agent)
+        job.status = JobStatus.FAILED
+        db_session.commit()
+        with patch("api.routes.jobs.settings.JOB_EXECUTION_STRICT_QUEUE", True), patch(
+            "api.routes.jobs.queue_job_execution", side_effect=RuntimeError("broker down")
+        ):
+            resp = client.post(
+                f"/api/jobs/{job.id}/rerun",
+                headers=_auth_headers(user),
+            )
+        assert resp.status_code == 503

@@ -79,10 +79,18 @@ def _description_for_type(tool_type: MCPToolType, name: str) -> str:
         MCPToolType.CHROMA: "Query Chroma vector store",
         MCPToolType.POSTGRES: "Execute read-only PostgreSQL query",
         MCPToolType.MYSQL: "Execute read-only MySQL query",
+        MCPToolType.SQLSERVER: "Execute read and write SQL Server operations",
+        MCPToolType.SNOWFLAKE: "Execute read and write Snowflake operations",
+        MCPToolType.DATABRICKS: "Execute read and write Databricks operations",
+        MCPToolType.BIGQUERY: "Execute read and write BigQuery operations",
         MCPToolType.ELASTICSEARCH: "Search Elasticsearch index",
         MCPToolType.PAGEINDEX: "Query PageIndex (vectorless document retrieval)",
         MCPToolType.FILESYSTEM: "Read or list files in configured base path",
         MCPToolType.S3: "Read or list objects in S3 bucket",
+        MCPToolType.MINIO: "Read or write objects in MinIO bucket",
+        MCPToolType.CEPH: "Read or write objects in Ceph object storage",
+        MCPToolType.AZURE_BLOB: "Read or write objects in Azure Blob storage",
+        MCPToolType.GCS: "Read or write objects in Google Cloud Storage",
         MCPToolType.SLACK: "Send message or list channels (Slack)",
         MCPToolType.GITHUB: "Query GitHub repos, issues, or files",
         MCPToolType.NOTION: "Query or search Notion workspace",
@@ -102,7 +110,34 @@ def _input_schema_for_type(tool_type: MCPToolType) -> dict:
     }
     sql_schema = {
         "type": "object",
-        "properties": {"query": {"type": "string", "description": "SQL SELECT query (read-only)"}},
+        "properties": {
+            "operation_type": {
+                "type": "string",
+                "enum": ["read", "insert", "update", "upsert", "merge"],
+                "default": "read",
+            },
+            "query": {"type": "string", "description": "SQL query (read or write as allowed by policy)"},
+            "artifact_ref": {
+                "type": "object",
+                "properties": {
+                    "storage": {"type": "string"},
+                    "path": {"type": "string"},
+                    "format": {"type": "string"},
+                },
+            },
+            "target": {
+                "type": "object",
+                "properties": {
+                    "database": {"type": "string"},
+                    "schema": {"type": "string"},
+                    "table": {"type": "string"},
+                    "name": {"type": "string"},
+                },
+            },
+            "write_mode": {"type": "string", "enum": ["append", "overwrite", "upsert", "merge"], "default": "upsert"},
+            "merge_keys": {"type": "array", "items": {"type": "string"}},
+            "idempotency_key": {"type": "string"},
+        },
         "required": ["query"],
     }
     schemas = {
@@ -113,6 +148,10 @@ def _input_schema_for_type(tool_type: MCPToolType) -> dict:
         MCPToolType.CHROMA: vector_schema,
         MCPToolType.POSTGRES: sql_schema,
         MCPToolType.MYSQL: sql_schema,
+        MCPToolType.SQLSERVER: sql_schema,
+        MCPToolType.SNOWFLAKE: sql_schema,
+        MCPToolType.DATABRICKS: sql_schema,
+        MCPToolType.BIGQUERY: sql_schema,
         MCPToolType.ELASTICSEARCH: {
             "type": "object",
             "properties": {
@@ -143,7 +182,54 @@ def _input_schema_for_type(tool_type: MCPToolType) -> dict:
             "type": "object",
             "properties": {
                 "key": {"type": "string", "description": "Object key or prefix"},
-                "action": {"type": "string", "enum": ["get", "list"], "default": "get"},
+                "artifact_ref": {
+                    "type": "object",
+                    "properties": {
+                        "path": {"type": "string"},
+                        "format": {"type": "string"},
+                    },
+                },
+                "action": {"type": "string", "enum": ["get", "list", "put", "write"], "default": "get"},
+            },
+            "required": ["key"],
+        },
+        MCPToolType.MINIO: {
+            "type": "object",
+            "properties": {
+                "key": {"type": "string", "description": "Object key or prefix"},
+                "artifact_ref": {"type": "object", "properties": {"path": {"type": "string"}, "format": {"type": "string"}}},
+                "action": {"type": "string", "enum": ["get", "list", "put", "write"], "default": "get"},
+                "idempotency_key": {"type": "string"},
+            },
+            "required": ["key"],
+        },
+        MCPToolType.CEPH: {
+            "type": "object",
+            "properties": {
+                "key": {"type": "string", "description": "Object key or prefix"},
+                "artifact_ref": {"type": "object", "properties": {"path": {"type": "string"}, "format": {"type": "string"}}},
+                "action": {"type": "string", "enum": ["get", "list", "put", "write"], "default": "get"},
+                "idempotency_key": {"type": "string"},
+            },
+            "required": ["key"],
+        },
+        MCPToolType.AZURE_BLOB: {
+            "type": "object",
+            "properties": {
+                "key": {"type": "string", "description": "Blob name or prefix"},
+                "artifact_ref": {"type": "object", "properties": {"path": {"type": "string"}, "format": {"type": "string"}}},
+                "action": {"type": "string", "enum": ["get", "list", "put", "write"], "default": "get"},
+                "idempotency_key": {"type": "string"},
+            },
+            "required": ["key"],
+        },
+        MCPToolType.GCS: {
+            "type": "object",
+            "properties": {
+                "key": {"type": "string", "description": "Object key or prefix"},
+                "artifact_ref": {"type": "object", "properties": {"path": {"type": "string"}, "format": {"type": "string"}}},
+                "action": {"type": "string", "enum": ["get", "list", "put", "write"], "default": "get"},
+                "idempotency_key": {"type": "string"},
             },
             "required": ["key"],
         },

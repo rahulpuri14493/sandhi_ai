@@ -22,3 +22,5 @@ pytest-asyncio==0.23.3
 pytest-cov==4.1.0
 cryptography>=42.0.0
 APScheduler==3.10.4
+celery==5.4.0
+redis==5.1.1

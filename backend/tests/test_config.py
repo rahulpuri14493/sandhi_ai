@@ -11,6 +11,22 @@ def test_settings_has_required_attributes():
     assert hasattr(settings, "ALGORITHM")
     assert hasattr(settings, "ACCESS_TOKEN_EXPIRE_MINUTES")
     assert hasattr(settings, "PLATFORM_COMMISSION_RATE")
+    assert hasattr(settings, "MCP_TOOL_MAX_ARGUMENT_BYTES")
+    assert hasattr(settings, "MCP_TOOL_DEFAULT_TIMEOUT_SECONDS")
+    assert hasattr(settings, "MCP_TOOL_MAX_TIMEOUT_SECONDS")
+    assert hasattr(settings, "MCP_WRITE_OPERATION_MAX_ATTEMPTS")
+    assert hasattr(settings, "MCP_WRITE_OPERATION_RETRY_BASE_DELAY_SECONDS")
+    assert hasattr(settings, "MCP_WRITE_OPERATION_RETRY_MAX_DELAY_SECONDS")
+    assert hasattr(settings, "MCP_WRITE_OPERATION_RETRY_JITTER_SECONDS")
+    assert hasattr(settings, "JOB_EXECUTION_BACKEND")
+    assert hasattr(settings, "JOB_EXECUTION_STRICT_QUEUE")
+    assert hasattr(settings, "CELERY_BROKER_URL")
+    assert hasattr(settings, "CELERY_RESULT_BACKEND")
+    assert hasattr(settings, "CELERY_WORKER_AUTOSCALE_MAX")
+    assert hasattr(settings, "CELERY_WORKER_AUTOSCALE_MIN")
+    assert hasattr(settings, "CELERY_WORKER_CONCURRENCY")
+    assert hasattr(settings, "CELERY_EXECUTE_MAX_RETRIES")
+    assert hasattr(settings, "CELERY_EXECUTE_RETRY_BACKOFF_SECONDS")
 
 
 def test_settings_has_s3_storage_attributes():

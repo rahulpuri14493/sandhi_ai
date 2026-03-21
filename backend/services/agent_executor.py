@@ -1,7 +1,8 @@
 import logging
 import json
+import uuid
 from datetime import datetime
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, List
 import httpx
 from sqlalchemy.orm import Session
 from models.job import Job, JobStatus, WorkflowStep
@@ -13,6 +14,7 @@ from services.payment_processor import PaymentProcessor
 from services.a2a_client import execute_via_a2a
 from services.mcp_client import call_tool as mcp_call_tool
 from services.db_schema_introspection import format_schema_for_prompt
+from services.job_file_storage import persist_file
 from core.config import settings
 
 logger = logging.getLogger(__name__)
@@ -77,11 +79,68 @@ def _apply_tool_visibility(tools: list, visibility: Optional[str]) -> list:
     return tools
 
 
+def _parse_output_contract(raw: Optional[str]) -> Dict[str, Any]:
+    if not raw:
+        return {}
+    try:
+        data = json.loads(raw)
+    except (json.JSONDecodeError, TypeError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _parse_write_policy(contract: Dict[str, Any], write_targets_count: int) -> Dict[str, Any]:
+    policy = contract.get("write_policy") if isinstance(contract, dict) else {}
+    if not isinstance(policy, dict):
+        policy = {}
+    on_write_error = str(policy.get("on_write_error") or "fail_job").strip().lower()
+    if on_write_error not in ("fail_job", "continue"):
+        on_write_error = "fail_job"
+    min_success_default = write_targets_count
+    raw_min = policy.get("min_successful_targets", min_success_default)
+    try:
+        min_successful_targets = int(raw_min)
+    except (TypeError, ValueError):
+        min_successful_targets = min_success_default
+    min_successful_targets = max(0, min(min_successful_targets, write_targets_count))
+    return {
+        "on_write_error": on_write_error,
+        "min_successful_targets": min_successful_targets,
+    }
+
+
 # OpenAI-style tool parameter schemas for MCP tool types (must match platform MCP server expectations)
 def _input_schema_for_tool_type(tool_type: str) -> dict:
     sql_schema = {
         "type": "object",
-        "properties": {"query": {"type": "string", "description": "SQL SELECT query (read-only)"}},
+        "properties": {
+            "operation_type": {
+                "type": "string",
+                "enum": ["read", "insert", "update", "upsert", "merge"],
+                "default": "read",
+            },
+            "query": {"type": "string", "description": "SQL query (read or write as allowed by policy)"},
+            "artifact_ref": {
+                "type": "object",
+                "properties": {
+                    "storage": {"type": "string"},
+                    "path": {"type": "string"},
+                    "format": {"type": "string"},
+                },
+            },
+            "target": {
+                "type": "object",
+                "properties": {
+                    "database": {"type": "string"},
+                    "schema": {"type": "string"},
+                    "table": {"type": "string"},
+                    "name": {"type": "string"},
+                },
+            },
+            "write_mode": {"type": "string", "enum": ["append", "overwrite", "upsert", "merge"], "default": "upsert"},
+            "merge_keys": {"type": "array", "items": {"type": "string"}},
+            "idempotency_key": {"type": "string"},
+        },
         "required": ["query"],
     }
     vector_schema = {
@@ -95,6 +154,10 @@ def _input_schema_for_tool_type(tool_type: str) -> dict:
     schemas = {
         "postgres": sql_schema,
         "mysql": sql_schema,
+        "sqlserver": sql_schema,
+        "snowflake": sql_schema,
+        "databricks": sql_schema,
+        "bigquery": sql_schema,
         "vector_db": vector_schema,
         "pinecone": vector_schema,
         "weaviate": vector_schema,
@@ -130,7 +193,52 @@ def _input_schema_for_tool_type(tool_type: str) -> dict:
             "type": "object",
             "properties": {
                 "key": {"type": "string", "description": "Object key or prefix"},
-                "action": {"type": "string", "enum": ["get", "list"], "default": "get"},
+                "artifact_ref": {
+                    "type": "object",
+                    "properties": {"path": {"type": "string"}, "format": {"type": "string"}},
+                },
+                "action": {"type": "string", "enum": ["get", "list", "put", "write"], "default": "get"},
+                "idempotency_key": {"type": "string"},
+            },
+            "required": ["key"],
+        },
+        "minio": {
+            "type": "object",
+            "properties": {
+                "key": {"type": "string", "description": "Object key or prefix"},
+                "artifact_ref": {"type": "object", "properties": {"path": {"type": "string"}, "format": {"type": "string"}}},
+                "action": {"type": "string", "enum": ["get", "list", "put", "write"], "default": "get"},
+                "idempotency_key": {"type": "string"},
+            },
+            "required": ["key"],
+        },
+        "ceph": {
+            "type": "object",
+            "properties": {
+                "key": {"type": "string", "description": "Object key or prefix"},
+                "artifact_ref": {"type": "object", "properties": {"path": {"type": "string"}, "format": {"type": "string"}}},
+                "action": {"type": "string", "enum": ["get", "list", "put", "write"], "default": "get"},
+                "idempotency_key": {"type": "string"},
+            },
+            "required": ["key"],
+        },
+        "azure_blob": {
+            "type": "object",
+            "properties": {
+                "key": {"type": "string", "description": "Blob name or prefix"},
+                "artifact_ref": {"type": "object", "properties": {"path": {"type": "string"}, "format": {"type": "string"}}},
+                "action": {"type": "string", "enum": ["get", "list", "put", "write"], "default": "get"},
+                "idempotency_key": {"type": "string"},
+            },
+            "required": ["key"],
+        },
+        "gcs": {
+            "type": "object",
+            "properties": {
+                "key": {"type": "string", "description": "Object key or prefix"},
+                "artifact_ref": {"type": "object", "properties": {"path": {"type": "string"}, "format": {"type": "string"}}},
+                "action": {"type": "string", "enum": ["get", "list", "put", "write"], "default": "get"},
+                "idempotency_key": {"type": "string"},
             },
             "required": ["key"],
         },
@@ -197,6 +305,67 @@ class AgentExecutor:
     def __init__(self, db: Session):
         self.db = db
         self.payment_processor = PaymentProcessor(db)
+
+    async def _persist_output_artifact(self, job: Job, step: WorkflowStep, output_data: Dict[str, Any]) -> Dict[str, Any]:
+        output_format = (getattr(job, "output_artifact_format", None) or "jsonl").strip().lower()
+        if output_format not in ("jsonl", "json"):
+            output_format = "jsonl"
+        if output_format == "json":
+            payload_bytes = json.dumps(output_data, ensure_ascii=False).encode("utf-8")
+            filename = f"job_{job.id}_step_{step.step_order}_output.json"
+        else:
+            if isinstance(output_data, dict):
+                records = output_data.get("records")
+                if isinstance(records, list):
+                    lines = [json.dumps(r, ensure_ascii=False) for r in records]
+                else:
+                    lines = [json.dumps(output_data, ensure_ascii=False)]
+            else:
+                lines = [json.dumps({"result": output_data}, ensure_ascii=False)]
+            payload_bytes = ("\n".join(lines) + "\n").encode("utf-8")
+            filename = f"job_{job.id}_step_{step.step_order}_output.jsonl"
+
+        file_meta = await persist_file(filename, payload_bytes, "application/json", job_id=job.id)
+        return {
+            "artifact_id": str(uuid.uuid4()),
+            "storage": file_meta.get("storage", "s3"),
+            "bucket": file_meta.get("bucket"),
+            "key": file_meta.get("key"),
+            "path": file_meta.get("path"),
+            "format": output_format,
+            "size_bytes": int(file_meta.get("size", len(payload_bytes))),
+            "created_at": datetime.utcnow().isoformat(),
+        }
+
+    async def _trigger_platform_write(self, *, business_id: int, write_spec: Dict[str, Any], artifact_ref: Dict[str, Any], step: WorkflowStep) -> Dict[str, Any]:
+        tool_name = str(write_spec.get("tool_name", "")).strip()
+        if not tool_name:
+            raise ValueError("output_contract.write_targets[].tool_name is required for platform mode")
+        operation_type = str(write_spec.get("operation_type", "upsert")).strip().lower()
+        write_mode = str(write_spec.get("write_mode", "upsert")).strip().lower()
+        arguments = {
+            "artifact_ref": {
+                "storage": artifact_ref.get("storage"),
+                "bucket": artifact_ref.get("bucket"),
+                "path": artifact_ref.get("key") or artifact_ref.get("path"),
+                "format": artifact_ref.get("format"),
+            },
+            "target": write_spec.get("target") or {},
+            "operation_type": operation_type,
+            "write_mode": write_mode,
+            "merge_keys": write_spec.get("merge_keys") or [],
+            "idempotency_key": f"job-{step.job_id}-step-{step.id}-{artifact_ref.get('artifact_id')}",
+            "options": {"step_order": step.step_order, **(write_spec.get("options") or {})},
+        }
+        timeout = float(write_spec.get("timeout_seconds") or getattr(settings, "MCP_TOOL_DEFAULT_TIMEOUT_SECONDS", 60.0))
+        return await mcp_call_tool(
+            base_url=settings.PLATFORM_MCP_SERVER_URL.rstrip("/"),
+            tool_name=tool_name,
+            arguments=arguments,
+            endpoint_path="/mcp",
+            extra_headers={"X-MCP-Business-Id": str(business_id)},
+            timeout=timeout,
+        )
     
     async def execute_job(self, job_id: int):
         """Execute a job by running all workflow steps"""
@@ -214,6 +383,7 @@ class AgentExecutor:
         
         if not workflow_steps:
             job.status = JobStatus.FAILED
+            job.execution_token = None
             job.failure_reason = "No workflow steps found for this job"
             self.db.commit()
             return
@@ -354,11 +524,59 @@ class AgentExecutor:
                 logger.debug("=================================================")
                 
                 # Execute agent (API or plugin)
+                output_data = None
+                artifact_ref = None
+                contract = _parse_output_contract(getattr(job, "output_contract", None))
+                write_mode = (getattr(job, "write_execution_mode", None) or "platform").strip().lower()
+                write_targets: List[Dict[str, Any]] = contract.get("write_targets") if isinstance(contract, dict) else []
+                write_policy = _parse_write_policy(contract, len(write_targets) if isinstance(write_targets, list) else 0)
+                write_results: List[Dict[str, Any]] = []
                 try:
                     output_data = await self._execute_agent(agent, input_data)
-                    
-                    # Update step with output
-                    step.output_data = json.dumps(output_data)
+                    artifact_ref = await self._persist_output_artifact(job, step, output_data)
+                    if write_mode == "platform" and isinstance(write_targets, list) and write_targets:
+                        successful_writes = 0
+                        for target in write_targets:
+                            if not isinstance(target, dict):
+                                continue
+                            tool_name = str(target.get("tool_name", "")).strip() or None
+                            try:
+                                write_result = await self._trigger_platform_write(
+                                    business_id=job.business_id,
+                                    write_spec=target,
+                                    artifact_ref=artifact_ref,
+                                    step=step,
+                                )
+                                write_results.append({
+                                    "tool_name": tool_name,
+                                    "status": "success",
+                                    "result": write_result,
+                                })
+                                successful_writes += 1
+                            except Exception as target_error:
+                                write_results.append({
+                                    "tool_name": tool_name,
+                                    "status": "failed",
+                                    "error": str(target_error),
+                                })
+                                # Policy-controlled behavior: fail immediately or continue collecting target outcomes.
+                                if write_policy.get("on_write_error") == "fail_job":
+                                    raise
+                        if successful_writes < int(write_policy.get("min_successful_targets", 0)):
+                            raise ValueError(
+                                "Write policy violation: "
+                                f"successful_targets={successful_writes} < "
+                                f"min_successful_targets={write_policy.get('min_successful_targets')}"
+                            )
+
+                    # Update step with output + persisted artifact reference contract
+                    step.output_data = json.dumps({
+                        "agent_output": output_data,
+                        "artifact_ref": artifact_ref,
+                        "write_execution_mode": write_mode,
+                        "write_policy": write_policy,
+                        "write_results": write_results,
+                    })
                     step.status = "completed"
                     step.completed_at = datetime.utcnow()
                     step.cost = agent.price_per_task
@@ -369,8 +587,15 @@ class AgentExecutor:
                     error_msg = str(step_error)
                     if len(error_msg) > 500:
                         error_msg = error_msg[:500] + "..."
-                    # Store error in output_data for reference
-                    step.output_data = json.dumps({"error": error_msg})
+                    # Persist error with best-effort context for postmortem debugging.
+                    step.output_data = json.dumps({
+                        "error": error_msg,
+                        "agent_output": output_data,
+                        "artifact_ref": artifact_ref,
+                        "write_execution_mode": write_mode,
+                        "write_policy": write_policy,
+                        "write_results": write_results,
+                    })
                     self.db.commit()
                     
                     # Re-raise to mark job as failed
@@ -393,6 +618,7 @@ class AgentExecutor:
             
             # Mark job as completed
             job.status = JobStatus.COMPLETED
+            job.execution_token = None
             job.completed_at = datetime.utcnow()
             self.db.commit()
             
@@ -407,6 +633,7 @@ class AgentExecutor:
         except Exception as e:
             # Mark job as failed with reason
             job.status = JobStatus.FAILED
+            job.execution_token = None
             error_message = str(e)
             # Truncate very long error messages
             if len(error_message) > 500:
@@ -936,10 +1163,18 @@ END DOCUMENT {i+1}: {doc_name}
             "chroma": "Chroma vector store",
             "postgres": "PostgreSQL database",
             "mysql": "MySQL database",
+            "sqlserver": "SQL Server database",
+            "snowflake": "Snowflake data warehouse",
+            "databricks": "Databricks SQL warehouse",
+            "bigquery": "Google BigQuery warehouse",
             "elasticsearch": "Elasticsearch search",
             "pageindex": "PageIndex (vectorless document retrieval)",
             "filesystem": "File system access",
             "s3": "AWS S3 storage",
+            "minio": "MinIO object storage",
+            "ceph": "Ceph object storage",
+            "azure_blob": "Azure Blob storage",
+            "gcs": "Google Cloud Storage",
             "slack": "Slack integration",
             "github": "GitHub API",
             "notion": "Notion API",

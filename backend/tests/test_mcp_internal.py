@@ -143,6 +143,30 @@ class TestInternalMCPListTools:
         names = [t["name"] for t in r.json()["tools"]]
         assert "Inactive FS" not in names or not any("Inactive" in n for n in names)
 
+    def test_list_tools_includes_write_capable_schema_for_snowflake(self, db_session, client_internal, internal_secret, business_user):
+        from core.encryption import encrypt_json
+        tool = MCPToolConfig(
+            user_id=business_user.id,
+            tool_type=MCPToolType.SNOWFLAKE,
+            name="Snowflake DW",
+            encrypted_config=encrypt_json({"account": "a", "warehouse": "w"}),
+            is_active=True,
+        )
+        db_session.add(tool)
+        db_session.commit()
+        r = client_internal.get(
+            f"/api/internal/mcp/tools?business_id={business_user.id}",
+            headers={"X-Internal-Secret": internal_secret},
+        )
+        assert r.status_code == 200
+        entries = r.json()["tools"]
+        sf = next((x for x in entries if x["id"] == tool.id), None)
+        assert sf is not None
+        assert "inputSchema" in sf
+        props = sf["inputSchema"].get("properties", {})
+        assert "operation_type" in props
+        assert "merge_keys" in props
+
 
 class TestInternalMCPGetConfig:
     """POST /api/internal/mcp/tools/{tool_id}/config with body { business_id }."""
