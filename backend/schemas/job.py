@@ -242,6 +242,9 @@ class JobResponse(BaseModel):
     allowed_platform_tool_ids: Optional[List[int]] = None
     allowed_connection_ids: Optional[List[int]] = None
     tool_visibility: Optional[str] = None  # full | names_only | none
+    # Schedule-aware fields for frontend UX
+    show_cancel_option: bool = False  # True when in_progress job exceeds stuck threshold
+    scheduled_at: Optional[datetime] = None  # From job's schedule, for countdown timer
 
     class Config:
         from_attributes = True

@@ -19,6 +19,8 @@ def upgrade() -> None:
         "DO $$ BEGIN CREATE TYPE schedulestatus AS ENUM ('active','inactive'); "
         "EXCEPTION WHEN duplicate_object THEN NULL; END $$"
     )
+    # Add IN_QUEUE to jobstatus enum (required for scheduled jobs).
+    op.execute("ALTER TYPE jobstatus ADD VALUE IF NOT EXISTS 'IN_QUEUE' AFTER 'APPROVED'")
     op.execute("""
         CREATE TABLE IF NOT EXISTS job_schedules (
             id SERIAL PRIMARY KEY,
@@ -31,6 +33,12 @@ def upgrade() -> None:
             created_at TIMESTAMP NOT NULL DEFAULT NOW()
         )
     """)
+    # Clean up columns from an earlier prototype that supported cron/recurring
+    # schedules.  Safe no-op when columns do not exist (IF EXISTS).
+    op.execute("ALTER TABLE job_schedules DROP COLUMN IF EXISTS cron_expression")
+    op.execute("ALTER TABLE job_schedules DROP COLUMN IF EXISTS is_one_time")
+    op.execute("ALTER TABLE job_schedules DROP COLUMN IF EXISTS days_of_week")
+    op.execute("ALTER TABLE job_schedules DROP COLUMN IF EXISTS schedule_time")
     op.execute(
         "CREATE INDEX IF NOT EXISTS idx_job_schedules_next_run_time "
         "ON job_schedules(next_run_time) WHERE next_run_time IS NOT NULL"
