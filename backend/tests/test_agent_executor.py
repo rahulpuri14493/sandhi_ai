@@ -272,8 +272,8 @@ def test_apply_tool_visibility_none_returns_empty():
     assert _apply_tool_visibility([], "full") == []
 
 
-def test_apply_tool_visibility_names_only_strips_schema():
-    """tool_visibility 'names_only' returns name/description only, no schema or business_description."""
+def test_apply_tool_visibility_names_only_truncates_but_keeps_routing_fields():
+    """tool_visibility 'names_only' shortens description but keeps schema/business context for SQL and BYO routing."""
     tools = [
         {"name": "db1", "description": "PostgreSQL DB", "schema_metadata": "{}", "business_description": "Sales DB"},
     ]
@@ -281,8 +281,8 @@ def test_apply_tool_visibility_names_only_strips_schema():
     assert len(out) == 1
     assert out[0]["name"] == "db1"
     assert "PostgreSQL" in out[0]["description"]
-    assert "schema_metadata" not in out[0]
-    assert "business_description" not in out[0]
+    assert out[0]["schema_metadata"] == "{}"
+    assert out[0]["business_description"] == "Sales DB"
 
 
 def test_apply_tool_visibility_full_returns_unchanged():

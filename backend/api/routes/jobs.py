@@ -228,7 +228,16 @@ class UserResponseRequest(BaseModel):
 
 @router.get("/output-contract/template", status_code=status.HTTP_200_OK)
 def get_output_contract_template():
-    """Universal output contract template for artifact-first write execution."""
+    """
+    Universal output contract template for artifact-first write execution.
+
+    Use `write_execution_mode` / `write_mode` = platform so the job executor pushes the step
+    artifact to each `write_targets[]` tool. Object stores, Snowflake/BigQuery, SQL Server,
+    Postgres, and MySQL are supported for structured loads (merge_keys + operation_type).
+
+    Agent-driven SQL (reads and ad-hoc writes) still uses the interactive Postgres/MySQL tools
+    with `query` / `params` only; that path is separate from this contract.
+    """
     return {
         "version": "1.0",
         "record_schema": {
@@ -1506,6 +1515,14 @@ def auto_split_workflow(
     tv = body.tool_visibility
     if tv is not None and tv not in ("full", "names_only", "none"):
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="tool_visibility must be 'full', 'names_only', or 'none'")
+    if body.write_execution_mode is not None:
+        job.write_execution_mode = _validate_write_execution_mode(body.write_execution_mode)
+    if body.output_artifact_format is not None:
+        job.output_artifact_format = _validate_output_artifact_format(body.output_artifact_format)
+    if body.output_contract is not None:
+        contract_obj = _validate_output_contract_policy(body.output_contract)
+        job.output_contract = json.dumps(contract_obj) if contract_obj is not None else None
+    db.commit()
     workflow_builder = WorkflowBuilder(db)
     preview = workflow_builder.auto_split_workflow(job_id, body.agent_ids, workflow_mode=workflow_mode, step_tools=step_tools, tool_visibility=tv)
     return preview

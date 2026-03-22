@@ -193,17 +193,36 @@ export const jobsAPI = {
     agentIds: number[],
     workflowMode?: 'independent' | 'sequential',
     stepTools?: Array<{ agent_index: number; allowed_platform_tool_ids?: number[]; allowed_connection_ids?: number[]; tool_visibility?: 'full' | 'names_only' | 'none' }>,
-    toolVisibility?: 'full' | 'names_only' | 'none'
+    toolVisibility?: 'full' | 'names_only' | 'none',
+    outputSettings?: {
+      write_execution_mode?: 'platform' | 'agent'
+      output_artifact_format?: 'jsonl' | 'json'
+      output_contract?: Record<string, unknown>
+    }
   ) {
     const body: {
       agent_ids: number[]
       workflow_mode?: string
       step_tools?: Array<{ agent_index: number; allowed_platform_tool_ids?: number[]; allowed_connection_ids?: number[]; tool_visibility?: string }>
       tool_visibility?: string
+      write_execution_mode?: string
+      output_artifact_format?: string
+      output_contract?: Record<string, unknown>
     } = { agent_ids: agentIds }
     if (workflowMode) body.workflow_mode = workflowMode
     if (stepTools?.length) body.step_tools = stepTools
     if (toolVisibility) body.tool_visibility = toolVisibility
+    if (outputSettings) {
+      if (outputSettings.write_execution_mode !== undefined) {
+        body.write_execution_mode = outputSettings.write_execution_mode
+      }
+      if (outputSettings.output_artifact_format !== undefined) {
+        body.output_artifact_format = outputSettings.output_artifact_format
+      }
+      if (outputSettings.output_contract !== undefined) {
+        body.output_contract = outputSettings.output_contract
+      }
+    }
     return api.post('/jobs/' + jobId + '/workflow/auto-split', body).then((res) => res.data)
   },
   updateStepTools(
@@ -347,6 +366,7 @@ export const mcpAPI = {
         name: string
         tool_type?: string
         description?: string
+        access_mode?: 'read_only' | 'read_write'
       }>;
       connection_tools: Array<{
         connection_id: number

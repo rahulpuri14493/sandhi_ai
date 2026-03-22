@@ -12,10 +12,12 @@ from models.audit_log import AuditLog
 from models.mcp_server import MCPToolConfig, MCPServerConnection
 from services.payment_processor import PaymentProcessor
 from services.a2a_client import execute_via_a2a
-from services.mcp_client import call_tool as mcp_call_tool
+from services.mcp_client import call_tool as mcp_call_tool, list_tools as mcp_list_tools
+from core.encryption import decrypt_json
 from services.db_schema_introspection import format_schema_for_prompt
 from services.job_file_storage import persist_file
 from core.config import settings
+from services.mcp_tool_input_schemas import input_schema_for_platform_tool_type
 
 logger = logging.getLogger(__name__)
 
@@ -73,6 +75,11 @@ def _apply_tool_visibility(tools: list, visibility: Optional[str]) -> list:
                 "platform_tool_id": t.get("platform_tool_id"),
                 "connection_id": t.get("connection_id"),
                 "tool_type": t.get("tool_type"),
+                # Required for BYO routing and OpenAI parameters (read + write tool calls)
+                "external_tool_name": t.get("external_tool_name"),
+                "input_schema": t.get("input_schema"),
+                "schema_metadata": t.get("schema_metadata"),
+                "business_description": t.get("business_description"),
             }
             for t in tools
         ]
@@ -109,173 +116,18 @@ def _parse_write_policy(contract: Dict[str, Any], write_targets_count: int) -> D
     }
 
 
-# OpenAI-style tool parameter schemas for MCP tool types (must match platform MCP server expectations)
 def _input_schema_for_tool_type(tool_type: str) -> dict:
-    sql_schema = {
-        "type": "object",
-        "properties": {
-            "operation_type": {
-                "type": "string",
-                "enum": ["read", "insert", "update", "upsert", "merge"],
-                "default": "read",
-            },
-            "query": {"type": "string", "description": "SQL query (read or write as allowed by policy)"},
-            "artifact_ref": {
-                "type": "object",
-                "properties": {
-                    "storage": {"type": "string"},
-                    "path": {"type": "string"},
-                    "format": {"type": "string"},
-                },
-            },
-            "target": {
-                "type": "object",
-                "properties": {
-                    "database": {"type": "string"},
-                    "schema": {"type": "string"},
-                    "table": {"type": "string"},
-                    "name": {"type": "string"},
-                },
-            },
-            "write_mode": {"type": "string", "enum": ["append", "overwrite", "upsert", "merge"], "default": "upsert"},
-            "merge_keys": {"type": "array", "items": {"type": "string"}},
-            "idempotency_key": {"type": "string"},
-        },
-        "required": ["query"],
-    }
-    vector_schema = {
-        "type": "object",
-        "properties": {
-            "query": {"type": "string", "description": "Search query or embedding query"},
-            "top_k": {"type": "integer", "description": "Max results", "default": 5},
-        },
-        "required": ["query"],
-    }
-    schemas = {
-        "postgres": sql_schema,
-        "mysql": sql_schema,
-        "sqlserver": sql_schema,
-        "snowflake": sql_schema,
-        "databricks": sql_schema,
-        "bigquery": sql_schema,
-        "vector_db": vector_schema,
-        "pinecone": vector_schema,
-        "weaviate": vector_schema,
-        "qdrant": vector_schema,
-        "chroma": vector_schema,
-        "elasticsearch": {
-            "type": "object",
-            "properties": {
-                "query": {"type": "string", "description": "Search query"},
-                "index": {"type": "string", "description": "Index name"},
-                "size": {"type": "integer", "default": 10},
-            },
-            "required": ["query"],
-        },
-        "pageindex": {
-            "type": "object",
-            "properties": {
-                "query": {"type": "string", "description": "Natural language or keyword query over documents"},
-                "doc_id": {"type": "string", "description": "PageIndex document ID (optional if default_doc_id in config)"},
-                "thinking": {"type": "boolean", "description": "Use reasoning before retrieval", "default": False},
-            },
-            "required": ["query"],
-        },
-        "filesystem": {
-            "type": "object",
-            "properties": {
-                "path": {"type": "string", "description": "Relative path under base_path"},
-                "action": {"type": "string", "enum": ["read", "list"], "default": "read"},
-            },
-            "required": ["path"],
-        },
-        "s3": {
-            "type": "object",
-            "properties": {
-                "key": {"type": "string", "description": "Object key or prefix"},
-                "artifact_ref": {
-                    "type": "object",
-                    "properties": {"path": {"type": "string"}, "format": {"type": "string"}},
-                },
-                "action": {"type": "string", "enum": ["get", "list", "put", "write"], "default": "get"},
-                "idempotency_key": {"type": "string"},
-            },
-            "required": ["key"],
-        },
-        "minio": {
-            "type": "object",
-            "properties": {
-                "key": {"type": "string", "description": "Object key or prefix"},
-                "artifact_ref": {"type": "object", "properties": {"path": {"type": "string"}, "format": {"type": "string"}}},
-                "action": {"type": "string", "enum": ["get", "list", "put", "write"], "default": "get"},
-                "idempotency_key": {"type": "string"},
-            },
-            "required": ["key"],
-        },
-        "ceph": {
-            "type": "object",
-            "properties": {
-                "key": {"type": "string", "description": "Object key or prefix"},
-                "artifact_ref": {"type": "object", "properties": {"path": {"type": "string"}, "format": {"type": "string"}}},
-                "action": {"type": "string", "enum": ["get", "list", "put", "write"], "default": "get"},
-                "idempotency_key": {"type": "string"},
-            },
-            "required": ["key"],
-        },
-        "azure_blob": {
-            "type": "object",
-            "properties": {
-                "key": {"type": "string", "description": "Blob name or prefix"},
-                "artifact_ref": {"type": "object", "properties": {"path": {"type": "string"}, "format": {"type": "string"}}},
-                "action": {"type": "string", "enum": ["get", "list", "put", "write"], "default": "get"},
-                "idempotency_key": {"type": "string"},
-            },
-            "required": ["key"],
-        },
-        "gcs": {
-            "type": "object",
-            "properties": {
-                "key": {"type": "string", "description": "Object key or prefix"},
-                "artifact_ref": {"type": "object", "properties": {"path": {"type": "string"}, "format": {"type": "string"}}},
-                "action": {"type": "string", "enum": ["get", "list", "put", "write"], "default": "get"},
-                "idempotency_key": {"type": "string"},
-            },
-            "required": ["key"],
-        },
-        "slack": {
-            "type": "object",
-            "properties": {
-                "channel": {"type": "string", "description": "Channel ID or name"},
-                "message": {"type": "string", "description": "Message text"},
-                "action": {"type": "string", "enum": ["list_channels", "send"], "default": "send"},
-            },
-        },
-        "github": {
-            "type": "object",
-            "properties": {
-                "repo": {"type": "string", "description": "owner/repo"},
-                "path": {"type": "string", "description": "File path or 'issues'"},
-                "action": {"type": "string", "enum": ["get_file", "list_issues", "search"], "default": "get_file"},
-            },
-        },
-        "notion": {
-            "type": "object",
-            "properties": {
-                "action": {"type": "string", "enum": ["search", "get_page", "get_database"], "default": "search"},
-                "query": {"type": "string", "description": "Search query or page/database ID"},
-            },
-        },
-        "rest_api": {
-            "type": "object",
-            "properties": {
-                "method": {"type": "string", "enum": ["GET", "POST", "PUT", "PATCH", "DELETE"], "default": "GET"},
-                "path": {"type": "string", "description": "Path or full URL"},
-                "body": {"type": "object", "description": "JSON body for POST/PUT/PATCH"},
-            },
-            "required": ["path"],
-        },
-    }
-    return schemas.get((tool_type or "").lower(), {"type": "object", "properties": {}})
+    """OpenAI-style parameters for platform MCP tools (same JSON Schema as internal tools/list)."""
+    return input_schema_for_platform_tool_type(tool_type)
+
+
+def _sanitize_platform_sql_tool_arguments(tool_type: str, arguments: Dict[str, Any]) -> Dict[str, Any]:
+    """Strip artifact/output-contract keys models sometimes mix into interactive Postgres/MySQL calls."""
+    tt = (tool_type or "").strip().lower()
+    if tt not in ("postgres", "mysql") or not isinstance(arguments, dict):
+        return arguments
+    out = {k: v for k, v in arguments.items() if k in ("query", "params")}
+    return out
 
 
 def _openai_tools_from_mcp(available_mcp_tools: list) -> list:
@@ -289,7 +141,13 @@ def _openai_tools_from_mcp(available_mcp_tools: list) -> list:
         if t.get("schema_metadata") or t.get("business_description"):
             description = description.rstrip(". ") + ". Database schema and business context are in the system message—use them to write correct SQL."
         tool_type = t.get("tool_type")
-        schema = _input_schema_for_tool_type(tool_type) if tool_type else {"type": "object", "properties": {}}
+        # BYO MCP: use remote inputSchema so read/write arguments match the external server
+        if (t.get("source") == "external") and t.get("input_schema"):
+            schema = t.get("input_schema")
+            if not isinstance(schema, dict):
+                schema = {"type": "object", "properties": {}}
+        else:
+            schema = _input_schema_for_tool_type(tool_type) if tool_type else {"type": "object", "properties": {}}
         tools.append({
             "type": "function",
             "function": {
@@ -452,7 +310,7 @@ class AgentExecutor:
                 if job_conn_ids is not None and effective_conn is not None:
                     effective_conn = [x for x in effective_conn if x in job_conn_ids]
 
-                available_mcp_tools = self._get_available_mcp_tools(
+                available_mcp_tools = await self._get_available_mcp_tools_async(
                     job.business_id,
                     platform_tool_ids=effective_platform if effective_platform is not None else None,
                     connection_ids=effective_conn if effective_conn is not None else None,
@@ -705,10 +563,14 @@ class AgentExecutor:
         available_mcp_tools = input_data.get("available_mcp_tools") or []
         openai_tools = _openai_tools_from_mcp(available_mcp_tools) if available_mcp_tools else []
         business_id = input_data.get("business_id")
-        max_tool_iterations = 5
+        # One model call per round. A workflow with N tool rounds needs N+1 calls (tools then final answer).
+        # A fixed `for range(5)` could end right after a tool round with no follow-up call, leaving `content` "".
+        max_agent_rounds = 20
+        round_idx = 0
         content = ""
 
-        for iteration in range(max_tool_iterations):
+        while round_idx < max_agent_rounds:
+            round_idx += 1
             metadata = {
                 "openai_url": url,
                 "openai_api_key": api_key or "",
@@ -731,6 +593,7 @@ class AgentExecutor:
                 break
             # Append assistant message with tool_calls
             messages.append({"role": "assistant", "content": content or None, "tool_calls": tool_calls})
+            routing = {t.get("name"): t for t in (available_mcp_tools or []) if t.get("name")}
             for tc in tool_calls:
                 tc_id = tc.get("id")
                 fn = tc.get("function") or {}
@@ -740,9 +603,20 @@ class AgentExecutor:
                     args = json.loads(args_raw) if isinstance(args_raw, str) else args_raw
                 except (json.JSONDecodeError, TypeError):
                     args = {}
-                tool_result = await self._call_platform_mcp_tool(business_id, tool_name, args)
+                tool_result = await self._invoke_mcp_tool(business_id, tool_name, args, routing)
                 messages.append({"role": "tool", "tool_call_id": tc_id, "content": tool_result})
-            logger.info("MCP tool round %s: %s tool call(s), continuing agent loop", iteration + 1, len(tool_calls))
+            logger.info("MCP tool round %s: %s tool call(s), continuing agent loop", round_idx, len(tool_calls))
+
+        if not (content or "").strip():
+            for msg in reversed(messages):
+                if isinstance(msg, dict) and msg.get("role") == "tool":
+                    tr = msg.get("content")
+                    if tr:
+                        content = (
+                            "The model did not return a final assistant message after tools ran. "
+                            "Last tool result:\n\n" + str(tr)
+                        )
+                        break
 
         return {"content": content}
 
@@ -934,6 +808,24 @@ class AgentExecutor:
             for t in available_mcp_tools:
                 system_content += f"  - {t.get('name', '')}: {t.get('description', '')}\n"
             system_content += "\n"
+            if any(str(t.get("tool_type", "")).lower() in ("postgres", "mysql") for t in available_mcp_tools):
+                system_content += (
+                    "CRITICAL — PostgreSQL/MySQL platform tools: call with ONLY the arguments allowed by the tool schema: "
+                    "`query` (required) and optionally `params`. "
+                    "Do NOT send write_mode, operation_type, target, artifact_ref, merge_keys, or idempotency_key with "
+                    "these tools — those fields belong to the job output contract (e.g. MinIO/Snowflake artifact writes), "
+                    "not to interactive SQL. "
+                    "For a row count use only: {\"query\": \"SELECT COUNT(*) FROM your_table\"}.\n\n"
+                )
+            if any(
+                str(t.get("tool_type", "")).lower() in ("s3", "minio", "ceph", "azure_blob", "gcs")
+                for t in available_mcp_tools
+            ):
+                system_content += (
+                    "CRITICAL — S3 / MinIO / object storage tools: for action put or write you MUST include "
+                    "`body` or `content` with the full file payload as a string in the SAME tool call (e.g. JSONL text). "
+                    "Calling put/write with only `key` will fail. For listing or reading, use action list or get.\n\n"
+                )
             # Database schema and business context for SQL tools (so the agent can write correct queries)
             schema_tools = [t for t in available_mcp_tools if t.get("schema_metadata") or t.get("business_description")]
             if schema_tools:
@@ -1144,7 +1036,7 @@ END DOCUMENT {i+1}: {doc_name}
             })
         return peer_list
 
-    def _get_available_mcp_tools(
+    async def _get_available_mcp_tools_async(
         self,
         business_id: int,
         platform_tool_ids: Optional[list] = None,
@@ -1154,6 +1046,8 @@ END DOCUMENT {i+1}: {doc_name}
         Return list of MCP tool descriptors for the business (tenant) for agent context.
         If platform_tool_ids/connection_ids are provided, only those tools are returned
         (per-step or per-job allowlist). Otherwise all active business tools are returned.
+        BYO connections: calls tools/list on each server and registers one OpenAI function per remote tool
+        (name byo_{connection_id}_{slug}) so tools/call can route read and write operations correctly.
         """
         TOOL_TYPE_DESC = {
             "vector_db": "Vector database (semantic search)",
@@ -1209,15 +1103,117 @@ END DOCUMENT {i+1}: {doc_name}
         )
         if connection_ids:
             conn_query = conn_query.filter(MCPServerConnection.id.in_(connection_ids))
-        conns = conn_query.all()
+        conns = conn_query.order_by(MCPServerConnection.name).all()
         for c in conns:
-            tools.append({
-                "name": c.name,
-                "description": f"External MCP server: {c.base_url}",
-                "source": "external",
-                "connection_id": c.id,
-            })
+            creds = None
+            if c.encrypted_credentials:
+                try:
+                    creds = decrypt_json(c.encrypted_credentials)
+                except Exception:
+                    creds = None
+            base_url = (c.base_url or "").strip().rstrip("/")
+            endpoint_path = (c.endpoint_path or "/mcp").strip()
+            if not endpoint_path.startswith("/"):
+                endpoint_path = "/" + endpoint_path
+            remote_tools: list = []
+            try:
+                res = await mcp_list_tools(
+                    base_url=base_url,
+                    endpoint_path=endpoint_path,
+                    auth_type=c.auth_type or "none",
+                    credentials=creds,
+                    timeout=20.0,
+                )
+                remote_tools = res.get("tools") or []
+            except Exception as e:
+                logger.warning(
+                    "BYO MCP tools/list failed for connection id=%s name=%s url=%s: %s",
+                    c.id, c.name, base_url, e,
+                )
+                continue
+            used_slugs: set = set()
+            for idx, rt in enumerate(remote_tools):
+                raw_name = (rt.get("name") or "").strip()
+                if not raw_name:
+                    continue
+                base_slug = _safe_slug(raw_name) or f"tool_{idx}"
+                slug = base_slug
+                suffix = 0
+                while slug in used_slugs:
+                    suffix += 1
+                    slug = f"{base_slug}_{suffix}"
+                used_slugs.add(slug)
+                fn_name = f"byo_{c.id}_{slug}"
+                desc = (rt.get("description") or raw_name).strip()
+                if len(desc) > 1800:
+                    desc = desc[:1800] + "…"
+                schema = rt.get("inputSchema") or rt.get("input_schema")
+                if not isinstance(schema, dict):
+                    schema = {"type": "object", "properties": {}}
+                tools.append({
+                    "name": fn_name,
+                    "description": f"[BYO MCP: {c.name}] {desc}",
+                    "source": "external",
+                    "connection_id": c.id,
+                    "external_tool_name": raw_name,
+                    "input_schema": schema,
+                })
         return tools
+
+    @staticmethod
+    def _mcp_tool_result_to_text(result: Dict[str, Any]) -> str:
+        content_list = result.get("content") or []
+        texts = []
+        for part in content_list:
+            if isinstance(part, dict) and part.get("type") == "text":
+                texts.append(part.get("text", ""))
+        return "\n".join(texts) if texts else json.dumps(result)
+
+    async def _invoke_mcp_tool(
+        self,
+        business_id: int,
+        tool_name: str,
+        arguments: Dict[str, Any],
+        routing: Dict[str, Dict[str, Any]],
+    ) -> str:
+        """
+        Route tool call to platform MCP server or BYO (external) MCP connection.
+        BYO tools use names from tools/list (byo_{connection_id}_{slug}) and forward to tools/call on that server.
+        """
+        meta = routing.get(tool_name) if routing else None
+        if not meta:
+            return json.dumps({"error": f"Unknown tool {tool_name!r}. Not in this job's MCP tool list."})
+        if meta.get("source") == "external":
+            conn = self.db.query(MCPServerConnection).filter(
+                MCPServerConnection.id == meta["connection_id"],
+                MCPServerConnection.user_id == business_id,
+                MCPServerConnection.is_active == True,
+            ).first()
+            if not conn:
+                return json.dumps({"error": "MCP connection not found or not allowed for this job."})
+            ext_name = (meta.get("external_tool_name") or "").strip()
+            if not ext_name:
+                return json.dumps({"error": "External MCP tool name missing in registry."})
+            creds = decrypt_json(conn.encrypted_credentials) if conn.encrypted_credentials else None
+            timeout = float(getattr(settings, "MCP_TOOL_DEFAULT_TIMEOUT_SECONDS", 60.0))
+            try:
+                result = await mcp_call_tool(
+                    base_url=conn.base_url.rstrip("/"),
+                    tool_name=ext_name,
+                    arguments=arguments or {},
+                    endpoint_path=conn.endpoint_path or "/mcp",
+                    auth_type=conn.auth_type or "none",
+                    credentials=creds,
+                    timeout=timeout,
+                )
+            except Exception as e:
+                logger.exception("BYO MCP tools/call failed connection_id=%s tool=%s", meta.get("connection_id"), ext_name)
+                return json.dumps({"error": str(e)})
+            return self._mcp_tool_result_to_text(result)
+        args = arguments if isinstance(arguments, dict) else {}
+        if meta.get("source") == "platform":
+            args = _sanitize_platform_sql_tool_arguments(str(meta.get("tool_type") or ""), args)
+        return await self._call_platform_mcp_tool(business_id, tool_name, args)
 
     async def _call_platform_mcp_tool(
         self, business_id: int, tool_name: str, arguments: Dict[str, Any]
@@ -1238,12 +1234,7 @@ END DOCUMENT {i+1}: {doc_name}
             )
         except Exception as e:
             return json.dumps({"error": str(e)})
-        content_list = result.get("content") or []
-        texts = []
-        for part in content_list:
-            if isinstance(part, dict) and part.get("type") == "text":
-                texts.append(part.get("text", ""))
-        return "\n".join(texts) if texts else json.dumps(result)
+        return self._mcp_tool_result_to_text(result)
 
     def _log_action(self, entity_type: str, entity_id: int, action: str, details: Dict[str, Any]):
         """Log an action to the audit log"""

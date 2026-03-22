@@ -14,6 +14,7 @@ from models.mcp_server import MCPToolConfig, MCPToolType
 from models.audit_log import AuditLog
 from core.encryption import decrypt_json
 from core.config import settings
+from services.mcp_tool_input_schemas import input_schema_for_platform_tool_type
 
 router = APIRouter(prefix="/api/internal/mcp", tags=["mcp-internal"])
 
@@ -72,201 +73,35 @@ def _tool_name(tool_id: int, name: str) -> str:
 
 def _description_for_type(tool_type: MCPToolType, name: str) -> str:
     d = {
-        MCPToolType.VECTOR_DB: "Query vector database",
-        MCPToolType.PINECONE: "Query Pinecone vector index",
-        MCPToolType.WEAVIATE: "Query Weaviate vector store",
-        MCPToolType.QDRANT: "Query Qdrant vector database",
-        MCPToolType.CHROMA: "Query Chroma vector store",
-        MCPToolType.POSTGRES: "Execute read-only PostgreSQL query",
-        MCPToolType.MYSQL: "Execute read-only MySQL query",
-        MCPToolType.SQLSERVER: "Execute read and write SQL Server operations",
-        MCPToolType.SNOWFLAKE: "Execute read and write Snowflake operations",
-        MCPToolType.DATABRICKS: "Execute read and write Databricks operations",
-        MCPToolType.BIGQUERY: "Execute read and write BigQuery operations",
-        MCPToolType.ELASTICSEARCH: "Search Elasticsearch index",
-        MCPToolType.PAGEINDEX: "Query PageIndex (vectorless document retrieval)",
-        MCPToolType.FILESYSTEM: "Read or list files in configured base path",
-        MCPToolType.S3: "Read or list objects in S3 bucket",
-        MCPToolType.MINIO: "Read or write objects in MinIO bucket",
-        MCPToolType.CEPH: "Read or write objects in Ceph object storage",
-        MCPToolType.AZURE_BLOB: "Read or write objects in Azure Blob storage",
-        MCPToolType.GCS: "Read or write objects in Google Cloud Storage",
-        MCPToolType.SLACK: "Send message or list channels (Slack)",
-        MCPToolType.GITHUB: "Query GitHub repos, issues, or files",
-        MCPToolType.NOTION: "Query or search Notion workspace",
-        MCPToolType.REST_API: "Call external REST API",
+        MCPToolType.VECTOR_DB: "Query vector database (read/search; writes via provider or job flows)",
+        MCPToolType.PINECONE: "Query Pinecone vector index (read/search; writes via provider or job flows)",
+        MCPToolType.WEAVIATE: "Query Weaviate vector store (read/search; writes via provider or job flows)",
+        MCPToolType.QDRANT: "Query Qdrant vector database (read/search; writes via provider or job flows)",
+        MCPToolType.CHROMA: "Query Chroma vector store (read/search; writes via provider or job flows)",
+        MCPToolType.POSTGRES: "Execute PostgreSQL SQL (reads and writes)",
+        MCPToolType.MYSQL: "Execute MySQL SQL (reads and writes)",
+        MCPToolType.SQLSERVER: "Execute SQL Server SQL (reads and writes)",
+        MCPToolType.SNOWFLAKE: "Execute Snowflake SQL (reads and writes)",
+        MCPToolType.DATABRICKS: "Execute Databricks SQL (reads and writes)",
+        MCPToolType.BIGQUERY: "Execute BigQuery SQL (reads and writes)",
+        MCPToolType.ELASTICSEARCH: "Search Elasticsearch index (read); index updates via ES APIs or job flows",
+        MCPToolType.PAGEINDEX: "Query PageIndex documents (read/search; writes via PageIndex APIs where applicable)",
+        MCPToolType.FILESYSTEM: "Read, list, and write files under configured base path",
+        MCPToolType.S3: "Read, list, and write objects in S3 bucket",
+        MCPToolType.MINIO: "Read, list, and write objects in MinIO bucket",
+        MCPToolType.CEPH: "Read, list, and write objects in Ceph object storage",
+        MCPToolType.AZURE_BLOB: "Read, list, and write objects in Azure Blob storage",
+        MCPToolType.GCS: "Read, list, and write objects in Google Cloud Storage",
+        MCPToolType.SLACK: "List channels and send messages (Slack)",
+        MCPToolType.GITHUB: "Read GitHub repos, issues, and files (read-only in platform MCP)",
+        MCPToolType.NOTION: "Search and retrieve Notion pages and databases (read-only in platform MCP)",
+        MCPToolType.REST_API: "Call external REST API (reads and writes)",
     }
     return f"{d.get(tool_type, tool_type.value)}: {name}"
 
 
 def _input_schema_for_type(tool_type: MCPToolType) -> dict:
-    vector_schema = {
-        "type": "object",
-        "properties": {
-            "query": {"type": "string", "description": "Search query or embedding query"},
-            "top_k": {"type": "integer", "description": "Max results", "default": 5},
-        },
-        "required": ["query"],
-    }
-    sql_schema = {
-        "type": "object",
-        "properties": {
-            "operation_type": {
-                "type": "string",
-                "enum": ["read", "insert", "update", "upsert", "merge"],
-                "default": "read",
-            },
-            "query": {"type": "string", "description": "SQL query (read or write as allowed by policy)"},
-            "artifact_ref": {
-                "type": "object",
-                "properties": {
-                    "storage": {"type": "string"},
-                    "path": {"type": "string"},
-                    "format": {"type": "string"},
-                },
-            },
-            "target": {
-                "type": "object",
-                "properties": {
-                    "database": {"type": "string"},
-                    "schema": {"type": "string"},
-                    "table": {"type": "string"},
-                    "name": {"type": "string"},
-                },
-            },
-            "write_mode": {"type": "string", "enum": ["append", "overwrite", "upsert", "merge"], "default": "upsert"},
-            "merge_keys": {"type": "array", "items": {"type": "string"}},
-            "idempotency_key": {"type": "string"},
-        },
-        "required": ["query"],
-    }
-    schemas = {
-        MCPToolType.VECTOR_DB: vector_schema,
-        MCPToolType.PINECONE: vector_schema,
-        MCPToolType.WEAVIATE: vector_schema,
-        MCPToolType.QDRANT: vector_schema,
-        MCPToolType.CHROMA: vector_schema,
-        MCPToolType.POSTGRES: sql_schema,
-        MCPToolType.MYSQL: sql_schema,
-        MCPToolType.SQLSERVER: sql_schema,
-        MCPToolType.SNOWFLAKE: sql_schema,
-        MCPToolType.DATABRICKS: sql_schema,
-        MCPToolType.BIGQUERY: sql_schema,
-        MCPToolType.ELASTICSEARCH: {
-            "type": "object",
-            "properties": {
-                "query": {"type": "string", "description": "Search query"},
-                "index": {"type": "string", "description": "Index name"},
-                "size": {"type": "integer", "default": 10},
-            },
-            "required": ["query"],
-        },
-        MCPToolType.PAGEINDEX: {
-            "type": "object",
-            "properties": {
-                "query": {"type": "string", "description": "Natural language or keyword query over documents"},
-                "doc_id": {"type": "string", "description": "PageIndex document ID (optional if default_doc_id is set in config)"},
-                "thinking": {"type": "boolean", "description": "Use reasoning before retrieval", "default": False},
-            },
-            "required": ["query"],
-        },
-        MCPToolType.FILESYSTEM: {
-            "type": "object",
-            "properties": {
-                "path": {"type": "string", "description": "Relative path under base_path"},
-                "action": {"type": "string", "enum": ["read", "list"], "default": "read"},
-            },
-            "required": ["path"],
-        },
-        MCPToolType.S3: {
-            "type": "object",
-            "properties": {
-                "key": {"type": "string", "description": "Object key or prefix"},
-                "artifact_ref": {
-                    "type": "object",
-                    "properties": {
-                        "path": {"type": "string"},
-                        "format": {"type": "string"},
-                    },
-                },
-                "action": {"type": "string", "enum": ["get", "list", "put", "write"], "default": "get"},
-            },
-            "required": ["key"],
-        },
-        MCPToolType.MINIO: {
-            "type": "object",
-            "properties": {
-                "key": {"type": "string", "description": "Object key or prefix"},
-                "artifact_ref": {"type": "object", "properties": {"path": {"type": "string"}, "format": {"type": "string"}}},
-                "action": {"type": "string", "enum": ["get", "list", "put", "write"], "default": "get"},
-                "idempotency_key": {"type": "string"},
-            },
-            "required": ["key"],
-        },
-        MCPToolType.CEPH: {
-            "type": "object",
-            "properties": {
-                "key": {"type": "string", "description": "Object key or prefix"},
-                "artifact_ref": {"type": "object", "properties": {"path": {"type": "string"}, "format": {"type": "string"}}},
-                "action": {"type": "string", "enum": ["get", "list", "put", "write"], "default": "get"},
-                "idempotency_key": {"type": "string"},
-            },
-            "required": ["key"],
-        },
-        MCPToolType.AZURE_BLOB: {
-            "type": "object",
-            "properties": {
-                "key": {"type": "string", "description": "Blob name or prefix"},
-                "artifact_ref": {"type": "object", "properties": {"path": {"type": "string"}, "format": {"type": "string"}}},
-                "action": {"type": "string", "enum": ["get", "list", "put", "write"], "default": "get"},
-                "idempotency_key": {"type": "string"},
-            },
-            "required": ["key"],
-        },
-        MCPToolType.GCS: {
-            "type": "object",
-            "properties": {
-                "key": {"type": "string", "description": "Object key or prefix"},
-                "artifact_ref": {"type": "object", "properties": {"path": {"type": "string"}, "format": {"type": "string"}}},
-                "action": {"type": "string", "enum": ["get", "list", "put", "write"], "default": "get"},
-                "idempotency_key": {"type": "string"},
-            },
-            "required": ["key"],
-        },
-        MCPToolType.SLACK: {
-            "type": "object",
-            "properties": {
-                "channel": {"type": "string", "description": "Channel ID or name"},
-                "message": {"type": "string", "description": "Message text"},
-                "action": {"type": "string", "enum": ["list_channels", "send"], "default": "send"},
-            },
-        },
-        MCPToolType.GITHUB: {
-            "type": "object",
-            "properties": {
-                "repo": {"type": "string", "description": "owner/repo"},
-                "path": {"type": "string", "description": "File path or 'issues'"},
-                "action": {"type": "string", "enum": ["get_file", "list_issues", "search"], "default": "get_file"},
-            },
-        },
-        MCPToolType.NOTION: {
-            "type": "object",
-            "properties": {
-                "action": {"type": "string", "enum": ["search", "get_page", "get_database"], "default": "search"},
-                "query": {"type": "string", "description": "Search query or page/database ID"},
-            },
-        },
-        MCPToolType.REST_API: {
-            "type": "object",
-            "properties": {
-                "method": {"type": "string", "enum": ["GET", "POST", "PUT", "PATCH", "DELETE"], "default": "GET"},
-                "path": {"type": "string", "description": "Path or full URL"},
-                "body": {"type": "object", "description": "JSON body for POST/PUT/PATCH"},
-            },
-            "required": ["path"],
-        },
-    }
-    return schemas.get(tool_type, {"type": "object", "properties": {}})
+    return input_schema_for_platform_tool_type(tool_type.value)
 
 
 @router.post("/tools/{tool_id}/config")

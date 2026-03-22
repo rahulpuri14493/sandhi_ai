@@ -212,6 +212,9 @@ class AutoSplitBody(BaseModel):
     workflow_mode: Optional[str] = None  # "independent" | "sequential" | None (infer from BRD/conversation)
     step_tools: Optional[List[StepToolsAssignment]] = None  # Which tools each agent (step) can use
     tool_visibility: Optional[str] = None  # Job-level: full | names_only | none
+    write_execution_mode: Optional[str] = None  # platform | agent
+    output_artifact_format: Optional[str] = None  # jsonl | json
+    output_contract: Optional[Dict[str, Any]] = None
 
 
 class AnswerQuestionBody(BaseModel):

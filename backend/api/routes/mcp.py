@@ -786,6 +786,7 @@ async def get_registry(
             "name": _registry_tool_name(t.id, t.name),
             "tool_type": t.tool_type.value,
             "description": _registry_description(t.tool_type.value, t.name),
+            "access_mode": _registry_access_mode(t.tool_type.value),
         })
 
     # For each connection, fetch tools from that MCP server (tools/list)
@@ -858,6 +859,28 @@ def _registry_tool_name(tool_id: int, name: str) -> str:
     return f"platform_{tool_id}_{safe}" if safe else f"platform_{tool_id}"
 
 
+# Tool types whose interactive platform MCP execution is read/search only (no writes in tools/call).
+_READ_ONLY_PLATFORM_TOOL_TYPES = frozenset({
+    "vector_db",
+    "pinecone",
+    "weaviate",
+    "qdrant",
+    "chroma",
+    "elasticsearch",
+    "pageindex",
+    "github",
+    "notion",
+})
+
+
+def _registry_access_mode(tool_type: str) -> str:
+    """Registry UI: read_only vs read_write from actual platform MCP execute paths."""
+    tt = (tool_type or "").strip().lower()
+    if tt in _READ_ONLY_PLATFORM_TOOL_TYPES:
+        return "read_only"
+    return "read_write"
+
+
 def _registry_description(tool_type: str, name: str) -> str:
     d = {
         "vector_db": "Vector database",
@@ -865,8 +888,8 @@ def _registry_description(tool_type: str, name: str) -> str:
         "weaviate": "Weaviate",
         "qdrant": "Qdrant",
         "chroma": "Chroma",
-        "postgres": "PostgreSQL",
-        "mysql": "MySQL",
+        "postgres": "PostgreSQL (SELECT + DML/DDL)",
+        "mysql": "MySQL (SELECT + DML/DDL)",
         "sqlserver": "SQL Server",
         "snowflake": "Snowflake",
         "databricks": "Databricks",

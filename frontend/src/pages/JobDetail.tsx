@@ -529,6 +529,35 @@ export default function JobDetailPage() {
           </div>
         )}
 
+        {job.status !== 'draft' && job.workflow_steps && job.workflow_steps.length > 0 && (
+          <div className="mb-8 bg-dark-100/50 backdrop-blur-xl rounded-2xl shadow-2xl p-6 border border-dark-200/50">
+            <div className="flex flex-wrap gap-4">
+              <button
+                type="button"
+                onClick={() => setMode('status')}
+                className={`px-6 py-3.5 rounded-xl font-bold transition-all duration-200 flex items-center gap-2 ${
+                  mode === 'status'
+                    ? 'bg-gradient-to-r from-primary-500 to-primary-700 text-white shadow-2xl shadow-primary-500/50 scale-105'
+                    : 'bg-dark-200/50 text-white/70 hover:text-white hover:bg-dark-200 border border-dark-300'
+                }`}
+              >
+                Job status
+              </button>
+              <button
+                type="button"
+                onClick={() => setMode('workflow')}
+                className={`px-6 py-3.5 rounded-xl font-bold transition-all duration-200 flex items-center gap-2 ${
+                  mode === 'workflow'
+                    ? 'bg-gradient-to-r from-primary-500 to-primary-700 text-white shadow-2xl shadow-primary-500/50 scale-105'
+                    : 'bg-dark-200/50 text-white/70 hover:text-white hover:bg-dark-200 border border-dark-300'
+                }`}
+              >
+                Output contract &amp; write mode
+              </button>
+            </div>
+          </div>
+        )}
+
         {mode === 'qa' && (
           <DocumentConversation
             jobId={jobId}
@@ -544,9 +573,10 @@ export default function JobDetailPage() {
           />
         )}
 
-        {mode === 'workflow' && job.status === 'draft' && (
+        {mode === 'workflow' && (job.status === 'draft' || (job.workflow_steps && job.workflow_steps.length > 0)) && (
           <>
             <WorkflowBuilder
+              key={jobId}
               jobId={jobId}
               job={job}
               onWorkflowCreated={() => { loadJob(); loadWorkflowPreview(); }}

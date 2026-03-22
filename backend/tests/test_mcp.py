@@ -353,6 +353,19 @@ class TestMCPRegistry:
         assert len(platform_tools) >= 1
         assert any("platform_" in t["name"] for t in platform_tools)
         assert any(t.get("tool_type") == "chroma" for t in platform_tools)
+        chroma_entries = [t for t in data["platform_tools"] if t.get("tool_type") == "chroma"]
+        assert chroma_entries and chroma_entries[0].get("access_mode") == "read_only"
+
+    def test_registry_platform_tool_read_write_slack(self, client_mcp: TestClient, business_user):
+        client_mcp.post(
+            "/api/mcp/tools",
+            headers=business_user["headers"],
+            json={"tool_type": "slack", "name": "Slack RW", "config": {}},
+        )
+        r = client_mcp.get("/api/mcp/registry", headers=business_user["headers"])
+        assert r.status_code == 200
+        slack_entries = [t for t in r.json().get("platform_tools", []) if t.get("tool_type") == "slack"]
+        assert slack_entries and slack_entries[0].get("access_mode") == "read_write"
 
 
 class TestMCPProxy:

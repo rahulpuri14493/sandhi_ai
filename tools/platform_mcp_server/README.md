@@ -6,7 +6,7 @@ Platform-hosted MCP (Model Context Protocol) server that exposes **enterprise to
 
 - **MCP protocol**: JSON-RPC 2.0 `initialize`, `tools/list`, `tools/call`
 - **Tool discovery**: Tools are fetched from the backend per `X-MCP-Business-Id` (tenant)
-- **Tool execution**: Runs Vector DB queries, read-only PostgreSQL, and file read/list under configured base path
+- **Tool execution**: Runs Vector DB queries, PostgreSQL/MySQL reads and writes (per SQL), object store get/list/put, filesystem read/list/write under configured base path, and artifact-driven platform writes where implemented
 - **Secure**: No credentials stored here; decrypted config is fetched per request from the backend using `MCP_INTERNAL_SECRET`
 
 ## Configuration
