@@ -1,10 +1,13 @@
 """Unit tests: execution helpers and app log helpers (no HTTP)."""
+import json
 import logging
+from unittest.mock import MagicMock, patch
 
 import pytest
 
 import execution
 from app import _parse_platform_tool_id, _tool_result_for_log
+from execution_object_storage import execute_s3_family
 
 pytestmark = pytest.mark.unit
 
@@ -65,3 +68,37 @@ class TestLogMcpSql:
         execution._log_mcp_sql("postgres", "SELECT 1", mode="read", dest="localhost:5432/db")
         assert any("MCP SQL" in r.message for r in caplog.records)
         assert any("SELECT 1" in r.message for r in caplog.records)
+
+
+class TestS3FamilyWritePrefix:
+    def test_put_rejected_when_key_not_under_prefix(self, monkeypatch):
+        monkeypatch.setenv("MCP_S3_WRITE_KEY_PREFIX", "reports")
+        out = execute_s3_family(
+            "minio",
+            {"bucket": "b"},
+            {"action": "put", "key": "total_jobs.txt", "body": b"x"},
+        )
+        assert "Error" in out
+        assert "reports" in out
+
+    def test_put_allowed_when_key_under_prefix(self, monkeypatch):
+        monkeypatch.setenv("MCP_S3_WRITE_KEY_PREFIX", "reports")
+        fake_client = MagicMock()
+        with patch("boto3.client", return_value=fake_client):
+            out = execute_s3_family(
+                "minio",
+                {"bucket": "b", "endpoint": "http://minio:9000"},
+                {"action": "put", "key": "reports/job-revenue/out.jsonl", "body": b"{}\n"},
+            )
+        data = json.loads(out)
+        assert data.get("status") == "ok"
+        fake_client.put_object.assert_called_once()
+
+    def test_write_prefix_from_tool_config_overrides_env(self, monkeypatch):
+        monkeypatch.delenv("MCP_S3_WRITE_KEY_PREFIX", raising=False)
+        out = execute_s3_family(
+            "minio",
+            {"bucket": "b", "write_key_prefix": "reports"},
+            {"action": "put", "key": "other.txt", "body": b"x"},
+        )
+        assert "Error" in out

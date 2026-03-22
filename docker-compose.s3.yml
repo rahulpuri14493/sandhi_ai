@@ -115,6 +115,8 @@ services:
       S3_SECRET_ACCESS_KEY: ${S3_SECRET_ACCESS_KEY:?Set S3_SECRET_ACCESS_KEY in .env}
       S3_BUCKET: ${S3_BUCKET:-sandhi-brd-docs}
       S3_REGION: ${S3_REGION:-us-east-1}
+      # Block interactive MinIO/S3 put/write unless key is under reports/...
+      MCP_S3_WRITE_KEY_PREFIX: ${MCP_S3_WRITE_KEY_PREFIX:-reports}
 
 volumes:
   minio-data:

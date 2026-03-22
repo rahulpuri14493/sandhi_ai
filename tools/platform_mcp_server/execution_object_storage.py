@@ -13,6 +13,21 @@ logger = logging.getLogger(__name__)
 
 _PUT_BODY_MISSING_LAST_LOG: Dict[Tuple[str, str], float] = {}
 
+
+def _required_s3_write_prefix(config: Dict[str, Any]) -> str:
+    """Normalized prefix (no slashes); empty = no restriction."""
+    p = (config.get("write_key_prefix") or os.environ.get("MCP_S3_WRITE_KEY_PREFIX") or "").strip()
+    return p.strip("/")
+
+
+def _s3_key_allowed_for_write(key: str, required_prefix: str) -> bool:
+    if not required_prefix:
+        return True
+    k = key.strip().lstrip("/")
+    p = required_prefix.strip().strip("/")
+    return k == p or k.startswith(p + "/")
+
+
 def execute_s3_family(
     tool_type: str,
     config: Dict[str, Any],
@@ -28,6 +43,13 @@ def execute_s3_family(
     key = (arguments.get("key") or "").strip()
     if not key:
         return "Error: key is required"
+    write_prefix = _required_s3_write_prefix(config)
+    if action in ("put", "write") and not _s3_key_allowed_for_write(key, write_prefix):
+        return (
+            "Error: key must be under the configured write prefix "
+            f"'{write_prefix}/' (set write_key_prefix on the tool or MCP_S3_WRITE_KEY_PREFIX). "
+            f"Refused key: {key!r}"
+        )
     bucket = (config.get("bucket") or "").strip()
     if not bucket:
         return "Error: bucket not configured"
