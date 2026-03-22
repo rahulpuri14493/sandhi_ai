@@ -77,12 +77,9 @@ def test_split_fallback_when_api_returns_error(multi_agents):
     splitter.api_endpoint = "https://api.example.com/chat"
     splitter.api_key = None
 
-    with patch("services.task_splitter.httpx.AsyncClient") as mock_client:
-        mock_resp = MagicMock()
-        mock_resp.status_code = 500
-        mock_client.return_value.__aenter__.return_value.post = AsyncMock(
-            return_value=mock_resp
-        )
+    mock_resp = MagicMock()
+    mock_resp.status_code = 500
+    with patch("services.task_splitter.post_openai_compatible_raw", new=AsyncMock(return_value=mock_resp)):
         result = asyncio.run(split_job_for_agents(
             job_title="Fail Job",
             job_description="Will fail",
@@ -108,15 +105,12 @@ def test_split_success_parses_json_from_api(multi_agents):
         {"agent_index": 2, "task": "Task C for agent 3", "assigned_document_ids": ["BRD3"]},
     ]
 
-    with patch("services.task_splitter.httpx.AsyncClient") as mock_client:
-        mock_resp = MagicMock()
-        mock_resp.status_code = 200
-        mock_resp.json.return_value = {
-            "choices": [{"message": {"content": json.dumps(api_response)}}]
-        }
-        mock_client.return_value.__aenter__.return_value.post = AsyncMock(
-            return_value=mock_resp
-        )
+    mock_resp = MagicMock()
+    mock_resp.status_code = 200
+    mock_resp.json.return_value = {
+        "choices": [{"message": {"content": json.dumps(api_response)}}]
+    }
+    with patch("services.task_splitter.post_openai_compatible_raw", new=AsyncMock(return_value=mock_resp)):
         result = asyncio.run(split_job_for_agents(
             job_title="API Job",
             job_description="Use API",
@@ -150,15 +144,12 @@ def test_split_strips_markdown_code_blocks(multi_agents):
         {"agent_index": 2, "task": "Task 3"},
     ]
     raw_content = "```json\n" + json.dumps(api_response) + "\n```"
-    with patch("services.task_splitter.httpx.AsyncClient") as mock_client:
-        mock_resp = MagicMock()
-        mock_resp.status_code = 200
-        mock_resp.json.return_value = {
-            "choices": [{"message": {"content": raw_content}}]
-        }
-        mock_client.return_value.__aenter__.return_value.post = AsyncMock(
-            return_value=mock_resp
-        )
+    mock_resp = MagicMock()
+    mock_resp.status_code = 200
+    mock_resp.json.return_value = {
+        "choices": [{"message": {"content": raw_content}}]
+    }
+    with patch("services.task_splitter.post_openai_compatible_raw", new=AsyncMock(return_value=mock_resp)):
         result = asyncio.run(split_job_for_agents(
             job_title="Markdown Job",
             job_description="",
@@ -183,15 +174,12 @@ def test_split_enforces_explicit_job_description_document_mapping(multi_agents):
         {"agent_index": 1, "task": "Task 2"},
         {"agent_index": 2, "task": "Task 3"},
     ]
-    with patch("services.task_splitter.httpx.AsyncClient") as mock_client:
-        mock_resp = MagicMock()
-        mock_resp.status_code = 200
-        mock_resp.json.return_value = {
-            "choices": [{"message": {"content": json.dumps(api_response)}}]
-        }
-        mock_client.return_value.__aenter__.return_value.post = AsyncMock(
-            return_value=mock_resp
-        )
+    mock_resp = MagicMock()
+    mock_resp.status_code = 200
+    mock_resp.json.return_value = {
+        "choices": [{"message": {"content": json.dumps(api_response)}}]
+    }
+    with patch("services.task_splitter.post_openai_compatible_raw", new=AsyncMock(return_value=mock_resp)):
         result = asyncio.run(split_job_for_agents(
             job_title="Mapping Job",
             job_description="BRD1 addition handled by Agent1. BRD2 subtraction handled by Agent2.",
@@ -218,15 +206,12 @@ def test_split_explicit_mapping_handles_filename_extensions_without_breaking(mul
         {"agent_index": 1, "task": "Task 2"},
         {"agent_index": 2, "task": "Task 3"},
     ]
-    with patch("services.task_splitter.httpx.AsyncClient") as mock_client:
-        mock_resp = MagicMock()
-        mock_resp.status_code = 200
-        mock_resp.json.return_value = {
-            "choices": [{"message": {"content": json.dumps(api_response)}}]
-        }
-        mock_client.return_value.__aenter__.return_value.post = AsyncMock(
-            return_value=mock_resp
-        )
+    mock_resp = MagicMock()
+    mock_resp.status_code = 200
+    mock_resp.json.return_value = {
+        "choices": [{"message": {"content": json.dumps(api_response)}}]
+    }
+    with patch("services.task_splitter.post_openai_compatible_raw", new=AsyncMock(return_value=mock_resp)):
         result = asyncio.run(split_job_for_agents(
             job_title="Mapping With Extensions",
             job_description="anova_test.docx handled by Agent1 and chi_square_test.pdf handled by Agent2",
@@ -257,15 +242,12 @@ def test_split_explicit_mapping_uses_bounded_token_matching():
     splitter.api_endpoint = "https://api.example.com/chat"
     splitter.api_key = None
     api_response = [{"agent_index": i, "task": f"Task {i + 1}"} for i in range(10)]
-    with patch("services.task_splitter.httpx.AsyncClient") as mock_client:
-        mock_resp = MagicMock()
-        mock_resp.status_code = 200
-        mock_resp.json.return_value = {
-            "choices": [{"message": {"content": json.dumps(api_response)}}]
-        }
-        mock_client.return_value.__aenter__.return_value.post = AsyncMock(
-            return_value=mock_resp
-        )
+    mock_resp = MagicMock()
+    mock_resp.status_code = 200
+    mock_resp.json.return_value = {
+        "choices": [{"message": {"content": json.dumps(api_response)}}]
+    }
+    with patch("services.task_splitter.post_openai_compatible_raw", new=AsyncMock(return_value=mock_resp)):
         result = asyncio.run(split_job_for_agents(
             job_title="Bounded Matching",
             job_description="BRD10 handled by agent10. BRD1 handled by agent1.",

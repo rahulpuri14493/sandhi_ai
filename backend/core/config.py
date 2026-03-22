@@ -86,5 +86,10 @@ class Settings(BaseSettings):
     ZIP_EXTRACT_RETRY_BASE_DELAY_SECONDS: float = 0.1
     ZIP_EXTRACT_RETRY_MAX_DELAY_SECONDS: float = 0.5
     ZIP_EXTRACT_RETRY_JITTER_SECONDS: float = 0.05
+    # httpx (LLM splitter, A2A, document analyzer): verify TLS by default; set false only for dev
+    HTTPX_VERIFY_SSL: bool = True
+    HTTPX_CA_BUNDLE_PATH: str = ""  # optional path to CA bundle (corporate proxy / custom roots)
+    # When set, task/tool splitters retry once with this model after 429 or 5xx from the LLM endpoint
+    LLM_HTTP_FALLBACK_MODEL: str = ""
 
 settings = Settings()

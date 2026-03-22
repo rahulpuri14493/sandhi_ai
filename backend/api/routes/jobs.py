@@ -28,6 +28,7 @@ from core.config import settings
 from services.job_scheduler import get_scheduler, reset_job_for_execution, queue_job_execution
 from services.task_queue import get_queue_stats
 from services.workflow_builder import WorkflowBuilder
+from services.tool_splitter import suggest_tool_assignments_for_agents
 from services.payment_processor import PaymentProcessor
 from services.document_analyzer import DocumentAnalyzer
 from models.transaction import Transaction, Earnings
@@ -1476,7 +1477,7 @@ def delete_job(
 
 
 @router.post("/{job_id}/workflow/auto-split", response_model=WorkflowPreview)
-def auto_split_workflow(
+async def auto_split_workflow(
     job_id: int,
     body: AutoSplitBody,
     current_user: User = Depends(get_current_business_user),
@@ -1524,12 +1525,109 @@ def auto_split_workflow(
         job.output_contract = json.dumps(contract_obj) if contract_obj is not None else None
     db.commit()
     workflow_builder = WorkflowBuilder(db)
-    preview = workflow_builder.auto_split_workflow(job_id, body.agent_ids, workflow_mode=workflow_mode, step_tools=step_tools, tool_visibility=tv)
+    preview = await workflow_builder.auto_split_workflow_async(
+        job_id, body.agent_ids, workflow_mode=workflow_mode, step_tools=step_tools, tool_visibility=tv
+    )
     return preview
 
 
+class SuggestWorkflowToolsBody(BaseModel):
+    """Agents in workflow order (same as auto-split). Used to suggest per-step platform tools from BRD + job prompt."""
+    agent_ids: List[int]
+
+
+@router.get("/{job_id}/suggest-workflow-tools", include_in_schema=True)
+def suggest_workflow_tools_get_hint(job_id: int):
+    """
+    Opening this URL in a browser sends GET; the real API is POST-only.
+    Returns 405 so clients see a clear hint instead of a generic 404.
+    """
+    raise HTTPException(
+        status_code=status.HTTP_405_METHOD_NOT_ALLOWED,
+        detail='Method Not Allowed: use POST with JSON body {"agent_ids": [agent ids in workflow order]}.',
+        headers={"Allow": "POST"},
+    )
+
+
+@router.post("/{job_id}/suggest-workflow-tools")
+async def suggest_workflow_tools(
+    job_id: int,
+    body: SuggestWorkflowToolsBody,
+    current_user: User = Depends(get_current_business_user),
+    db: Session = Depends(get_db),
+):
+    """
+    BRD-aware suggestion: which platform MCP tools to assign to each agent step (read vs write heuristics),
+    plus an output_contract stub with write_targets using platform_{id}_* tool names.
+
+    Uses the same document and Q&A context as auto-split. First selected agent must expose an OpenAI-compatible
+    API (same as task splitter); otherwise a deterministic fallback split is returned.
+    """
+    job = db.query(Job).filter(Job.id == job_id).first()
+    if not job:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Job not found")
+    if job.business_id != current_user.id:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Not authorized")
+
+    if not body.agent_ids:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="agent_ids is required")
+
+    q = db.query(MCPToolConfig).filter(
+        MCPToolConfig.user_id == current_user.id,
+        MCPToolConfig.is_active == True,
+    )
+    if getattr(job, "allowed_platform_tool_ids", None):
+        try:
+            parsed = json.loads(job.allowed_platform_tool_ids)
+            if isinstance(parsed, list) and len(parsed) > 0:
+                q = q.filter(MCPToolConfig.id.in_([int(x) for x in parsed]))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            pass
+    platform_tools = q.order_by(MCPToolConfig.created_at.desc()).all()
+    if not platform_tools:
+        return {
+            "step_suggestions": [],
+            "output_contract_stub": None,
+            "fallback_used": True,
+            "detail": "No platform tools configured for this job (check job allowed tools or create MCP tools).",
+        }
+
+    rows = db.query(Agent).filter(Agent.id.in_(body.agent_ids)).all()
+    by_id = {a.id: a for a in rows}
+    agents_ordered = []
+    for aid in body.agent_ids:
+        if aid not in by_id:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Agent id {aid} not found",
+            )
+        agents_ordered.append(by_id[aid])
+
+    conversation_data = None
+    if job.conversation:
+        try:
+            conversation_data = json.loads(job.conversation)
+        except (json.JSONDecodeError, TypeError):
+            pass
+
+    wb = WorkflowBuilder(db)
+    documents_content = await wb.load_job_documents_content_async(job)
+    splitter_agent = agents_ordered[0]
+
+    result = await suggest_tool_assignments_for_agents(
+        job_title=job.title or "",
+        job_description=job.description or "",
+        documents_content=documents_content,
+        conversation_data=conversation_data,
+        agents=agents_ordered,
+        platform_tools=platform_tools,
+        splitter_agent=splitter_agent,
+    )
+    return result
+
+
 @router.post("/{job_id}/workflow/manual", response_model=WorkflowPreview)
-def manual_workflow(
+async def manual_workflow(
     job_id: int,
     workflow_steps: List[dict],
     current_user: User = Depends(get_current_business_user),
@@ -1549,7 +1647,7 @@ def manual_workflow(
         )
     
     workflow_builder = WorkflowBuilder(db)
-    preview = workflow_builder.create_manual_workflow(job_id, workflow_steps)
+    preview = await workflow_builder.create_manual_workflow_async(job_id, workflow_steps)
     return preview
 
 

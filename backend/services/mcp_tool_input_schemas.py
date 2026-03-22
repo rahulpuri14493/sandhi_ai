@@ -151,7 +151,7 @@ def input_schema_for_platform_tool_type(tool_type: str) -> Dict[str, Any]:
                 "idempotency_key": {"type": "string"},
                 "body": {
                     "type": "string",
-                    "description": "Required for put/write: full object payload as string (e.g. JSONL). Omitting this causes errors — include content in the same call.",
+                    "description": "Required for put/write (interactive MinIO): full object payload as string (e.g. JSONL). Models often omit this and trigger errors — always send body or content in the same tool call.",
                 },
                 "content": {
                     "type": "string",

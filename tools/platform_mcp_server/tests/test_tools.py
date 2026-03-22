@@ -12,6 +12,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import pytest
 
 import execution
+import execution_common
 from app import execute_platform_tool
 
 
@@ -63,12 +64,12 @@ class TestArtifactWriteDatabases:
     """Artifact-first platform writes (output contract path); no real DB required."""
 
     def test_postgres_artifact_write_missing_connection(self, monkeypatch):
-        monkeypatch.setattr(execution, "read_artifact_bytes", lambda ref: b'{"id":1,"name":"a"}\n')
+        monkeypatch.setattr(execution_common, "read_artifact_bytes", lambda ref: b'{"id":1,"name":"a"}\n')
         out = execution.execute_artifact_write("postgres", {}, _artifact_args())
         assert "connection_string" in out.lower()
 
     def test_postgres_artifact_write_missing_table(self, monkeypatch):
-        monkeypatch.setattr(execution, "read_artifact_bytes", lambda ref: b'{"id":1}\n')
+        monkeypatch.setattr(execution_common, "read_artifact_bytes", lambda ref: b'{"id":1}\n')
         args = _artifact_args()
         args["target"] = {"schema": "public"}
         out = execution.execute_artifact_write(
@@ -79,7 +80,7 @@ class TestArtifactWriteDatabases:
         assert "target.table" in out.lower() or "table" in out.lower()
 
     def test_mysql_artifact_write_missing_database(self, monkeypatch):
-        monkeypatch.setattr(execution, "read_artifact_bytes", lambda ref: b'{"id":1}\n')
+        monkeypatch.setattr(execution_common, "read_artifact_bytes", lambda ref: b'{"id":1}\n')
         args = _artifact_args()
         args["target"] = {"table": "t"}
         out = execution.execute_artifact_write("mysql", {"host": "localhost", "user": "u", "password": "p"}, args)

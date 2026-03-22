@@ -108,7 +108,7 @@ jobs:
           pytest --cov=. --cov-report=term-missing --cov-fail-under=80 -v
 
   platform-mcp-tests:
-    name: Platform MCP server tests
+    name: Platform MCP server tests (unit + integration + e2e)
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -126,7 +126,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/.cache/pip
-          key: ${{ runner.os }}-pip-mcp-${{ hashFiles('tools/platform_mcp_server/requirements.txt') }}
+          key: ${{ runner.os }}-pip-mcp-${{ hashFiles('tools/platform_mcp_server/requirements.txt', 'tools/platform_mcp_server/pytest.ini') }}
           restore-keys: |
             ${{ runner.os }}-pip-mcp-
 
@@ -136,8 +136,10 @@ jobs:
           pip install -r requirements.txt
           pip install pytest
 
-      - name: Run platform MCP tool tests
-        run: pytest tests/ -v --tb=short
+      # tools/platform_mcp_server/tests: test_tools.py, test_execution_helpers_unit.py,
+      # test_jsonrpc_http_integration.py, test_mcp_protocol_e2e.py; test_mcp_live_e2e.py skips without PLATFORM_MCP_E2E_BASE_URL
+      - name: Run platform MCP pytest suite
+        run: python -m pytest tests -c pytest.ini --rootdir . -v --tb=short
 
   frontend-tests:
     name: Frontend tests

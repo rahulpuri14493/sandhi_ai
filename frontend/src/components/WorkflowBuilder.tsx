@@ -1,5 +1,6 @@
 import { useState, useEffect, useRef } from 'react'
 import { jobsAPI, agentsAPI, mcpAPI } from '../lib/api'
+import { getToolAccessBadge } from '../lib/mcpToolAccess'
 import type { Agent } from '../lib/types'
 import type { Job } from '../lib/types'
 import type { MCPToolConfigRes, MCPServerConnectionRes } from '../lib/api'
@@ -287,6 +288,47 @@ export function WorkflowBuilder({ jobId, onWorkflowCreated, initialSelectedAgent
     }
   }
 
+  const handleSuggestToolsFromBrd = async () => {
+    if (workflowLocked) return
+    if (selectedAgents.length === 0) {
+      setError('Select at least one agent first')
+      return
+    }
+    if (platformTools.length === 0) {
+      setError('No platform tools in scope for this job — add job-level tools on the job or create MCP tools.')
+      return
+    }
+    setIsLoading(true)
+    setError('')
+    try {
+      const data = await jobsAPI.suggestWorkflowTools(jobId, selectedAgents)
+      if (data.detail && !(data.step_suggestions && data.step_suggestions.length)) {
+        setError(data.detail)
+        return
+      }
+      const base = stepToolSelectionsRef.current
+      const next: StepToolSelection = { ...base }
+      for (const s of data.step_suggestions || []) {
+        const idx = s.agent_index
+        const prev = base[idx] ?? { platformIds: [], connectionIds: [] }
+        next[idx] = {
+          platformIds: s.platform_tool_ids ?? [],
+          connectionIds: prev.connectionIds,
+          toolVisibility: prev.toolVisibility,
+        }
+      }
+      setStepToolSelections(next)
+      if (data.output_contract_stub) {
+        setOutputContractText(JSON.stringify(data.output_contract_stub, null, 2))
+      }
+    } catch (err: unknown) {
+      const d = err as { response?: { data?: { detail?: string } } }
+      setError(d.response?.data?.detail || 'Failed to suggest tools')
+    } finally {
+      setIsLoading(false)
+    }
+  }
+
   const handleAutoSplit = async () => {
     if (workflowLocked) {
       await handleSaveOutputSettings()
@@ -412,6 +454,13 @@ export function WorkflowBuilder({ jobId, onWorkflowCreated, initialSelectedAgent
         <p className="text-sm text-white/90 font-medium">
           Work is divided among agents based on your <strong>job prompt</strong> and <strong>BRD documents</strong>. Run <strong>Analyze Documents</strong> first so the AI can ask questions from your BRD; your answers are then used when splitting work. Each agent receives only its assigned subtask derived from the BRD and prompt.
         </p>
+        <p className="text-sm text-white/80 font-medium mt-3 border-t border-emerald-500/30 pt-3">
+          <strong className="text-emerald-300">Tools &amp; contracts (same inputs):</strong> Use{' '}
+          <strong className="text-white">Suggest tools from BRD &amp; job</strong> below to propose which platform tools
+          each step should see — search-heavy tools toward early steps, persistence (SQL / buckets) toward the last step.
+          Badges show read vs write posture. The optional <strong className="text-white">output contract</strong> stub
+          lists <code className="text-primary-300">write_targets</code> with <code className="text-primary-300">platform_&lt;id&gt;_…</code> names; edit buckets/prefixes/tables to match your configs.
+        </p>
       </div>
       <div className="mb-8">
         <h2 className="text-4xl font-black text-white tracking-tight mb-6">Build Workflow</h2>
@@ -526,8 +575,21 @@ export function WorkflowBuilder({ jobId, onWorkflowCreated, initialSelectedAgent
           </div>
           {(platformTools.length > 0 || connections.length > 0) && selectedAgents.length > 0 && !workflowLocked && (
             <div className="mb-6 p-5 bg-emerald-500/10 border-2 border-emerald-500/30 rounded-xl">
-              <h4 className="font-bold text-emerald-400 mb-3">Tools per agent (optional)</h4>
-              <p className="text-sm text-white/70 mb-4">Add only the tools each agent can use. If none are added, that agent will have access to all job tools.</p>
+              <div className="flex flex-wrap items-center justify-between gap-3 mb-3">
+                <h4 className="font-bold text-emerald-400">Tools per agent (optional)</h4>
+                <button
+                  type="button"
+                  onClick={handleSuggestToolsFromBrd}
+                  disabled={isLoading || platformTools.length === 0}
+                  className="px-4 py-2 rounded-lg text-sm font-bold bg-emerald-600/80 text-white hover:bg-emerald-500 disabled:opacity-50 disabled:cursor-not-allowed border border-emerald-400/40"
+                >
+                  Suggest tools from BRD &amp; job
+                </button>
+              </div>
+              <p className="text-sm text-white/70 mb-4">
+                Add only the tools each agent can use. If none are added, that agent will have access to all job tools.
+                Suggestions use the same BRD excerpts and Q&amp;A as task splitting (first selected agent = splitter API).
+              </p>
               <div className="mb-4 p-4 rounded-xl bg-dark-100/80 border border-dark-300 text-sm text-white/85 space-y-2">
                 <p className="font-semibold text-white">How reads and writes work</p>
                 <ul className="list-disc list-inside space-y-1 text-white/75">
@@ -572,23 +634,46 @@ export function WorkflowBuilder({ jobId, onWorkflowCreated, initialSelectedAgent
                         {!hasAnySelected ? (
                           <p className="text-xs text-white/50 italic">No tools selected — this step will use all job tools.</p>
                         ) : (
-                          <div className="flex flex-wrap gap-2">
-                            {selectedPlatformTools.map((t) => (
-                              <span
-                                key={t.id}
-                                className="inline-flex items-center gap-1.5 px-2.5 py-1 bg-primary-500/20 border border-primary-500/50 rounded-lg text-sm text-white"
-                              >
-                                <span>{t.name}</span>
-                                <button
-                                  type="button"
-                                  onClick={() => toggleStepPlatformTool(idx, t.id)}
-                                  className="text-white/70 hover:text-white focus:outline-none"
-                                  aria-label={`Remove ${t.name}`}
+                          <div className="flex flex-wrap gap-3">
+                            {selectedPlatformTools.map((t) => {
+                              const access = getToolAccessBadge(t.tool_type)
+                              return (
+                                <div
+                                  key={t.id}
+                                  className="flex min-w-[220px] max-w-full flex-col gap-1.5 rounded-xl border border-primary-500/45 bg-dark-50/95 px-3 py-2.5 shadow-inner shadow-black/30"
                                 >
-                                  <span className="sr-only">Remove</span>×
-                                </button>
-                              </span>
-                            ))}
+                                  <div className="flex items-start justify-between gap-2">
+                                    <div className="min-w-0 flex-1">
+                                      <div className="truncate text-sm font-bold text-white" title={t.name}>
+                                        {t.name}
+                                      </div>
+                                      <div className="mt-1 flex flex-wrap items-center gap-2">
+                                        <span className="text-[10px] font-semibold uppercase tracking-wide text-white/45">
+                                          Access
+                                        </span>
+                                        <span
+                                          className="max-w-[200px] truncate rounded-md bg-emerald-600 px-2 py-1 text-[11px] font-semibold leading-snug text-white shadow-sm ring-1 ring-emerald-400/40"
+                                          title={access.hint}
+                                        >
+                                          {access.label}
+                                        </span>
+                                      </div>
+                                      <div className="mt-0.5 text-[10px] font-mono text-dark-500" title="Platform tool type">
+                                        {t.tool_type}
+                                      </div>
+                                    </div>
+                                    <button
+                                      type="button"
+                                      onClick={() => toggleStepPlatformTool(idx, t.id)}
+                                      className="shrink-0 rounded-md px-2 py-0.5 text-lg leading-none text-white/60 transition hover:bg-white/10 hover:text-white focus:outline-none focus:ring-2 focus:ring-primary-400"
+                                      aria-label={`Remove ${t.name}`}
+                                    >
+                                      <span className="sr-only">Remove</span>×
+                                    </button>
+                                  </div>
+                                </div>
+                              )
+                            })}
                             {selectedConns.map((c) => (
                               <span
                                 key={c.id}
@@ -622,7 +707,9 @@ export function WorkflowBuilder({ jobId, onWorkflowCreated, initialSelectedAgent
                               >
                                 <option value="">— Platform tool —</option>
                                 {availableToAddPlatform.map((t) => (
-                                  <option key={t.id} value={t.id}>{t.name}</option>
+                                  <option key={t.id} value={t.id}>
+                                    {t.name} — {getToolAccessBadge(t.tool_type).label}
+                                  </option>
                                 ))}
                               </select>
                             )}

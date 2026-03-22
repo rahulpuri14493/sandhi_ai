@@ -93,7 +93,7 @@ def _normalize_platform_write_arguments(body: MCPPlatformWriteRequest) -> dict:
 def _run_platform_write_operation(operation_id: str, user_id: int) -> None:
     from services.mcp_client import call_tool
     from core.config import settings
-    import asyncio
+    from services.async_runner import run_coroutine_sync
 
     db = SessionLocal()
     try:
@@ -118,7 +118,7 @@ def _run_platform_write_operation(operation_id: str, user_id: int) -> None:
         result = None
         for attempt in range(max_attempts):
             try:
-                result = asyncio.run(
+                result = run_coroutine_sync(
                     call_tool(
                         base_url=settings.PLATFORM_MCP_SERVER_URL.rstrip("/"),
                         tool_name=op.tool_name,
@@ -127,7 +127,7 @@ def _run_platform_write_operation(operation_id: str, user_id: int) -> None:
                         extra_headers={"X-MCP-Business-Id": str(user_id)},
                         timeout=timeout,
                     )
-            )
+                )
                 break
             except Exception as e:
                 last_error = e

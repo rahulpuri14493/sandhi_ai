@@ -29,6 +29,7 @@ import logging
 import os
 import re
 import sys
+from contextlib import asynccontextmanager
 from typing import Any, Dict, List, Optional
 
 import httpx
@@ -45,23 +46,28 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-app = FastAPI(
-    title="Sandhi AI Platform MCP Server",
-    description="MCP server exposing platform-configured tools (Vector DB, Postgres, File system) per tenant.",
-    version="1.0.0",
-)
-
-
-@app.on_event("startup")
-def startup():
-    logger.info("Platform MCP server started; BACKEND_INTERNAL_URL=%s", BACKEND_BASE)
-
 # Backend internal API (same network as platform)
 BACKEND_BASE = os.environ.get("BACKEND_INTERNAL_URL", "http://backend:8000").strip().rstrip("/")
 MCP_INTERNAL_SECRET = os.environ.get("MCP_INTERNAL_SECRET", "").strip()
 INTERNAL_HEADERS = {"Content-Type": "application/json"}
 if MCP_INTERNAL_SECRET:
     INTERNAL_HEADERS["X-Internal-Secret"] = MCP_INTERNAL_SECRET
+
+
+@asynccontextmanager
+async def _lifespan(app: FastAPI):
+    logger.info("Platform MCP server started; BACKEND_INTERNAL_URL=%s", BACKEND_BASE)
+    yield
+    logger.info("Platform MCP server shutdown")
+
+
+app = FastAPI(
+    title="Sandhi AI Platform MCP Server",
+    description="MCP server exposing platform-configured tools (Vector DB, Postgres, File system) per tenant.",
+    version="1.0.0",
+    lifespan=_lifespan,
+)
+
 
 JSONRPC_VERSION = "2.0"
 BUSINESS_ID_HEADER = "x-mcp-business-id"

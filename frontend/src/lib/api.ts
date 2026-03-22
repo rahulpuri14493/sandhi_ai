@@ -188,6 +188,16 @@ export const jobsAPI = {
   generateWorkflowQuestions(jobId: number) {
     return api.post('/jobs/' + jobId + '/generate-workflow-questions').then((res) => res.data)
   },
+  suggestWorkflowTools(jobId: number, agentIds: number[]) {
+    return api
+      .post<{
+        step_suggestions: Array<{ agent_index: number; platform_tool_ids: number[]; rationale?: string }>
+        output_contract_stub: Record<string, unknown> | null
+        fallback_used: boolean
+        detail?: string
+      }>('/jobs/' + jobId + '/suggest-workflow-tools', { agent_ids: agentIds })
+      .then((res) => res.data)
+  },
   autoSplitWorkflow(
     jobId: number,
     agentIds: number[],
