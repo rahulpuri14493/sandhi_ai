@@ -19,7 +19,7 @@ def _normalized_job_output_settings(job: Job) -> tuple[str, str]:
     write_mode_raw = getattr(job, "write_execution_mode", "platform")
     write_mode = write_mode_raw if isinstance(write_mode_raw, str) else "platform"
     write_mode = (write_mode or "platform").strip().lower()
-    if write_mode not in ("platform", "agent"):
+    if write_mode not in ("platform", "agent", "ui_only"):
         write_mode = "platform"
 
     artifact_format_raw = getattr(job, "output_artifact_format", "jsonl")

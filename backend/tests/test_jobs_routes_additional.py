@@ -39,6 +39,14 @@ def test_create_job_rejects_invalid_write_execution_mode(client: TestClient, db_
     assert "write_execution_mode" in r.text
 
 
+def test_create_job_accepts_ui_only_write_execution_mode(client: TestClient, db_session):
+    _, headers = _make_business(db_session)
+    r = client.post("/api/jobs", data={"title": "T", "write_execution_mode": "ui_only"}, headers=headers)
+    assert r.status_code == 201
+    body = r.json()
+    assert body["write_execution_mode"] == "ui_only"
+
+
 def test_create_job_accepts_output_contract(client: TestClient, db_session):
     _, headers = _make_business(db_session)
     contract = {

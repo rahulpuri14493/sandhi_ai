@@ -107,7 +107,7 @@ export interface Job {
   /** Restrict what tool info agents see: full | names_only | none. Credentials never shared. */
   tool_visibility?: 'full' | 'names_only' | 'none' | null;
   /** Who triggers MCP writes from persisted output artifact references. */
-  write_execution_mode?: 'platform' | 'agent' | null;
+  write_execution_mode?: 'platform' | 'agent' | 'ui_only' | null;
   /** Persisted AI output artifact format in object storage. */
   output_artifact_format?: 'jsonl' | 'json' | null;
   /** Universal output contract for downstream MCP write execution. */

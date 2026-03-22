@@ -181,7 +181,7 @@ class JobCreate(BaseModel):
     allowed_platform_tool_ids: Optional[List[int]] = None  # Tools in scope for this job (empty = all)
     allowed_connection_ids: Optional[List[int]] = None  # MCP connections in scope (empty = all)
     tool_visibility: Optional[str] = None  # full | names_only | none (default full)
-    write_execution_mode: Optional[str] = "platform"  # platform | agent
+    write_execution_mode: Optional[str] = "platform"  # platform | agent | ui_only
     output_artifact_format: Optional[str] = "jsonl"  # jsonl | json
     output_contract: Optional[Dict[str, Any]] = None  # universal output contract
 
@@ -212,7 +212,7 @@ class AutoSplitBody(BaseModel):
     workflow_mode: Optional[str] = None  # "independent" | "sequential" | None (infer from BRD/conversation)
     step_tools: Optional[List[StepToolsAssignment]] = None  # Which tools each agent (step) can use
     tool_visibility: Optional[str] = None  # Job-level: full | names_only | none
-    write_execution_mode: Optional[str] = None  # platform | agent
+    write_execution_mode: Optional[str] = None  # platform | agent | ui_only
     output_artifact_format: Optional[str] = None  # jsonl | json
     output_contract: Optional[Dict[str, Any]] = None
 
@@ -251,7 +251,7 @@ class JobResponse(BaseModel):
     allowed_platform_tool_ids: Optional[List[int]] = None
     allowed_connection_ids: Optional[List[int]] = None
     tool_visibility: Optional[str] = None  # full | names_only | none
-    write_execution_mode: Optional[str] = "platform"  # platform | agent
+    write_execution_mode: Optional[str] = "platform"  # platform | agent | ui_only
     output_artifact_format: Optional[str] = "jsonl"  # jsonl | json
     output_contract: Optional[Dict[str, Any]] = None
     # Schedule-aware fields for frontend UX

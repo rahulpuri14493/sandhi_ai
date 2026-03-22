@@ -79,6 +79,102 @@ class TestArtifactWriteDatabases:
         )
         assert "target.table" in out.lower() or "table" in out.lower()
 
+    def test_postgres_bootstrap_sql_runs_before_insert(self, monkeypatch):
+        from unittest.mock import MagicMock
+
+        import psycopg2
+
+        monkeypatch.setattr(execution_common, "read_artifact_bytes", lambda ref: b'{"id":1,"name":"a"}\n')
+        mock_cur = MagicMock()
+        mock_cur.rowcount = 1
+        mock_conn = MagicMock()
+        mock_conn.cursor.return_value = mock_cur
+        monkeypatch.setattr(psycopg2, "connect", lambda conn_str: mock_conn)
+
+        ddl = 'CREATE TABLE IF NOT EXISTS public.t_job_out ("id" INT, "name" TEXT);'
+        args = _artifact_args()
+        args["target"] = {
+            "schema": "public",
+            "table": "t_job_out",
+            "bootstrap_sql": ddl,
+        }
+        out = execution.execute_artifact_write(
+            "postgres",
+            {"connection_string": "postgresql://u:p@localhost:5432/db"},
+            args,
+        )
+        assert "ok" in out
+        assert mock_cur.execute.call_count >= 1
+        assert mock_cur.executemany.call_count >= 1
+        first_sql = mock_cur.execute.call_args_list[0][0][0]
+        assert "CREATE TABLE" in first_sql
+
+    def test_postgres_column_mapping_maps_artifact_keys(self, monkeypatch):
+        from unittest.mock import MagicMock
+
+        import psycopg2
+
+        monkeypatch.setattr(
+            execution_common,
+            "read_artifact_bytes",
+            lambda ref: b'{"content": {"a": 1}}\n',
+        )
+        mock_cur = MagicMock()
+        mock_cur.rowcount = 1
+        mock_conn = MagicMock()
+        mock_conn.cursor.return_value = mock_cur
+        monkeypatch.setattr(psycopg2, "connect", lambda conn_str: mock_conn)
+
+        args = _artifact_args()
+        args["target"] = {
+            "schema": "public",
+            "table": "t_out",
+            "column_mapping": {"content": "result_json"},
+        }
+        out = execution.execute_artifact_write(
+            "postgres",
+            {"connection_string": "postgresql://u:p@localhost:5432/db"},
+            args,
+        )
+        assert "ok" in out
+        ins_sql = mock_cur.executemany.call_args[0][0]
+        assert "result_json" in ins_sql
+        assert "content" not in ins_sql
+
+    def test_postgres_jsonb_columns_wraps_plain_text(self, monkeypatch):
+        """Plain text in a JSONB column must use Json() — raw strings are invalid JSON for JSONB."""
+        from unittest.mock import MagicMock
+
+        import psycopg2
+        from psycopg2.extras import Json
+
+        monkeypatch.setattr(
+            execution_common,
+            "read_artifact_bytes",
+            lambda ref: b'{"content": "The analysis summary text."}\n',
+        )
+        mock_cur = MagicMock()
+        mock_cur.rowcount = 1
+        mock_conn = MagicMock()
+        mock_conn.cursor.return_value = mock_cur
+        monkeypatch.setattr(psycopg2, "connect", lambda conn_str: mock_conn)
+
+        args = _artifact_args()
+        args["target"] = {
+            "schema": "public",
+            "table": "t_out",
+            "column_mapping": {"content": "result_json"},
+            "jsonb_columns": ["result_json"],
+        }
+        out = execution.execute_artifact_write(
+            "postgres",
+            {"connection_string": "postgresql://u:p@localhost:5432/db"},
+            args,
+        )
+        assert "ok" in out
+        rows = mock_cur.executemany.call_args[0][1]
+        assert isinstance(rows[0][0], Json)
+
     def test_mysql_artifact_write_missing_database(self, monkeypatch):
         monkeypatch.setattr(execution_common, "read_artifact_bytes", lambda ref: b'{"id":1}\n')
         args = _artifact_args()

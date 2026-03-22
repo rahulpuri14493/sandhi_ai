@@ -42,7 +42,7 @@ class Job(Base):
     allowed_connection_ids = Column(Text, nullable=True)  # e.g. "[1]"
     # Restrict what tool info agents see: full | names_only | none (credentials never shared)
     tool_visibility = Column(String(20), nullable=True)  # default full
-    # Controls who triggers final MCP write from output artifact reference: platform | agent
+    # platform | agent | ui_only (ui_only: no artifact file, no contract MCP writes; output in DB for UI)
     write_execution_mode = Column(String(20), nullable=False, default="platform")
     # Preferred persisted artifact format for AI outputs: jsonl | json
     output_artifact_format = Column(String(20), nullable=False, default="jsonl")

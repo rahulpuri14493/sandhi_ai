@@ -4,7 +4,7 @@ from __future__ import annotations
 import json
 import logging
 import re
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 import execution_common
 from execution_common import (
@@ -17,6 +17,86 @@ from execution_common import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _postgres_run_bootstrap_sql(cur: Any, conn: Any, target: Dict[str, Any]) -> Optional[str]:
+    """
+    Run optional DDL before artifact INSERT (e.g. CREATE TABLE IF NOT EXISTS).
+    Set output_contract write_targets[].target.bootstrap_sql to one SQL string or a list of statements.
+    Returns an error string on failure, or None on success.
+    """
+    raw = target.get("bootstrap_sql")
+    if raw is None:
+        return None
+    stmts: List[str]
+    if isinstance(raw, str):
+        s = raw.strip()
+        if not s:
+            return None
+        stmts = [s]
+    elif isinstance(raw, list):
+        stmts = [str(x).strip() for x in raw if str(x).strip()]
+        if not stmts:
+            return None
+    else:
+        return "Error: target.bootstrap_sql must be a string or a list of SQL strings"
+    for stmt in stmts:
+        try:
+            cur.execute(stmt)
+        except Exception as e:
+            logger.exception("Postgres bootstrap_sql failed")
+            return f"Error: bootstrap_sql failed: {e}"
+    conn.commit()
+    return None
+
+
+def _apply_postgres_column_mapping(
+    records: List[Dict[str, Any]], target: Dict[str, Any]
+) -> List[Dict[str, Any]]:
+    """
+    Map artifact record keys to DB column names (e.g. agent emits {"content": ...} but table has result_json).
+
+    Set write_targets[].target.column_mapping to {"artifact_key": "db_column", ...}.
+    Keys not listed pass through unchanged.
+    """
+    cm = target.get("column_mapping") or target.get("artifact_column_mapping")
+    if not isinstance(cm, dict) or not cm:
+        return records
+    out: List[Dict[str, Any]] = []
+    for rec in records:
+        if not isinstance(rec, dict):
+            out.append(rec)
+            continue
+        row: Dict[str, Any] = {}
+        for k, v in rec.items():
+            ks = str(k)
+            dest = cm.get(ks, ks)
+            row[str(dest)] = v
+        out.append(row)
+    return out
+
+
+def _jsonb_column_set(target: Dict[str, Any]) -> set:
+    """Column names that use psycopg2.extras.Json so plain text maps to valid JSON/JSONB."""
+    raw = target.get("jsonb_columns") or target.get("json_columns")
+    if isinstance(raw, list):
+        return {str(x) for x in raw}
+    if isinstance(raw, str) and raw.strip():
+        return {raw.strip()}
+    return set()
+
+
+def _postgres_adapt_cell(col: str, val: Any, jsonb_cols: set) -> Any:
+    if col not in jsonb_cols:
+        return val
+    if val is None:
+        return None
+    try:
+        from psycopg2.extras import Json
+    except ImportError:
+        return val
+    return Json(val)
+
 
 def execute_artifact_write(tool_type: str, config: Dict[str, Any], arguments: Dict[str, Any]) -> str:
     artifact_ref = arguments.get("artifact_ref") or {}
@@ -101,6 +181,9 @@ def _artifact_write_postgres(
     table = (target.get("table") or "").strip()
     if not table:
         return "Error: target.table is required for Postgres artifact write"
+    records = _apply_postgres_column_mapping(records, target)
+    if not records or not isinstance(records[0], dict):
+        return "Error: artifact contained no row data after column_mapping"
     cols = [str(c) for c in records[0].keys()]
     for k in merge_keys:
         if k not in cols:
@@ -109,7 +192,11 @@ def _artifact_write_postgres(
     col_sql = ", ".join(f'"{_safe_ident(c)}"' for c in cols)
     placeholders = ", ".join(["%s"] * len(cols))
     ins = f"INSERT INTO {fq} ({col_sql}) VALUES ({placeholders})"
-    tuples = [tuple(rec.get(c) for c in cols) for rec in records]
+    jsonb_cols = _jsonb_column_set(target)
+    tuples = [
+        tuple(_postgres_adapt_cell(c, rec.get(c), jsonb_cols) for c in cols)
+        for rec in records
+    ]
     logger.info(
         "MCP artifact Postgres write dest=%s schema=%s table=%s rows=%s operation_type=%s write_mode=%s sample_sql=%s",
         _postgres_dest_hint(conn_str),
@@ -123,6 +210,11 @@ def _artifact_write_postgres(
     try:
         conn = psycopg2.connect(conn_str)
         cur = conn.cursor()
+        boot_err = _postgres_run_bootstrap_sql(cur, conn, target)
+        if boot_err:
+            cur.close()
+            conn.close()
+            return boot_err
         wm = str(write_mode or "").lower()
         # Full replace: empty table then append (only for plain insert, not upsert)
         if wm == "overwrite" and operation_type in ("append", "insert") and not merge_keys:
@@ -147,7 +239,7 @@ def _artifact_write_postgres(
         flat: List[Any] = []
         for rec in records:
             value_rows.append("(" + ",".join(["%s"] * len(cols)) + ")")
-            flat.extend(rec.get(c) for c in cols)
+            flat.extend([_postgres_adapt_cell(c, rec.get(c), jsonb_cols) for c in cols])
         values_sql = ", ".join(value_rows)
         conflict = ", ".join(f'"{_safe_ident(k)}"' for k in merge_keys)
         if non_keys:

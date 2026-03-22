@@ -232,9 +232,10 @@ def get_output_contract_template():
     """
     Universal output contract template for artifact-first write execution.
 
-    Use `write_execution_mode` / `write_mode` = platform so the job executor pushes the step
-    artifact to each `write_targets[]` tool. Object stores, Snowflake/BigQuery, SQL Server,
-    Postgres, and MySQL are supported for structured loads (merge_keys + operation_type).
+    Use `write_execution_mode` = platform so the job executor pushes the step artifact to each
+    `write_targets[]` tool. Use `ui_only` to skip artifact files and contract writes (results only in DB/UI).
+
+    Object stores, Snowflake/BigQuery, SQL Server, Postgres, and MySQL are supported for structured loads.
 
     Agent-driven SQL (reads and ad-hoc writes) still uses the interactive Postgres/MySQL tools
     with `query` / `params` only; that path is separate from this contract.
@@ -294,9 +295,12 @@ def _validate_tool_visibility(v: Optional[str]) -> Optional[str]:
 
 def _validate_write_execution_mode(v: Optional[str]) -> str:
     s = (v or "platform").strip().lower()
-    if s in ("platform", "agent"):
+    if s in ("platform", "agent", "ui_only"):
         return s
-    raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="write_execution_mode must be 'platform' or 'agent'")
+    raise HTTPException(
+        status_code=status.HTTP_400_BAD_REQUEST,
+        detail="write_execution_mode must be 'platform', 'agent', or 'ui_only'",
+    )
 
 
 def _validate_output_artifact_format(v: Optional[str]) -> str:

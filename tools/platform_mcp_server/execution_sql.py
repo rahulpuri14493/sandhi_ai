@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from typing import Any, Dict
 
 from execution_common import (
@@ -25,6 +26,16 @@ def execute_postgres(config: Dict[str, Any], arguments: Dict[str, Any]) -> str:
     params = arguments.get("params")
     upper = query.lstrip().upper()
     is_read_query = upper.startswith("SELECT") or upper.startswith("WITH")
+    interactive_readonly = bool(config.get("interactive_readonly")) or (
+        os.environ.get("MCP_POSTGRES_INTERACTIVE_READONLY", "").strip().lower() in ("1", "true", "yes")
+    )
+    if interactive_readonly and not is_read_query:
+        return (
+            "Error: interactive Postgres is read-only for this tool "
+            "(set interactive_readonly on the MCP tool config or MCP_POSTGRES_INTERACTIVE_READONLY=1). "
+            "Only SELECT (and read-only WITH) queries are allowed. "
+            "Use output_contract platform writes for controlled INSERT/DDL to named tables."
+        )
     _log_mcp_sql(
         "postgres",
         query,

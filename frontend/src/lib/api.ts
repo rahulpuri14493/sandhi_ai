@@ -90,7 +90,7 @@ export const jobsAPI = {
     allowed_platform_tool_ids?: number[]
     allowed_connection_ids?: number[]
     tool_visibility?: 'full' | 'names_only' | 'none'
-    write_execution_mode?: 'platform' | 'agent'
+    write_execution_mode?: 'platform' | 'agent' | 'ui_only'
     output_artifact_format?: 'jsonl' | 'json'
     output_contract?: Record<string, unknown>
     schedule_timezone?: string
@@ -205,7 +205,7 @@ export const jobsAPI = {
     stepTools?: Array<{ agent_index: number; allowed_platform_tool_ids?: number[]; allowed_connection_ids?: number[]; tool_visibility?: 'full' | 'names_only' | 'none' }>,
     toolVisibility?: 'full' | 'names_only' | 'none',
     outputSettings?: {
-      write_execution_mode?: 'platform' | 'agent'
+      write_execution_mode?: 'platform' | 'agent' | 'ui_only'
       output_artifact_format?: 'jsonl' | 'json'
       output_contract?: Record<string, unknown>
     }

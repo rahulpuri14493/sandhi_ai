@@ -106,7 +106,7 @@ export function WorkflowBuilder({ jobId, onWorkflowCreated, initialSelectedAgent
   const [jobToolVisibility, setJobToolVisibility] = useState<ToolVisibility>('full')
   const [mode, setMode] = useState<'auto' | 'manual'>('auto')
   const [workflowCollaboration, setWorkflowCollaboration] = useState<WorkflowCollaborationMode>('from_brd')
-  const [writeExecutionMode, setWriteExecutionMode] = useState<'platform' | 'agent'>('platform')
+  const [writeExecutionMode, setWriteExecutionMode] = useState<'platform' | 'agent' | 'ui_only'>('platform')
   const [outputArtifactFormat, setOutputArtifactFormat] = useState<'jsonl' | 'json'>('jsonl')
   const [outputContractText, setOutputContractText] = useState(JSON.stringify(DEFAULT_OUTPUT_CONTRACT, null, 2))
   const [isLoading, setIsLoading] = useState(false)
@@ -134,7 +134,11 @@ export function WorkflowBuilder({ jobId, onWorkflowCreated, initialSelectedAgent
 
   useEffect(() => {
     if (!job?.id) return
-    if (job.write_execution_mode === 'agent' || job.write_execution_mode === 'platform') {
+    if (
+      job.write_execution_mode === 'agent' ||
+      job.write_execution_mode === 'platform' ||
+      job.write_execution_mode === 'ui_only'
+    ) {
       setWriteExecutionMode(job.write_execution_mode)
     }
     if (job.output_artifact_format === 'json' || job.output_artifact_format === 'jsonl') {
@@ -749,11 +753,14 @@ export function WorkflowBuilder({ jobId, onWorkflowCreated, initialSelectedAgent
                   <label className="block text-white/80 text-sm font-semibold mb-1">Write execution mode</label>
                   <select
                     value={writeExecutionMode}
-                    onChange={(e) => setWriteExecutionMode(e.target.value as 'platform' | 'agent')}
+                    onChange={(e) =>
+                      setWriteExecutionMode(e.target.value as 'platform' | 'agent' | 'ui_only')
+                    }
                     className="px-4 py-2.5 bg-dark-200/80 border-2 border-dark-300 rounded-xl text-white font-medium focus:ring-2 focus:ring-primary-500 focus:border-primary-500 w-full"
                   >
                     <option value="platform">Platform triggers write tools from artifact reference</option>
                     <option value="agent">AI agent triggers write tools from artifact reference</option>
+                    <option value="ui_only">UI only — show results in app; no artifact file or contract writes</option>
                   </select>
                 </div>
                 <div>

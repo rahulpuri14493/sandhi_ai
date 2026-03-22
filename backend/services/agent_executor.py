@@ -2,7 +2,7 @@ import logging
 import json
 import uuid
 from datetime import datetime
-from typing import Dict, Any, Optional, List
+from typing import Any, Dict, List, Optional
 import httpx
 from sqlalchemy.orm import Session
 from models.job import Job, JobStatus, WorkflowStep
@@ -18,6 +18,7 @@ from services.db_schema_introspection import format_schema_for_prompt
 from services.job_file_storage import persist_file
 from core.config import settings
 from services.mcp_tool_input_schemas import input_schema_for_platform_tool_type
+from core.artifact_contract import normalize_agent_output_for_artifact
 
 logger = logging.getLogger(__name__)
 
@@ -391,7 +392,21 @@ class AgentExecutor:
                 write_results: List[Dict[str, Any]] = []
                 try:
                     output_data = await self._execute_agent(agent, input_data)
-                    artifact_ref = await self._persist_output_artifact(job, step, output_data)
+                    output_data = normalize_agent_output_for_artifact(output_data)
+                    # ui_only: keep results in step.output_data (DB) for the UI only — no S3/local artifact file, no contract writes.
+                    if write_mode == "ui_only":
+                        output_format = (getattr(job, "output_artifact_format", None) or "jsonl").strip().lower()
+                        if output_format not in ("jsonl", "json"):
+                            output_format = "jsonl"
+                        artifact_ref = {
+                            "artifact_id": str(uuid.uuid4()),
+                            "storage": "inline",
+                            "inline_only": True,
+                            "format": output_format,
+                            "created_at": datetime.utcnow().isoformat(),
+                        }
+                    else:
+                        artifact_ref = await self._persist_output_artifact(job, step, output_data)
                     if write_mode == "platform" and isinstance(write_targets, list) and write_targets:
                         successful_writes = 0
                         for target in write_targets:

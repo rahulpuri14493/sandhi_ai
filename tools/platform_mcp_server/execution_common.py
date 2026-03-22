@@ -11,9 +11,27 @@ import json
 import logging
 import os
 import re
+import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlparse, unquote
+
+# Local dev: .../repo/tools/platform_mcp_server/execution_common.py -> parents[2] is repo root.
+# Docker: /app/execution_common.py has only two parents (/app, /) — parents[2] raises IndexError.
+_here = Path(__file__).resolve()
+try:
+    _repo_root = _here.parents[2]
+except IndexError:
+    _repo_root = None
+else:
+    if not (_repo_root / "backend" / "core" / "artifact_contract.py").is_file():
+        _repo_root = None
+if _repo_root is not None and str(_repo_root) not in sys.path:
+    sys.path.insert(0, str(_repo_root))
+try:
+    from backend.core.artifact_contract import normalize_parsed_artifact_lines
+except ImportError:
+    from artifact_contract import normalize_parsed_artifact_lines
 
 logger = logging.getLogger(__name__)
 
@@ -250,14 +268,16 @@ def parse_artifact_records(data: bytes, fmt: str) -> List[Dict[str, Any]]:
             if not line:
                 continue
             out.append(json.loads(line))
-        return out
+        return normalize_parsed_artifact_lines(out)
     if fmt == "json":
         j = json.loads(data.decode("utf-8"))
         if isinstance(j, list):
-            return [x for x in j if isinstance(x, dict)]
-        if isinstance(j, dict):
-            return [j]
-        return []
+            out = [x for x in j if isinstance(x, dict)]
+        elif isinstance(j, dict):
+            out = [j]
+        else:
+            return []
+        return normalize_parsed_artifact_lines(out)
     if fmt == "csv":
         text = data.decode("utf-8", errors="replace")
         r = csv.DictReader(io.StringIO(text))
