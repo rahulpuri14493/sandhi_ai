@@ -11,6 +11,7 @@ import uuid
 import httpx
 
 from core.config import settings
+from services.httpx_tls import httpx_verify_parameter
 
 
 # JSON-RPC 2.0 and A2A constants
@@ -214,7 +215,7 @@ async def send_message(
     normalized_url = (url or "").strip()
     safe_url = _validate_public_http_url(normalized_url)
 
-    async with httpx.AsyncClient(timeout=timeout, verify=False) as client:
+    async with httpx.AsyncClient(timeout=timeout, verify=httpx_verify_parameter()) as client:
         # codeql[py/full-ssrf] URL validated by _validate_public_http_url (scheme, hostname, port, public IP)
         response = await client.post(safe_url, json=payload, headers=headers)
 

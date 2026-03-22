@@ -19,6 +19,7 @@ from middleware.error_handler import (
 from core.encryption import ensure_encryption_key_for_production
 from core.logging_config import configure_logging
 from services.job_file_storage import verify_s3_connectivity
+from services.task_queue import get_queue_health
 from core.config import settings
 from services.job_scheduler import JobSchedulerService
 
@@ -164,7 +165,10 @@ def root():
 @app.get("/health")
 def health_check():
     s3 = verify_s3_connectivity()
+    queue = get_queue_health()
+    overall_ok = bool(s3["ok"]) and bool(queue["ok"])
     return {
-        "status": "healthy" if s3["ok"] else "degraded",
+        "status": "healthy" if overall_ok else "degraded",
         "storage": s3,
+        "queue": queue,
     }

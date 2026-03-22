@@ -2,7 +2,8 @@
 import logging
 import json
 import re
-import httpx
+from core.config import settings
+from services.llm_http_client import post_openai_compatible_raw
 from typing import List, Dict, Any, Optional
 from models.agent import Agent
 
@@ -116,53 +117,55 @@ If user text explicitly says mappings like "BRD1 handled by Agent1", enforce the
         headers["Authorization"] = f"Bearer {(splitter_agent.api_key or '').strip()}"
 
     try:
-        async with httpx.AsyncClient(timeout=60.0, verify=False) as client:
-            resp = await client.post(url, json=payload, headers=headers)
-            if resp.status_code >= 400:
-                return _fallback_tasks(agents, job_title, job_description, documents_content)
+        fb = (getattr(settings, "LLM_HTTP_FALLBACK_MODEL", None) or "").strip() or None
+        resp = await post_openai_compatible_raw(
+            url, headers, payload, timeout=60.0, max_retries=2, fallback_model=fb
+        )
+        if resp.status_code >= 400:
+            return _fallback_tasks(agents, job_title, job_description, documents_content)
 
-            data = resp.json()
-            text = (
-                data.get("choices", [{}])[0].get("message", {}).get("content", "")
-                or ""
-            ).strip()
-            # Remove markdown code blocks if present
-            if text.startswith("```"):
-                text = text.split("```")[1]
-                if text.startswith("json"):
-                    text = text[4:]
-                text = text.strip()
-            parsed = json.loads(text)
-            if isinstance(parsed, list) and len(parsed) >= len(agents):
-                explicit_map = _extract_explicit_document_agent_mapping(job_description, doc_catalog, agents)
-                has_model_scope = any(isinstance(e.get("assigned_document_ids"), list) and len(e.get("assigned_document_ids")) > 0 for e in parsed if isinstance(e, dict))
-                strict_scope = bool(explicit_map) or has_model_scope
-                normalized_scope = _normalize_agent_document_scope(
-                    parsed_assignments=parsed,
-                    explicit_assignments=explicit_map,
-                    doc_catalog=doc_catalog,
-                    agents=agents,
-                    strict_scope=strict_scope,
-                )
-                # Ensure we have one entry per agent
-                result = []
-                for i in range(len(agents)):
-                    entry = next((e for e in parsed if e.get("agent_index") == i), None)
-                    if entry and isinstance(entry.get("task"), str):
-                        result.append({
-                            "agent_index": i,
-                            "task": entry["task"],
-                            "assigned_document_ids": normalized_scope.get(i),
-                        })
-                    else:
-                        result.append({
-                            "agent_index": i,
-                            "task": _build_agent_task_fallback(
-                                agents[i], job_title, job_description, i, len(agents)
-                            ),
-                            "assigned_document_ids": normalized_scope.get(i),
-                        })
-                return result
+        data = resp.json()
+        text = (
+            data.get("choices", [{}])[0].get("message", {}).get("content", "")
+            or ""
+        ).strip()
+        # Remove markdown code blocks if present
+        if text.startswith("```"):
+            text = text.split("```")[1]
+            if text.startswith("json"):
+                text = text[4:]
+            text = text.strip()
+        parsed = json.loads(text)
+        if isinstance(parsed, list) and len(parsed) >= len(agents):
+            explicit_map = _extract_explicit_document_agent_mapping(job_description, doc_catalog, agents)
+            has_model_scope = any(isinstance(e.get("assigned_document_ids"), list) and len(e.get("assigned_document_ids")) > 0 for e in parsed if isinstance(e, dict))
+            strict_scope = bool(explicit_map) or has_model_scope
+            normalized_scope = _normalize_agent_document_scope(
+                parsed_assignments=parsed,
+                explicit_assignments=explicit_map,
+                doc_catalog=doc_catalog,
+                agents=agents,
+                strict_scope=strict_scope,
+            )
+            # Ensure we have one entry per agent
+            result = []
+            for i in range(len(agents)):
+                entry = next((e for e in parsed if e.get("agent_index") == i), None)
+                if entry and isinstance(entry.get("task"), str):
+                    result.append({
+                        "agent_index": i,
+                        "task": entry["task"],
+                        "assigned_document_ids": normalized_scope.get(i),
+                    })
+                else:
+                    result.append({
+                        "agent_index": i,
+                        "task": _build_agent_task_fallback(
+                            agents[i], job_title, job_description, i, len(agents)
+                        ),
+                        "assigned_document_ids": normalized_scope.get(i),
+                    })
+            return result
     except Exception as e:
         logger.warning("Task split failed: %s, using fallback", e)
 

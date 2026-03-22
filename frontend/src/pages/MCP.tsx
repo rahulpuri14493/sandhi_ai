@@ -16,7 +16,7 @@ export default function MCPPage() {
   const [connections, setConnections] = useState<MCPServerConnectionRes[]>([])
   const [tools, setTools] = useState<MCPToolConfigRes[]>([])
   const [registryCount, setRegistryCount] = useState<number | null>(null)
-  const [platformRegistryTools, setPlatformRegistryTools] = useState<Array<{ source: string; id?: number; name: string; tool_type?: string; description?: string }>>([])
+  const [platformRegistryTools, setPlatformRegistryTools] = useState<Array<{ source: string; id?: number; name: string; tool_type?: string; description?: string; access_mode?: 'read_only' | 'read_write' }>>([])
   const [connectionRegistryTools, setConnectionRegistryTools] = useState<Array<{ connection_id: number; name: string; base_url: string; tools: Array<{ name: string; description?: string }>; error?: string }>>([])
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
@@ -119,29 +119,6 @@ export default function MCPPage() {
             <p className="text-primary-400/90 mt-2 text-sm font-medium">
               {registryCount} tool{registryCount !== 1 ? 's' : ''} available for agents in your jobs.
             </p>
-            {/* Platform tools (internal MCP server) — Vector DB, Postgres, File system, etc. */}
-            {platformRegistryTools.length > 0 && (
-              <div className="mt-3 p-4 rounded-xl bg-dark-100/80 border border-dark-200">
-                <h3 className="text-sm font-semibold text-white/90 mb-2">Platform tools (internal MCP server)</h3>
-                <p className="text-white/50 text-xs mb-2">Vector DB, PostgreSQL, File system, and other platform-configured tools.</p>
-                <ul className="flex flex-wrap gap-2">
-                  {platformRegistryTools.map((t, idx) => (
-                    <li
-                      key={`platform-${t.id ?? idx}`}
-                      className="inline-flex items-center gap-2 px-3 py-1.5 rounded-lg bg-dark-200/80 border border-dark-300 text-sm"
-                    >
-                      <span className="font-medium text-white truncate max-w-[200px]" title={t.name}>{t.name}</span>
-                      {t.tool_type && (
-                        <span className="inline-flex px-2 py-0.5 rounded text-xs font-medium bg-primary-500/20 text-primary-300 border border-primary-500/30 shrink-0">
-                          {TOOL_LABELS[t.tool_type] ?? t.tool_type}
-                        </span>
-                      )}
-                    </li>
-                  ))}
-                </ul>
-              </div>
-            )}
-            {/* Tools from your MCP connections (external servers, e.g. Pageindex) */}
             {connectionRegistryTools.length > 0 && (
               <div className="mt-3 p-4 rounded-xl bg-dark-100/80 border border-dark-200">
                 <h3 className="text-sm font-semibold text-white/90 mb-2">Tools from your MCP connections</h3>
@@ -175,6 +152,59 @@ export default function MCPPage() {
                       )}
                     </div>
                   ))}
+                </div>
+              </div>
+            )}
+            {platformRegistryTools.length > 0 && (
+              <div className="mt-3 p-4 rounded-xl bg-dark-100/80 border border-dark-200">
+                <h3 className="text-sm font-semibold text-white/90 mb-2">Platform tools (internal MCP server)</h3>
+                <p className="text-white/50 text-xs mb-3">
+                  Vector DB, PostgreSQL, file storage, and other tools run by the platform MCP server for your account.
+                  {' '}
+                  <span className="text-white/40">Badges reflect each tool’s interactive capabilities (read-only vs read & write).</span>
+                </p>
+                <div className="space-y-4">
+                  <div className="rounded-lg bg-dark-200/60 border border-dark-300 p-3">
+                    <div className="flex items-center gap-2 mb-2 flex-wrap">
+                      <span className="font-medium text-white">Platform MCP</span>
+                      <span className="text-white/50 text-xs">Internal · one server, your configured tools</span>
+                    </div>
+                    <ul className="flex flex-wrap gap-2">
+                      {platformRegistryTools.map((t, idx) => {
+                        const secondary =
+                          (t.description && t.description.trim()) ||
+                          (t.tool_type ? (TOOL_LABELS[t.tool_type] ?? t.tool_type) : '')
+                        const mode = resolvePlatformRegistryAccessMode(t)
+                        const isReadWrite = mode === 'read_write'
+                        const tt = (t.tool_type || '').toLowerCase()
+                        const readWriteHint =
+                          tt === 'postgres' || tt === 'mysql'
+                            ? 'SELECT/WITH use a read-only session; other SQL (DML/DDL) is committed — you can write to Postgres through this tool.'
+                            : 'This tool supports both read and write operations in the platform MCP server.'
+                        return (
+                          <li
+                            key={`platform-${t.id ?? idx}`}
+                            className="inline-flex items-center gap-2 px-3 py-1.5 rounded-lg bg-dark-300/60 border border-dark-400 text-sm flex-wrap"
+                          >
+                            <span className="font-medium text-white truncate max-w-[200px]" title={secondary || t.name}>{t.name}</span>
+                            <span
+                              className={
+                                isReadWrite
+                                  ? 'inline-flex shrink-0 px-2 py-0.5 rounded text-[10px] font-semibold uppercase tracking-wide bg-emerald-500/15 text-emerald-300 border border-emerald-500/40'
+                                  : 'inline-flex shrink-0 px-2 py-0.5 rounded text-[10px] font-semibold uppercase tracking-wide bg-slate-500/20 text-slate-300 border border-slate-500/35'
+                              }
+                              title={isReadWrite ? readWriteHint : 'This tool supports read/search only in the platform MCP server (no interactive writes).'}
+                            >
+                              {isReadWrite ? 'Read & write' : 'Read-only'}
+                            </span>
+                            {secondary && (
+                              <span className="text-white/50 text-xs max-w-[180px] truncate" title={secondary}>{secondary}</span>
+                            )}
+                          </li>
+                        )
+                      })}
+                    </ul>
+                  </div>
                 </div>
               </div>
             )}
@@ -261,9 +291,30 @@ export default function MCPPage() {
           <div className="rounded-2xl border border-dark-200 overflow-hidden bg-dark-100/50">
             <div className="px-6 py-4 border-b border-dark-200 bg-dark-50/50">
               <h2 className="text-lg font-bold text-white">Your configured items</h2>
-              <p className="text-sm text-white/60 mt-0.5">Platform tools and MCP connections available to your agents.</p>
+              <p className="text-sm text-white/60 mt-0.5">MCP connections and platform tools available to your agents.</p>
             </div>
             <div className="grid md:grid-cols-2 gap-0 md:gap-6 md:divide-x md:divide-dark-200">
+              <div className="p-6">
+                <h3 className="text-sm font-semibold text-white/80 uppercase tracking-wider mb-3">MCP connections</h3>
+                {connections.length === 0 ? (
+                  <p className="text-white/50 text-sm mb-3">No MCP servers connected yet.</p>
+                ) : (
+                  <ul className="space-y-2 mb-3">
+                    {connections.slice(0, 5).map((c) => (
+                      <li key={c.id} className="flex items-center gap-2 flex-wrap">
+                        <span className="font-medium text-white truncate">{c.name}</span>
+                        <span className="text-white/50 text-sm truncate max-w-[180px]">{c.base_url}{c.endpoint_path && c.endpoint_path !== '/mcp' ? c.endpoint_path : ''}</span>
+                      </li>
+                    ))}
+                    {connections.length > 5 && (
+                      <li className="text-white/50 text-sm">+{connections.length - 5} more</li>
+                    )}
+                  </ul>
+                )}
+                <button type="button" onClick={() => setView('connections')} className="text-sm font-medium text-primary-400 hover:text-primary-300">
+                  {connections.length > 0 ? 'Manage connections →' : 'Connect MCP server →'}
+                </button>
+              </div>
               <div className="p-6">
                 <h3 className="text-sm font-semibold text-white/80 uppercase tracking-wider mb-3">Platform tools</h3>
                 {tools.length === 0 ? (
@@ -285,27 +336,6 @@ export default function MCPPage() {
                 )}
                 <button type="button" onClick={() => setView('tools')} className="text-sm font-medium text-primary-400 hover:text-primary-300">
                   {tools.length > 0 ? 'Manage tools →' : 'Configure platform tools →'}
-                </button>
-              </div>
-              <div className="p-6">
-                <h3 className="text-sm font-semibold text-white/80 uppercase tracking-wider mb-3">MCP connections</h3>
-                {connections.length === 0 ? (
-                  <p className="text-white/50 text-sm mb-3">No MCP servers connected yet.</p>
-                ) : (
-                  <ul className="space-y-2 mb-3">
-                    {connections.slice(0, 5).map((c) => (
-                      <li key={c.id} className="flex items-center gap-2 flex-wrap">
-                        <span className="font-medium text-white truncate">{c.name}</span>
-                        <span className="text-white/50 text-sm truncate max-w-[180px]">{c.base_url}{c.endpoint_path && c.endpoint_path !== '/mcp' ? c.endpoint_path : ''}</span>
-                      </li>
-                    ))}
-                    {connections.length > 5 && (
-                      <li className="text-white/50 text-sm">+{connections.length - 5} more</li>
-                    )}
-                  </ul>
-                )}
-                <button type="button" onClick={() => setView('connections')} className="text-sm font-medium text-primary-400 hover:text-primary-300">
-                  {connections.length > 0 ? 'Manage connections →' : 'Connect MCP server →'}
                 </button>
               </div>
             </div>
@@ -710,14 +740,40 @@ const TOOL_LABELS: Record<string, string> = {
   chroma: 'Chroma',
   postgres: 'PostgreSQL',
   mysql: 'MySQL',
+  sqlserver: 'SQL Server',
+  snowflake: 'Snowflake',
+  databricks: 'Databricks',
+  bigquery: 'BigQuery',
   elasticsearch: 'Elasticsearch',
   pageindex: 'PageIndex',
   filesystem: 'File system',
   s3: 'AWS S3',
+  minio: 'MinIO',
+  ceph: 'Ceph (S3-compatible)',
+  azure_blob: 'Azure Blob Storage',
+  gcs: 'Google Cloud Storage',
   slack: 'Slack',
   github: 'GitHub',
   notion: 'Notion',
   rest_api: 'REST API',
+}
+
+/** Matches backend `_READ_ONLY_PLATFORM_TOOL_TYPES` — used when `access_mode` is absent (stale client/cache). */
+const READ_ONLY_PLATFORM_TOOL_TYPES = new Set([
+  'vector_db', 'pinecone', 'weaviate', 'qdrant', 'chroma',
+  'elasticsearch', 'pageindex', 'github', 'notion',
+])
+
+function resolvePlatformRegistryAccessMode(t: {
+  access_mode?: 'read_only' | 'read_write'
+  tool_type?: string
+}): 'read_only' | 'read_write' {
+  if (t.access_mode === 'read_only' || t.access_mode === 'read_write') {
+    return t.access_mode
+  }
+  const tt = (t.tool_type || '').toLowerCase()
+  if (READ_ONLY_PLATFORM_TOOL_TYPES.has(tt)) return 'read_only'
+  return 'read_write'
 }
 
 const TOOL_OPTIONS_GROUPS: { label: string; options: { value: string; label: string }[] }[] = [
@@ -731,13 +787,22 @@ const TOOL_OPTIONS_GROUPS: { label: string; options: { value: string; label: str
   { label: 'Databases', options: [
     { value: 'postgres', label: 'PostgreSQL' },
     { value: 'mysql', label: 'MySQL' },
+    { value: 'sqlserver', label: 'SQL Server' },
+    { value: 'snowflake', label: 'Snowflake' },
+    { value: 'databricks', label: 'Databricks' },
+    { value: 'bigquery', label: 'BigQuery' },
   ]},
   { label: 'Search', options: [
     { value: 'elasticsearch', label: 'Elasticsearch' },
+    { value: 'pageindex', label: 'PageIndex' },
   ]},
   { label: 'Storage', options: [
     { value: 'filesystem', label: 'File system' },
     { value: 's3', label: 'AWS S3' },
+    { value: 'minio', label: 'MinIO' },
+    { value: 'ceph', label: 'Ceph (S3-compatible)' },
+    { value: 'azure_blob', label: 'Azure Blob Storage' },
+    { value: 'gcs', label: 'Google Cloud Storage' },
   ]},
   { label: 'Integrations', options: [
     { value: 'slack', label: 'Slack' },
@@ -846,6 +911,31 @@ function ConfigureFlow({
       { key: 'password', label: 'Password', placeholder: '', secret: true },
       { key: 'database', label: 'Database', placeholder: 'mydb' },
     ],
+    sqlserver: [
+      { key: 'host', label: 'Host', placeholder: 'sql.example.com' },
+      { key: 'port', label: 'Port', placeholder: '1433' },
+      { key: 'database', label: 'Database', placeholder: 'mydb' },
+      { key: 'user', label: 'User', placeholder: 'app_user', secret: false },
+      { key: 'password', label: 'Password', placeholder: '', secret: true },
+    ],
+    snowflake: [
+      { key: 'account', label: 'Account identifier', placeholder: 'xy12345.us-east-1.aws' },
+      { key: 'user', label: 'User', placeholder: 'SERVICE_USER' },
+      { key: 'password', label: 'Password', placeholder: '', secret: true },
+      { key: 'warehouse', label: 'Warehouse', placeholder: 'COMPUTE_WH' },
+      { key: 'database', label: 'Database', placeholder: 'MY_DB' },
+      { key: 'schema', label: 'Schema', placeholder: 'PUBLIC' },
+    ],
+    databricks: [
+      { key: 'host', label: 'Workspace URL', placeholder: 'https://dbc-xxxx.cloud.databricks.com' },
+      { key: 'sql_warehouse_id', label: 'SQL warehouse ID', placeholder: 'Required for SQL queries' },
+      { key: 'token', label: 'Personal access token', placeholder: 'dapi...', secret: true },
+    ],
+    bigquery: [
+      { key: 'project_id', label: 'GCP project ID', placeholder: 'my-project' },
+      { key: 'dataset', label: 'Dataset', placeholder: 'my_dataset' },
+      { key: 'credentials_json', label: 'Service account JSON (optional)', placeholder: 'Paste JSON if not using ADC', secret: true },
+    ],
     elasticsearch: [
       { key: 'url', label: 'Elasticsearch URL', placeholder: 'http://localhost:9200' },
       { key: 'api_key', label: 'API key (optional)', placeholder: '', secret: true },
@@ -864,6 +954,28 @@ function ConfigureFlow({
       { key: 'region', label: 'Region', placeholder: 'us-east-1' },
       { key: 'access_key_id', label: 'Access key ID', placeholder: '', secret: true },
       { key: 'secret_access_key', label: 'Secret access key', placeholder: '', secret: true },
+    ],
+    minio: [
+      { key: 'endpoint', label: 'Endpoint URL', placeholder: 'http://minio:9000' },
+      { key: 'bucket', label: 'Bucket name', placeholder: 'my-bucket' },
+      { key: 'access_key', label: 'Access key (optional)', placeholder: 'minioadmin', secret: true },
+      { key: 'secret_key', label: 'Secret key (optional)', placeholder: '', secret: true },
+    ],
+    ceph: [
+      { key: 'endpoint', label: 'RGW / S3 endpoint URL', placeholder: 'http://ceph-rgw:7480' },
+      { key: 'bucket', label: 'Bucket name', placeholder: 'my-bucket' },
+      { key: 'access_key', label: 'Access key (optional)', placeholder: '', secret: true },
+      { key: 'secret_key', label: 'Secret key (optional)', placeholder: '', secret: true },
+    ],
+    azure_blob: [
+      { key: 'account_url', label: 'Account URL', placeholder: 'https://myaccount.blob.core.windows.net' },
+      { key: 'container', label: 'Container name', placeholder: 'my-container' },
+      { key: 'connection_string', label: 'Connection string (optional)', placeholder: 'DefaultEndpointsProtocol=...', secret: true },
+    ],
+    gcs: [
+      { key: 'project_id', label: 'GCP project ID', placeholder: 'my-project' },
+      { key: 'bucket', label: 'Bucket name', placeholder: 'my-bucket' },
+      { key: 'credentials_json', label: 'Service account JSON (optional)', placeholder: 'Paste JSON if not using ADC', secret: true },
     ],
     slack: [
       { key: 'bot_token', label: 'Bot token (xoxb-...)', placeholder: '', secret: true },
@@ -928,6 +1040,42 @@ function ConfigureFlow({
       }
       if (toolType === 'mysql' && (!config.host?.trim() || !config.database?.trim())) {
         setValidateMessage({ success: false, text: 'MySQL requires host and database.' })
+        return
+      }
+      if (toolType === 'sqlserver' && (!config.host?.trim() || !config.database?.trim())) {
+        setValidateMessage({ success: false, text: 'SQL Server requires host and database.' })
+        return
+      }
+      if (toolType === 'snowflake' && (!config.account?.trim() || !config.warehouse?.trim())) {
+        setValidateMessage({ success: false, text: 'Snowflake requires account and warehouse.' })
+        return
+      }
+      if (toolType === 'databricks' && (!config.host?.trim() || !config.sql_warehouse_id?.trim())) {
+        setValidateMessage({ success: false, text: 'Databricks requires workspace URL and SQL warehouse ID.' })
+        return
+      }
+      if (toolType === 'bigquery' && (!config.project_id?.trim() || !config.dataset?.trim())) {
+        setValidateMessage({ success: false, text: 'BigQuery requires project ID and dataset.' })
+        return
+      }
+      if (toolType === 'pageindex' && !config.api_key?.trim()) {
+        setValidateMessage({ success: false, text: 'PageIndex requires an API key.' })
+        return
+      }
+      if (toolType === 'minio' && (!config.endpoint?.trim() || !config.bucket?.trim())) {
+        setValidateMessage({ success: false, text: 'MinIO requires endpoint and bucket.' })
+        return
+      }
+      if (toolType === 'ceph' && (!config.endpoint?.trim() || !config.bucket?.trim())) {
+        setValidateMessage({ success: false, text: 'Ceph requires endpoint and bucket.' })
+        return
+      }
+      if (toolType === 'azure_blob' && (!config.account_url?.trim() || !config.container?.trim())) {
+        setValidateMessage({ success: false, text: 'Azure Blob requires account URL and container.' })
+        return
+      }
+      if (toolType === 'gcs' && (!config.project_id?.trim() || !config.bucket?.trim())) {
+        setValidateMessage({ success: false, text: 'Google Cloud Storage requires project ID and bucket.' })
         return
       }
     }

@@ -4,15 +4,19 @@ Credentials stored encrypted; platform talks to MCP server via API (JSON-RPC pro
 """
 import json
 import logging
-from fastapi import APIRouter, Depends, HTTPException, status
-from pydantic import BaseModel
+import uuid
+from datetime import datetime
+import time
+import random
+from fastapi import APIRouter, Depends, HTTPException, status, BackgroundTasks
 from sqlalchemy.orm import Session
+from sqlalchemy.exc import IntegrityError
 from typing import List
 
 from db.database import get_db
 from models.user import User
 from models.audit_log import AuditLog
-from models.mcp_server import MCPServerConnection, MCPToolConfig, MCPToolType
+from models.mcp_server import MCPServerConnection, MCPToolConfig, MCPToolType, MCPWriteOperation
 from schemas.mcp import (
     MCPServerConnectionCreate,
     MCPServerConnectionUpdate,
@@ -22,11 +26,141 @@ from schemas.mcp import (
     MCPToolConfigResponse,
     MCPProxyRequest,
     ValidateToolConfigRequest,
+    MCPPlatformToolCallRequest,
+    MCPPlatformWriteRequest,
+    MCPWriteOperationResponse,
 )
 from core.security import get_current_business_user
 from core.encryption import encrypt_json, decrypt_json
+from db.database import SessionLocal
 
 router = APIRouter(prefix="/api/mcp", tags=["mcp"])
+
+
+def _estimate_json_size_bytes(data: dict) -> int:
+    try:
+        return len(json.dumps(data, separators=(",", ":"), ensure_ascii=False).encode("utf-8"))
+    except Exception:
+        return 0
+
+
+def _op_to_response(op: MCPWriteOperation) -> MCPWriteOperationResponse:
+    result_obj = None
+    if op.response_payload:
+        try:
+            result_obj = json.loads(op.response_payload)
+        except (TypeError, json.JSONDecodeError):
+            result_obj = None
+    return MCPWriteOperationResponse(
+        operation_id=op.operation_id,
+        idempotency_key=op.idempotency_key,
+        tool_name=op.tool_name,
+        status=op.status,
+        result=result_obj,
+        error_message=op.error_message,
+        created_at=op.created_at,
+        started_at=op.started_at,
+        completed_at=op.completed_at,
+    )
+
+
+def _is_write_capable_tool_descriptor(tool: dict) -> bool:
+    name = str((tool or {}).get("name", "")).lower()
+    if any(token in name for token in ("write", "upsert", "merge", "insert", "put")):
+        return True
+    schema = (tool or {}).get("inputSchema") or (tool or {}).get("input_schema") or {}
+    props = schema.get("properties") if isinstance(schema, dict) else {}
+    op_type = (props or {}).get("operation_type") if isinstance(props, dict) else None
+    if isinstance(op_type, dict):
+        enums = [str(x).lower() for x in (op_type.get("enum") or [])]
+        if any(x in enums for x in ("insert", "update", "upsert", "merge", "put", "write")):
+            return True
+    return False
+
+
+def _normalize_platform_write_arguments(body: MCPPlatformWriteRequest) -> dict:
+    return {
+        "artifact_ref": body.artifact_ref.model_dump(),
+        "target": body.target.model_dump(by_alias=True),
+        "operation_type": body.operation_type,
+        "write_mode": body.write_mode,
+        "merge_keys": body.merge_keys,
+        "idempotency_key": body.idempotency_key,
+        "options": body.options or {},
+    }
+
+
+def _run_platform_write_operation(operation_id: str, user_id: int) -> None:
+    from services.mcp_client import call_tool
+    from core.config import settings
+    from services.async_runner import run_coroutine_sync
+
+    db = SessionLocal()
+    try:
+        op = db.query(MCPWriteOperation).filter(
+            MCPWriteOperation.operation_id == operation_id,
+            MCPWriteOperation.user_id == user_id,
+        ).first()
+        if not op or op.status in ("success", "failure"):
+            return
+        op.status = "in_progress"
+        op.started_at = datetime.utcnow()
+        db.commit()
+
+        payload = json.loads(op.request_payload)
+        timeout = float(payload.get("timeout_seconds") or getattr(settings, "MCP_TOOL_DEFAULT_TIMEOUT_SECONDS", 60.0))
+        max_attempts = max(1, int(getattr(settings, "MCP_WRITE_OPERATION_MAX_ATTEMPTS", 3)))
+        base_delay = max(0.01, float(getattr(settings, "MCP_WRITE_OPERATION_RETRY_BASE_DELAY_SECONDS", 0.5)))
+        max_delay = max(base_delay, float(getattr(settings, "MCP_WRITE_OPERATION_RETRY_MAX_DELAY_SECONDS", 5.0)))
+        jitter = max(0.0, float(getattr(settings, "MCP_WRITE_OPERATION_RETRY_JITTER_SECONDS", 0.2)))
+
+        last_error = None
+        result = None
+        for attempt in range(max_attempts):
+            try:
+                result = run_coroutine_sync(
+                    call_tool(
+                        base_url=settings.PLATFORM_MCP_SERVER_URL.rstrip("/"),
+                        tool_name=op.tool_name,
+                        arguments=payload["arguments"],
+                        endpoint_path="/mcp",
+                        extra_headers={"X-MCP-Business-Id": str(user_id)},
+                        timeout=timeout,
+                    )
+                )
+                break
+            except Exception as e:
+                last_error = e
+                if attempt >= max_attempts - 1:
+                    break
+                delay = min(max_delay, base_delay * (2 ** attempt)) + random.uniform(0, jitter)
+                time.sleep(delay)
+
+        if result is None:
+            raise RuntimeError(str(last_error) if last_error else "MCP write operation failed")
+        op.status = "success"
+        op.response_payload = json.dumps(result)
+        op.completed_at = datetime.utcnow()
+        db.commit()
+    except Exception as e:
+        try:
+            op = db.query(MCPWriteOperation).filter(
+                MCPWriteOperation.operation_id == operation_id,
+                MCPWriteOperation.user_id == user_id,
+            ).first()
+            if op:
+                op.status = "failure"
+                op.error_message = str(e)[:2000]
+                op.completed_at = datetime.utcnow()
+                db.commit()
+        except Exception:
+            # Do not bubble background-task DB errors to request thread.
+            pass
+    finally:
+        try:
+            db.close()
+        except Exception:
+            pass
 
 
 def _connection_to_response(c: MCPServerConnection) -> MCPServerConnectionResponse:
@@ -108,6 +242,71 @@ async def validate_connection(
             "valid": False,
             "message": "Failed to connect to MCP server. Please verify the server URL, endpoint, and credentials.",
         }
+
+
+@router.post("/connections/{connection_id}/certify")
+async def certify_connection_for_production(
+    connection_id: int,
+    current_user: User = Depends(get_current_business_user),
+    db: Session = Depends(get_db),
+):
+    """
+    BYO MCP certification probe:
+    - initialize works
+    - tools/list works
+    - at least one write-capable tool is discoverable
+    """
+    from services.mcp_client import call_mcp_server, list_tools as mcp_list_tools
+    conn = db.query(MCPServerConnection).filter(
+        MCPServerConnection.id == connection_id,
+        MCPServerConnection.user_id == current_user.id,
+        MCPServerConnection.is_active == True,
+    ).first()
+    if not conn:
+        raise HTTPException(status_code=404, detail="Connection not found")
+    credentials = decrypt_json(conn.encrypted_credentials) if conn.encrypted_credentials else None
+    checks = []
+    try:
+        await call_mcp_server(
+            base_url=conn.base_url,
+            endpoint_path=conn.endpoint_path or "/mcp",
+            method="initialize",
+            params={
+                "protocolVersion": "2024-11-05",
+                "capabilities": {},
+                "clientInfo": {"name": "sandhi-ai-mcp-certify", "version": "1.0.0"},
+            },
+            auth_type=conn.auth_type,
+            credentials=credentials,
+            timeout=20.0,
+        )
+        checks.append({"name": "initialize", "passed": True})
+    except Exception as e:
+        checks.append({"name": "initialize", "passed": False, "error": str(e)})
+        return {"certified": False, "checks": checks, "recommended_policy": "fix_connection"}
+
+    try:
+        tools_result = await mcp_list_tools(
+            base_url=conn.base_url,
+            endpoint_path=conn.endpoint_path or "/mcp",
+            auth_type=conn.auth_type,
+            credentials=credentials,
+            timeout=20.0,
+        )
+        tools = tools_result.get("tools", []) if isinstance(tools_result, dict) else []
+        checks.append({"name": "tools_list", "passed": True, "tool_count": len(tools)})
+    except Exception as e:
+        checks.append({"name": "tools_list", "passed": False, "error": str(e)})
+        return {"certified": False, "checks": checks, "recommended_policy": "fix_tools_list"}
+
+    write_capable = [t for t in tools if _is_write_capable_tool_descriptor(t)]
+    checks.append({"name": "write_capability", "passed": len(write_capable) > 0, "write_tool_count": len(write_capable)})
+    certified = len(write_capable) > 0
+    return {
+        "certified": certified,
+        "checks": checks,
+        "recommended_policy": "allow_read_write" if certified else "read_only_until_write_tool_added",
+    }
 
 
 @router.get("/connections", response_model=List[MCPServerConnectionResponse])
@@ -255,7 +454,11 @@ def create_tool(
     except ValueError:
         raise HTTPException(
             status_code=400,
-            detail="tool_type must be one of: vector_db, pinecone, weaviate, qdrant, chroma, postgres, mysql, elasticsearch, pageindex, filesystem, s3, slack, github, notion, rest_api",
+            detail=(
+                "tool_type must be one of: vector_db, pinecone, weaviate, qdrant, chroma, "
+                "postgres, mysql, sqlserver, snowflake, databricks, bigquery, elasticsearch, pageindex, "
+                "filesystem, s3, minio, ceph, azure_blob, gcs, slack, github, notion, rest_api"
+            ),
         )
     encrypted = encrypt_json(body.config)
     business_description = (body.business_description or "").strip() or None
@@ -410,14 +613,9 @@ async def mcp_proxy(
 
 # --- Invoke platform MCP tool (for UI or agent-driven invocation) ---
 
-class InvokePlatformToolRequest(BaseModel):
-    tool_name: str
-    arguments: dict
-
-
 @router.post("/call-platform-tool")
 async def call_platform_tool(
-    body: InvokePlatformToolRequest,
+    body: MCPPlatformToolCallRequest,
     current_user: User = Depends(get_current_business_user),
 ):
     """
@@ -427,6 +625,21 @@ async def call_platform_tool(
     from core.config import settings
     if not settings.PLATFORM_MCP_SERVER_URL or not settings.MCP_INTERNAL_SECRET:
         raise HTTPException(status_code=503, detail="Platform MCP server not configured")
+    payload_bytes = _estimate_json_size_bytes(body.arguments or {})
+    max_payload = max(1024, int(getattr(settings, "MCP_TOOL_MAX_ARGUMENT_BYTES", 5 * 1024 * 1024)))
+    if payload_bytes > max_payload:
+        raise HTTPException(
+            status_code=413,
+            detail=f"Tool arguments exceed max payload size ({payload_bytes} > {max_payload} bytes)",
+        )
+    default_timeout = float(getattr(settings, "MCP_TOOL_DEFAULT_TIMEOUT_SECONDS", 60.0))
+    timeout = float(body.timeout_seconds or default_timeout)
+    max_timeout = float(getattr(settings, "MCP_TOOL_MAX_TIMEOUT_SECONDS", 300.0))
+    if timeout <= 0 or timeout > max_timeout:
+        raise HTTPException(
+            status_code=400,
+            detail=f"timeout_seconds must be > 0 and <= {max_timeout}",
+        )
     from services.mcp_client import call_tool
     base = settings.PLATFORM_MCP_SERVER_URL.rstrip("/")
     extra_headers = {"X-MCP-Business-Id": str(current_user.id)}
@@ -437,10 +650,107 @@ async def call_platform_tool(
             arguments=body.arguments,
             endpoint_path="/mcp",
             extra_headers=extra_headers,
+            timeout=timeout,
         )
         return result
     except Exception as e:
         raise HTTPException(status_code=502, detail=str(e))
+
+
+@router.post("/call-platform-write")
+async def call_platform_write(
+    body: MCPPlatformWriteRequest,
+    current_user: User = Depends(get_current_business_user),
+):
+    """
+    Invoke a platform MCP write-capable tool with a normalized artifact-first contract.
+    This endpoint standardizes production writes (upsert/merge/insert/update) and
+    enforces payload + timeout guards for high-load stability.
+    """
+    if body.operation_type in ("upsert", "merge") and not body.merge_keys:
+        raise HTTPException(
+            status_code=422,
+            detail="merge_keys are required when operation_type is upsert or merge",
+        )
+    arguments = _normalize_platform_write_arguments(body)
+    tool_call_body = MCPPlatformToolCallRequest(
+        tool_name=body.tool_name,
+        arguments=arguments,
+        timeout_seconds=body.timeout_seconds,
+    )
+    return await call_platform_tool(tool_call_body, current_user)
+
+
+@router.post("/call-platform-write-async", response_model=MCPWriteOperationResponse, status_code=status.HTTP_202_ACCEPTED)
+async def call_platform_write_async(
+    body: MCPPlatformWriteRequest,
+    background_tasks: BackgroundTasks,
+    current_user: User = Depends(get_current_business_user),
+    db: Session = Depends(get_db),
+):
+    """Submit write request as async operation and return operation_id for polling."""
+    from core.config import settings
+    if not settings.PLATFORM_MCP_SERVER_URL or not settings.MCP_INTERNAL_SECRET:
+        raise HTTPException(status_code=503, detail="Platform MCP server not configured")
+    if body.operation_type in ("upsert", "merge") and not body.merge_keys:
+        raise HTTPException(status_code=422, detail="merge_keys are required when operation_type is upsert or merge")
+
+    existing = db.query(MCPWriteOperation).filter(
+        MCPWriteOperation.user_id == current_user.id,
+        MCPWriteOperation.idempotency_key == body.idempotency_key,
+    ).first()
+    if existing:
+        return _op_to_response(existing)
+
+    arguments = _normalize_platform_write_arguments(body)
+    payload_bytes = _estimate_json_size_bytes(arguments)
+    max_payload = max(1024, int(getattr(settings, "MCP_TOOL_MAX_ARGUMENT_BYTES", 5 * 1024 * 1024)))
+    if payload_bytes > max_payload:
+        raise HTTPException(status_code=413, detail=f"Tool arguments exceed max payload size ({payload_bytes} > {max_payload} bytes)")
+
+    op_id = f"op_{uuid.uuid4().hex}"
+    op = MCPWriteOperation(
+        user_id=current_user.id,
+        operation_id=op_id,
+        idempotency_key=body.idempotency_key,
+        tool_name=body.tool_name,
+        status="accepted",
+        request_payload=json.dumps({
+            "arguments": arguments,
+            "timeout_seconds": body.timeout_seconds,
+        }),
+    )
+    db.add(op)
+    try:
+        db.commit()
+    except IntegrityError:
+        # Idempotency race: another request inserted same (user_id, idempotency_key).
+        db.rollback()
+        existing = db.query(MCPWriteOperation).filter(
+            MCPWriteOperation.user_id == current_user.id,
+            MCPWriteOperation.idempotency_key == body.idempotency_key,
+        ).first()
+        if existing:
+            return _op_to_response(existing)
+        raise
+    db.refresh(op)
+    background_tasks.add_task(_run_platform_write_operation, op.operation_id, current_user.id)
+    return _op_to_response(op)
+
+
+@router.get("/operations/{operation_id}", response_model=MCPWriteOperationResponse)
+def get_write_operation(
+    operation_id: str,
+    current_user: User = Depends(get_current_business_user),
+    db: Session = Depends(get_db),
+):
+    op = db.query(MCPWriteOperation).filter(
+        MCPWriteOperation.operation_id == operation_id,
+        MCPWriteOperation.user_id == current_user.id,
+    ).first()
+    if not op:
+        raise HTTPException(status_code=404, detail="Operation not found")
+    return _op_to_response(op)
 
 
 # --- Tool registry (for agent orchestration: discover available MCP tools) ---
@@ -476,6 +786,7 @@ async def get_registry(
             "name": _registry_tool_name(t.id, t.name),
             "tool_type": t.tool_type.value,
             "description": _registry_description(t.tool_type.value, t.name),
+            "access_mode": _registry_access_mode(t.tool_type.value),
         })
 
     # For each connection, fetch tools from that MCP server (tools/list)
@@ -548,6 +859,28 @@ def _registry_tool_name(tool_id: int, name: str) -> str:
     return f"platform_{tool_id}_{safe}" if safe else f"platform_{tool_id}"
 
 
+# Tool types whose interactive platform MCP execution is read/search only (no writes in tools/call).
+_READ_ONLY_PLATFORM_TOOL_TYPES = frozenset({
+    "vector_db",
+    "pinecone",
+    "weaviate",
+    "qdrant",
+    "chroma",
+    "elasticsearch",
+    "pageindex",
+    "github",
+    "notion",
+})
+
+
+def _registry_access_mode(tool_type: str) -> str:
+    """Registry UI: read_only vs read_write from actual platform MCP execute paths."""
+    tt = (tool_type or "").strip().lower()
+    if tt in _READ_ONLY_PLATFORM_TOOL_TYPES:
+        return "read_only"
+    return "read_write"
+
+
 def _registry_description(tool_type: str, name: str) -> str:
     d = {
         "vector_db": "Vector database",
@@ -555,12 +888,20 @@ def _registry_description(tool_type: str, name: str) -> str:
         "weaviate": "Weaviate",
         "qdrant": "Qdrant",
         "chroma": "Chroma",
-        "postgres": "PostgreSQL",
-        "mysql": "MySQL",
+        "postgres": "PostgreSQL (SELECT + DML/DDL)",
+        "mysql": "MySQL (SELECT + DML/DDL)",
+        "sqlserver": "SQL Server",
+        "snowflake": "Snowflake",
+        "databricks": "Databricks",
+        "bigquery": "BigQuery",
         "elasticsearch": "Elasticsearch",
         "pageindex": "PageIndex",
         "filesystem": "File system",
         "s3": "AWS S3",
+        "minio": "MinIO",
+        "ceph": "Ceph",
+        "azure_blob": "Azure Blob",
+        "gcs": "Google Cloud Storage",
         "slack": "Slack",
         "github": "GitHub",
         "notion": "Notion",

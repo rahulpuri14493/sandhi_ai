@@ -1,5 +1,5 @@
-from pydantic import BaseModel
-from typing import Optional, Any
+from pydantic import BaseModel, Field
+from typing import Optional, Any, Literal
 from datetime import datetime
 
 
@@ -81,3 +81,76 @@ class MCPProxyRequest(BaseModel):
     connection_id: int
     method: str
     params: Optional[dict] = None
+
+
+# --- Platform tool invocation contracts (read/write, artifact-first) ---
+
+class MCPArtifactRef(BaseModel):
+    storage: Literal["s3", "minio", "ceph", "gcs", "azure_blob"] = "s3"
+    path: str = Field(..., min_length=1)
+    format: Literal["parquet", "jsonl", "csv", "json"] = "parquet"
+    checksum: Optional[str] = None
+
+
+class MCPTargetRef(BaseModel):
+    target_type: Literal[
+        "bigquery",
+        "databricks",
+        "snowflake",
+        "sqlserver",
+        "s3",
+        "minio",
+        "ceph",
+        "aws_s3",
+        "azure_blob",
+        "gcs",
+    ]
+    name: str = Field(..., min_length=1)
+    database: Optional[str] = None
+    schema_name: Optional[str] = Field(default=None, alias="schema")
+    table: Optional[str] = None
+    bucket: Optional[str] = None
+    prefix: Optional[str] = None
+
+
+class MCPPlatformToolCallRequest(BaseModel):
+    tool_name: str
+    arguments: dict
+    timeout_seconds: Optional[float] = None
+
+
+class MCPPlatformWriteRequest(BaseModel):
+    tool_name: str
+    artifact_ref: MCPArtifactRef
+    target: MCPTargetRef
+    operation_type: Literal["insert", "update", "upsert", "merge"] = "upsert"
+    write_mode: Literal["append", "overwrite", "upsert", "merge"] = "upsert"
+    merge_keys: list[str] = Field(default_factory=list)
+    idempotency_key: str = Field(..., min_length=8)
+    options: dict = Field(default_factory=dict)
+    timeout_seconds: Optional[float] = None
+
+
+class MCPToolWriteResult(BaseModel):
+    status: Literal["success", "failure", "accepted"]
+    rows_received: Optional[int] = None
+    rows_inserted: Optional[int] = None
+    rows_updated: Optional[int] = None
+    rows_failed: Optional[int] = None
+    target: Optional[str] = None
+    idempotency_key: Optional[str] = None
+    operation_id: Optional[str] = None
+    error_code: Optional[str] = None
+    error_message: Optional[str] = None
+
+
+class MCPWriteOperationResponse(BaseModel):
+    operation_id: str
+    idempotency_key: str
+    tool_name: str
+    status: Literal["accepted", "in_progress", "success", "failure"]
+    result: Optional[dict] = None
+    error_message: Optional[str] = None
+    created_at: datetime
+    started_at: Optional[datetime] = None
+    completed_at: Optional[datetime] = None

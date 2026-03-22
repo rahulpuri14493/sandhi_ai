@@ -8,6 +8,7 @@ from services.agent_executor import (
     AgentExecutor,
     _apply_tool_visibility,
     _get_workflow_collaboration_hint_from_job,
+    normalize_agent_output_for_artifact,
 )
 
 
@@ -15,6 +16,39 @@ def _get_executor_format_input(agent: Agent, input_data: dict) -> dict:
     """Helper to call _format_input_for_agent via executor."""
     executor = AgentExecutor(db=MagicMock())
     return executor._format_for_openai(agent, input_data)
+
+
+def test_normalize_agent_output_unwraps_json_records_from_content_string():
+    """Adapter returns {content: json_string}; artifact needs top-level records."""
+    raw = {
+        "content": json.dumps(
+            {
+                "records": [
+                    {"job_creation_date": "2026-03-22T00:00:00Z", "job_count": 4},
+                ]
+            }
+        )
+    }
+    out = normalize_agent_output_for_artifact(raw)
+    assert out["records"][0]["job_creation_date"] == "2026-03-22T00:00:00Z"
+    assert "content" not in out or out.get("content") is None
+
+
+def test_normalize_agent_output_passes_through_when_records_already_top_level():
+    structured = {"records": [{"a": 1}]}
+    assert normalize_agent_output_for_artifact(structured) == structured
+
+
+def test_normalize_agent_output_leaves_prose_unchanged():
+    assert normalize_agent_output_for_artifact({"content": "Hello world"}) == {"content": "Hello world"}
+
+
+def test_normalize_agent_output_unwraps_json_fence_inside_content():
+    """Model returns content wrapped in ```json ... ```."""
+    inner = {"records": [{"job_creation_date": "2026-03-22T00:00:00Z", "job_count": 4}]}
+    fenced = "```json\n" + json.dumps(inner, indent=2) + "\n```"
+    out = normalize_agent_output_for_artifact({"content": fenced})
+    assert out["records"][0]["job_count"] == 4
 
 
 def test_format_for_openai_includes_documents():
@@ -272,8 +306,8 @@ def test_apply_tool_visibility_none_returns_empty():
     assert _apply_tool_visibility([], "full") == []
 
 
-def test_apply_tool_visibility_names_only_strips_schema():
-    """tool_visibility 'names_only' returns name/description only, no schema or business_description."""
+def test_apply_tool_visibility_names_only_truncates_but_keeps_routing_fields():
+    """tool_visibility 'names_only' shortens description but keeps schema/business context for SQL and BYO routing."""
     tools = [
         {"name": "db1", "description": "PostgreSQL DB", "schema_metadata": "{}", "business_description": "Sales DB"},
     ]
@@ -281,8 +315,8 @@ def test_apply_tool_visibility_names_only_strips_schema():
     assert len(out) == 1
     assert out[0]["name"] == "db1"
     assert "PostgreSQL" in out[0]["description"]
-    assert "schema_metadata" not in out[0]
-    assert "business_description" not in out[0]
+    assert out[0]["schema_metadata"] == "{}"
+    assert out[0]["business_description"] == "Sales DB"
 
 
 def test_apply_tool_visibility_full_returns_unchanged():

@@ -11,7 +11,21 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import pytest
 
+import execution
+import execution_common
 from app import execute_platform_tool
+
+
+class TestArtifactObjectBasename:
+    def test_no_double_jsonl_extension(self):
+        assert (
+            execution._artifact_object_storage_basename(
+                "uploads/jobs/x/job_7_step_1_output.jsonl", ".jsonl"
+            ).endswith(".jsonl")
+        )
+        out = execution._artifact_object_storage_basename("job_7_step_1_output.jsonl", ".jsonl")
+        assert out == "job_7_step_1_output.jsonl"
+        assert out.count(".jsonl") == 1
 
 
 class TestPostgres:
@@ -31,6 +45,143 @@ class TestMysql:
         out = execute_platform_tool("mysql", {"host": "localhost", "user": "u", "password": "p", "database": "d"}, {})
         assert "Error:" in out
         assert "query" in out.lower() and ("not configured" in out.lower() or "required" in out.lower())
+
+
+def _artifact_args(**kwargs):
+    base = {
+        "artifact_ref": {"path": "uploads/jobs/x", "format": "jsonl"},
+        "target": {"schema": "public", "table": "t"},
+        "operation_type": "append",
+        "write_mode": "append",
+        "merge_keys": [],
+        "idempotency_key": "k1",
+    }
+    base.update(kwargs)
+    return base
+
+
+class TestArtifactWriteDatabases:
+    """Artifact-first platform writes (output contract path); no real DB required."""
+
+    def test_postgres_artifact_write_missing_connection(self, monkeypatch):
+        monkeypatch.setattr(execution_common, "read_artifact_bytes", lambda ref: b'{"id":1,"name":"a"}\n')
+        out = execution.execute_artifact_write("postgres", {}, _artifact_args())
+        assert "connection_string" in out.lower()
+
+    def test_postgres_artifact_write_missing_table(self, monkeypatch):
+        monkeypatch.setattr(execution_common, "read_artifact_bytes", lambda ref: b'{"id":1}\n')
+        args = _artifact_args()
+        args["target"] = {"schema": "public"}
+        out = execution.execute_artifact_write(
+            "postgres",
+            {"connection_string": "postgresql://x:y@localhost:5432/db"},
+            args,
+        )
+        assert "target.table" in out.lower() or "table" in out.lower()
+
+    def test_postgres_bootstrap_sql_runs_before_insert(self, monkeypatch):
+        from unittest.mock import MagicMock
+
+        import psycopg2
+
+        monkeypatch.setattr(execution_common, "read_artifact_bytes", lambda ref: b'{"id":1,"name":"a"}\n')
+        mock_cur = MagicMock()
+        mock_cur.rowcount = 1
+        mock_conn = MagicMock()
+        mock_conn.cursor.return_value = mock_cur
+        monkeypatch.setattr(psycopg2, "connect", lambda conn_str: mock_conn)
+
+        ddl = 'CREATE TABLE IF NOT EXISTS public.t_job_out ("id" INT, "name" TEXT);'
+        args = _artifact_args()
+        args["target"] = {
+            "schema": "public",
+            "table": "t_job_out",
+            "bootstrap_sql": ddl,
+        }
+        out = execution.execute_artifact_write(
+            "postgres",
+            {"connection_string": "postgresql://u:p@localhost:5432/db"},
+            args,
+        )
+        assert "ok" in out
+        assert mock_cur.execute.call_count >= 1
+        assert mock_cur.executemany.call_count >= 1
+        first_sql = mock_cur.execute.call_args_list[0][0][0]
+        assert "CREATE TABLE" in first_sql
+
+    def test_postgres_column_mapping_maps_artifact_keys(self, monkeypatch):
+        from unittest.mock import MagicMock
+
+        import psycopg2
+
+        monkeypatch.setattr(
+            execution_common,
+            "read_artifact_bytes",
+            lambda ref: b'{"content": {"a": 1}}\n',
+        )
+        mock_cur = MagicMock()
+        mock_cur.rowcount = 1
+        mock_conn = MagicMock()
+        mock_conn.cursor.return_value = mock_cur
+        monkeypatch.setattr(psycopg2, "connect", lambda conn_str: mock_conn)
+
+        args = _artifact_args()
+        args["target"] = {
+            "schema": "public",
+            "table": "t_out",
+            "column_mapping": {"content": "result_json"},
+        }
+        out = execution.execute_artifact_write(
+            "postgres",
+            {"connection_string": "postgresql://u:p@localhost:5432/db"},
+            args,
+        )
+        assert "ok" in out
+        ins_sql = mock_cur.executemany.call_args[0][0]
+        assert "result_json" in ins_sql
+        assert "content" not in ins_sql
+
+    def test_postgres_jsonb_columns_wraps_plain_text(self, monkeypatch):
+        """Plain text in a JSONB column must use Json() — raw strings are invalid JSON for JSONB."""
+        from unittest.mock import MagicMock
+
+        import psycopg2
+        from psycopg2.extras import Json
+
+        monkeypatch.setattr(
+            execution_common,
+            "read_artifact_bytes",
+            lambda ref: b'{"content": "The analysis summary text."}\n',
+        )
+        mock_cur = MagicMock()
+        mock_cur.rowcount = 1
+        mock_conn = MagicMock()
+        mock_conn.cursor.return_value = mock_cur
+        monkeypatch.setattr(psycopg2, "connect", lambda conn_str: mock_conn)
+
+        args = _artifact_args()
+        args["target"] = {
+            "schema": "public",
+            "table": "t_out",
+            "column_mapping": {"content": "result_json"},
+            "jsonb_columns": ["result_json"],
+        }
+        out = execution.execute_artifact_write(
+            "postgres",
+            {"connection_string": "postgresql://u:p@localhost:5432/db"},
+            args,
+        )
+        assert "ok" in out
+        rows = mock_cur.executemany.call_args[0][1]
+        assert isinstance(rows[0][0], Json)
+
+    def test_mysql_artifact_write_missing_database(self, monkeypatch):
+        monkeypatch.setattr(execution_common, "read_artifact_bytes", lambda ref: b'{"id":1}\n')
+        args = _artifact_args()
+        args["target"] = {"table": "t"}
+        out = execution.execute_artifact_write("mysql", {"host": "localhost", "user": "u", "password": "p"}, args)
+        assert "database" in out.lower() and "table" in out.lower()
+
 
 class TestFilesystem:
     def test_filesystem_missing_base_path(self):
@@ -62,6 +213,15 @@ class TestFilesystem:
         assert isinstance(out, str)
         # Returns newline-separated names (empty for empty dir)
         assert out == "" or "\n" in out or len(out) > 0
+
+    def test_filesystem_write_creates_file(self, tmp_path):
+        out = execute_platform_tool(
+            "filesystem",
+            {"base_path": str(tmp_path)},
+            {"path": "out/new.txt", "action": "write", "content": "hello"},
+        )
+        assert "Error:" not in out
+        assert (tmp_path / "out" / "new.txt").read_text() == "hello"
 
 
 class TestChroma:
@@ -124,27 +284,23 @@ class TestRestApi:
 
 
 class TestStubTools:
-    """S3, Slack, GitHub, Notion return configured message (no external call in unit test)."""
+    """S3 / Slack / GitHub / Notion return clear errors without real credentials (or SDK missing)."""
 
-    def test_s3_configured_message(self):
+    def test_s3_without_aws_returns_error(self):
         out = execute_platform_tool("s3", {"bucket": "my-bucket"}, {"key": "x", "action": "get"})
-        assert "S3" in out
-        assert "configured" in out.lower() or "boto3" in out.lower()
+        assert "Error:" in out or "Unable" in out or "NoSuchKey" in out or "not found" in out.lower()
 
-    def test_slack_configured_message(self):
-        out = execute_platform_tool("slack", {"token": "x"}, {"channel": "C1", "message": "hi", "action": "send"})
-        assert "Slack" in out
-        assert "configured" in out.lower()
+    def test_slack_invalid_token_returns_error(self):
+        out = execute_platform_tool("slack", {"bot_token": "xoxb-invalid"}, {"action": "list_channels"})
+        assert "Error:" in out
 
-    def test_github_configured_message(self):
-        out = execute_platform_tool("github", {"token": "x"}, {"repo": "a/b", "path": "README.md", "action": "get_file"})
-        assert "GitHub" in out
-        assert "configured" in out.lower()
+    def test_github_invalid_token_returns_error(self):
+        out = execute_platform_tool("github", {"api_key": "ghp_invalid"}, {"repo": "a/b", "path": "README.md", "action": "get_file"})
+        assert "Error:" in out
 
-    def test_notion_configured_message(self):
-        out = execute_platform_tool("notion", {"api_key": "x"}, {"action": "search", "query": "test"})
-        assert "Notion" in out
-        assert "configured" in out.lower()
+    def test_notion_invalid_key_returns_error(self):
+        out = execute_platform_tool("notion", {"api_key": "secret_invalid"}, {"action": "search", "query": "test"})
+        assert "Error:" in out
 
 
 class TestUnknownTool:

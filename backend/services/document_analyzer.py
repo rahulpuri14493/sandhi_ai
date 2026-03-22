@@ -4,6 +4,7 @@ from pathlib import Path
 import json
 from core.config import settings
 from services.a2a_client import execute_via_a2a
+from services.httpx_tls import httpx_verify_parameter
 from services.job_file_storage import materialize_to_temp_path, cleanup_temp_path
 
 
@@ -676,7 +677,7 @@ No markdown. No extra keys. No explanation text."""
             headers = {"Content-Type": "application/json"}
             if agent_api_key and (agent_api_key or "").strip():
                 headers["Authorization"] = f"Bearer {(agent_api_key or '').strip()}"
-            async with httpx.AsyncClient(timeout=120.0, verify=False) as client:
+            async with httpx.AsyncClient(timeout=120.0, verify=httpx_verify_parameter()) as client:
                 resp = await client.post(agent_api_url.strip(), json=payload, headers=headers)
                 resp.raise_for_status()
                 data = resp.json()

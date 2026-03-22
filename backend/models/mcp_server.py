@@ -3,7 +3,7 @@ MCP (Model Context Protocol) models: user/tenant-scoped server connections
 and platform-configured tools (Vector DB, PostgreSQL, File system, etc.).
 Credentials are stored encrypted in the database.
 """
-from sqlalchemy import Column, Integer, String, DateTime, Boolean, ForeignKey, Text
+from sqlalchemy import Column, Integer, String, DateTime, Boolean, ForeignKey, Text, UniqueConstraint
 from sqlalchemy.orm import relationship
 from sqlalchemy.types import TypeDecorator
 from datetime import datetime
@@ -44,12 +44,20 @@ class MCPToolType(str, enum.Enum):
     # Databases
     POSTGRES = "postgres"
     MYSQL = "mysql"
+    SQLSERVER = "sqlserver"
+    SNOWFLAKE = "snowflake"
+    DATABRICKS = "databricks"
+    BIGQUERY = "bigquery"
     # Search
     ELASTICSEARCH = "elasticsearch"
     PAGEINDEX = "pageindex"  # Vectorless RAG (keyword/tree retrieval, no vectors)
     # Storage
     FILESYSTEM = "filesystem"
     S3 = "s3"
+    MINIO = "minio"
+    CEPH = "ceph"
+    AZURE_BLOB = "azure_blob"
+    GCS = "gcs"
     # Integrations
     SLACK = "slack"
     GITHUB = "github"
@@ -101,3 +109,26 @@ class MCPToolConfig(Base):
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
     user = relationship("User", backref="mcp_tool_configs")
+
+
+class MCPWriteOperation(Base):
+    """Async write operation ledger for idempotent MCP write execution."""
+    __tablename__ = "mcp_write_operations"
+    __table_args__ = (
+        UniqueConstraint("user_id", "idempotency_key", name="uq_mcp_write_ops_user_idempotency"),
+    )
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    operation_id = Column(String(64), nullable=False, unique=True, index=True)
+    idempotency_key = Column(String(255), nullable=False, index=True)
+    tool_name = Column(String(255), nullable=False)
+    status = Column(String(32), nullable=False, default="accepted")  # accepted | in_progress | success | failure
+    request_payload = Column(Text, nullable=False)
+    response_payload = Column(Text, nullable=True)
+    error_message = Column(Text, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    started_at = Column(DateTime, nullable=True)
+    completed_at = Column(DateTime, nullable=True)
+
+    user = relationship("User", backref="mcp_write_operations")

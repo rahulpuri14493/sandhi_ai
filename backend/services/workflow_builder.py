@@ -15,11 +15,74 @@ from services.task_splitter import split_job_for_agents
 logger = logging.getLogger(__name__)
 
 
+def _normalized_job_output_settings(job: Job) -> tuple[str, str]:
+    write_mode_raw = getattr(job, "write_execution_mode", "platform")
+    write_mode = write_mode_raw if isinstance(write_mode_raw, str) else "platform"
+    write_mode = (write_mode or "platform").strip().lower()
+    if write_mode not in ("platform", "agent", "ui_only"):
+        write_mode = "platform"
+
+    artifact_format_raw = getattr(job, "output_artifact_format", "jsonl")
+    artifact_format = artifact_format_raw if isinstance(artifact_format_raw, str) else "jsonl"
+    artifact_format = (artifact_format or "jsonl").strip().lower()
+    if artifact_format not in ("jsonl", "json"):
+        artifact_format = "jsonl"
+    return write_mode, artifact_format
+
+
 class WorkflowBuilder:
     def __init__(self, db: Session):
         self.db = db
         self.payment_processor = PaymentProcessor(db)
-    
+
+    async def load_job_documents_content_async(self, job: Job) -> List[Dict[str, Any]]:
+        """Read BRD / job file text for task splitting and tool suggestion (same as auto-split)."""
+        documents_content: List[Dict[str, Any]] = []
+        if not job.files:
+            return documents_content
+        try:
+            from services.document_analyzer import DocumentAnalyzer
+
+            files_data = json.loads(job.files)
+            analyzer = DocumentAnalyzer()
+            for file_info in files_data:
+                if file_info.get("path") or (
+                    file_info.get("storage") == "s3" and file_info.get("bucket") and file_info.get("key")
+                ):
+                    try:
+                        content = await analyzer.read_file_info(file_info)
+                        if not content or not content.strip():
+                            logger.warning(
+                                "Document %s has empty content - skipping (documents are optional)",
+                                file_info.get("name"),
+                            )
+                            continue
+                        doc_id = str(file_info.get("id") or f"BRD{len(documents_content) + 1}")
+                        documents_content.append(
+                            {
+                                "id": doc_id,
+                                "name": file_info.get("name", "Unknown"),
+                                "type": file_info.get("type", "unknown"),
+                                "content": content,
+                            }
+                        )
+                    except Exception as e:
+                        logger.warning(
+                            "Failed to read document %s: %s - skipping (documents are optional)",
+                            file_info.get("name"),
+                            e,
+                        )
+                        continue
+                else:
+                    logger.warning("Document %s has no readable source metadata", file_info.get("name"))
+        except (json.JSONDecodeError, TypeError, Exception) as e:
+            logger.warning("Failed to parse job.files: %s - Continuing without documents", e)
+        return documents_content
+
+    def load_job_documents_content(self, job: Job) -> List[Dict[str, Any]]:
+        """Sync wrapper for tests and non-async code paths (runs the async loader in a new event loop)."""
+        return asyncio.run(self.load_job_documents_content_async(job))
+
     def _get_workflow_collaboration_hint(self, job: Job) -> Optional[str]:
         """Get workflow_collaboration_hint from job conversation (BRD/analyze-documents). Returns 'sequential', 'async_a2a', or None."""
         if not job.conversation:
@@ -36,7 +99,7 @@ class WorkflowBuilder:
             pass
         return None
 
-    def auto_split_workflow(
+    async def auto_split_workflow_async(
         self,
         job_id: int,
         agent_ids: List[int],
@@ -47,9 +110,6 @@ class WorkflowBuilder:
         """Automatically split a job across selected agents. workflow_mode: 'independent' | 'sequential' | None.
         step_tools: optional list of {agent_index, allowed_platform_tool_ids, allowed_connection_ids, tool_visibility} per step.
         tool_visibility: job-level full | names_only | none (restricts what tool info agents see; credentials never shared)."""
-        import json
-        import asyncio
-        
         job = self.db.query(Job).filter(Job.id == job_id).first()
         if not job:
             raise ValueError("Job not found")
@@ -69,44 +129,9 @@ class WorkflowBuilder:
                 conversation_data = json.loads(job.conversation)
             except (json.JSONDecodeError, TypeError):
                 pass
-        
-        # Parse and read document content
-        documents_content = []
-        if job.files:
-            try:
-                from services.document_analyzer import DocumentAnalyzer
-                files_data = json.loads(job.files)
-                analyzer = DocumentAnalyzer()
-                
-                # Read content from each document
-                for file_info in files_data:
-                    if file_info.get("path") or (file_info.get("storage") == "s3" and file_info.get("bucket") and file_info.get("key")):
-                        try:
-                            # Use asyncio to call async method
-                            content = asyncio.run(analyzer.read_file_info(file_info))
-                            # Validate content was extracted - skip empty documents (they're optional)
-                            if not content or not content.strip():
-                                logger.warning("Document %s has empty content - skipping (documents are optional)", file_info.get('name'))
-                                continue
-                            
-                            logger.debug("Successfully read document: %s - Content length: %s chars", file_info.get('name'), len(content))
-                            doc_id = str(file_info.get("id") or f"BRD{len(documents_content) + 1}")
-                            documents_content.append({
-                                "id": doc_id,
-                                "name": file_info.get("name", "Unknown"),
-                                "type": file_info.get("type", "unknown"),
-                                "content": content
-                            })
-                        except Exception as e:
-                            # If document reading fails, skip it (documents are optional)
-                            logger.warning("Failed to read document %s: %s - skipping (documents are optional)", file_info.get('name'), e)
-                            continue
-                    else:
-                        logger.warning("Document %s has no readable source metadata", file_info.get('name'))
-            except (json.JSONDecodeError, TypeError, Exception) as e:
-                # If document parsing fails, continue without document content (documents are optional)
-                logger.warning("Failed to parse job.files: %s - Continuing without documents (they are optional)", e)
-        
+
+        documents_content = await self.load_job_documents_content_async(job)
+
         # Log document status
         if documents_content:
             logger.debug("%s document(s) will be included as additional information", len(documents_content))
@@ -114,11 +139,14 @@ class WorkflowBuilder:
             logger.debug("No documents provided - agent will work with job title and description only")
         
         # Prepare base input data with job context, Q&A conversation, and documents
+        write_mode, artifact_format = _normalized_job_output_settings(job)
         base_input_data = {
             "job_title": job.title,
             "job_description": job.description,
             "conversation": conversation_data or [],  # Include Q&A conversation
-            "documents": documents_content  # Include document content
+            "documents": documents_content,  # Include document content
+            "write_execution_mode": write_mode,
+            "output_artifact_format": artifact_format,
         }
         
         # Split job into subtasks per agent (generalized, uses first agent's API when available)
@@ -127,15 +155,13 @@ class WorkflowBuilder:
             splitter = agents[0] if (agents[0].api_endpoint and (agents[0].api_endpoint or "").strip()) else None
             try:
                 if splitter:
-                    task_assignments = asyncio.run(
-                        split_job_for_agents(
-                            job_title=job.title,
-                            job_description=job.description or "",
-                            documents_content=documents_content,
-                            conversation_data=conversation_data,
-                            agents=agents,
-                            splitter_agent=splitter,
-                        )
+                    task_assignments = await split_job_for_agents(
+                        job_title=job.title,
+                        job_description=job.description or "",
+                        documents_content=documents_content,
+                        conversation_data=conversation_data,
+                        agents=agents,
+                        splitter_agent=splitter,
                     )
             except Exception as e:
                 logger.warning("Task split failed: %s, using fallback", e)
@@ -275,12 +301,28 @@ class WorkflowBuilder:
         # Calculate costs
         preview = self.payment_processor.calculate_job_cost(job_id)
         return preview
+
+    def auto_split_workflow(
+        self,
+        job_id: int,
+        agent_ids: List[int],
+        workflow_mode: Optional[str] = None,
+        step_tools: Optional[List[Dict[str, Any]]] = None,
+        tool_visibility: Optional[str] = None,
+    ) -> WorkflowPreview:
+        """Sync wrapper for tests and scripts (uses asyncio.run). Prefer auto_split_workflow_async from async routes."""
+        return asyncio.run(
+            self.auto_split_workflow_async(
+                job_id,
+                agent_ids,
+                workflow_mode=workflow_mode,
+                step_tools=step_tools,
+                tool_visibility=tool_visibility,
+            )
+        )
     
-    def create_manual_workflow(self, job_id: int, workflow_steps: List[Dict[str, Any]]) -> WorkflowPreview:
+    async def create_manual_workflow_async(self, job_id: int, workflow_steps: List[Dict[str, Any]]) -> WorkflowPreview:
         """Create a manual workflow from user-specified steps"""
-        import json
-        import asyncio
-        
         job = self.db.query(Job).filter(Job.id == job_id).first()
         if not job:
             raise ValueError("Job not found")
@@ -292,44 +334,9 @@ class WorkflowBuilder:
                 conversation_data = json.loads(job.conversation)
             except (json.JSONDecodeError, TypeError):
                 pass
-        
-        # Parse and read document content
-        documents_content = []
-        if job.files:
-            try:
-                from services.document_analyzer import DocumentAnalyzer
-                files_data = json.loads(job.files)
-                analyzer = DocumentAnalyzer()
-                
-                # Read content from each document
-                for file_info in files_data:
-                    if file_info.get("path") or (file_info.get("storage") == "s3" and file_info.get("bucket") and file_info.get("key")):
-                        try:
-                            # Use asyncio to call async method
-                            content = asyncio.run(analyzer.read_file_info(file_info))
-                            # Validate content was extracted - skip empty documents (they're optional)
-                            if not content or not content.strip():
-                                logger.warning("Document %s has empty content - skipping (documents are optional)", file_info.get('name'))
-                                continue
-                            
-                            logger.debug("Successfully read document: %s - Content length: %s chars", file_info.get('name'), len(content))
-                            doc_id = str(file_info.get("id") or f"BRD{len(documents_content) + 1}")
-                            documents_content.append({
-                                "id": doc_id,
-                                "name": file_info.get("name", "Unknown"),
-                                "type": file_info.get("type", "unknown"),
-                                "content": content
-                            })
-                        except Exception as e:
-                            # If document reading fails, skip it (documents are optional)
-                            logger.warning("Failed to read document %s: %s - skipping (documents are optional)", file_info.get('name'), e)
-                            continue
-                    else:
-                        logger.warning("Document %s has no readable source metadata", file_info.get('name'))
-            except (json.JSONDecodeError, TypeError, Exception) as e:
-                # If document parsing fails, continue without document content (documents are optional)
-                logger.warning("Failed to parse job.files: %s - Continuing without documents (they are optional)", e)
-        
+
+        documents_content = await self.load_job_documents_content_async(job)
+
         # Log document status
         if documents_content:
             logger.debug("%s document(s) will be included as additional information", len(documents_content))
@@ -339,11 +346,14 @@ class WorkflowBuilder:
         # Prepare base input data with job context, Q&A conversation, and documents
         logger.debug("Building manual workflow for job %s title=%s conversation_items=%s documents=%s", job_id, job.title, len(conversation_data) if conversation_data else 0, len(documents_content))
         
+        write_mode, artifact_format = _normalized_job_output_settings(job)
         base_input_data = {
             "job_title": job.title,
             "job_description": job.description,
             "conversation": conversation_data or [],  # Include Q&A conversation
-            "documents": documents_content  # Include document content
+            "documents": documents_content,  # Include document content
+            "write_execution_mode": write_mode,
+            "output_artifact_format": artifact_format,
         }
         
         # Validate that documents and conversation are included
@@ -437,3 +447,7 @@ class WorkflowBuilder:
         # Calculate costs
         preview = self.payment_processor.calculate_job_cost(job_id)
         return preview
+
+    def create_manual_workflow(self, job_id: int, workflow_steps: List[Dict[str, Any]]) -> WorkflowPreview:
+        """Sync wrapper for tests and scripts. Prefer create_manual_workflow_async from async routes."""
+        return asyncio.run(self.create_manual_workflow_async(job_id, workflow_steps))

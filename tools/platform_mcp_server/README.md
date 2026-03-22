@@ -6,7 +6,7 @@ Platform-hosted MCP (Model Context Protocol) server that exposes **enterprise to
 
 - **MCP protocol**: JSON-RPC 2.0 `initialize`, `tools/list`, `tools/call`
 - **Tool discovery**: Tools are fetched from the backend per `X-MCP-Business-Id` (tenant)
-- **Tool execution**: Runs Vector DB queries, read-only PostgreSQL, and file read/list under configured base path
+- **Tool execution**: Runs Vector DB queries, PostgreSQL/MySQL reads and writes (per SQL), object store get/list/put, filesystem read/list/write under configured base path, and artifact-driven platform writes where implemented
 - **Secure**: No credentials stored here; decrypted config is fetched per request from the backend using `MCP_INTERNAL_SECRET`
 
 ## Configuration
@@ -15,6 +15,8 @@ Platform-hosted MCP (Model Context Protocol) server that exposes **enterprise to
 |----------|-------------|
 | `BACKEND_INTERNAL_URL` | Backend base URL (e.g. `http://backend:8000`) |
 | `MCP_INTERNAL_SECRET` | Must match backend `MCP_INTERNAL_SECRET` |
+| `MCP_POSTGRES_INTERACTIVE_READONLY` | If `1`/`true`, interactive Postgres tool allows only `SELECT` (and read-only `WITH`); use `output_contract` for INSERT/DDL. Optional per-tool: `interactive_readonly` in encrypted tool config. |
+| `MCP_S3_WRITE_KEY_PREFIX` | If set (e.g. `reports`), interactive S3/MinIO `put`/`write` keys must be under that prefix. |
 
 **Vector stores (no platform OpenAI key):** The platform does **not** provide an OpenAI API key. When query-by-text needs an embedding, the server uses the **end-user’s** OpenAI API key from the tool configuration (optional field “OpenAI API key for embedding”). If embedding is required and the user has not provided a key, the tool returns a clear message asking them to add it in the MCP Server tool config.
 
