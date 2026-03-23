@@ -4,6 +4,7 @@ from pathlib import Path
 import json
 from core.config import settings
 from services.a2a_client import execute_via_a2a
+from services.httpx_tls import httpx_verify_parameter
 from services.job_file_storage import materialize_to_temp_path, cleanup_temp_path
 
 
@@ -45,17 +46,17 @@ class DocumentAnalyzer:
             # PDF files
             elif file_ext == '.pdf':
                 try:
-                    import PyPDF2
+                    from pypdf import PdfReader
                     content = []
                     with open(path, 'rb') as f:
-                        pdf_reader = PyPDF2.PdfReader(f)
+                        pdf_reader = PdfReader(f)
                         for page_num, page in enumerate(pdf_reader.pages):
                             text = page.extract_text()
                             if text.strip():
                                 content.append(f"--- Page {page_num + 1} ---\n{text}")
                     return '\n\n'.join(content) if content else "[PDF file contains no extractable text]"
                 except ImportError:
-                    return f"[PDF extraction requires PyPDF2 library. File: {path.name}]"
+                    return f"[PDF extraction requires pypdf library. File: {path.name}]"
                 except Exception as e:
                     return f"[Error extracting PDF content: {str(e)}]"
             
@@ -676,7 +677,7 @@ No markdown. No extra keys. No explanation text."""
             headers = {"Content-Type": "application/json"}
             if agent_api_key and (agent_api_key or "").strip():
                 headers["Authorization"] = f"Bearer {(agent_api_key or '').strip()}"
-            async with httpx.AsyncClient(timeout=120.0, verify=False) as client:
+            async with httpx.AsyncClient(timeout=120.0, verify=httpx_verify_parameter()) as client:
                 resp = await client.post(agent_api_url.strip(), json=payload, headers=headers)
                 resp.raise_for_status()
                 data = resp.json()

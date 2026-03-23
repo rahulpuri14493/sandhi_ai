@@ -4,9 +4,10 @@ import io
 import json
 import zipfile
 import random
+import uuid
 from pathlib import Path
 from typing import List, Optional
-from fastapi import APIRouter, Depends, HTTPException, status, BackgroundTasks, UploadFile, File, Form, Query
+from fastapi import APIRouter, Depends, HTTPException, status, UploadFile, File, Form, Query
 from fastapi.responses import FileResponse, Response, StreamingResponse
 from sqlalchemy.orm import Session
 from pydantic import BaseModel
@@ -24,14 +25,14 @@ from schemas.job import (
 )
 from core.security import get_current_user, get_current_business_user
 from core.config import settings
-from services.job_scheduler import get_scheduler, reset_job_for_execution, run_job_in_thread
+from services.job_scheduler import get_scheduler, reset_job_for_execution, queue_job_execution
+from services.task_queue import get_queue_stats
 from services.workflow_builder import WorkflowBuilder
+from services.tool_splitter import suggest_tool_assignments_for_agents
 from services.payment_processor import PaymentProcessor
-from services.agent_executor import AgentExecutor
 from services.document_analyzer import DocumentAnalyzer
 from models.transaction import Transaction, Earnings
 from core.external_token import create_job_token, get_share_url
-import threading
 from datetime import datetime, timedelta
 from models.communication import AgentCommunication
 from models.mcp_server import MCPToolConfig, MCPServerConnection
@@ -226,6 +227,52 @@ class UserResponseRequest(BaseModel):
     answer: str
 
 
+@router.get("/output-contract/template", status_code=status.HTTP_200_OK)
+def get_output_contract_template():
+    """
+    Universal output contract template for artifact-first write execution.
+
+    Use `write_execution_mode` = platform so the job executor pushes the step artifact to each
+    `write_targets[]` tool. Use `ui_only` to skip artifact files and contract writes (results only in DB/UI).
+
+    Object stores, Snowflake/BigQuery, SQL Server, Postgres, and MySQL are supported for structured loads.
+
+    Agent-driven SQL (reads and ad-hoc writes) still uses the interactive Postgres/MySQL tools
+    with `query` / `params` only; that path is separate from this contract.
+    """
+    return {
+        "version": "1.0",
+        "record_schema": {
+            "customer_id": "string",
+            "decision": "string",
+            "confidence": "number",
+            "reason_codes": ["string"],
+            "evidence_refs": ["string"],
+            "processed_at": "datetime",
+        },
+        "write_policy": {
+            "on_write_error": "fail_job",
+            "min_successful_targets": 1,
+        },
+        "write_targets": [
+            {
+                "tool_name": "platform_1_snowflake_kyc_results",
+                "operation_type": "upsert",
+                "write_mode": "upsert",
+                "merge_keys": ["customer_id"],
+                "target": {
+                    "database": "BANK",
+                    "schema": "RISK",
+                    "table": "KYC_AML_DECISIONS",
+                },
+                "options": {
+                    "on_conflict": "update",
+                },
+            }
+        ],
+    }
+
+
 def _parse_int_list_form(value: Optional[str]) -> Optional[List[int]]:
     """Parse Form JSON string to list of ints."""
     if not value or not value.strip():
@@ -246,6 +293,106 @@ def _validate_tool_visibility(v: Optional[str]) -> Optional[str]:
     raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="tool_visibility must be 'full', 'names_only', or 'none'")
 
 
+def _validate_write_execution_mode(v: Optional[str]) -> str:
+    s = (v or "platform").strip().lower()
+    if s in ("platform", "agent", "ui_only"):
+        return s
+    raise HTTPException(
+        status_code=status.HTTP_400_BAD_REQUEST,
+        detail="write_execution_mode must be 'platform', 'agent', or 'ui_only'",
+    )
+
+
+def _validate_output_artifact_format(v: Optional[str]) -> str:
+    s = (v or "jsonl").strip().lower()
+    if s in ("jsonl", "json"):
+        return s
+    raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="output_artifact_format must be 'jsonl' or 'json'")
+
+
+def _parse_json_form(value: Optional[str]) -> Optional[dict]:
+    if value is None:
+        return None
+    raw = value.strip()
+    if not raw:
+        return None
+    try:
+        obj = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid JSON provided in output_contract") from exc
+    if not isinstance(obj, dict):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="output_contract must be a JSON object")
+    return obj
+
+
+def _validate_output_contract_policy(contract: Optional[dict]) -> Optional[dict]:
+    if contract is None:
+        return None
+    if not isinstance(contract, dict):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="output_contract must be a JSON object")
+    policy = contract.get("write_policy")
+    if policy is None:
+        return contract
+    if not isinstance(policy, dict):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="output_contract.write_policy must be an object")
+    on_write_error = policy.get("on_write_error")
+    if on_write_error is not None and str(on_write_error).strip().lower() not in ("fail_job", "continue"):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="output_contract.write_policy.on_write_error must be 'fail_job' or 'continue'",
+        )
+    min_successful_targets = policy.get("min_successful_targets")
+    if min_successful_targets is not None:
+        try:
+            v = int(min_successful_targets)
+        except (TypeError, ValueError):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="output_contract.write_policy.min_successful_targets must be an integer >= 0",
+            )
+        if v < 0:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="output_contract.write_policy.min_successful_targets must be an integer >= 0",
+            )
+    return contract
+
+
+def _parse_contract_json(raw: Optional[str]) -> Optional[dict]:
+    if not raw:
+        return None
+    try:
+        data = json.loads(raw)
+    except (json.JSONDecodeError, TypeError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _transition_job_status_if_current(
+    db: Session,
+    *,
+    job_id: int,
+    business_id: int,
+    from_statuses: List[JobStatus],
+    to_status: JobStatus,
+    extra_updates: Optional[dict] = None,
+) -> bool:
+    updates = {"status": to_status}
+    if extra_updates:
+        updates.update(extra_updates)
+    updated = (
+        db.query(Job)
+        .filter(
+            Job.id == job_id,
+            Job.business_id == business_id,
+            Job.status.in_(from_statuses),
+        )
+        .update(updates, synchronize_session=False)
+    )
+    db.commit()
+    return bool(updated)
+
+
 @router.post("", response_model=JobResponse, status_code=status.HTTP_201_CREATED)
 async def create_job(
     title: str = Form(...),
@@ -256,6 +403,9 @@ async def create_job(
     allowed_platform_tool_ids: Optional[str] = Form(None),
     allowed_connection_ids: Optional[str] = Form(None),
     tool_visibility: Optional[str] = Form(None),
+    write_execution_mode: Optional[str] = Form("platform"),
+    output_artifact_format: Optional[str] = Form("jsonl"),
+    output_contract: Optional[str] = Form(None),
     current_user: User = Depends(get_current_business_user),
     db: Session = Depends(get_db)
 ):
@@ -268,6 +418,9 @@ async def create_job(
         platform_ids, connection_ids = _validate_allowed_tools(db, current_user.id, platform_ids, connection_ids)
 
     tv = _validate_tool_visibility(tool_visibility) if tool_visibility else None
+    write_mode = _validate_write_execution_mode(write_execution_mode)
+    artifact_format = _validate_output_artifact_format(output_artifact_format)
+    output_contract_obj = _validate_output_contract_policy(_parse_json_form(output_contract))
     new_job = Job(
         business_id=current_user.id,
         title=title,
@@ -278,6 +431,9 @@ async def create_job(
         allowed_platform_tool_ids=json.dumps(platform_ids) if platform_ids is not None else None,
         allowed_connection_ids=json.dumps(connection_ids) if connection_ids is not None else None,
         tool_visibility=tv,
+        write_execution_mode=write_mode,
+        output_artifact_format=artifact_format,
+        output_contract=json.dumps(output_contract_obj) if output_contract_obj is not None else None,
     )
     db.add(new_job)
     db.commit()
@@ -357,6 +513,9 @@ async def create_job(
         "allowed_platform_tool_ids": platform_ids,
         "allowed_connection_ids": connection_ids,
         "tool_visibility": new_job.tool_visibility,
+        "write_execution_mode": new_job.write_execution_mode,
+        "output_artifact_format": new_job.output_artifact_format,
+        "output_contract": output_contract_obj,
     }
     return JobResponse(**response_data)
 
@@ -799,6 +958,17 @@ def get_job_filter_options(
     return JobFilterOptions(statuses=statuses, sort_options=sort_options)
 
 
+@router.get("/queue/stats", status_code=status.HTTP_200_OK)
+def get_runtime_queue_stats(
+    current_user: User = Depends(get_current_user),
+):
+    """
+    Queue runtime stats for production operations.
+    Useful to validate Redis/Celery usage and parallel processing behavior.
+    """
+    return get_queue_stats()
+
+
 @router.get("", response_model=List[JobResponse])
 def list_jobs(
     current_user: User = Depends(get_current_user),
@@ -871,6 +1041,9 @@ def list_jobs(
             "allowed_platform_tool_ids": job_platform,
             "allowed_connection_ids": job_conn,
             "tool_visibility": getattr(job, "tool_visibility", None),
+            "write_execution_mode": getattr(job, "write_execution_mode", "platform"),
+            "output_artifact_format": getattr(job, "output_artifact_format", "jsonl"),
+            "output_contract": _parse_contract_json(getattr(job, "output_contract", None)),
         }
         result.append(JobResponse(**job_dict))
     return result
@@ -978,6 +1151,9 @@ def get_job(
         "allowed_platform_tool_ids": job_platform,
         "allowed_connection_ids": job_conn,
         "tool_visibility": getattr(job, "tool_visibility", None),
+        "write_execution_mode": getattr(job, "write_execution_mode", "platform"),
+        "output_artifact_format": getattr(job, "output_artifact_format", "jsonl"),
+        "output_contract": _parse_contract_json(getattr(job, "output_contract", None)),
     }
     return JobResponse(**job_dict)
 
@@ -992,6 +1168,9 @@ async def update_job(
     allowed_platform_tool_ids: Optional[str] = Form(None),
     allowed_connection_ids: Optional[str] = Form(None),
     tool_visibility: Optional[str] = Form(None),
+    write_execution_mode: Optional[str] = Form(None),
+    output_artifact_format: Optional[str] = Form(None),
+    output_contract: Optional[str] = Form(None),
     current_user: User = Depends(get_current_business_user),
     db: Session = Depends(get_db)
 ):
@@ -1030,6 +1209,13 @@ async def update_job(
         job.allowed_connection_ids = json.dumps(cids) if cids is not None else None
     if tool_visibility is not None:
         job.tool_visibility = _validate_tool_visibility(tool_visibility)
+    if write_execution_mode is not None:
+        job.write_execution_mode = _validate_write_execution_mode(write_execution_mode)
+    if output_artifact_format is not None:
+        job.output_artifact_format = _validate_output_artifact_format(output_artifact_format)
+    if output_contract is not None:
+        contract_obj = _validate_output_contract_policy(_parse_json_form(output_contract))
+        job.output_contract = json.dumps(contract_obj) if contract_obj is not None else None
 
     # Update basic fields
     if title is not None:
@@ -1224,6 +1410,9 @@ async def update_job(
         "allowed_platform_tool_ids": job_platform,
         "allowed_connection_ids": job_conn,
         "tool_visibility": getattr(job, "tool_visibility", None),
+        "write_execution_mode": getattr(job, "write_execution_mode", "platform"),
+        "output_artifact_format": getattr(job, "output_artifact_format", "jsonl"),
+        "output_contract": _parse_contract_json(getattr(job, "output_contract", None)),
     }
 
     return JobResponse(**job_dict)
@@ -1292,7 +1481,7 @@ def delete_job(
 
 
 @router.post("/{job_id}/workflow/auto-split", response_model=WorkflowPreview)
-def auto_split_workflow(
+async def auto_split_workflow(
     job_id: int,
     body: AutoSplitBody,
     current_user: User = Depends(get_current_business_user),
@@ -1331,13 +1520,118 @@ def auto_split_workflow(
     tv = body.tool_visibility
     if tv is not None and tv not in ("full", "names_only", "none"):
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="tool_visibility must be 'full', 'names_only', or 'none'")
+    if body.write_execution_mode is not None:
+        job.write_execution_mode = _validate_write_execution_mode(body.write_execution_mode)
+    if body.output_artifact_format is not None:
+        job.output_artifact_format = _validate_output_artifact_format(body.output_artifact_format)
+    if body.output_contract is not None:
+        contract_obj = _validate_output_contract_policy(body.output_contract)
+        job.output_contract = json.dumps(contract_obj) if contract_obj is not None else None
+    db.commit()
     workflow_builder = WorkflowBuilder(db)
-    preview = workflow_builder.auto_split_workflow(job_id, body.agent_ids, workflow_mode=workflow_mode, step_tools=step_tools, tool_visibility=tv)
+    preview = await workflow_builder.auto_split_workflow_async(
+        job_id, body.agent_ids, workflow_mode=workflow_mode, step_tools=step_tools, tool_visibility=tv
+    )
     return preview
 
 
+class SuggestWorkflowToolsBody(BaseModel):
+    """Agents in workflow order (same as auto-split). Used to suggest per-step platform tools from BRD + job prompt."""
+    agent_ids: List[int]
+
+
+@router.get("/{job_id}/suggest-workflow-tools", include_in_schema=True)
+def suggest_workflow_tools_get_hint(job_id: int):
+    """
+    Opening this URL in a browser sends GET; the real API is POST-only.
+    Returns 405 so clients see a clear hint instead of a generic 404.
+    """
+    raise HTTPException(
+        status_code=status.HTTP_405_METHOD_NOT_ALLOWED,
+        detail='Method Not Allowed: use POST with JSON body {"agent_ids": [agent ids in workflow order]}.',
+        headers={"Allow": "POST"},
+    )
+
+
+@router.post("/{job_id}/suggest-workflow-tools")
+async def suggest_workflow_tools(
+    job_id: int,
+    body: SuggestWorkflowToolsBody,
+    current_user: User = Depends(get_current_business_user),
+    db: Session = Depends(get_db),
+):
+    """
+    BRD-aware suggestion: which platform MCP tools to assign to each agent step (read vs write heuristics),
+    plus an output_contract stub with write_targets using platform_{id}_* tool names.
+
+    Uses the same document and Q&A context as auto-split. First selected agent must expose an OpenAI-compatible
+    API (same as task splitter); otherwise a deterministic fallback split is returned.
+    """
+    job = db.query(Job).filter(Job.id == job_id).first()
+    if not job:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Job not found")
+    if job.business_id != current_user.id:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Not authorized")
+
+    if not body.agent_ids:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="agent_ids is required")
+
+    q = db.query(MCPToolConfig).filter(
+        MCPToolConfig.user_id == current_user.id,
+        MCPToolConfig.is_active == True,
+    )
+    if getattr(job, "allowed_platform_tool_ids", None):
+        try:
+            parsed = json.loads(job.allowed_platform_tool_ids)
+            if isinstance(parsed, list) and len(parsed) > 0:
+                q = q.filter(MCPToolConfig.id.in_([int(x) for x in parsed]))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            pass
+    platform_tools = q.order_by(MCPToolConfig.created_at.desc()).all()
+    if not platform_tools:
+        return {
+            "step_suggestions": [],
+            "output_contract_stub": None,
+            "fallback_used": True,
+            "detail": "No platform tools configured for this job (check job allowed tools or create MCP tools).",
+        }
+
+    rows = db.query(Agent).filter(Agent.id.in_(body.agent_ids)).all()
+    by_id = {a.id: a for a in rows}
+    agents_ordered = []
+    for aid in body.agent_ids:
+        if aid not in by_id:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Agent id {aid} not found",
+            )
+        agents_ordered.append(by_id[aid])
+
+    conversation_data = None
+    if job.conversation:
+        try:
+            conversation_data = json.loads(job.conversation)
+        except (json.JSONDecodeError, TypeError):
+            pass
+
+    wb = WorkflowBuilder(db)
+    documents_content = await wb.load_job_documents_content_async(job)
+    splitter_agent = agents_ordered[0]
+
+    result = await suggest_tool_assignments_for_agents(
+        job_title=job.title or "",
+        job_description=job.description or "",
+        documents_content=documents_content,
+        conversation_data=conversation_data,
+        agents=agents_ordered,
+        platform_tools=platform_tools,
+        splitter_agent=splitter_agent,
+    )
+    return result
+
+
 @router.post("/{job_id}/workflow/manual", response_model=WorkflowPreview)
-def manual_workflow(
+async def manual_workflow(
     job_id: int,
     workflow_steps: List[dict],
     current_user: User = Depends(get_current_business_user),
@@ -1357,7 +1651,7 @@ def manual_workflow(
         )
     
     workflow_builder = WorkflowBuilder(db)
-    preview = workflow_builder.create_manual_workflow(job_id, workflow_steps)
+    preview = await workflow_builder.create_manual_workflow_async(job_id, workflow_steps)
     return preview
 
 
@@ -1494,7 +1788,10 @@ def approve_job(
         "workflow_steps": [],
         "files": files_data,
         "conversation": conversation_data,
-        "failure_reason": job.failure_reason
+        "failure_reason": job.failure_reason,
+        "write_execution_mode": getattr(job, "write_execution_mode", "platform"),
+        "output_artifact_format": getattr(job, "output_artifact_format", "jsonl"),
+        "output_contract": _parse_contract_json(getattr(job, "output_contract", None)),
     }
     return JobResponse(**job_dict)
 
@@ -1502,7 +1799,6 @@ def approve_job(
 @router.post("/{job_id}/execute", response_model=JobResponse)
 def execute_job(
     job_id: int,
-    background_tasks: BackgroundTasks,
     current_user: User = Depends(get_current_business_user),
     db: Session = Depends(get_db)
 ):
@@ -1525,26 +1821,40 @@ def execute_job(
             detail="Job must be approved before execution"
         )
     
-    # Mark job as in progress
-    job.status = JobStatus.IN_PROGRESS
-    db.commit()
+    execution_token = uuid.uuid4().hex
+    transitioned = _transition_job_status_if_current(
+        db,
+        job_id=job.id,
+        business_id=current_user.id,
+        from_statuses=[JobStatus.PENDING_APPROVAL],
+        to_status=JobStatus.IN_PROGRESS,
+        extra_updates={"execution_token": execution_token},
+    )
+    if not transitioned:
+        db.refresh(job)
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Job must be approved before execution",
+        )
     db.refresh(job)
     
-    # Trigger async job execution
-    def run_job():
-        # Create a new event loop for the background task
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        try:
-            executor = AgentExecutor(db)
-            loop.run_until_complete(executor.execute_job(job_id))
-        except Exception as e:
-            # Job status will be updated to failed by executor
-            logger.exception("Job execution failed: %s", e)
-        finally:
-            loop.close()
-    
-    background_tasks.add_task(run_job)
+    # Queue async execution (Redis/Celery) with strict mode option.
+    try:
+        queue_job_execution(
+            job_id=job_id,
+            history_id=None,
+            execution_token=execution_token,
+            strict=bool(getattr(settings, "JOB_EXECUTION_STRICT_QUEUE", False)),
+        )
+    except Exception as exc:
+        job.status = JobStatus.PENDING_APPROVAL
+        job.execution_token = None
+        job.failure_reason = f"Failed to enqueue execution: {str(exc)[:200]}"
+        db.commit()
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Failed to enqueue job execution. Please try again.",
+        )
     
     # Parse files and conversation for response
     files_data = None
@@ -1574,7 +1884,10 @@ def execute_job(
         "workflow_steps": [],
         "files": files_data,
         "conversation": conversation_data,
-        "failure_reason": job.failure_reason
+        "failure_reason": job.failure_reason,
+        "write_execution_mode": getattr(job, "write_execution_mode", "platform"),
+        "output_artifact_format": getattr(job, "output_artifact_format", "jsonl"),
+        "output_contract": _parse_contract_json(getattr(job, "output_contract", None)),
     }
     return JobResponse(**job_dict)
 
@@ -1693,6 +2006,9 @@ def get_job_status(
         "allowed_platform_tool_ids": job_platform,
         "allowed_connection_ids": job_conn,
         "tool_visibility": getattr(job, "tool_visibility", None),
+        "write_execution_mode": getattr(job, "write_execution_mode", "platform"),
+        "output_artifact_format": getattr(job, "output_artifact_format", "jsonl"),
+        "output_contract": _parse_contract_json(getattr(job, "output_contract", None)),
     }
 
     # Compute schedule-aware fields for frontend UX
@@ -2060,18 +2376,39 @@ def rerun_job(
         db.flush()
         history_id = history.id
 
-    # Reset steps and set IN_PROGRESS directly (execution starts now)
+    # Acquire execution claim atomically, then reset steps for a clean run.
+    execution_token = uuid.uuid4().hex
+    transitioned = _transition_job_status_if_current(
+        db,
+        job_id=job.id,
+        business_id=current_user.id,
+        from_statuses=[JobStatus.FAILED, JobStatus.CANCELLED],
+        to_status=JobStatus.IN_PROGRESS,
+        extra_updates={"execution_token": execution_token},
+    )
+    if not transitioned:
+        db.refresh(job)
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Can only rerun failed or cancelled jobs. Current status: {job.status.value}",
+        )
+
+    db.refresh(job)
     reset_job_for_execution(db, job)
-    job.status = JobStatus.IN_PROGRESS
     db.commit()
 
     # Spawn execution thread — job is already IN_PROGRESS
     try:
-        thread = threading.Thread(target=run_job_in_thread, args=(job.id, history_id), daemon=True)
-        thread.start()
+        queue_job_execution(
+            job_id=job.id,
+            history_id=history_id,
+            execution_token=execution_token,
+            strict=bool(getattr(settings, "JOB_EXECUTION_STRICT_QUEUE", False)),
+        )
     except Exception as exc:
-        logger.exception("Failed to start execution thread for job %s", job.id)
+        logger.exception("Failed to enqueue execution for job %s", job.id)
         job.status = JobStatus.FAILED
+        job.execution_token = None
         job.failure_reason = f"Failed to start execution: {str(exc)[:200]}"
         if history_id:
             hist = db.query(ScheduleExecutionHistory).filter(ScheduleExecutionHistory.id == history_id).first()
@@ -2080,8 +2417,8 @@ def rerun_job(
                 hist.failure_reason = job.failure_reason
         db.commit()
         raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to start job execution: {str(exc)[:200]}",
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=f"Failed to enqueue job execution: {str(exc)[:200]}",
         )
 
     return RerunResponse(
@@ -2117,6 +2454,7 @@ def cancel_job(
         )
 
     job.status = JobStatus.CANCELLED
+    job.execution_token = None
     job.failure_reason = "Cancelled by user"
     db.commit()
 

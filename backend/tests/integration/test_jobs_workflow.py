@@ -538,14 +538,12 @@ class TestJobsWorkflow:
             {"agent_index": 0, "task": "Handle ANOVA calculations only."},
             {"agent_index": 1, "task": "Handle chi-square calculations only."},
         ]
-        with patch("services.task_splitter.httpx.AsyncClient") as mock_client:
-            mock_resp = MagicMock()
-            mock_resp.status_code = 200
-            mock_resp.json.return_value = {
-                "choices": [{"message": {"content": json.dumps(llm_assignments)}}]
-            }
-            mock_client.return_value.__aenter__.return_value.post = AsyncMock(return_value=mock_resp)
-
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = {
+            "choices": [{"message": {"content": json.dumps(llm_assignments)}}]
+        }
+        with patch("services.task_splitter.post_openai_compatible_raw", new=AsyncMock(return_value=mock_resp)) as mock_post:
             split_resp = integration_client.post(
                 f"/api/jobs/{job_id}/workflow/auto-split",
                 json={"agent_ids": [openai_agent.id, groq_agent.id], "workflow_mode": "independent"},
@@ -553,8 +551,8 @@ class TestJobsWorkflow:
             )
         assert split_resp.status_code == 200, split_resp.text
         # Ensure splitter AI interaction is mocked and no real network call is made.
-        mock_client.return_value.__aenter__.return_value.post.assert_awaited_once()
-        called_url = mock_client.return_value.__aenter__.return_value.post.await_args.args[0]
+        mock_post.assert_awaited_once()
+        called_url = mock_post.await_args.args[0]
         assert called_url == openai_agent.api_endpoint
 
         job_resp = integration_client.get(
@@ -629,7 +627,7 @@ class TestJobsWorkflow:
         assert create_resp.status_code == 201, create_resp.text
         job_id = create_resp.json()["id"]
 
-        with patch("services.task_splitter.httpx.AsyncClient") as mock_client:
+        with patch("services.task_splitter.post_openai_compatible_raw", new=AsyncMock()) as mock_post:
             split_resp = integration_client.post(
                 f"/api/jobs/{job_id}/workflow/auto-split",
                 json={"agent_ids": [solo_agent.id], "workflow_mode": "independent"},
@@ -637,7 +635,7 @@ class TestJobsWorkflow:
             )
         assert split_resp.status_code == 200, split_resp.text
         # Single-agent split should not call external splitter endpoint at all.
-        assert mock_client.call_count == 0
+        assert mock_post.call_count == 0
 
         job_resp = integration_client.get(
             f"/api/jobs/{job_id}",
@@ -732,20 +730,19 @@ class TestJobsWorkflow:
                 "assigned_document_ids": [chi_meta["id"]],
             },
         ]
-        with patch("services.task_splitter.httpx.AsyncClient") as mock_client:
-            mock_resp = MagicMock()
-            mock_resp.status_code = 200
-            mock_resp.json.return_value = {
-                "choices": [{"message": {"content": json.dumps(llm_assignments)}}]
-            }
-            mock_client.return_value.__aenter__.return_value.post = AsyncMock(return_value=mock_resp)
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = {
+            "choices": [{"message": {"content": json.dumps(llm_assignments)}}]
+        }
+        with patch("services.task_splitter.post_openai_compatible_raw", new=AsyncMock(return_value=mock_resp)) as mock_post:
             split_resp = integration_client.post(
                 f"/api/jobs/{job_id}/workflow/auto-split",
                 json={"agent_ids": [openai_agent.id, groq_agent.id], "workflow_mode": "independent"},
                 headers=_auth_headers(business_user),
             )
         assert split_resp.status_code == 200, split_resp.text
-        mock_client.return_value.__aenter__.return_value.post.assert_awaited_once()
+        mock_post.assert_awaited_once()
 
         job_resp = integration_client.get(
             f"/api/jobs/{job_id}",

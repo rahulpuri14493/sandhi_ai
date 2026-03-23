@@ -1,4 +1,16 @@
 services:
+  redis:
+    image: redis:7-alpine
+    container_name: sandhi-redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
   db:
     image: postgres:15-alpine
     container_name: sandhi-db
@@ -32,6 +44,7 @@ services:
       - "8000:8000"
     environment:
       DATABASE_URL: postgresql://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@db:5432/${POSTGRES_DB:-agent_marketplace}
+      UVICORN_RELOAD: ${UVICORN_RELOAD:-false}
       A2A_ADAPTER_URL: http://a2a-openai-adapter:8080
       PLATFORM_MCP_SERVER_URL: http://platform-mcp-server:8081
       # Document storage backend: s3 (default) or local
@@ -56,6 +69,15 @@ services:
       S3_OPERATION_RETRY_JITTER_SECONDS: ${S3_OPERATION_RETRY_JITTER_SECONDS:-0.1}
       # Use dev default so stack runs without .env; set MCP_INTERNAL_SECRET in .env for production
       MCP_INTERNAL_SECRET: ${MCP_INTERNAL_SECRET:-dev-mcp-internal-secret}
+      JOB_EXECUTION_BACKEND: ${JOB_EXECUTION_BACKEND:-celery}
+      JOB_EXECUTION_STRICT_QUEUE: ${JOB_EXECUTION_STRICT_QUEUE:-false}
+      CELERY_BROKER_URL: ${CELERY_BROKER_URL:-redis://redis:6379/0}
+      CELERY_RESULT_BACKEND: ${CELERY_RESULT_BACKEND:-redis://redis:6379/1}
+      CELERY_WORKER_AUTOSCALE_MAX: ${CELERY_WORKER_AUTOSCALE_MAX:-16}
+      CELERY_WORKER_AUTOSCALE_MIN: ${CELERY_WORKER_AUTOSCALE_MIN:-2}
+      CELERY_WORKER_CONCURRENCY: ${CELERY_WORKER_CONCURRENCY:-4}
+      CELERY_EXECUTE_MAX_RETRIES: ${CELERY_EXECUTE_MAX_RETRIES:-3}
+      CELERY_EXECUTE_RETRY_BACKOFF_SECONDS: ${CELERY_EXECUTE_RETRY_BACKOFF_SECONDS:-5}
       # Debug logging (set to 1 to log JSON response previews; avoid in production)
       LOG_API_RESPONSE_BODY: ${LOG_API_RESPONSE_BODY:-1}
     env_file:
@@ -63,8 +85,45 @@ services:
     depends_on:
       db:
         condition: service_healthy
+      redis:
+        condition: service_healthy
       a2a-openai-adapter:
         condition: service_started
+
+  celery-worker:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: sandhi-celery-worker
+    restart: unless-stopped
+    command: celery -A services.task_queue.celery_app worker --loglevel=info --concurrency=${CELERY_WORKER_CONCURRENCY:-4} --autoscale=${CELERY_WORKER_AUTOSCALE_MAX:-16},${CELERY_WORKER_AUTOSCALE_MIN:-2}
+    volumes:
+      - ./backend:/app
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@db:5432/${POSTGRES_DB:-agent_marketplace}
+      JOB_EXECUTION_BACKEND: ${JOB_EXECUTION_BACKEND:-celery}
+      JOB_EXECUTION_STRICT_QUEUE: ${JOB_EXECUTION_STRICT_QUEUE:-false}
+      CELERY_BROKER_URL: ${CELERY_BROKER_URL:-redis://redis:6379/0}
+      CELERY_RESULT_BACKEND: ${CELERY_RESULT_BACKEND:-redis://redis:6379/1}
+      CELERY_WORKER_AUTOSCALE_MAX: ${CELERY_WORKER_AUTOSCALE_MAX:-16}
+      CELERY_WORKER_AUTOSCALE_MIN: ${CELERY_WORKER_AUTOSCALE_MIN:-2}
+      CELERY_WORKER_CONCURRENCY: ${CELERY_WORKER_CONCURRENCY:-4}
+      CELERY_EXECUTE_MAX_RETRIES: ${CELERY_EXECUTE_MAX_RETRIES:-3}
+      CELERY_EXECUTE_RETRY_BACKOFF_SECONDS: ${CELERY_EXECUTE_RETRY_BACKOFF_SECONDS:-5}
+      OBJECT_STORAGE_BACKEND: ${OBJECT_STORAGE_BACKEND:-s3}
+      S3_ENDPOINT_URL: ${S3_ENDPOINT_URL:-}
+      S3_ACCESS_KEY_ID: ${S3_ACCESS_KEY_ID:-}
+      S3_SECRET_ACCESS_KEY: ${S3_SECRET_ACCESS_KEY:-}
+      S3_BUCKET: ${S3_BUCKET:-}
+      S3_REGION: ${S3_REGION:-us-east-1}
+      MCP_INTERNAL_SECRET: ${MCP_INTERNAL_SECRET:-dev-mcp-internal-secret}
+    env_file:
+      - .env
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
 
   a2a-openai-adapter:
     build:
@@ -78,15 +137,24 @@ services:
 
   platform-mcp-server:
     build:
-      context: ./tools/platform_mcp_server
-      dockerfile: Dockerfile
+      context: .
+      dockerfile: tools/platform_mcp_server/Dockerfile
     container_name: platform-mcp-server
     restart: unless-stopped
     ports:
       - "8081:8081"
+    volumes:
+      # Same job artifact files as backend (local OBJECT_STORAGE_BACKEND) for platform writes
+      - ./backend/uploads/jobs:/uploads/jobs:ro
     environment:
       BACKEND_INTERNAL_URL: http://backend:8000
       MCP_INTERNAL_SECRET: ${MCP_INTERNAL_SECRET:-dev-mcp-internal-secret}
+      ARTIFACT_UPLOAD_ROOT: /uploads/jobs
+      S3_ENDPOINT_URL: ${S3_ENDPOINT_URL:-}
+      S3_ACCESS_KEY_ID: ${S3_ACCESS_KEY_ID:-}
+      S3_SECRET_ACCESS_KEY: ${S3_SECRET_ACCESS_KEY:-}
+      S3_BUCKET: ${S3_BUCKET:-}
+      S3_REGION: ${S3_REGION:-us-east-1}
     env_file:
       - .env
     depends_on:

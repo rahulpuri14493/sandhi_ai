@@ -35,11 +35,19 @@ class Job(Base):
     files = Column(Text)  # JSON string storing file metadata: [{"name": "...", "path": "...", "type": "..."}]
     conversation = Column(Text)  # JSON string storing Q&A conversation with AI
     failure_reason = Column(Text, nullable=True)  # Reason for job failure
+    # Execution lease token to prevent duplicate/stale worker deliveries.
+    execution_token = Column(String(64), nullable=True, index=True)
     # Tool scope for this job: JSON arrays of IDs (empty/null = all business tools)
     allowed_platform_tool_ids = Column(Text, nullable=True)  # e.g. "[1,2]"
     allowed_connection_ids = Column(Text, nullable=True)  # e.g. "[1]"
     # Restrict what tool info agents see: full | names_only | none (credentials never shared)
     tool_visibility = Column(String(20), nullable=True)  # default full
+    # platform | agent | ui_only (ui_only: no artifact file, no contract MCP writes; output in DB for UI)
+    write_execution_mode = Column(String(20), nullable=False, default="platform")
+    # Preferred persisted artifact format for AI outputs: jsonl | json
+    output_artifact_format = Column(String(20), nullable=False, default="jsonl")
+    # User-defined output contract and write plan (JSON string)
+    output_contract = Column(Text, nullable=True)
 
     # Relationships
     business = relationship("User", back_populates="jobs", foreign_keys=[business_id])
@@ -96,7 +104,15 @@ class JobSchedule(Base):
 
     id = Column(Integer, primary_key=True, index=True)
     job_id = Column(Integer, ForeignKey("jobs.id"), nullable=False, unique=True)
-    status = Column(Enum(ScheduleStatus, name="schedulestatus"), default=ScheduleStatus.ACTIVE, nullable=False)
+    status = Column(
+        Enum(
+            ScheduleStatus,
+            name="schedulestatus",
+            values_callable=lambda x: [e.value for e in x],
+        ),
+        default=ScheduleStatus.ACTIVE,
+        nullable=False,
+    )
     timezone = Column(String, nullable=False, default="UTC")  # IANA timezone e.g. "Asia/Kolkata"
     scheduled_at = Column(DateTime, nullable=False)
     last_run_time = Column(DateTime, nullable=True)

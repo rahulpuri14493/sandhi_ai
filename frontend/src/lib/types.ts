@@ -106,6 +106,12 @@ export interface Job {
   allowed_connection_ids?: number[] | null;
   /** Restrict what tool info agents see: full | names_only | none. Credentials never shared. */
   tool_visibility?: 'full' | 'names_only' | 'none' | null;
+  /** Who triggers MCP writes from persisted output artifact references. */
+  write_execution_mode?: 'platform' | 'agent' | 'ui_only' | null;
+  /** Persisted AI output artifact format in object storage. */
+  output_artifact_format?: 'jsonl' | 'json' | null;
+  /** Universal output contract for downstream MCP write execution. */
+  output_contract?: Record<string, any> | null;
   /** True when in-progress job exceeds stuck threshold — frontend shows cancel button. */
   show_cancel_option?: boolean;
   /** From job's schedule, used for countdown timer on in_queue jobs. */

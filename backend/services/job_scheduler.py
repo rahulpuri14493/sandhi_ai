@@ -18,7 +18,10 @@ Workflow (from the user's perspective):
 
 import asyncio
 import logging
+import os
+import sys
 import threading
+import uuid
 from datetime import datetime, timedelta
 from typing import Optional
 
@@ -28,12 +31,21 @@ from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.date import DateTrigger
 from sqlalchemy.orm import Session
 
-from db.database import SessionLocal
+try:
+    from db.database import SessionLocal
+except ModuleNotFoundError:
+    # Celery workers can start with a different import path; ensure backend root is importable.
+    backend_root = os.path.dirname(os.path.dirname(__file__))
+    if backend_root not in sys.path:
+        sys.path.insert(0, backend_root)
+    from db.database import SessionLocal
+from core.config import settings
 from models.job import (
     Job, JobSchedule, JobStatus, ScheduleStatus,
     WorkflowStep, ScheduleExecutionHistory,
 )
 from services.agent_executor import AgentExecutor
+from services.task_queue import enqueue_execute_platform_job
 
 logger = logging.getLogger(__name__)
 
@@ -70,7 +82,7 @@ def reset_job_for_execution(db: Session, job: Job):
     job.failure_reason = None
 
 
-def run_job_in_thread(job_id: int, history_id: int = None):
+def run_job_in_thread(job_id: int, history_id: int = None, execution_token: Optional[str] = None):
     """Execute a job in a dedicated thread with its own DB session and event loop.
 
     The caller is responsible for setting the job status to IN_PROGRESS before
@@ -82,6 +94,52 @@ def run_job_in_thread(job_id: int, history_id: int = None):
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     try:
+        job = db.query(Job).filter(Job.id == job_id).first()
+        if not job:
+            logger.warning("Skipping execution for missing job_id=%s", job_id)
+            if history_id:
+                hist = db.query(ScheduleExecutionHistory).filter(
+                    ScheduleExecutionHistory.id == history_id
+                ).first()
+                if hist:
+                    hist.status = "failed"
+                    hist.failure_reason = "Execution skipped: job not found"
+                    hist.completed_at = datetime.utcnow()
+                    db.commit()
+            return
+        if job.status != JobStatus.IN_PROGRESS:
+            logger.warning(
+                "Skipping duplicate/stale execution for job_id=%s with status=%s",
+                job_id,
+                job.status.value,
+            )
+            if history_id:
+                hist = db.query(ScheduleExecutionHistory).filter(
+                    ScheduleExecutionHistory.id == history_id
+                ).first()
+                if hist:
+                    hist.status = "skipped"
+                    hist.failure_reason = f"Execution skipped: job status is {job.status.value}"
+                    hist.completed_at = datetime.utcnow()
+                    db.commit()
+            return
+        if execution_token and getattr(job, "execution_token", None) != execution_token:
+            logger.warning(
+                "Skipping stale execution for job_id=%s token=%s current_token=%s",
+                job_id,
+                execution_token,
+                getattr(job, "execution_token", None),
+            )
+            if history_id:
+                hist = db.query(ScheduleExecutionHistory).filter(
+                    ScheduleExecutionHistory.id == history_id
+                ).first()
+                if hist:
+                    hist.status = "skipped"
+                    hist.failure_reason = "Execution skipped: stale execution token"
+                    hist.completed_at = datetime.utcnow()
+                    db.commit()
+            return
         executor = AgentExecutor(db)
         loop.run_until_complete(executor.execute_job(job_id))
 
@@ -117,6 +175,28 @@ def run_job_in_thread(job_id: int, history_id: int = None):
     finally:
         loop.close()
         db.close()
+
+
+def queue_job_execution(
+    job_id: int,
+    history_id: int = None,
+    execution_token: Optional[str] = None,
+    *,
+    strict: bool = False,
+):
+    """
+    Queue-first execution: enqueue to Celery/Redis when enabled, else fallback to local thread.
+    """
+    if enqueue_execute_platform_job(
+        job_id=job_id,
+        history_id=history_id,
+        execution_token=execution_token,
+        strict=strict,
+    ):
+        logger.info("Queued job execution via Celery for job_id=%s history_id=%s", job_id, history_id)
+        return
+    thread = threading.Thread(target=run_job_in_thread, args=(job_id, history_id, execution_token), daemon=True)
+    thread.start()
 
 
 def _execute_schedule(schedule_id: int):
@@ -210,7 +290,9 @@ def _execute_schedule(schedule_id: int):
         reset_job_for_execution(db, job)
 
         # Transition: IN_QUEUE → IN_PROGRESS (execution is starting now)
+        execution_token = f"sched-{schedule.id}-{uuid.uuid4().hex}"
         job.status = JobStatus.IN_PROGRESS
+        job.execution_token = execution_token
 
         # Deactivate schedule before starting the thread (one-time schedule).
         # User can reschedule via PUT /schedule if the job fails.
@@ -224,18 +306,19 @@ def _execute_schedule(schedule_id: int):
         if svc:
             svc.remove_schedule(schedule_id)
 
-        # Start execution in a background thread
+        # Queue execution (Celery first; thread fallback)
         logger.info("Triggering scheduled execution for job %s (schedule %s)", job.id, schedule.id)
         try:
-            thread = threading.Thread(
-                target=run_job_in_thread,
-                args=(job.id, history.id),
-                daemon=True,
+            queue_job_execution(
+                job.id,
+                history.id,
+                execution_token=execution_token,
+                strict=bool(getattr(settings, "JOB_EXECUTION_STRICT_QUEUE", False)),
             )
-            thread.start()
         except Exception as exc:
             logger.exception("Failed to start execution thread for job %s", job.id)
             job.status = JobStatus.FAILED
+            job.execution_token = None
             job.failure_reason = f"Scheduler failed to start execution: {str(exc)[:200]}"
             history.status = "failed"
             history.failure_reason = job.failure_reason

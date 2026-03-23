@@ -32,6 +32,25 @@ class Settings(BaseSettings):
     MCP_INTERNAL_SECRET: str = ""
     # Optional dedicated encryption key for MCP credentials at rest
     MCP_ENCRYPTION_KEY: str = ""
+    # MCP tool-call guards (stability under high load)
+    MCP_TOOL_MAX_ARGUMENT_BYTES: int = 5242880  # 5 MB
+    MCP_TOOL_DEFAULT_TIMEOUT_SECONDS: float = 60.0
+    MCP_TOOL_MAX_TIMEOUT_SECONDS: float = 300.0
+    # Async MCP write operation retry policy
+    MCP_WRITE_OPERATION_MAX_ATTEMPTS: int = 3
+    MCP_WRITE_OPERATION_RETRY_BASE_DELAY_SECONDS: float = 0.5
+    MCP_WRITE_OPERATION_RETRY_MAX_DELAY_SECONDS: float = 5.0
+    MCP_WRITE_OPERATION_RETRY_JITTER_SECONDS: float = 0.2
+    # Job execution backend: celery (Redis queue) or local_thread fallback.
+    JOB_EXECUTION_BACKEND: str = "celery"
+    JOB_EXECUTION_STRICT_QUEUE: bool = False  # True: no local fallback when enqueue fails
+    CELERY_BROKER_URL: str = "redis://redis:6379/0"
+    CELERY_RESULT_BACKEND: str = "redis://redis:6379/1"
+    CELERY_WORKER_AUTOSCALE_MAX: int = 16
+    CELERY_WORKER_AUTOSCALE_MIN: int = 2
+    CELERY_WORKER_CONCURRENCY: int = 4
+    CELERY_EXECUTE_MAX_RETRIES: int = 3
+    CELERY_EXECUTE_RETRY_BACKOFF_SECONDS: int = 5
     # When True, allow agent endpoints that resolve to private/loopback IPs (dev, Docker, same host). Default False in production.
     ALLOW_PRIVATE_AGENT_ENDPOINTS: bool = False
     # Job document storage backend: S3-compatible object storage (default) or local filesystem
@@ -67,5 +86,10 @@ class Settings(BaseSettings):
     ZIP_EXTRACT_RETRY_BASE_DELAY_SECONDS: float = 0.1
     ZIP_EXTRACT_RETRY_MAX_DELAY_SECONDS: float = 0.5
     ZIP_EXTRACT_RETRY_JITTER_SECONDS: float = 0.05
+    # httpx (LLM splitter, A2A, document analyzer): verify TLS by default; set false only for dev
+    HTTPX_VERIFY_SSL: bool = True
+    HTTPX_CA_BUNDLE_PATH: str = ""  # optional path to CA bundle (corporate proxy / custom roots)
+    # When set, task/tool splitters retry once with this model after 429 or 5xx from the LLM endpoint
+    LLM_HTTP_FALLBACK_MODEL: str = ""
 
 settings = Settings()

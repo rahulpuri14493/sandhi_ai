@@ -5,11 +5,31 @@ Exposes MCP protocol (JSON-RPC 2.0): initialize, tools/list, tools/call.
 Tools are resolved per business (tenant) via the Sandhi AI backend internal API.
 Implements Vector DB, PostgreSQL, and File system tools using tenant-stored config.
 """
+from execution_common import safe_tool_error
+from execution import (
+    execute_artifact_write,
+    execute_azure_blob,
+    execute_bigquery_sql,
+    execute_databricks_sql,
+    execute_elasticsearch,
+    execute_gcs,
+    execute_github,
+    execute_mysql,
+    execute_notion,
+    execute_postgres,
+    execute_rest_api,
+    execute_s3_family,
+    execute_slack,
+    execute_sqlserver_sql,
+    execute_snowflake_sql,
+    is_artifact_platform_write,
+)
 import json
 import logging
 import os
 import re
 import sys
+from contextlib import asynccontextmanager
 from typing import Any, Dict, List, Optional
 
 import httpx
@@ -26,23 +46,28 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-app = FastAPI(
-    title="Sandhi AI Platform MCP Server",
-    description="MCP server exposing platform-configured tools (Vector DB, Postgres, File system) per tenant.",
-    version="1.0.0",
-)
-
-
-@app.on_event("startup")
-def startup():
-    logger.info("Platform MCP server started; BACKEND_INTERNAL_URL=%s", BACKEND_BASE)
-
 # Backend internal API (same network as platform)
 BACKEND_BASE = os.environ.get("BACKEND_INTERNAL_URL", "http://backend:8000").strip().rstrip("/")
 MCP_INTERNAL_SECRET = os.environ.get("MCP_INTERNAL_SECRET", "").strip()
 INTERNAL_HEADERS = {"Content-Type": "application/json"}
 if MCP_INTERNAL_SECRET:
     INTERNAL_HEADERS["X-Internal-Secret"] = MCP_INTERNAL_SECRET
+
+
+@asynccontextmanager
+async def _lifespan(app: FastAPI):
+    logger.info("Platform MCP server started; BACKEND_INTERNAL_URL=%s", BACKEND_BASE)
+    yield
+    logger.info("Platform MCP server shutdown")
+
+
+app = FastAPI(
+    title="Sandhi AI Platform MCP Server",
+    description="MCP server exposing platform-configured tools (Vector DB, Postgres, File system) per tenant.",
+    version="1.0.0",
+    lifespan=_lifespan,
+)
+
 
 JSONRPC_VERSION = "2.0"
 BUSINESS_ID_HEADER = "x-mcp-business-id"
@@ -78,6 +103,18 @@ def _fetch_tool_config(business_id: int, tool_id: int) -> Dict[str, Any]:
         return r.json()
 
 
+def _tool_result_for_log(text: str, max_len: int = 12000) -> str:
+    """Redacted summary for MCP tool output logs (never includes tool result content)."""
+    _ = max_len  # backward-compatible signature; output content is always redacted
+    if text is None:
+        length = 0
+        is_err = False
+    else:
+        length = len(text)
+        is_err = str(text).startswith("Error:")
+    return f"[redacted tool output] len={length} is_error={is_err}"
+
+
 def _to_json_safe(obj: Any) -> Any:
     """Convert object to JSON-serializable form (e.g. Chroma SparseVector in metadata)."""
     if obj is None or isinstance(obj, (bool, int, float, str)):
@@ -107,46 +144,6 @@ def _parse_platform_tool_id(name: str) -> Optional[int]:
 
 
 # --- Tool execution (vector_db, postgres, filesystem) ---
-
-def _execute_postgres(config: Dict[str, Any], arguments: Dict[str, Any]) -> str:
-    """Run a read-only query against configured PostgreSQL.
-
-    The SQL query text must come from trusted configuration (config["query"]),
-    while user-controlled values are passed separately via parameters
-    (arguments["params"]) and bound using psycopg2's parameterized execution.
-    """
-    import psycopg2
-    conn_str = config.get("connection_string") or ""
-    if not conn_str:
-        return "Error: connection_string not configured"
-    query = (config.get("query") or "").strip()
-    if not query:
-        return "Error: query is not configured for this tool"
-    if not query.upper().startswith("SELECT"):
-        return "Error: only SELECT queries are allowed"
-    params = arguments.get("params")
-    try:
-        conn = psycopg2.connect(conn_str)
-        conn.set_session(readonly=True)
-        cur = conn.cursor()
-        if params is None:
-            cur.execute(query)
-        else:
-            cur.execute(query, params)
-        rows = cur.fetchall()
-        colnames = [d[0] for d in cur.description] if cur.description else []
-        cur.close()
-        conn.close()
-        if not rows:
-            return "No rows returned."
-        lines = ["\t".join(colnames)]
-        for row in rows:
-            lines.append("\t".join(str(c) for c in row))
-        return "\n".join(lines)
-    except Exception as e:
-        logger.exception("Postgres query error")
-        return "Query error"
-
 
 def _execute_filesystem(config: Dict[str, Any], arguments: Dict[str, Any]) -> str:
     """Read file or list directory under base_path."""
@@ -182,12 +179,27 @@ def _execute_filesystem(config: Dict[str, Any], arguments: Dict[str, Any]) -> st
             entries = sorted(full.iterdir())
             return "\n".join(e.name for e in entries)
         except Exception:
-            logger.exception("Filesystem list error")
+            logger.error("Filesystem list error")
             return "List error"
+    if action == "write":
+        raw = arguments.get("content")
+        if raw is None and arguments.get("body") is not None:
+            raw = arguments.get("body")
+        if raw is None:
+            return "Error: content is required for write"
+        text = raw if isinstance(raw, str) else str(raw)
+        if full.exists() and full.is_dir():
+            return "Error: path is a directory; use a file path for write"
+        try:
+            full.parent.mkdir(parents=True, exist_ok=True)
+            full.write_text(text, encoding="utf-8")
+            return json.dumps({"status": "ok", "path": rel, "bytes_written": len(text.encode("utf-8"))})
+        except Exception as e:
+            return safe_tool_error("Filesystem write error", e)
     try:
         return full.read_text(encoding="utf-8", errors="replace")
     except Exception:
-        logger.exception("Filesystem read error")
+        logger.error("Filesystem read error")
         return "Read error"
 
 
@@ -210,7 +222,7 @@ def _embed_with_user_key(
         if r.data and len(r.data) > 0:
             return r.data[0].embedding
     except Exception as e:
-        logger.warning("OpenAI embedding (user key) failed: %s", e)
+        logger.warning("OpenAI embedding (user key) failed: %s", type(e).__name__)
     return None
 
 
@@ -290,7 +302,10 @@ def _execute_pinecone(config: Dict[str, Any], arguments: Dict[str, Any]) -> str:
                 or isinstance(text_err, AttributeError)  # e.g. .search() not in this SDK
             )
             if fallback:
-                logger.info("Pinecone integrated text search not available, falling back to vector query: %s", text_err)
+                logger.info(
+                    "Pinecone integrated text search not available, falling back to vector query (exc_type=%s)",
+                    type(text_err).__name__,
+                )
             else:
                 raise
 
@@ -305,8 +320,7 @@ def _execute_pinecone(config: Dict[str, Any], arguments: Dict[str, Any]) -> str:
         result = index.query(**payload)
         return _normalize_result(result, namespace)
     except Exception as e:
-        if "OPENAI" not in str(e) and "embed" not in str(e).lower():
-            logger.exception("Pinecone query error")
+        logger.error("Pinecone query error (%s)", type(e).__name__)
         return "Pinecone query error"
 
 
@@ -375,7 +389,10 @@ def _execute_weaviate(config: Dict[str, Any], arguments: Dict[str, Any]) -> str:
                     out["matches"].append(entry)
                 return json.dumps(out, indent=2)
             except Exception as text_err:
-                logger.info("Weaviate near_text not available, trying embed + near_vector: %s", text_err)
+                logger.info(
+                    "Weaviate near_text not available, trying embed + near_vector (exc_type=%s)",
+                    type(text_err).__name__,
+                )
             # 2) Fall back: user's OpenAI key from config + near_vector
             vector = _embed_with_user_key(query_text, config)
             if not vector:
@@ -391,7 +408,7 @@ def _execute_weaviate(config: Dict[str, Any], arguments: Dict[str, Any]) -> str:
         finally:
             client.close()
     except Exception as e:
-        logger.exception("Weaviate query error")
+        logger.error("Weaviate query error (%s)", type(e).__name__)
         return "Weaviate query error"
 
 
@@ -453,7 +470,10 @@ def _execute_qdrant(config: Dict[str, Any], arguments: Dict[str, Any]) -> str:
                         "Cluster name is not the same as collection name: in the tool config, set **Collection name** to the exact name of your collection. "
                         "List collections in Qdrant Cloud (Cluster UI → Collections) to see the correct name."
                     )
-                logger.info("Qdrant Cloud Document query failed, falling back to vector query: %s", doc_err)
+                logger.info(
+                    "Qdrant Cloud Document query failed, falling back to vector query (exc_type=%s)",
+                    type(doc_err).__name__,
+                )
         # 2) Self-hosted or fallback: embed with user's OpenAI key then query by vector
         vector = _embed_with_user_key(query_text, config)
         if not vector:
@@ -472,7 +492,7 @@ def _execute_qdrant(config: Dict[str, Any], arguments: Dict[str, Any]) -> str:
         )
         return _parse_points_result(result)
     except Exception as e:
-        logger.exception("Qdrant query error")
+        logger.error("Qdrant query error (%s)", type(e).__name__)
         return "Qdrant query error"
 
 
@@ -562,7 +582,7 @@ def _execute_chroma(config: Dict[str, Any], arguments: Dict[str, Any]) -> str:
             matches.append(m)
         return json.dumps({"matches": matches}, indent=2)
     except Exception as e:
-        logger.exception("Chroma query error")
+        logger.error("Chroma query error (%s)", type(e).__name__)
         return "Chroma query error"
 
 
@@ -585,47 +605,9 @@ def _execute_vector_db(config: Dict[str, Any], arguments: Dict[str, Any]) -> str
                 if r.status_code == 200:
                     return json.dumps(r.json(), indent=2)
         except Exception as e:
-            logger.exception("Vector DB query error")
+            logger.error("Vector DB query error (%s)", type(e).__name__)
             return "Vector query error"
     return "Vector DB tool is configured; add a compatible endpoint (e.g. Pinecone/Weaviate/Qdrant/Chroma) for live queries."
-
-
-def _execute_mysql(config: Dict[str, Any], arguments: Dict[str, Any]) -> str:
-    """Run read-only query against MySQL. Query from config (trusted), params from arguments."""
-    try:
-        import pymysql
-    except ImportError:
-        return "Error: pymysql not installed. Add pymysql to platform_mcp_server requirements."
-    query = (config.get("query") or "").strip()
-    if not query:
-        return "Error: query is not configured for this tool"
-    if not query.upper().startswith("SELECT"):
-        return "Error: only SELECT queries are allowed"
-    params = arguments.get("params")
-    try:
-        conn = pymysql.connect(
-            host=config.get("host", "localhost"),
-            port=int(config.get("port", 3306)),
-            user=config.get("user", ""),
-            password=config.get("password", ""),
-            database=config.get("database", ""),
-        )
-        cur = conn.cursor()
-        if params is None:
-            cur.execute(query)
-        else:
-            cur.execute(query, params)
-        rows = cur.fetchall()
-        cols = [d[0] for d in cur.description] if cur.description else []
-        cur.close()
-        conn.close()
-        if not rows:
-            return "No rows returned."
-        lines = ["\t".join(cols)] + ["\t".join(str(c) for c in row) for row in rows]
-        return "\n".join(lines)
-    except Exception as e:
-        logger.exception("MySQL query error")
-        return "Query error"
 
 
 def _execute_pageindex(config: Dict[str, Any], arguments: Dict[str, Any]) -> str:
@@ -691,16 +673,26 @@ def _execute_pageindex(config: Dict[str, Any], arguments: Dict[str, Any]) -> str
                 return f"PageIndex retrieval failed: {data.get('detail', data)}"
         return "PageIndex retrieval timed out (still processing)."
     except Exception as e:
-        logger.exception("PageIndex error")
+        logger.error("PageIndex error (%s)", type(e).__name__)
         return "PageIndex error"
 
 
 def execute_platform_tool(tool_type: str, config: Dict[str, Any], arguments: Dict[str, Any]) -> str:
     """Dispatch to the right tool implementation."""
+    if is_artifact_platform_write(arguments):
+        return execute_artifact_write(tool_type, config, arguments)
     if tool_type == "postgres":
-        return _execute_postgres(config, arguments)
+        return execute_postgres(config, arguments)
     if tool_type == "mysql":
-        return _execute_mysql(config, arguments)
+        return execute_mysql(config, arguments)
+    if tool_type == "sqlserver":
+        return execute_sqlserver_sql(config, arguments)
+    if tool_type == "snowflake":
+        return execute_snowflake_sql(config, arguments)
+    if tool_type == "bigquery":
+        return execute_bigquery_sql(config, arguments)
+    if tool_type == "databricks":
+        return execute_databricks_sql(config, arguments)
     if tool_type == "filesystem":
         return _execute_filesystem(config, arguments)
     if tool_type == "pinecone":
@@ -715,47 +707,22 @@ def execute_platform_tool(tool_type: str, config: Dict[str, Any], arguments: Dic
         return _execute_vector_db(config, arguments)
     if tool_type == "pageindex":
         return _execute_pageindex(config, arguments)
-    # Stub implementations for integrations (extend with real SDKs as needed)
     if tool_type == "elasticsearch":
-        url = (config.get("url") or config.get("host") or "").strip() or "http://localhost:9200"
-        query = (arguments.get("query") or "").strip()
-        if not query:
-            return "Error: query is required"
-        try:
-            with httpx.Client(timeout=10.0) as client:
-                r = client.get(f"{url.rstrip('/')}/_search", json={"query": {"query_string": {"query": query}}, "size": arguments.get("size", 10)}, headers={"Content-Type": "application/json"})
-                if r.status_code == 200:
-                    return json.dumps(r.json(), indent=2)
-                return f"Elasticsearch error: {r.status_code} {r.text}"
-        except Exception as e:
-            logger.exception("Elasticsearch error")
-            return "Elasticsearch error"
-    if tool_type == "s3":
-        return "S3 tool is configured. Add boto3 and implement get/list in platform MCP server to enable."
+        return execute_elasticsearch(config, arguments)
+    if tool_type in ("s3", "minio", "ceph"):
+        return execute_s3_family(tool_type, config, arguments)
+    if tool_type == "azure_blob":
+        return execute_azure_blob(config, arguments)
+    if tool_type == "gcs":
+        return execute_gcs(config, arguments)
     if tool_type == "slack":
-        return "Slack tool is configured. Add slack_sdk and implement send/list in platform MCP server to enable."
+        return execute_slack(config, arguments)
     if tool_type == "github":
-        return "GitHub tool is configured. Add PyGithub and implement in platform MCP server to enable."
+        return execute_github(config, arguments)
     if tool_type == "notion":
-        return "Notion tool is configured. Add notion-client and implement in platform MCP server to enable."
+        return execute_notion(config, arguments)
     if tool_type == "rest_api":
-        base = (config.get("base_url") or "").strip()
-        path = (arguments.get("path") or "").strip()
-        method = (arguments.get("method") or "GET").upper()
-        if not path:
-            return "Error: path is required"
-        if path.startswith("http") or "://" in path or path.startswith("/"):
-            return "Error: path must be a relative path (no full URLs or leading slash)"
-        if not base:
-            return "Error: base_url not configured for REST API tool"
-        url = base.rstrip("/") + "/" + path.lstrip("/")
-        try:
-            with httpx.Client(timeout=15.0) as client:
-                r = client.request(method, url, json=arguments.get("body"), headers={"Authorization": f"Bearer {config.get('api_key', '')}"} if config.get("api_key") else {})
-                return json.dumps({"status": r.status_code, "body": r.json() if r.headers.get("content-type", "").startswith("application/json") else r.text})
-        except Exception as e:
-            logger.exception("REST API error")
-            return "REST API error"
+        return execute_rest_api(config, arguments)
     return f"Unknown tool type: {tool_type}"
 
 
@@ -805,14 +772,15 @@ async def jsonrpc(request: Request, x_mcp_business_id: Optional[str] = Header(No
                 "result": {"tools": tools, "nextCursor": None},
             })
         except httpx.HTTPStatusError as e:
-            logger.exception("Backend tools/list failed business_id=%s", business_id)
+            status = e.response.status_code if e.response is not None else None
+            logger.error("Backend tools/list failed business_id=%s http_status=%s", business_id, status)
             return JSONResponse({
                 "jsonrpc": JSONRPC_VERSION,
                 "id": req_id,
                 "error": {"code": -32000, "message": "Failed to fetch tool list from backend"},
             })
         except Exception as e:
-            logger.exception("tools/list error")
+            logger.error("tools/list error (%s)", type(e).__name__)
             return JSONResponse({
                 "jsonrpc": JSONRPC_VERSION,
                 "id": req_id,
@@ -841,10 +809,14 @@ async def jsonrpc(request: Request, x_mcp_business_id: Optional[str] = Header(No
             tool_type = data.get("tool_type") or "vector_db"
             result_text = execute_platform_tool(tool_type, config, arguments)
             is_err = result_text.startswith("Error:")
-            preview = (result_text[:80] + "…") if len(result_text) > 80 else result_text
             logger.info(
-                "MCP tools/call business_id=%s tool=%s tool_type=%s is_error=%s result_preview=%s",
-                business_id, name, tool_type, is_err, preview.replace("\n", " "),
+                "MCP tools/call business_id=%s tool=%s tool_type=%s is_error=%s result_chars=%s result_output=%s",
+                business_id,
+                name,
+                tool_type,
+                is_err,
+                len(result_text),
+                _tool_result_for_log(result_text),
             )
             return JSONResponse({
                 "jsonrpc": JSONRPC_VERSION,
@@ -855,14 +827,20 @@ async def jsonrpc(request: Request, x_mcp_business_id: Optional[str] = Header(No
                 },
             })
         except httpx.HTTPStatusError as e:
-            logger.exception("Backend config fetch failed business_id=%s tool_id=%s", business_id, tool_id)
+            status = e.response.status_code if e.response is not None else None
+            logger.error(
+                "Backend config fetch failed business_id=%s tool_id=%s http_status=%s",
+                business_id,
+                tool_id,
+                status,
+            )
             return JSONResponse({
                 "jsonrpc": JSONRPC_VERSION,
                 "id": req_id,
                 "error": {"code": -32000, "message": "Failed to fetch tool configuration from backend"},
             })
-        except Exception:
-            logger.error("tools/call error business_id=%s tool=%s", business_id, name)
+        except Exception as e:
+            logger.error("tools/call error business_id=%s tool=%s (%s)", business_id, name, type(e).__name__)
             return JSONResponse({
                 "jsonrpc": JSONRPC_VERSION,
                 "id": req_id,

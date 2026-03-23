@@ -23,6 +23,7 @@ import logging
 import os
 import socket
 import sys
+from contextlib import asynccontextmanager
 from typing import Any, Dict, List
 from urllib.parse import urlparse, urlunparse
 
@@ -40,22 +41,27 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-app = FastAPI(
-    title="A2A ↔ OpenAI Adapter",
-    description="Translates A2A SendMessage to OpenAI chat/completions and back.",
-)
-
-
-@app.on_event("startup")
-def startup():
-    logger.info("A2A OpenAI adapter started; default_url=%s", OPENAI_URL_DEFAULT or "(none, use metadata)")
-
 # Defaults (used when request metadata does not provide per-request target)
 OPENAI_URL_DEFAULT = os.environ.get("OPENAI_COMPATIBLE_URL", "").strip()
 OPENAI_API_KEY_DEFAULT = os.environ.get("OPENAI_API_KEY", "").strip() or None
 OPENAI_MODEL_DEFAULT = os.environ.get("OPENAI_MODEL", "").strip() or "gpt-4o-mini"
 # When set, per-request openai_url must match or be subdomain of this host (SSRF mitigation)
 _default_hostname = (urlparse(OPENAI_URL_DEFAULT).hostname or "").strip().lower() if OPENAI_URL_DEFAULT else ""
+
+
+@asynccontextmanager
+async def _lifespan(app: FastAPI):
+    logger.info("A2A OpenAI adapter started; default_url=%s", OPENAI_URL_DEFAULT or "(none, use metadata)")
+    yield
+    logger.info("A2A OpenAI adapter shutdown")
+
+
+app = FastAPI(
+    title="A2A ↔ OpenAI Adapter",
+    description="Translates A2A SendMessage to OpenAI chat/completions and back.",
+    lifespan=_lifespan,
+)
+
 JSONRPC_VERSION = "2.0"
 METHOD_SEND_MESSAGE = "SendMessage"
 ROLE_AGENT = "ROLE_AGENT"

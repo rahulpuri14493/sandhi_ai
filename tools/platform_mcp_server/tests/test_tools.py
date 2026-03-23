@@ -3,15 +3,32 @@ Unit tests for platform MCP server tool execution (execute_platform_tool).
 Tests each tool type with minimal/invalid config to assert error messages or stub behavior.
 No real DBs or external services required.
 """
+import json
 import sys
+import types
 from pathlib import Path
+from unittest.mock import MagicMock
 
 # Allow importing app from parent
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import pytest
 
+import execution
+import execution_common
 from app import execute_platform_tool
+
+
+class TestArtifactObjectBasename:
+    def test_no_double_jsonl_extension(self):
+        assert (
+            execution._artifact_object_storage_basename(
+                "uploads/jobs/x/job_7_step_1_output.jsonl", ".jsonl"
+            ).endswith(".jsonl")
+        )
+        out = execution._artifact_object_storage_basename("job_7_step_1_output.jsonl", ".jsonl")
+        assert out == "job_7_step_1_output.jsonl"
+        assert out.count(".jsonl") == 1
 
 
 class TestPostgres:
@@ -23,14 +40,357 @@ class TestPostgres:
     def test_postgres_missing_query(self):
         out = execute_platform_tool("postgres", {"connection_string": "postgresql://x/y"}, {})
         assert "Error:" in out
-        assert "query" in out.lower() and ("not configured" in out.lower() or "required" in out.lower())
+        low = out.lower()
+        assert "query" in low and "tool configuration" in low and "required" in low
 
 
 class TestMysql:
     def test_mysql_missing_query(self):
         out = execute_platform_tool("mysql", {"host": "localhost", "user": "u", "password": "p", "database": "d"}, {})
         assert "Error:" in out
-        assert "query" in out.lower() and ("not configured" in out.lower() or "required" in out.lower())
+        low = out.lower()
+        assert "query" in low and "tool configuration" in low and "required" in low
+
+
+def _artifact_args(**kwargs):
+    base = {
+        "artifact_ref": {"path": "uploads/jobs/x", "format": "jsonl"},
+        "target": {"schema": "public", "table": "t"},
+        "operation_type": "append",
+        "write_mode": "append",
+        "merge_keys": [],
+        "idempotency_key": "k1",
+    }
+    base.update(kwargs)
+    return base
+
+
+class TestArtifactWriteDatabases:
+    """Artifact-first platform writes (output contract path); no real DB required."""
+
+    def test_postgres_artifact_write_missing_connection(self, monkeypatch):
+        monkeypatch.setattr(execution_common, "read_artifact_bytes", lambda ref: b'{"id":1,"name":"a"}\n')
+        out = execution.execute_artifact_write("postgres", {}, _artifact_args())
+        assert "connection_string" in out.lower()
+
+    def test_postgres_artifact_write_missing_table(self, monkeypatch):
+        monkeypatch.setattr(execution_common, "read_artifact_bytes", lambda ref: b'{"id":1}\n')
+        args = _artifact_args()
+        args["target"] = {"schema": "public"}
+        out = execution.execute_artifact_write(
+            "postgres",
+            {"connection_string": "postgresql://x:y@localhost:5432/db"},
+            args,
+        )
+        assert "target.table" in out.lower() or "table" in out.lower()
+
+    def test_postgres_bootstrap_sql_runs_before_insert(self, monkeypatch):
+        from unittest.mock import MagicMock
+
+        import psycopg2
+
+        monkeypatch.setattr(execution_common, "read_artifact_bytes", lambda ref: b'{"id":1,"name":"a"}\n')
+        mock_cur = MagicMock()
+        mock_cur.rowcount = 1
+        mock_conn = MagicMock()
+        mock_conn.cursor.return_value = mock_cur
+        monkeypatch.setattr(psycopg2, "connect", lambda conn_str: mock_conn)
+
+        ddl = 'CREATE TABLE IF NOT EXISTS public.t_job_out ("id" INT, "name" TEXT);'
+        args = _artifact_args()
+        args["target"] = {
+            "schema": "public",
+            "table": "t_job_out",
+        }
+        out = execution.execute_artifact_write(
+            "postgres",
+            {
+                "connection_string": "postgresql://u:p@localhost:5432/db",
+                "target": {"bootstrap_sql": ddl},
+            },
+            args,
+        )
+        assert "ok" in out
+        assert mock_cur.execute.call_count >= 1
+        assert mock_cur.executemany.call_count >= 1
+        first_sql = mock_cur.execute.call_args_list[0][0][0]
+        assert "CREATE TABLE" in first_sql
+
+    def test_postgres_bootstrap_sql_in_arguments_is_ignored(self, monkeypatch):
+        from unittest.mock import MagicMock
+
+        import psycopg2
+
+        monkeypatch.setattr(execution_common, "read_artifact_bytes", lambda ref: b'{"id":1,"name":"a"}\n')
+        mock_cur = MagicMock()
+        mock_cur.rowcount = 1
+        mock_conn = MagicMock()
+        mock_conn.cursor.return_value = mock_cur
+        monkeypatch.setattr(psycopg2, "connect", lambda conn_str: mock_conn)
+
+        args = _artifact_args()
+        args["target"] = {
+            "schema": "public",
+            "table": "t_job_out",
+            "bootstrap_sql": 'CREATE TABLE IF NOT EXISTS public.t_job_out ("id" INT, "name" TEXT);',
+        }
+        out = execution.execute_artifact_write(
+            "postgres",
+            {"connection_string": "postgresql://u:p@localhost:5432/db"},
+            args,
+        )
+        assert "ok" in out
+        # runtime target.bootstrap_sql must be ignored; first execute should be upsert/insert path, not CREATE TABLE
+        first_sql = mock_cur.execute.call_args_list[0][0][0] if mock_cur.execute.call_args_list else ""
+        assert "CREATE TABLE" not in str(first_sql)
+
+    def test_postgres_bootstrap_sql_in_signed_runtime_target_is_applied(self, monkeypatch):
+        from unittest.mock import MagicMock
+        import execution_artifact as ea
+        import psycopg2
+
+        monkeypatch.setenv("MCP_INTERNAL_SECRET", "test-secret")
+        monkeypatch.setattr(execution_common, "read_artifact_bytes", lambda ref: b'{"id":1,"name":"a"}\n')
+        mock_cur = MagicMock()
+        mock_cur.rowcount = 1
+        mock_conn = MagicMock()
+        mock_conn.cursor.return_value = mock_cur
+        monkeypatch.setattr(psycopg2, "connect", lambda conn_str: mock_conn)
+
+        ddl = 'CREATE TABLE IF NOT EXISTS public.t_job_out ("id" INT, "name" TEXT);'
+        target = {"schema": "public", "table": "t_job_out", "bootstrap_sql": ddl}
+        sig = ea._trusted_bootstrap_signature(
+            tool_name="platform_2_local_postgres",
+            operation_type="append",
+            schema="public",
+            table="t_job_out",
+            bootstrap_sql=ddl,
+            secret="test-secret",
+        )
+        args = _artifact_args()
+        args["tool_name"] = "platform_2_local_postgres"
+        args["target"] = target
+        args["trusted_bootstrap"] = {"bootstrap_sql": ddl, "sig": sig}
+
+        out = execution.execute_artifact_write(
+            "postgres",
+            {"connection_string": "postgresql://u:p@localhost:5432/db"},
+            args,
+        )
+        assert "ok" in out
+        first_sql = mock_cur.execute.call_args_list[0][0][0]
+        assert "CREATE TABLE" in str(first_sql)
+
+    def test_postgres_bootstrap_sql_with_bad_signature_is_ignored(self, monkeypatch):
+        from unittest.mock import MagicMock
+        import psycopg2
+
+        monkeypatch.setenv("MCP_INTERNAL_SECRET", "test-secret")
+        monkeypatch.setattr(execution_common, "read_artifact_bytes", lambda ref: b'{"id":1,"name":"a"}\n')
+        mock_cur = MagicMock()
+        mock_cur.rowcount = 1
+        mock_conn = MagicMock()
+        mock_conn.cursor.return_value = mock_cur
+        monkeypatch.setattr(psycopg2, "connect", lambda conn_str: mock_conn)
+
+        ddl = 'CREATE TABLE IF NOT EXISTS public.t_job_out ("id" INT, "name" TEXT);'
+        args = _artifact_args()
+        args["tool_name"] = "platform_2_local_postgres"
+        args["target"] = {"schema": "public", "table": "t_job_out", "bootstrap_sql": ddl}
+        args["trusted_bootstrap"] = {"bootstrap_sql": ddl, "sig": "bad-signature"}
+        out = execution.execute_artifact_write(
+            "postgres",
+            {"connection_string": "postgresql://u:p@localhost:5432/db"},
+            args,
+        )
+        assert "ok" in out
+        first_sql = mock_cur.execute.call_args_list[0][0][0] if mock_cur.execute.call_args_list else ""
+        assert "CREATE TABLE" not in str(first_sql)
+
+    def test_postgres_column_mapping_maps_artifact_keys(self, monkeypatch):
+        from unittest.mock import MagicMock
+
+        import psycopg2
+
+        monkeypatch.setattr(
+            execution_common,
+            "read_artifact_bytes",
+            lambda ref: b'{"content": {"a": 1}}\n',
+        )
+        mock_cur = MagicMock()
+        mock_cur.rowcount = 1
+        mock_conn = MagicMock()
+        mock_conn.cursor.return_value = mock_cur
+        monkeypatch.setattr(psycopg2, "connect", lambda conn_str: mock_conn)
+
+        args = _artifact_args()
+        args["target"] = {
+            "schema": "public",
+            "table": "t_out",
+            "column_mapping": {"content": "result_json"},
+        }
+        out = execution.execute_artifact_write(
+            "postgres",
+            {"connection_string": "postgresql://u:p@localhost:5432/db"},
+            args,
+        )
+        assert "ok" in out
+        ins_comp = mock_cur.executemany.call_args[0][0]
+        ins_repr = repr(ins_comp)
+        assert "result_json" in ins_repr
+        assert "content" not in ins_repr
+
+    def test_postgres_jsonb_columns_wraps_plain_text(self, monkeypatch):
+        """Plain text in a JSONB column must use Json() — raw strings are invalid JSON for JSONB."""
+        from unittest.mock import MagicMock
+
+        import psycopg2
+        from psycopg2.extras import Json
+
+        monkeypatch.setattr(
+            execution_common,
+            "read_artifact_bytes",
+            lambda ref: b'{"content": "The analysis summary text."}\n',
+        )
+        mock_cur = MagicMock()
+        mock_cur.rowcount = 1
+        mock_conn = MagicMock()
+        mock_conn.cursor.return_value = mock_cur
+        monkeypatch.setattr(psycopg2, "connect", lambda conn_str: mock_conn)
+
+        args = _artifact_args()
+        args["target"] = {
+            "schema": "public",
+            "table": "t_out",
+            "column_mapping": {"content": "result_json"},
+            "jsonb_columns": ["result_json"],
+        }
+        out = execution.execute_artifact_write(
+            "postgres",
+            {"connection_string": "postgresql://u:p@localhost:5432/db"},
+            args,
+        )
+        assert "ok" in out
+        rows = mock_cur.executemany.call_args[0][1]
+        assert isinstance(rows[0][0], Json)
+
+    def test_mysql_artifact_write_missing_database(self, monkeypatch):
+        monkeypatch.setattr(execution_common, "read_artifact_bytes", lambda ref: b'{"id":1}\n')
+        args = _artifact_args()
+        args["target"] = {"table": "t"}
+        out = execution.execute_artifact_write("mysql", {"host": "localhost", "user": "u", "password": "p"}, args)
+        assert "database" in out.lower() and "table" in out.lower()
+
+    def test_bigquery_upsert_without_merge_keys_rejected(self, monkeypatch):
+        """Upsert/merge must not fall back to WRITE_TRUNCATE (destructive)."""
+        monkeypatch.setattr(execution_common, "read_artifact_bytes", lambda ref: b'{"id":1}\n')
+        args = _artifact_args()
+        args["target"] = {"schema": "ds", "table": "t"}
+        args["operation_type"] = "upsert"
+        args["merge_keys"] = []
+        out = execution.execute_artifact_write("bigquery", {"project_id": "p"}, args)
+        assert "Error:" in out
+        assert "merge_keys" in out.lower()
+
+    def test_bigquery_unsupported_operation_type(self, monkeypatch):
+        monkeypatch.setattr(execution_common, "read_artifact_bytes", lambda ref: b'{"id":1}\n')
+        args = _artifact_args()
+        args["target"] = {"schema": "ds", "table": "t"}
+        args["operation_type"] = "truncate"
+        out = execution.execute_artifact_write("bigquery", {"project_id": "p"}, args)
+        assert "unsupported operation_type" in out.lower()
+
+    def test_databricks_artifact_inserts_all_rows_not_capped_at_5000(self, monkeypatch):
+        """Regression: writer must not stop at 5000 rows while reporting len(records)."""
+        import execution_artifact as ea
+
+        mock_cur = MagicMock()
+        mock_conn = MagicMock()
+        mock_conn.cursor.return_value = mock_cur
+        sql_mod = types.ModuleType("databricks.sql")
+        sql_mod.connect = MagicMock(return_value=mock_conn)
+        monkeypatch.setitem(sys.modules, "databricks", types.ModuleType("databricks"))
+        monkeypatch.setitem(sys.modules, "databricks.sql", sql_mod)
+
+        n = 6001
+        records = [{"id": i, "v": "x"} for i in range(n)]
+        out = ea._artifact_write_databricks(
+            {"host": "https://x.cloud.databricks.com", "token": "t", "http_path": "/sql/1.0/warehouses/w"},
+            {"catalog": "c", "schema": "s", "table": "t"},
+            records,
+            [],
+            "append",
+        )
+        data = json.loads(out)
+        assert data["status"] == "ok"
+        assert data["rows"] == n
+        assert mock_cur.execute.call_count == n
+
+    def test_databricks_artifact_rejects_invalid_identifiers(self, monkeypatch):
+        import execution_artifact as ea
+
+        mock_cur = MagicMock()
+        mock_conn = MagicMock()
+        mock_conn.cursor.return_value = mock_cur
+        sql_mod = types.ModuleType("databricks.sql")
+        sql_mod.connect = MagicMock(return_value=mock_conn)
+        monkeypatch.setitem(sys.modules, "databricks", types.ModuleType("databricks"))
+        monkeypatch.setitem(sys.modules, "databricks.sql", sql_mod)
+
+        out = ea._artifact_write_databricks(
+            {"host": "https://x.cloud.databricks.com", "token": "t", "http_path": "/sql/1.0/warehouses/w"},
+            {"catalog": "bad;cat", "schema": "s", "table": "t"},
+            [{"id": 1}],
+            [],
+            "append",
+        )
+        assert "invalid catalog/schema/table" in out.lower()
+
+    def test_sqlserver_artifact_rejects_invalid_identifiers(self):
+        import execution_artifact as ea
+
+        out = ea._artifact_write_sqlserver(
+            {"host": "localhost", "user": "u", "password": "p", "database": "d"},
+            {"schema": "dbo;drop", "table": "t"},
+            [{"id": 1}],
+            [],
+            "append",
+        )
+        assert "invalid schema" in out.lower()
+
+    def test_sqlserver_artifact_rejects_invalid_merge_key(self):
+        import execution_artifact as ea
+
+        out = ea._artifact_write_sqlserver(
+            {"host": "localhost", "user": "u", "password": "p", "database": "d"},
+            {"schema": "dbo", "table": "t"},
+            [{"id": 1, "name": "a"}],
+            ["id;drop"],
+            "upsert",
+        )
+        assert "invalid merge key identifier" in out.lower()
+
+    def test_redact_target_for_log_hides_sensitive_values(self):
+        import execution_artifact as ea
+
+        red = ea._redact_target_for_log(
+            {
+                "target_type": "postgres",
+                "schema": "public",
+                "table": "orders",
+                "password": "super-secret",
+                "connection_string": "postgresql://u:pw@db:5432/x",
+                "api_key": "k-123",
+                "column_mapping": {"content": "result_json"},
+            }
+        )
+        s = json.dumps(red)
+        assert "super-secret" not in s
+        assert "postgresql://" not in s
+        assert "k-123" not in s
+        assert red.get("schema") == "public"
+        assert red.get("table") == "orders"
+
 
 class TestFilesystem:
     def test_filesystem_missing_base_path(self):
@@ -62,6 +422,15 @@ class TestFilesystem:
         assert isinstance(out, str)
         # Returns newline-separated names (empty for empty dir)
         assert out == "" or "\n" in out or len(out) > 0
+
+    def test_filesystem_write_creates_file(self, tmp_path):
+        out = execute_platform_tool(
+            "filesystem",
+            {"base_path": str(tmp_path)},
+            {"path": "out/new.txt", "action": "write", "content": "hello"},
+        )
+        assert "Error:" not in out
+        assert (tmp_path / "out" / "new.txt").read_text() == "hello"
 
 
 class TestChroma:
@@ -124,27 +493,23 @@ class TestRestApi:
 
 
 class TestStubTools:
-    """S3, Slack, GitHub, Notion return configured message (no external call in unit test)."""
+    """S3 / Slack / GitHub / Notion return clear errors without real credentials (or SDK missing)."""
 
-    def test_s3_configured_message(self):
+    def test_s3_without_aws_returns_error(self):
         out = execute_platform_tool("s3", {"bucket": "my-bucket"}, {"key": "x", "action": "get"})
-        assert "S3" in out
-        assert "configured" in out.lower() or "boto3" in out.lower()
+        assert "Error:" in out or "Unable" in out or "NoSuchKey" in out or "not found" in out.lower()
 
-    def test_slack_configured_message(self):
-        out = execute_platform_tool("slack", {"token": "x"}, {"channel": "C1", "message": "hi", "action": "send"})
-        assert "Slack" in out
-        assert "configured" in out.lower()
+    def test_slack_invalid_token_returns_error(self):
+        out = execute_platform_tool("slack", {"bot_token": "xoxb-invalid"}, {"action": "list_channels"})
+        assert "Error:" in out
 
-    def test_github_configured_message(self):
-        out = execute_platform_tool("github", {"token": "x"}, {"repo": "a/b", "path": "README.md", "action": "get_file"})
-        assert "GitHub" in out
-        assert "configured" in out.lower()
+    def test_github_invalid_token_returns_error(self):
+        out = execute_platform_tool("github", {"api_key": "ghp_invalid"}, {"repo": "a/b", "path": "README.md", "action": "get_file"})
+        assert "Error:" in out
 
-    def test_notion_configured_message(self):
-        out = execute_platform_tool("notion", {"api_key": "x"}, {"action": "search", "query": "test"})
-        assert "Notion" in out
-        assert "configured" in out.lower()
+    def test_notion_invalid_key_returns_error(self):
+        out = execute_platform_tool("notion", {"api_key": "secret_invalid"}, {"action": "search", "query": "test"})
+        assert "Error:" in out
 
 
 class TestUnknownTool:

@@ -90,6 +90,9 @@ export const jobsAPI = {
     allowed_platform_tool_ids?: number[]
     allowed_connection_ids?: number[]
     tool_visibility?: 'full' | 'names_only' | 'none'
+    write_execution_mode?: 'platform' | 'agent' | 'ui_only'
+    output_artifact_format?: 'jsonl' | 'json'
+    output_contract?: Record<string, unknown>
     schedule_timezone?: string
     schedule_scheduled_at?: string
   }) {
@@ -110,6 +113,9 @@ export const jobsAPI = {
       form.append('allowed_connection_ids', JSON.stringify(payload.allowed_connection_ids))
     }
     if (payload.tool_visibility) form.append('tool_visibility', payload.tool_visibility)
+    if (payload.write_execution_mode) form.append('write_execution_mode', payload.write_execution_mode)
+    if (payload.output_artifact_format) form.append('output_artifact_format', payload.output_artifact_format)
+    if (payload.output_contract) form.append('output_contract', JSON.stringify(payload.output_contract))
     return api.post('/jobs', form, { headers: { 'Content-Type': 'multipart/form-data' } }).then((res) => res.data)
   },
   get(jobId: number) {
@@ -128,6 +134,9 @@ export const jobsAPI = {
   },
   getStatus(jobId: number) {
     return api.get('/jobs/' + jobId + '/status').then((res) => res.data)
+  },
+  getQueueStats() {
+    return api.get('/jobs/queue/stats').then((res) => res.data)
   },
   previewWorkflow(jobId: number) {
     return api.get('/jobs/' + jobId + '/workflow/preview').then((res) => res.data)
@@ -179,22 +188,51 @@ export const jobsAPI = {
   generateWorkflowQuestions(jobId: number) {
     return api.post('/jobs/' + jobId + '/generate-workflow-questions').then((res) => res.data)
   },
+  suggestWorkflowTools(jobId: number, agentIds: number[]) {
+    return api
+      .post<{
+        step_suggestions: Array<{ agent_index: number; platform_tool_ids: number[]; rationale?: string }>
+        output_contract_stub: Record<string, unknown> | null
+        fallback_used: boolean
+        detail?: string
+      }>('/jobs/' + jobId + '/suggest-workflow-tools', { agent_ids: agentIds })
+      .then((res) => res.data)
+  },
   autoSplitWorkflow(
     jobId: number,
     agentIds: number[],
     workflowMode?: 'independent' | 'sequential',
     stepTools?: Array<{ agent_index: number; allowed_platform_tool_ids?: number[]; allowed_connection_ids?: number[]; tool_visibility?: 'full' | 'names_only' | 'none' }>,
-    toolVisibility?: 'full' | 'names_only' | 'none'
+    toolVisibility?: 'full' | 'names_only' | 'none',
+    outputSettings?: {
+      write_execution_mode?: 'platform' | 'agent' | 'ui_only'
+      output_artifact_format?: 'jsonl' | 'json'
+      output_contract?: Record<string, unknown>
+    }
   ) {
     const body: {
       agent_ids: number[]
       workflow_mode?: string
       step_tools?: Array<{ agent_index: number; allowed_platform_tool_ids?: number[]; allowed_connection_ids?: number[]; tool_visibility?: string }>
       tool_visibility?: string
+      write_execution_mode?: string
+      output_artifact_format?: string
+      output_contract?: Record<string, unknown>
     } = { agent_ids: agentIds }
     if (workflowMode) body.workflow_mode = workflowMode
     if (stepTools?.length) body.step_tools = stepTools
     if (toolVisibility) body.tool_visibility = toolVisibility
+    if (outputSettings) {
+      if (outputSettings.write_execution_mode !== undefined) {
+        body.write_execution_mode = outputSettings.write_execution_mode
+      }
+      if (outputSettings.output_artifact_format !== undefined) {
+        body.output_artifact_format = outputSettings.output_artifact_format
+      }
+      if (outputSettings.output_contract !== undefined) {
+        body.output_contract = outputSettings.output_contract
+      }
+    }
     return api.post('/jobs/' + jobId + '/workflow/auto-split', body).then((res) => res.data)
   },
   updateStepTools(
@@ -296,6 +334,13 @@ export const mcpAPI = {
   validateConnection(data: { name: string; base_url: string; endpoint_path?: string; auth_type?: string; credentials?: Record<string, string> }) {
     return api.post<{ valid: boolean; message: string }>('/mcp/connections/validate', data).then((res) => res.data)
   },
+  certifyConnection(connectionId: number) {
+    return api.post<{
+      certified: boolean
+      checks: Array<{ name: string; passed: boolean; error?: string; tool_count?: number; write_tool_count?: number }>
+      recommended_policy: string
+    }>('/mcp/connections/' + connectionId + '/certify').then((res) => res.data)
+  },
   listTools() {
     return api.get<MCPToolConfigRes[]>('/mcp/tools').then((res) => res.data)
   },
@@ -331,6 +376,7 @@ export const mcpAPI = {
         name: string
         tool_type?: string
         description?: string
+        access_mode?: 'read_only' | 'read_write'
       }>;
       connection_tools: Array<{
         connection_id: number
@@ -347,6 +393,22 @@ export const mcpAPI = {
   },
   getTool(toolId: number) {
     return api.get<MCPToolConfigRes>('/mcp/tools/' + toolId).then((res) => res.data)
+  },
+  callPlatformWriteAsync(payload: {
+    tool_name: string
+    artifact_ref: { storage: string; path: string; format: string; checksum?: string }
+    target: { target_type: string; name: string; database?: string; schema?: string; table?: string; bucket?: string; prefix?: string }
+    operation_type?: 'insert' | 'update' | 'upsert' | 'merge'
+    write_mode?: 'append' | 'overwrite' | 'upsert' | 'merge'
+    merge_keys?: string[]
+    idempotency_key: string
+    options?: Record<string, unknown>
+    timeout_seconds?: number
+  }) {
+    return api.post('/mcp/call-platform-write-async', payload).then((res) => res.data)
+  },
+  getWriteOperation(operationId: string) {
+    return api.get('/mcp/operations/' + operationId).then((res) => res.data)
   },
 }
 

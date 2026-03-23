@@ -7,6 +7,12 @@ import { Link, useNavigate } from 'react-router-dom'
 export function BusinessDashboard() {
   const [spending, setSpending] = useState({ total_spent: 0, job_count: 0 })
   const [jobs, setJobs] = useState<Job[]>([])
+  const [queueStats, setQueueStats] = useState<{
+    execution_backend: string
+    queue_name: string
+    pending_jobs: number | null
+    workers: { online: number; active: number; reserved: number }
+  } | null>(null)
   const [isLoading, setIsLoading] = useState(true)
   const [expandedJobId, setExpandedJobId] = useState<number | null>(null)
   const [searchTerm, setSearchTerm] = useState('')
@@ -16,6 +22,24 @@ export function BusinessDashboard() {
   useEffect(() => {
     loadData()
     // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
+
+  useEffect(() => {
+    let mounted = true
+    const loadQueueStats = async () => {
+      try {
+        const stats = await jobsAPI.getQueueStats()
+        if (mounted) setQueueStats(stats)
+      } catch {
+        if (mounted) setQueueStats(null)
+      }
+    }
+    loadQueueStats()
+    const timer = setInterval(loadQueueStats, 10000)
+    return () => {
+      mounted = false
+      clearInterval(timer)
+    }
   }, [])
 
   const loadData = async () => {
@@ -76,7 +100,7 @@ export function BusinessDashboard() {
         </div>
       </div>
 
-      <div className="grid md:grid-cols-2 gap-6 mb-10">
+      <div className="grid md:grid-cols-3 gap-6 mb-10">
         <div className="bg-dark-100/50 backdrop-blur-xl rounded-2xl shadow-2xl p-8 border border-dark-200/50 card-hover">
           <div className="flex items-center justify-between mb-6">
             <div className="p-4 bg-gradient-to-br from-primary-500 to-primary-700 rounded-2xl shadow-lg">
@@ -102,6 +126,21 @@ export function BusinessDashboard() {
           <h2 className="text-sm font-semibold text-white/60 mb-2 uppercase tracking-wider">Total Jobs</h2>
           <p className="text-5xl font-black text-white mb-2">{spending.job_count}</p>
           <p className="text-xs text-white/40 font-medium">Jobs created</p>
+        </div>
+        <div className="bg-dark-100/50 backdrop-blur-xl rounded-2xl shadow-2xl p-8 border border-dark-200/50 card-hover">
+          <div className="flex items-center justify-between mb-6">
+            <div className="p-4 bg-gradient-to-br from-primary-500 to-primary-700 rounded-2xl shadow-lg">
+              <svg className="w-8 h-8 text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M20 12H4m16 0l-4-4m4 4l-4 4" />
+              </svg>
+            </div>
+          </div>
+          <h2 className="text-sm font-semibold text-white/60 mb-2 uppercase tracking-wider">Queue (Redis/Celery)</h2>
+          <p className="text-4xl font-black text-white mb-1">{queueStats?.pending_jobs ?? '-'}</p>
+          <p className="text-xs text-white/40 font-medium mb-2">Pending jobs in `{queueStats?.queue_name || 'celery'}`</p>
+          <p className="text-xs text-white/60 font-medium">
+            Workers: {queueStats?.workers.online ?? '-'} online, {queueStats?.workers.active ?? '-'} active, {queueStats?.workers.reserved ?? '-'} reserved
+          </p>
         </div>
       </div>
 

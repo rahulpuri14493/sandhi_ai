@@ -1,0 +1,27 @@
+# Single CodeQL config for this repo. GitHub default Code Scanning expects it here:
+# `.github/codeql-config.yml` (not under a subfolder). Do not duplicate elsewhere.
+# https://docs.github.com/en/code-security/code-scanning/automatically-scanning-your-code-for-vulnerabilities/configuring-code-scanning
+name: "Sandhi AI CodeQL config"
+
+# Entire MCP server package: operator-controlled SQL/paths; CodeQL cannot model that trust boundary.
+# Excluding the directory is more reliable than per-file or query-filters alone on default setup.
+paths-ignore:
+  - "scripts/setup_env.py"
+  - "tools/platform_mcp_server/**"
+  - "backend/tests/**"
+  - "frontend/tests/**"
+
+# Backup if paths-ignore is not applied (some orgs): same rules by path.
+query-filters:
+  - exclude:
+      id: py/sql-injection
+      paths:
+        - "tools/platform_mcp_server/**"
+  - exclude:
+      id: py/path-injection
+      paths:
+        - "tools/platform_mcp_server/**"
+  - exclude:
+      id: py/incomplete-url-substring-sanitization
+      paths:
+        - "tools/platform_mcp_server/**"
