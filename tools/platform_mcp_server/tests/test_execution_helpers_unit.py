@@ -1,4 +1,5 @@
 """Unit tests: execution helpers and app log helpers (no HTTP)."""
+import hashlib
 import json
 import logging
 from unittest.mock import MagicMock, patch
@@ -35,12 +36,14 @@ class TestRedactObjectStoreKeyForLog:
         out = execution_common._redact_object_store_key_for_log(k)
         assert k not in out
         assert "secret-file" not in out
-        assert "len=" in out
-        assert "id=" in out
+        assert "jobs" not in out
+        assert out == f"len={len(k)} id={hashlib.sha256(k.encode('utf-8')).hexdigest()[:12]}"
         assert len(out) < len(k)
 
-    def test_short_key_masks(self):
-        out = execution_common._redact_object_store_key_for_log("abcdefgh")
+    def test_short_key_no_literal_substrings(self):
+        k = "abcdefgh"
+        out = execution_common._redact_object_store_key_for_log(k)
+        assert k not in out
         assert "len=8" in out
         assert "id=" in out
 
@@ -173,7 +176,7 @@ class TestMergeSqlDialect:
             "[dbo].[orders]",
             ["id", "name", "qty"],
             ["id"],
-            "#tmp_mcp_1",
+            "#tmp_mcp_" + "a" * 32,
         )
         assert "tgt.[id] = src.[id]" in sql
         assert "[name]" in sql and "[qty]" in sql

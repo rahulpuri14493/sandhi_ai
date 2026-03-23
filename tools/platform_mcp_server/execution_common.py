@@ -12,6 +12,7 @@ import json
 import logging
 import os
 import re
+import secrets
 import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -58,19 +59,15 @@ def _truncate_for_log(text: str, max_len: int = 2000) -> str:
 
 def _redact_object_store_key_for_log(key: str) -> str:
     """
-    Log-safe representation of an object storage key: tiny prefix/suffix hints, length,
-    and a short SHA-256 prefix for correlating log lines without exposing full paths or names.
+    Log-safe representation of an object storage key: length and a short SHA-256 prefix
+    for correlating log lines, without exposing any literal portion of the key itself.
     """
     s = str(key or "").strip()
     if not s:
         return ""
     n = len(s)
     digest = hashlib.sha256(s.encode("utf-8", errors="replace")).hexdigest()[:12]
-    if n <= 8:
-        if n <= 2:
-            return f"len={n} id={digest}"
-        return f"{s[0]}…{s[-1]} len={n} id={digest}"
-    return f"{s[:2]}…{s[-2:]} len={n} id={digest}"
+    return f"len={n} id={digest}"
 
 
 def _url_for_log(url: str) -> str:
@@ -263,6 +260,48 @@ def _merge_sql_dialect(
             f"WHEN NOT MATCHED THEN INSERT ({ins_cols}) VALUES ({ins_vals});"
         )
     raise ValueError(f"Unsupported merge dialect: {dialect}")
+
+
+# SQL Server artifact MERGE: staging #temp is random hex only; fq is two bracket-quoted identifiers from _safe_ident.
+_SQLSERVER_STAGING_TEMP_RE = re.compile(r"^#tmp_mcp_[0-9a-f]{32}$")
+_SQLSERVER_FQ_BRACKETED_RE = re.compile(
+    r"^\[[A-Za-z_][A-Za-z0-9_$]*\]\.\[[A-Za-z_][A-Za-z0-9_$]*\]$"
+)
+
+
+def _sqlserver_staging_temp_name() -> str:
+    """Random local #temp table name (no user-controlled characters)."""
+    return f"#tmp_mcp_{secrets.token_hex(16)}"
+
+
+def _pymssql_sqlserver_select_into_empty_clone(cur: Any, staging_temp: str, fq_bracketed: str) -> None:
+    """Clone target schema into an empty staging #temp (identifiers validated)."""
+    if not _SQLSERVER_STAGING_TEMP_RE.fullmatch(staging_temp):
+        raise ValueError("Invalid SQL Server staging temp name")
+    if not _SQLSERVER_FQ_BRACKETED_RE.fullmatch(fq_bracketed):
+        raise ValueError("Invalid SQL Server table reference")
+    cur.execute(f"SELECT * INTO {staging_temp} FROM {fq_bracketed} WHERE 1=0")
+
+
+def _sqlserver_staging_insert_sql(staging_temp: str, col_sql: str, placeholders: str) -> str:
+    """INSERT into staging #temp; column list/placeholders come from _safe_ident-derived fragments."""
+    if not _SQLSERVER_STAGING_TEMP_RE.fullmatch(staging_temp):
+        raise ValueError("Invalid SQL Server staging temp name")
+    return f"INSERT INTO {staging_temp} ({col_sql}) VALUES ({placeholders})"
+
+
+def _pymssql_sqlserver_execute_merge_artifact(cur: Any, merge_sql: str) -> None:
+    """
+    Run MERGE built by _merge_sql_dialect("sqlserver", ...).
+    Dynamic SQL only concatenates _safe_ident outputs and a staging name matching _SQLSERVER_STAGING_TEMP_RE.
+    """
+    cur.execute(merge_sql)
+
+
+def _pymssql_sqlserver_drop_staging(cur: Any, staging_temp: str) -> None:
+    if not _SQLSERVER_STAGING_TEMP_RE.fullmatch(staging_temp):
+        raise ValueError("Invalid SQL Server staging temp name")
+    cur.execute(f"DROP TABLE {staging_temp}")
 
 
 def _artifact_path_segments(path: str) -> Optional[List[str]]:

@@ -12,9 +12,14 @@ from execution_common import (
     _artifact_object_storage_basename,
     _merge_sql_dialect,
     _postgres_dest_hint,
+    _pymssql_sqlserver_drop_staging,
+    _pymssql_sqlserver_execute_merge_artifact,
+    _pymssql_sqlserver_select_into_empty_clone,
+    _sqlserver_staging_insert_sql,
     _redact_object_store_key_for_log,
     _resolve_s3_compatible_endpoint,
     _safe_ident,
+    _sqlserver_staging_temp_name,
     _truncate_for_log,
     safe_tool_error,
 )
@@ -493,12 +498,15 @@ def _artifact_write_mysql(
             value_rows.append("(" + ",".join(["%s"] * len(cols)) + ")")
             flat.extend(rec.get(c) for c in cols)
         values_sql = ", ".join(value_rows)
+        # Only keys that exist as artifact columns participate in ON DUPLICATE KEY UPDATE (breaks taint from stray merge_keys).
+        safe_merge_keys = [c for c in merge_keys if c in cols]
         if non_keys:
             upd = ", ".join(f"`{_safe_ident(c)}`=VALUES(`{_safe_ident(c)}`)" for c in non_keys)
             sql = f"INSERT INTO {fq} ({col_sql}) VALUES {values_sql} ON DUPLICATE KEY UPDATE {upd}"
         else:
-            sql = f"INSERT INTO {fq} ({col_sql}) VALUES {values_sql} ON DUPLICATE KEY UPDATE " + ", ".join(
-                f"`{_safe_ident(k)}`=`{_safe_ident(k)}`" for k in merge_keys
+            sql = (
+                f"INSERT INTO {fq} ({col_sql}) VALUES {values_sql} ON DUPLICATE KEY UPDATE "
+                + ", ".join(f"`{_safe_ident(k)}`=`{_safe_ident(k)}`" for k in safe_merge_keys)
             )
         try:
             # codeql[py/sql-injection]: Upsert SQL uses _safe_ident for table/columns; values in bound `flat`.
@@ -811,18 +819,14 @@ def _artifact_write_sqlserver(
                 # codeql[py/sql-injection]: INSERT into fq from target schema/table; values parameterized.
                 cur.execute(ins, tuple(rec.get(c) for c in cols))
         else:
-            temp = f"#tmp_mcp_{abs(hash(fq)) % 10**8}"
-            # codeql[py/sql-injection]: Temp clone schema from target fq only; no external SQL fragments.
-            cur.execute(f"SELECT * INTO {temp} FROM {fq} WHERE 1=0")
-            ins = f"INSERT INTO {temp} ({col_sql}) VALUES ({placeholders})"
+            temp = _sqlserver_staging_temp_name()
+            _pymssql_sqlserver_select_into_empty_clone(cur, temp, fq)
+            ins = _sqlserver_staging_insert_sql(temp, col_sql, placeholders)
             for rec in records:
-                # codeql[py/sql-injection]: Staging INSERT; values parameterized.
                 cur.execute(ins, tuple(rec.get(c) for c in cols))
             merge_sql = _merge_sql_dialect("sqlserver", fq, cols_ident, safe_merge_keys, temp)
-            # codeql[py/sql-injection]: MERGE from _merge_sql_dialect; identifiers from artifact column names + merge_keys.
-            cur.execute(merge_sql)
-            # codeql[py/sql-injection]: DROP temp table name from controlled `temp` prefix + hash.
-            cur.execute(f"DROP TABLE {temp}")
+            _pymssql_sqlserver_execute_merge_artifact(cur, merge_sql)
+            _pymssql_sqlserver_drop_staging(cur, temp)
         conn.commit()
         cur.close()
         conn.close()
