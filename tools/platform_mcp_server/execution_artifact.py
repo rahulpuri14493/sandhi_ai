@@ -12,6 +12,7 @@ from execution_common import (
     _artifact_object_storage_basename,
     _merge_sql_dialect,
     _postgres_dest_hint,
+    _redact_object_store_key_for_log,
     _resolve_s3_compatible_endpoint,
     _safe_ident,
     _truncate_for_log,
@@ -213,8 +214,7 @@ def execute_artifact_write(tool_type: str, config: Dict[str, Any], arguments: Di
     try:
         raw = execution_common.read_artifact_bytes(artifact_ref)
     except Exception as e:
-        logger.exception("Artifact read failed")
-        return f"Error: could not read artifact: {e}"
+        return safe_tool_error("Artifact read", e)
 
     fmt = (artifact_ref.get("format") or "jsonl").lower()
     try:
@@ -227,11 +227,12 @@ def execute_artifact_write(tool_type: str, config: Dict[str, Any], arguments: Di
 
     tgt_type = (resolved_target.get("target_type") or tool_type).strip().lower()
     safe_target_for_log = _redact_target_for_log(resolved_target)
+    logged_tgt_type = str(safe_target_for_log.get("target_type") or tool_type).strip().lower()
     logger.info(
         "MCP artifact_write tool_type=%s target_type=%s operation_type=%s write_mode=%s "
         "record_count=%s merge_keys=%s artifact_storage=%s artifact_path=%s target=%s",
         tool_type,
-        _truncate_for_log(str(tgt_type), 64),
+        _truncate_for_log(logged_tgt_type, 64),
         operation_type,
         write_mode,
         len(records),
@@ -345,10 +346,10 @@ def _artifact_write_postgres(
                 cur.execute(trunc_stmt)
                 conn.commit()
             except Exception as e:
-                logger.exception("Postgres TRUNCATE for overwrite")
+                logger.error("Postgres TRUNCATE for overwrite (%s)", type(e).__name__)
                 cur.close()
                 conn.close()
-                return f"Error: overwrite (TRUNCATE) failed: {e}"
+                return f"Error: overwrite (TRUNCATE) failed ({type(e).__name__})"
         if operation_type in ("append", "insert") or not merge_keys:
             cur.executemany(ins_stmt, tuples)
             conn.commit()
@@ -473,10 +474,10 @@ def _artifact_write_mysql(
                 cur.execute(f"TRUNCATE TABLE {truncate_fq}")
                 conn.commit()
             except Exception as e:
-                logger.exception("MySQL TRUNCATE for overwrite")
+                logger.error("MySQL TRUNCATE for overwrite (%s)", type(e).__name__)
                 cur.close()
                 conn.close()
-                return f"Error: overwrite (TRUNCATE) failed: {e}"
+                return f"Error: overwrite (TRUNCATE) failed ({type(e).__name__})"
         if operation_type in ("append", "insert") or not merge_keys:
             ins = f"INSERT INTO {fq} ({col_sql}) VALUES ({', '.join(['%s'] * len(cols))})"
             # codeql[py/sql-injection]: INSERT identifiers from _safe_ident; values via executemany parameters.
@@ -542,10 +543,7 @@ def _artifact_write_object_store(
     ext = ".json" if fmt == "json" else ".jsonl"
     safe_id = _artifact_object_storage_basename(str(artifact_ref.get("path") or "artifact"), ext)
     dest_key = f"{prefix}/{safe_id}" if prefix else safe_id
-    safe_dest_key = _truncate_for_log(dest_key)
-    safe_bucket = (
-        f"{bucket[:3]}...{bucket[-3:]}" if len(bucket) > 6 else bucket
-    )
+    safe_dest_key = _redact_object_store_key_for_log(dest_key)
     endpoint = _resolve_s3_compatible_endpoint(tool_type, config)
     ak = (config.get("access_key") or config.get("access_key_id") or "").strip()
     sk = (config.get("secret_key") or config.get("secret_access_key") or "").strip()
@@ -560,10 +558,9 @@ def _artifact_write_object_store(
     try:
         body = raw if raw else ("\n".join(json.dumps(r) for r in records) + "\n").encode("utf-8")
         logger.info(
-            "MCP object_store_put tool_type=%s endpoint=%s bucket=%s key=%s bytes=%s operation_type=%s write_mode=%s",
+            "MCP object_store_put tool_type=%s endpoint=%s key=%s bytes=%s operation_type=%s write_mode=%s",
             tool_type,
             endpoint or "(default)",
-            safe_bucket,
             safe_dest_key,
             len(body),
             operation_type,
@@ -723,8 +720,7 @@ def _artifact_write_bigquery(
             load_job.result()
             merge_sql = _merge_sql_dialect("bigquery", fq_target, cols, merge_keys, fq_stg)
             logger.info(
-                "MCP artifact BigQuery MERGE dest=%s rows=%s merge_keys=%s",
-                _truncate_for_log(table_ref),
+                "MCP artifact BigQuery MERGE rows=%s merge_keys=%s",
                 len(records),
                 merge_keys,
             )

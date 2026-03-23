@@ -179,7 +179,7 @@ def _execute_filesystem(config: Dict[str, Any], arguments: Dict[str, Any]) -> st
             entries = sorted(full.iterdir())
             return "\n".join(e.name for e in entries)
         except Exception:
-            logger.exception("Filesystem list error")
+            logger.error("Filesystem list error")
             return "List error"
     if action == "write":
         raw = arguments.get("content")
@@ -199,7 +199,7 @@ def _execute_filesystem(config: Dict[str, Any], arguments: Dict[str, Any]) -> st
     try:
         return full.read_text(encoding="utf-8", errors="replace")
     except Exception:
-        logger.exception("Filesystem read error")
+        logger.error("Filesystem read error")
         return "Read error"
 
 
@@ -222,7 +222,7 @@ def _embed_with_user_key(
         if r.data and len(r.data) > 0:
             return r.data[0].embedding
     except Exception as e:
-        logger.warning("OpenAI embedding (user key) failed: %s", e)
+        logger.warning("OpenAI embedding (user key) failed: %s", type(e).__name__)
     return None
 
 
@@ -302,7 +302,10 @@ def _execute_pinecone(config: Dict[str, Any], arguments: Dict[str, Any]) -> str:
                 or isinstance(text_err, AttributeError)  # e.g. .search() not in this SDK
             )
             if fallback:
-                logger.info("Pinecone integrated text search not available, falling back to vector query: %s", text_err)
+                logger.info(
+                    "Pinecone integrated text search not available, falling back to vector query (exc_type=%s)",
+                    type(text_err).__name__,
+                )
             else:
                 raise
 
@@ -316,8 +319,8 @@ def _execute_pinecone(config: Dict[str, Any], arguments: Dict[str, Any]) -> str:
         payload = {"vector": vector, "topK": top_k, "includeMetadata": True, "namespace": namespace}
         result = index.query(**payload)
         return _normalize_result(result, namespace)
-    except Exception:
-        logger.exception("Pinecone query error")
+    except Exception as e:
+        logger.error("Pinecone query error (%s)", type(e).__name__)
         return "Pinecone query error"
 
 
@@ -386,7 +389,10 @@ def _execute_weaviate(config: Dict[str, Any], arguments: Dict[str, Any]) -> str:
                     out["matches"].append(entry)
                 return json.dumps(out, indent=2)
             except Exception as text_err:
-                logger.info("Weaviate near_text not available, trying embed + near_vector: %s", text_err)
+                logger.info(
+                    "Weaviate near_text not available, trying embed + near_vector (exc_type=%s)",
+                    type(text_err).__name__,
+                )
             # 2) Fall back: user's OpenAI key from config + near_vector
             vector = _embed_with_user_key(query_text, config)
             if not vector:
@@ -402,7 +408,7 @@ def _execute_weaviate(config: Dict[str, Any], arguments: Dict[str, Any]) -> str:
         finally:
             client.close()
     except Exception as e:
-        logger.exception("Weaviate query error")
+        logger.error("Weaviate query error (%s)", type(e).__name__)
         return "Weaviate query error"
 
 
@@ -464,7 +470,10 @@ def _execute_qdrant(config: Dict[str, Any], arguments: Dict[str, Any]) -> str:
                         "Cluster name is not the same as collection name: in the tool config, set **Collection name** to the exact name of your collection. "
                         "List collections in Qdrant Cloud (Cluster UI → Collections) to see the correct name."
                     )
-                logger.info("Qdrant Cloud Document query failed, falling back to vector query: %s", doc_err)
+                logger.info(
+                    "Qdrant Cloud Document query failed, falling back to vector query (exc_type=%s)",
+                    type(doc_err).__name__,
+                )
         # 2) Self-hosted or fallback: embed with user's OpenAI key then query by vector
         vector = _embed_with_user_key(query_text, config)
         if not vector:
@@ -483,7 +492,7 @@ def _execute_qdrant(config: Dict[str, Any], arguments: Dict[str, Any]) -> str:
         )
         return _parse_points_result(result)
     except Exception as e:
-        logger.exception("Qdrant query error")
+        logger.error("Qdrant query error (%s)", type(e).__name__)
         return "Qdrant query error"
 
 
@@ -573,7 +582,7 @@ def _execute_chroma(config: Dict[str, Any], arguments: Dict[str, Any]) -> str:
             matches.append(m)
         return json.dumps({"matches": matches}, indent=2)
     except Exception as e:
-        logger.exception("Chroma query error")
+        logger.error("Chroma query error (%s)", type(e).__name__)
         return "Chroma query error"
 
 
@@ -596,7 +605,7 @@ def _execute_vector_db(config: Dict[str, Any], arguments: Dict[str, Any]) -> str
                 if r.status_code == 200:
                     return json.dumps(r.json(), indent=2)
         except Exception as e:
-            logger.exception("Vector DB query error")
+            logger.error("Vector DB query error (%s)", type(e).__name__)
             return "Vector query error"
     return "Vector DB tool is configured; add a compatible endpoint (e.g. Pinecone/Weaviate/Qdrant/Chroma) for live queries."
 
@@ -664,7 +673,7 @@ def _execute_pageindex(config: Dict[str, Any], arguments: Dict[str, Any]) -> str
                 return f"PageIndex retrieval failed: {data.get('detail', data)}"
         return "PageIndex retrieval timed out (still processing)."
     except Exception as e:
-        logger.exception("PageIndex error")
+        logger.error("PageIndex error (%s)", type(e).__name__)
         return "PageIndex error"
 
 
@@ -763,14 +772,15 @@ async def jsonrpc(request: Request, x_mcp_business_id: Optional[str] = Header(No
                 "result": {"tools": tools, "nextCursor": None},
             })
         except httpx.HTTPStatusError as e:
-            logger.exception("Backend tools/list failed business_id=%s", business_id)
+            status = e.response.status_code if e.response is not None else None
+            logger.error("Backend tools/list failed business_id=%s http_status=%s", business_id, status)
             return JSONResponse({
                 "jsonrpc": JSONRPC_VERSION,
                 "id": req_id,
                 "error": {"code": -32000, "message": "Failed to fetch tool list from backend"},
             })
         except Exception as e:
-            logger.exception("tools/list error")
+            logger.error("tools/list error (%s)", type(e).__name__)
             return JSONResponse({
                 "jsonrpc": JSONRPC_VERSION,
                 "id": req_id,
@@ -817,14 +827,20 @@ async def jsonrpc(request: Request, x_mcp_business_id: Optional[str] = Header(No
                 },
             })
         except httpx.HTTPStatusError as e:
-            logger.exception("Backend config fetch failed business_id=%s tool_id=%s", business_id, tool_id)
+            status = e.response.status_code if e.response is not None else None
+            logger.error(
+                "Backend config fetch failed business_id=%s tool_id=%s http_status=%s",
+                business_id,
+                tool_id,
+                status,
+            )
             return JSONResponse({
                 "jsonrpc": JSONRPC_VERSION,
                 "id": req_id,
                 "error": {"code": -32000, "message": "Failed to fetch tool configuration from backend"},
             })
-        except Exception:
-            logger.error("tools/call error business_id=%s tool=%s", business_id, name)
+        except Exception as e:
+            logger.error("tools/call error business_id=%s tool=%s (%s)", business_id, name, type(e).__name__)
             return JSONResponse({
                 "jsonrpc": JSONRPC_VERSION,
                 "id": req_id,

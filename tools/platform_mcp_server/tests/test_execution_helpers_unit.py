@@ -25,6 +25,26 @@ class TestTruncateForLog:
         assert "total_chars=3000" in out
 
 
+class TestRedactObjectStoreKeyForLog:
+    def test_empty(self):
+        assert execution_common._redact_object_store_key_for_log("") == ""
+        assert execution_common._redact_object_store_key_for_log("   ") == ""
+
+    def test_long_key_hides_full_path(self):
+        k = "jobs/tenant-uuid/reports/secret-file-name.jsonl"
+        out = execution_common._redact_object_store_key_for_log(k)
+        assert k not in out
+        assert "secret-file" not in out
+        assert "len=" in out
+        assert "id=" in out
+        assert len(out) < len(k)
+
+    def test_short_key_masks(self):
+        out = execution_common._redact_object_store_key_for_log("abcdefgh")
+        assert "len=8" in out
+        assert "id=" in out
+
+
 class TestPostgresDestHint:
     def test_no_password_in_output(self):
         hint = execution._postgres_dest_hint("postgresql://user:secret@db.example.com:5432/mydb")
@@ -108,7 +128,8 @@ class TestLogMcpSql:
         caplog.set_level(logging.INFO)
         execution._log_mcp_sql("postgres", "SELECT 1", mode="read", dest="localhost:5432/db")
         assert any("MCP SQL" in r.message for r in caplog.records)
-        assert any("SELECT 1" in r.message for r in caplog.records)
+        assert any("query_chars=8" in r.message for r in caplog.records)
+        assert not any("SELECT 1" in r.message for r in caplog.records)
 
 
 class TestS3FamilyWritePrefix:

@@ -6,6 +6,7 @@ Reads artifact files from a mounted uploads path (Docker) or S3-compatible stora
 from __future__ import annotations
 
 import csv
+import hashlib
 import io
 import json
 import logging
@@ -38,10 +39,11 @@ logger = logging.getLogger(__name__)
 
 def safe_tool_error(event: str, exc: BaseException) -> str:
     """
-    Return a tool response safe for clients (no exception text / paths). Full details go to logs only.
-    Mitigates CodeQL py/stack-trace-exposure on user-facing returns.
+    Return a tool response safe for clients (no exception text / paths).
+    Server logs record only the event label and exception type — not str(exc) or tracebacks,
+    to avoid leaking connection details, SQL fragments, or filesystem paths.
     """
-    logger.exception("%s", event)
+    logger.error("%s (%s)", event, type(exc).__name__)
     return f"Error: {event} ({type(exc).__name__})"
 
 
@@ -52,6 +54,40 @@ def _truncate_for_log(text: str, max_len: int = 2000) -> str:
     if len(t) <= max_len:
         return t
     return t[:max_len] + f"... [truncated, total_chars={len(t)}]"
+
+
+def _redact_object_store_key_for_log(key: str) -> str:
+    """
+    Log-safe representation of an object storage key: tiny prefix/suffix hints, length,
+    and a short SHA-256 prefix for correlating log lines without exposing full paths or names.
+    """
+    s = str(key or "").strip()
+    if not s:
+        return ""
+    n = len(s)
+    digest = hashlib.sha256(s.encode("utf-8", errors="replace")).hexdigest()[:12]
+    if n <= 8:
+        if n <= 2:
+            return f"len={n} id={digest}"
+        return f"{s[0]}…{s[-1]} len={n} id={digest}"
+    return f"{s[:2]}…{s[-2:]} len={n} id={digest}"
+
+
+def _url_for_log(url: str) -> str:
+    """Host/port/path for logs — strips userinfo (credentials) from URLs."""
+    raw = (url or "").strip()
+    if not raw:
+        return ""
+    try:
+        u = urlparse(raw if "://" in raw else f"http://{raw}")
+        if not u.hostname:
+            return "<invalid-url>"
+        netloc = u.hostname
+        if u.port:
+            netloc = f"{netloc}:{u.port}"
+        return urlunparse((u.scheme or "http", netloc, u.path or "", u.params, "", u.fragment)).rstrip("/")
+    except Exception:
+        return "<invalid-url>"
 
 
 def _postgres_dest_hint(conn_str: str) -> str:
@@ -69,12 +105,14 @@ def _postgres_dest_hint(conn_str: str) -> str:
 
 
 def _log_mcp_sql(dialect: str, query: str, *, mode: str, dest: str = "") -> None:
+    """Log SQL execution metadata only — never log query text (may contain secrets or PII)."""
+    n = len(query or "")
     logger.info(
-        "MCP SQL dialect=%s mode=%s dest=%s query=%s",
+        "MCP SQL dialect=%s mode=%s dest=%s query_chars=%s",
         dialect,
         mode,
         dest or "(configured)",
-        _truncate_for_log(query),
+        n,
     )
 
 # Docker: mount backend uploads to this prefix (see docker-compose)
@@ -131,9 +169,9 @@ def _resolve_s3_compatible_endpoint(tool_type: str, config: Dict[str, Any]) -> O
             h2 = (e2.hostname or "").lower()
             if h2 and h2 not in ("localhost", "127.0.0.1", "::1"):
                 logger.warning(
-                    "Replacing loopback S3 endpoint %r with S3_ENDPOINT_URL %r (required from inside Docker).",
-                    ep,
-                    env_ep.strip(),
+                    "Replacing loopback S3 endpoint %s with S3_ENDPOINT_URL %s (required from inside Docker).",
+                    _url_for_log(ep),
+                    _url_for_log(env_ep.strip()),
                 )
                 return env_ep.rstrip("/")
     except Exception:

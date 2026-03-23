@@ -134,11 +134,9 @@ def execute_s3_family(
             return json.dumps({"status": "ok", "bucket": bucket, "key": key})
         return f"Error: unknown action {action}"
     except ClientError as e:
-        logger.exception("S3 family error")
-        return f"Error: {e}"
+        return safe_tool_error("S3 operation", e)
     except Exception as e:
-        logger.exception("S3 family error")
-        return f"Error: {e}"
+        return safe_tool_error("S3 operation", e)
 
 
 def execute_azure_blob(config: Dict[str, Any], arguments: Dict[str, Any]) -> str:
