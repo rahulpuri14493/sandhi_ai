@@ -374,8 +374,8 @@ def _artifact_write_mysql(
                     "(set target.allow_truncate_overwrite to true in output_contract to enable)"
                 )
             try:
-                truncate_db = (config.get("database") or database or "").strip()
-                truncate_fq = f"`{_safe_ident(truncate_db)}`.`{table_si}`"
+                truncate_fq = f"`{db_si}`.`{table_si}`"
+                # codeql[py/sql-injection]: TRUNCATE identifiers come from _safe_ident; no user data in the SQL body.
                 cur.execute(f"TRUNCATE TABLE {truncate_fq}")
                 conn.commit()
             except Exception as e:
