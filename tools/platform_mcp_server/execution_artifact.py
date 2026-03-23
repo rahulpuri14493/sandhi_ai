@@ -21,6 +21,35 @@ from execution_common import (
 logger = logging.getLogger(__name__)
 
 
+def _is_safe_bootstrap_sql(stmt: str) -> bool:
+    """
+    Allow only a restricted set of DDL prefixes for bootstrap_sql (operator config).
+    Rejects stacked statements, SQL comments, and destructive commands.
+    """
+    if not isinstance(stmt, str) or not stmt.strip():
+        return False
+    parts = [p.strip() for p in stmt.split(";") if p.strip()]
+    if not parts:
+        return False
+    for p in parts:
+        lowered = re.sub(r"\s+", " ", p).strip().lower()
+        if "--" in lowered or "/*" in lowered or "*/" in lowered:
+            return False
+        if lowered.startswith("drop ") or lowered.startswith("truncate "):
+            return False
+        allowed = (
+            "create table",
+            "create schema",
+            "create index",
+            "create unique index",
+            "alter table",
+            "comment on",
+        )
+        if not any(lowered.startswith(pref) for pref in allowed):
+            return False
+    return True
+
+
 def _postgres_run_bootstrap_sql(cur: Any, conn: Any, target: Dict[str, Any]) -> Optional[str]:
     """
     Run optional DDL before artifact INSERT (e.g. CREATE TABLE IF NOT EXISTS).
@@ -43,8 +72,9 @@ def _postgres_run_bootstrap_sql(cur: Any, conn: Any, target: Dict[str, Any]) -> 
     else:
         return "Error: target.bootstrap_sql must be a string or a list of SQL strings"
     for stmt in stmts:
+        if not _is_safe_bootstrap_sql(stmt):
+            return "Error: bootstrap_sql rejected (only allowlisted CREATE/ALTER/COMMENT DDL; no comments or multi-statement abuse)"
         try:
-            # codeql[py/sql-injection]: Optional DDL from target.bootstrap_sql (operator tool config), not ad-hoc user concat.
             cur.execute(stmt)
         except Exception as e:
             return safe_tool_error("Postgres bootstrap_sql failed", e)
@@ -183,6 +213,11 @@ def _artifact_write_postgres(
     table = (target.get("table") or "").strip()
     if not table:
         return "Error: target.table is required for Postgres artifact write"
+    try:
+        schema_si = _safe_ident(schema)
+        table_si = _safe_ident(table)
+    except ValueError:
+        return "Error: invalid schema or table name (must be safe SQL identifiers)"
     records = _apply_postgres_column_mapping(records, target)
     if not records or not isinstance(records[0], dict):
         return "Error: artifact contained no row data after column_mapping"
@@ -190,7 +225,7 @@ def _artifact_write_postgres(
     for k in merge_keys:
         if k not in cols:
             return f"Error: merge_keys must be columns of the artifact; missing {k!r}"
-    fq = f'"{_safe_ident(schema)}"."{_safe_ident(table)}"'
+    fq = f'"{schema_si}"."{table_si}"'
     col_sql = ", ".join(f'"{_safe_ident(c)}"' for c in cols)
     placeholders = ", ".join(["%s"] * len(cols))
     ins = f"INSERT INTO {fq} ({col_sql}) VALUES ({placeholders})"
@@ -220,8 +255,14 @@ def _artifact_write_postgres(
         wm = str(write_mode or "").lower()
         # Full replace: empty table then append (only for plain insert, not upsert)
         if wm == "overwrite" and operation_type in ("append", "insert") and not merge_keys:
+            if target.get("allow_truncate_overwrite") is False:
+                cur.close()
+                conn.close()
+                return (
+                    "Error: overwrite TRUNCATE is disabled for this target "
+                    "(set target.allow_truncate_overwrite to true in output_contract to enable)"
+                )
             try:
-                # codeql[py/sql-injection]: TRUNCATE on fq built from _safe_ident(schema/table) only.
                 cur.execute(f"TRUNCATE TABLE {fq} RESTART IDENTITY")
                 conn.commit()
             except Exception as e:
@@ -291,11 +332,16 @@ def _artifact_write_mysql(
     table = (target.get("table") or "").strip()
     if not database or not table:
         return "Error: target.database and target.table are required for MySQL artifact write"
+    try:
+        db_si = _safe_ident(database)
+        table_si = _safe_ident(table)
+    except ValueError:
+        return "Error: invalid database or table name (must be safe SQL identifiers)"
     cols = [str(c) for c in records[0].keys()]
     for k in merge_keys:
         if k not in cols:
             return f"Error: merge_keys must be columns of the artifact; missing {k!r}"
-    fq = f"`{_safe_ident(database)}`.`{_safe_ident(table)}`"
+    fq = f"`{db_si}`.`{table_si}`"
     col_sql = ", ".join(f"`{_safe_ident(c)}`" for c in cols)
     tuples = [tuple(rec.get(c) for c in cols) for rec in records]
     preview_ins = f"INSERT INTO {fq} ({col_sql}) VALUES ({', '.join(['%s'] * len(cols))})"
@@ -320,9 +366,17 @@ def _artifact_write_mysql(
         cur = conn.cursor()
         wm = str(write_mode or "").lower()
         if wm == "overwrite" and operation_type in ("append", "insert") and not merge_keys:
+            if target.get("allow_truncate_overwrite") is False:
+                cur.close()
+                conn.close()
+                return (
+                    "Error: overwrite TRUNCATE is disabled for this target "
+                    "(set target.allow_truncate_overwrite to true in output_contract to enable)"
+                )
             try:
-                # codeql[py/sql-injection]: TRUNCATE on fq from _safe_ident-backed schema/table only.
-                cur.execute(f"TRUNCATE TABLE {fq}")
+                truncate_db = (config.get("database") or database or "").strip()
+                truncate_fq = f"`{_safe_ident(truncate_db)}`.`{table_si}`"
+                cur.execute(f"TRUNCATE TABLE {truncate_fq}")
                 conn.commit()
             except Exception as e:
                 logger.exception("MySQL TRUNCATE for overwrite")

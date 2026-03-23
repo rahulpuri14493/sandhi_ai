@@ -92,6 +92,16 @@ def execute_mysql(config: Dict[str, Any], arguments: Dict[str, Any]) -> str:
         return "Error: query is required in arguments or tool configuration"
     upper = query.lstrip().upper()
     is_read_query = upper.startswith("SELECT") or upper.startswith("WITH")
+    interactive_readonly = bool(config.get("interactive_readonly")) or (
+        os.environ.get("MCP_MYSQL_INTERACTIVE_READONLY", "").strip().lower() in ("1", "true", "yes")
+    )
+    if interactive_readonly and not is_read_query:
+        return (
+            "Error: interactive MySQL is read-only for this tool "
+            "(set interactive_readonly on the MCP tool config or MCP_MYSQL_INTERACTIVE_READONLY=1). "
+            "Only SELECT (and read-only WITH) queries are allowed. "
+            "Use output_contract platform writes for controlled INSERT/DDL to named tables."
+        )
     params = arguments.get("params")
     mysql_dest = f"{config.get('host', 'localhost')}:{int(config.get('port', 3306))}/{config.get('database', '')}"
     _log_mcp_sql("mysql", query, mode="read" if is_read_query else "write", dest=mysql_dest)
@@ -227,6 +237,16 @@ def execute_sqlserver_sql(config: Dict[str, Any], arguments: Dict[str, Any]) -> 
         return "Error: pymssql is not installed"
     upper_ss = query.lstrip().upper()
     is_read_ss = upper_ss.startswith("SELECT") or upper_ss.startswith("WITH")
+    interactive_readonly_ss = bool(config.get("interactive_readonly")) or (
+        os.environ.get("MCP_SQLSERVER_INTERACTIVE_READONLY", "").strip().lower() in ("1", "true", "yes")
+    )
+    if interactive_readonly_ss and not is_read_ss:
+        return (
+            "Error: interactive SQL Server is read-only for this tool "
+            "(set interactive_readonly on the MCP tool config or MCP_SQLSERVER_INTERACTIVE_READONLY=1). "
+            "Only SELECT (and read-only WITH) queries are allowed. "
+            "Use output_contract platform writes for controlled INSERT/DDL to named tables."
+        )
     mssql_dest = f"{(config.get('host') or 'localhost').strip()}:{int(config.get('port') or 1433)}/{config.get('database', '')}"
     _log_mcp_sql("sqlserver", query, mode="read" if is_read_ss else "write", dest=mssql_dest)
     try:
