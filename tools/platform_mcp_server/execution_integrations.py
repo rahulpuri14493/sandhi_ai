@@ -6,6 +6,8 @@ import logging
 from typing import Any, Dict
 from urllib.parse import urlparse
 
+from execution_common import safe_tool_error
+
 logger = logging.getLogger(__name__)
 
 
@@ -42,10 +44,10 @@ def execute_slack(config: Dict[str, Any], arguments: Dict[str, Any]) -> str:
         client.chat_postMessage(channel=channel, text=message)
         return json.dumps({"status": "ok"})
     except SlackApiError as e:
-        return f"Error: {e.response['error']}"
+        code = (e.response or {}).get("error") or "slack_api_error"
+        return f"Error: Slack API ({code})"
     except Exception as e:
-        logger.exception("Slack error")
-        return f"Error: {e}"
+        return safe_tool_error("Slack error", e)
 
 
 def execute_github(config: Dict[str, Any], arguments: Dict[str, Any]) -> str:
@@ -87,8 +89,7 @@ def execute_github(config: Dict[str, Any], arguments: Dict[str, Any]) -> str:
             return json.dumps([{"full_name": x.full_name} for x in r[:20]], indent=2)
         return f"Error: unknown action {action}"
     except Exception as e:
-        logger.exception("GitHub error")
-        return f"Error: {e}"
+        return safe_tool_error("GitHub error", e)
 
 
 def execute_notion(config: Dict[str, Any], arguments: Dict[str, Any]) -> str:
@@ -120,8 +121,7 @@ def execute_notion(config: Dict[str, Any], arguments: Dict[str, Any]) -> str:
             return json.dumps(d, indent=2, default=str)
         return f"Error: unknown action {action}"
     except Exception as e:
-        logger.exception("Notion error")
-        return f"Error: {e}"
+        return safe_tool_error("Notion error", e)
 
 
 def execute_rest_api(config: Dict[str, Any], arguments: Dict[str, Any]) -> str:
@@ -147,6 +147,5 @@ def execute_rest_api(config: Dict[str, Any], arguments: Dict[str, Any]) -> str:
             body = r.json() if ct.startswith("application/json") else r.text
             return json.dumps({"status": r.status_code, "body": body})
     except Exception as e:
-        logger.exception("REST API error")
-        return f"Error: {e}"
+        return safe_tool_error("REST API error", e)
 

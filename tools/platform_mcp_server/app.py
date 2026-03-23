@@ -5,6 +5,7 @@ Exposes MCP protocol (JSON-RPC 2.0): initialize, tools/list, tools/call.
 Tools are resolved per business (tenant) via the Sandhi AI backend internal API.
 Implements Vector DB, PostgreSQL, and File system tools using tenant-stored config.
 """
+from execution_common import safe_tool_error
 from execution import (
     _truncate_for_log,
     execute_artifact_write,
@@ -191,8 +192,7 @@ def _execute_filesystem(config: Dict[str, Any], arguments: Dict[str, Any]) -> st
             full.write_text(text, encoding="utf-8")
             return json.dumps({"status": "ok", "path": rel, "bytes_written": len(text.encode("utf-8"))})
         except Exception as e:
-            logger.exception("Filesystem write error")
-            return f"Error: {e}"
+            return safe_tool_error("Filesystem write error", e)
     try:
         return full.read_text(encoding="utf-8", errors="replace")
     except Exception:
@@ -313,9 +313,8 @@ def _execute_pinecone(config: Dict[str, Any], arguments: Dict[str, Any]) -> str:
         payload = {"vector": vector, "topK": top_k, "includeMetadata": True, "namespace": namespace}
         result = index.query(**payload)
         return _normalize_result(result, namespace)
-    except Exception as e:
-        if "OPENAI" not in str(e) and "embed" not in str(e).lower():
-            logger.exception("Pinecone query error")
+    except Exception:
+        logger.exception("Pinecone query error")
         return "Pinecone query error"
 
 

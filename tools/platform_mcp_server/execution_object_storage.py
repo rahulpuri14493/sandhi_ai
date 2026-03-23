@@ -7,7 +7,7 @@ import os
 import time
 from typing import Any, Dict, Tuple
 
-from execution_common import _resolve_s3_compatible_endpoint, _truncate_for_log
+from execution_common import _resolve_s3_compatible_endpoint, _truncate_for_log, safe_tool_error
 
 logger = logging.getLogger(__name__)
 
@@ -182,8 +182,7 @@ def execute_azure_blob(config: Dict[str, Any], arguments: Dict[str, Any]) -> str
             return json.dumps({"blobs": names}, indent=2)
         return f"Error: unknown action {action}"
     except Exception as e:
-        logger.exception("Azure blob error")
-        return f"Error: {e}"
+        return safe_tool_error("Azure blob error", e)
 
 
 def execute_gcs(config: Dict[str, Any], arguments: Dict[str, Any]) -> str:
@@ -230,5 +229,4 @@ def execute_gcs(config: Dict[str, Any], arguments: Dict[str, Any]) -> str:
             return json.dumps({"objects": names}, indent=2)
         return f"Error: unknown action {action}"
     except Exception as e:
-        logger.exception("GCS error")
-        return f"Error: {e}"
+        return safe_tool_error("GCS error", e)

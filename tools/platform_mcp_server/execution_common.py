@@ -228,30 +228,30 @@ def _merge_sql_dialect(
 def resolve_local_artifact_path(path: str) -> Optional[str]:
     """
     Map backend-relative path to container path when uploads volume is mounted.
-    Uses os.path.realpath + commonpath containment (CodeQL path-injection sanitizer pattern).
+    Uses os.path.realpath + root prefix checks (avoid Path(user_string); satisfies CodeQL path-injection).
     """
     if not path or not str(path).strip():
         return None
     p = str(path).strip().replace("\\", "/")
     try:
-        root = os.path.realpath(_ARTIFACT_ROOT)
+        root_real = os.path.realpath(_ARTIFACT_ROOT)
     except OSError:
         return None
 
-    def _is_under_root(candidate: str) -> bool:
+    def _file_if_under_root(candidate_path: str) -> Optional[str]:
+        """Return realpath only if it is a file under root_real (no Path() from untrusted full string)."""
         try:
-            return os.path.commonpath([candidate, root]) == root
-        except ValueError:
-            return False
-
-    if p.startswith("/"):
-        try:
-            cand = os.path.realpath(p)
+            real = os.path.realpath(candidate_path)
         except OSError:
             return None
-        if not _is_under_root(cand) or not os.path.isfile(cand):
+        if real != root_real and not real.startswith(root_real + os.sep):
             return None
-        return cand
+        if not os.path.isfile(real):
+            return None
+        return real
+
+    if p.startswith("/"):
+        return _file_if_under_root(p)
 
     if p.startswith("uploads/jobs/"):
         tail = p[len("uploads/jobs/") :].strip()
@@ -260,14 +260,9 @@ def resolve_local_artifact_path(path: str) -> Optional[str]:
         parts = [x for x in tail.split("/") if x]
         if not parts or any(x in ("..", ".") for x in parts):
             return None
-        try:
-            joined = os.path.join(root, *parts)
-            cand = os.path.realpath(joined)
-        except OSError:
-            return None
-        if not _is_under_root(cand) or not os.path.isfile(cand):
-            return None
-        return cand
+        joined = os.path.join(root_real, *parts)
+        return _file_if_under_root(joined)
+
     return None
 
 
@@ -298,7 +293,8 @@ def read_artifact_bytes(artifact_ref: Dict[str, Any]) -> bytes:
     key = (artifact_ref.get("key") or path or "").strip()
 
     local = resolve_local_artifact_path(path) if path else None
-    if local and os.path.isfile(local):
+    if local:
+        # local is already realpath-validated under artifact root
         with open(local, "rb") as fh:
             return fh.read()
 

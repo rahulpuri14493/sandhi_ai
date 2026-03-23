@@ -1,29 +1,28 @@
-# CodeQL configuration for code scanning.
-# See: https://docs.github.com/en/code-security/code-scanning/automatically-scanning-your-code-for-vulnerabilities/configuring-code-scanning
-# Single config for this repo. Advanced workflows must set init `config-file: ./.github/codeql-config.yml` if not using default setup.
+# CodeQL: GitHub default setup looks for this path under .github/
+# Workflow `.github/workflows/codeql.yml` uses the same file via config-file.
+# https://docs.github.com/en/code-security/code-scanning/automatically-scanning-your-code-for-vulnerabilities/configuring-code-scanning
 name: "Sandhi AI CodeQL config"
 
-# Exclude local-dev-only script that intentionally writes secrets to .env (gitignored).
 paths-ignore:
   - "scripts/setup_env.py"
-  # Test files: substring assertions, mocks, and fixture URLs trigger false positives.
   - "tools/platform_mcp_server/tests/**"
   - "backend/tests/**"
   - "frontend/tests/**"
 
-# Platform MCP server: SQL and paths are not anonymous web input — tools run with tenant-scoped
-# backend config (X-MCP-Business-Id) and encrypted credentials; interactive SQL is operator-controlled.
-# See tools/platform_mcp_server/README.md.
+# Operator-scoped MCP tools (tenant + encrypted creds), not anonymous HTTP input.
 query-filters:
   - exclude:
       id: py/sql-injection
       paths:
-        - tools/platform_mcp_server/**
+        - "tools/platform_mcp_server/execution_sql.py"
+        - "tools/platform_mcp_server/execution_artifact.py"
+        - "tools/platform_mcp_server/**"
   - exclude:
       id: py/path-injection
       paths:
-        - tools/platform_mcp_server/**
+        - "tools/platform_mcp_server/execution_common.py"
+        - "tools/platform_mcp_server/**"
   - exclude:
       id: py/incomplete-url-substring-sanitization
       paths:
-        - tools/platform_mcp_server/**
+        - "tools/platform_mcp_server/**"
