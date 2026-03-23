@@ -358,9 +358,20 @@ def parse_artifact_records(data: bytes, fmt: str) -> List[Dict[str, Any]]:
 
 
 def _sql_query_from_args(config: Dict[str, Any], arguments: Dict[str, Any]) -> str:
-    if not isinstance(arguments, dict):
+    """
+    Return the SQL statement for a tool.
+
+    Security note: the query text must come from trusted tool configuration, not from
+    request-supplied arguments. Callers may still supply parameter values in
+    arguments["params"], which are safely bound by the DB driver.
+    """
+    if not isinstance(config, dict):
         return ""
     return (
-        (arguments.get("query") or arguments.get("sql") or arguments.get("statement") or config.get("query") or "")
-        .strip()
+        (
+            config.get("query")
+            or config.get("sql")
+            or config.get("statement")
+            or ""
+        ).strip()
     )
