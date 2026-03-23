@@ -519,7 +519,13 @@ def update_tool(
     if body.name is not None:
         t.name = body.name
     if body.config is not None:
-        t.encrypted_config = encrypt_json(body.config)
+        # Merge partial updates so omitted keys (e.g. secret fields left blank in UI)
+        # are preserved instead of being dropped.
+        current_cfg = decrypt_json(t.encrypted_config) if t.encrypted_config else {}
+        if not isinstance(current_cfg, dict):
+            current_cfg = {}
+        merged_cfg = {**current_cfg, **body.config}
+        t.encrypted_config = encrypt_json(merged_cfg)
     if body.business_description is not None:
         bd = (body.business_description or "").strip() or None
         t.business_description = bd[:2000] if bd and len(bd) > 2000 else bd

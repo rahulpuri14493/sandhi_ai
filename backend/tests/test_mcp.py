@@ -234,6 +234,41 @@ class TestMCPTools:
         assert r.status_code == 200
         assert r.json()["name"] == "API1 Updated"
 
+    def test_update_tool_merges_config_instead_of_replacing(self, client_mcp: TestClient, business_user, db_session):
+        from core.encryption import decrypt_json
+        from models.mcp_server import MCPToolConfig
+
+        cr = client_mcp.post(
+            "/api/mcp/tools",
+            headers=business_user["headers"],
+            json={
+                "tool_type": "postgres",
+                "name": "PG Merge",
+                "config": {
+                    "connection_string": "postgresql://u:p@localhost/db",
+                    "schema": "public",
+                    "query": "SELECT now();",
+                },
+            },
+        )
+        assert cr.status_code == 201
+        tid = cr.json()["id"]
+
+        # Partial PATCH should preserve existing query/connection_string.
+        r = client_mcp.patch(
+            f"/api/mcp/tools/{tid}",
+            headers=business_user["headers"],
+            json={"config": {"schema": "analytics"}},
+        )
+        assert r.status_code == 200
+
+        row = db_session.query(MCPToolConfig).filter(MCPToolConfig.id == tid).first()
+        assert row is not None
+        cfg = decrypt_json(row.encrypted_config)
+        assert cfg["schema"] == "analytics"
+        assert cfg["query"] == "SELECT now();"
+        assert cfg["connection_string"] == "postgresql://u:p@localhost/db"
+
     def test_delete_tool(self, client_mcp: TestClient, business_user):
         cr = client_mcp.post(
             "/api/mcp/tools",

@@ -29,9 +29,21 @@ def input_schema_for_platform_tool_type(tool_type: str) -> Dict[str, Any]:
     sql_schema_interactive: Dict[str, Any] = {
         "type": "object",
         "properties": {
+            "query": {
+                "type": "string",
+                "description": "Optional runtime SQL. Allowed only for a strict single read-only SELECT/WITH statement.",
+            },
+            "sql": {
+                "type": "string",
+                "description": "Alias of query (read-only SELECT/WITH only).",
+            },
+            "statement": {
+                "type": "string",
+                "description": "Alias of query (read-only SELECT/WITH only).",
+            },
             "params": {
                 "type": "array",
-                "description": "Optional bound parameters for the SQL statement stored in tool configuration (query/sql/statement).",
+                "description": "Optional bound parameters for configured SQL or runtime read-only query.",
                 "items": {},
             },
         },

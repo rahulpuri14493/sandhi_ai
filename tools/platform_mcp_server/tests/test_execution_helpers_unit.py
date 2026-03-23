@@ -26,6 +26,44 @@ class TestTruncateForLog:
         assert "total_chars=3000" in out
 
 
+class TestSqlQueryFromArgs:
+    def test_reads_top_level_query_from_config_only(self):
+        q = execution_common._sql_query_from_args(
+            {"query": "  SELECT 1  "},
+            {"query": "SELECT should_not_be_used"},
+        )
+        assert q == "SELECT 1"
+
+    def test_reads_nested_statement_from_settings(self):
+        q = execution_common._sql_query_from_args(
+            {"settings": {"statement": "SELECT 2"}},
+            {},
+        )
+        assert q == "SELECT 2"
+
+    def test_reads_nested_value_object(self):
+        q = execution_common._sql_query_from_args(
+            {"sql": {"text": "SELECT 3"}},
+            {},
+        )
+        assert q == "SELECT 3"
+
+    def test_arguments_query_is_ignored_when_config_missing(self):
+        q = execution_common._sql_query_from_args({}, {"query": "SELECT 1"})
+        assert q == "SELECT 1"
+
+    def test_runtime_query_rejects_non_readonly(self):
+        with pytest.raises(ValueError, match="read-only"):
+            execution_common._sql_query_from_args({}, {"query": "DELETE FROM jobs"})
+
+    def test_config_query_wins_over_runtime_query(self):
+        q = execution_common._sql_query_from_args(
+            {"query": "SELECT from_config"},
+            {"query": "SELECT from_runtime"},
+        )
+        assert q == "SELECT from_config"
+
+
 class TestRedactObjectStoreKeyForLog:
     def test_empty(self):
         assert execution_common._redact_object_store_key_for_log("") == ""

@@ -903,6 +903,7 @@ function ConfigureFlow({
     postgres: [
       { key: 'connection_string', label: 'Connection string', placeholder: 'postgresql://user:pass@host:5432/db', secret: true },
       { key: 'schema', label: 'Schema (optional)', placeholder: 'public' },
+      { key: 'query', label: 'Default SQL query (optional fallback)', placeholder: 'SELECT now()' },
     ],
     mysql: [
       { key: 'host', label: 'Host', placeholder: 'localhost' },
@@ -910,6 +911,7 @@ function ConfigureFlow({
       { key: 'user', label: 'User', placeholder: 'root', secret: false },
       { key: 'password', label: 'Password', placeholder: '', secret: true },
       { key: 'database', label: 'Database', placeholder: 'mydb' },
+      { key: 'query', label: 'Default SQL query (optional fallback)', placeholder: 'SELECT NOW()' },
     ],
     sqlserver: [
       { key: 'host', label: 'Host', placeholder: 'sql.example.com' },
@@ -917,6 +919,7 @@ function ConfigureFlow({
       { key: 'database', label: 'Database', placeholder: 'mydb' },
       { key: 'user', label: 'User', placeholder: 'app_user', secret: false },
       { key: 'password', label: 'Password', placeholder: '', secret: true },
+      { key: 'query', label: 'Default SQL query (optional fallback)', placeholder: 'SELECT GETUTCDATE()' },
     ],
     snowflake: [
       { key: 'account', label: 'Account identifier', placeholder: 'xy12345.us-east-1.aws' },
@@ -925,16 +928,19 @@ function ConfigureFlow({
       { key: 'warehouse', label: 'Warehouse', placeholder: 'COMPUTE_WH' },
       { key: 'database', label: 'Database', placeholder: 'MY_DB' },
       { key: 'schema', label: 'Schema', placeholder: 'PUBLIC' },
+      { key: 'query', label: 'Default SQL query (optional fallback)', placeholder: 'SELECT CURRENT_TIMESTAMP()' },
     ],
     databricks: [
       { key: 'host', label: 'Workspace URL', placeholder: 'https://dbc-xxxx.cloud.databricks.com' },
       { key: 'sql_warehouse_id', label: 'SQL warehouse ID', placeholder: 'Required for SQL queries' },
       { key: 'token', label: 'Personal access token', placeholder: 'dapi...', secret: true },
+      { key: 'query', label: 'Default SQL query (optional fallback)', placeholder: 'SELECT current_timestamp()' },
     ],
     bigquery: [
       { key: 'project_id', label: 'GCP project ID', placeholder: 'my-project' },
       { key: 'dataset', label: 'Dataset', placeholder: 'my_dataset' },
       { key: 'credentials_json', label: 'Service account JSON (optional)', placeholder: 'Paste JSON if not using ADC', secret: true },
+      { key: 'query', label: 'Default SQL query (optional fallback)', placeholder: 'SELECT CURRENT_TIMESTAMP()' },
     ],
     elasticsearch: [
       { key: 'url', label: 'Elasticsearch URL', placeholder: 'http://localhost:9200' },
@@ -1205,6 +1211,11 @@ function ConfigureFlow({
               />
               {toolType === 'postgres' && f.key === 'connection_string' && (
                 <p className="mt-1 text-xs text-white/50">If the app runs in Docker, use <code className="bg-dark-200/50 px-1 rounded">host.docker.internal</code> instead of localhost to reach PostgreSQL on your host.</p>
+              )}
+              {['postgres', 'mysql', 'sqlserver', 'snowflake', 'databricks', 'bigquery'].includes(toolType) && f.key === 'query' && (
+                <p className="mt-1 text-xs text-white/50">
+                  Optional fallback query. Agents can provide per-job runtime read-only SELECT/WITH query; this value is used when runtime query is not supplied.
+                </p>
               )}
             </div>
           ))}

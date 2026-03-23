@@ -1,5 +1,7 @@
 import logging
 import json
+import hashlib
+import hmac
 import uuid
 from datetime import datetime
 from typing import Any, Dict, List, Optional
@@ -21,6 +23,28 @@ from services.mcp_tool_input_schemas import input_schema_for_platform_tool_type
 from core.artifact_contract import normalize_agent_output_for_artifact
 
 logger = logging.getLogger(__name__)
+
+
+def _sign_trusted_bootstrap_payload(
+    *,
+    tool_name: str,
+    operation_type: str,
+    schema: str,
+    table: str,
+    bootstrap_sql: Any,
+) -> Optional[str]:
+    secret = (settings.MCP_INTERNAL_SECRET or "").strip()
+    if not secret:
+        return None
+    payload = {
+        "tool_name": str(tool_name or "").strip(),
+        "operation_type": str(operation_type or "").strip().lower(),
+        "schema": str(schema or "").strip(),
+        "table": str(table or "").strip(),
+        "bootstrap_sql": bootstrap_sql,
+    }
+    msg = json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str)
+    return hmac.new(secret.encode("utf-8"), msg.encode("utf-8"), hashlib.sha256).hexdigest()
 
 
 def _safe_slug(name: str) -> str:
@@ -202,6 +226,8 @@ class AgentExecutor:
             raise ValueError("output_contract.write_targets[].tool_name is required for platform mode")
         operation_type = str(write_spec.get("operation_type", "upsert")).strip().lower()
         write_mode = str(write_spec.get("write_mode", "upsert")).strip().lower()
+        runtime_target = dict(write_spec.get("target") or {})
+        bootstrap_sql = runtime_target.pop("bootstrap_sql", None)
         arguments = {
             "artifact_ref": {
                 "storage": artifact_ref.get("storage"),
@@ -209,13 +235,29 @@ class AgentExecutor:
                 "path": artifact_ref.get("key") or artifact_ref.get("path"),
                 "format": artifact_ref.get("format"),
             },
-            "target": write_spec.get("target") or {},
+            "target": runtime_target,
             "operation_type": operation_type,
             "write_mode": write_mode,
             "merge_keys": write_spec.get("merge_keys") or [],
             "idempotency_key": f"job-{step.job_id}-step-{step.id}-{artifact_ref.get('artifact_id')}",
             "options": {"step_order": step.step_order, **(write_spec.get("options") or {})},
+            "tool_name": tool_name,
         }
+        if bootstrap_sql is not None:
+            schema = str(runtime_target.get("schema") or runtime_target.get("schema_name") or "").strip()
+            table = str(runtime_target.get("table") or "").strip()
+            sig = _sign_trusted_bootstrap_payload(
+                tool_name=tool_name,
+                operation_type=operation_type,
+                schema=schema,
+                table=table,
+                bootstrap_sql=bootstrap_sql,
+            )
+            if sig:
+                arguments["trusted_bootstrap"] = {
+                    "bootstrap_sql": bootstrap_sql,
+                    "sig": sig,
+                }
         timeout = float(write_spec.get("timeout_seconds") or getattr(settings, "MCP_TOOL_DEFAULT_TIMEOUT_SECONDS", 60.0))
         return await mcp_call_tool(
             base_url=settings.PLATFORM_MCP_SERVER_URL.rstrip("/"),

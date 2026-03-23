@@ -2,7 +2,10 @@
 from __future__ import annotations
 
 import json
+import hashlib
+import hmac
 import logging
+import os
 import re
 import uuid
 from typing import Any, Dict, List, Optional
@@ -115,6 +118,58 @@ def _is_safe_bootstrap_sql(stmt: str) -> bool:
     return True
 
 
+def _trusted_bootstrap_signature(
+    *,
+    tool_name: str,
+    operation_type: str,
+    schema: str,
+    table: str,
+    bootstrap_sql: Any,
+    secret: str,
+) -> str:
+    payload = {
+        "tool_name": str(tool_name or "").strip(),
+        "operation_type": str(operation_type or "").strip().lower(),
+        "schema": str(schema or "").strip(),
+        "table": str(table or "").strip(),
+        "bootstrap_sql": bootstrap_sql,
+    }
+    msg = json.dumps(payload, sort_keys=True, separators=(",", ":"), default=str)
+    return hmac.new(secret.encode("utf-8"), msg.encode("utf-8"), hashlib.sha256).hexdigest()
+
+
+def _bootstrap_sql_from_signed_runtime(arguments: Dict[str, Any], runtime_target: Dict[str, Any], operation_type: str) -> Optional[Any]:
+    """
+    Accept bootstrap_sql from runtime only when signed by the backend with MCP_INTERNAL_SECRET.
+    This preserves the trust boundary while enabling per-job output_contract bootstrap SQL.
+    """
+    signed = arguments.get("trusted_bootstrap")
+    if not isinstance(signed, dict):
+        return None
+    secret = (os.environ.get("MCP_INTERNAL_SECRET") or "").strip()
+    if not secret:
+        return None
+    boot = signed.get("bootstrap_sql")
+    sig = str(signed.get("sig") or "").strip().lower()
+    tool_name = str(arguments.get("tool_name") or "").strip()
+    schema = str((runtime_target or {}).get("schema") or (runtime_target or {}).get("schema_name") or "").strip()
+    table = str((runtime_target or {}).get("table") or "").strip()
+    if not (sig and tool_name and schema and table):
+        return None
+    expected = _trusted_bootstrap_signature(
+        tool_name=tool_name,
+        operation_type=operation_type,
+        schema=schema,
+        table=table,
+        bootstrap_sql=boot,
+        secret=secret,
+    )
+    if not hmac.compare_digest(expected, sig):
+        logger.warning("Ignoring runtime trusted_bootstrap with invalid signature")
+        return None
+    return boot
+
+
 def _postgres_run_bootstrap_sql(cur: Any, conn: Any, target: Dict[str, Any]) -> Optional[str]:
     """
     Run optional DDL before artifact INSERT (e.g. CREATE TABLE IF NOT EXISTS).
@@ -213,6 +268,9 @@ def execute_artifact_write(tool_type: str, config: Dict[str, Any], arguments: Di
             resolved_target[k] = v
     operation_type = str(arguments.get("operation_type") or "upsert").lower()
     write_mode = str(arguments.get("write_mode") or "upsert").lower()
+    signed_bootstrap = _bootstrap_sql_from_signed_runtime(arguments, runtime_target, operation_type)
+    if signed_bootstrap is not None:
+        resolved_target["bootstrap_sql"] = signed_bootstrap
     merge_keys: List[str] = list(arguments.get("merge_keys") or [])
     idem = str(arguments.get("idempotency_key") or "")[:200]
 

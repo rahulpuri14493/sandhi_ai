@@ -144,6 +144,69 @@ class TestArtifactWriteDatabases:
         first_sql = mock_cur.execute.call_args_list[0][0][0] if mock_cur.execute.call_args_list else ""
         assert "CREATE TABLE" not in str(first_sql)
 
+    def test_postgres_bootstrap_sql_in_signed_runtime_target_is_applied(self, monkeypatch):
+        from unittest.mock import MagicMock
+        import execution_artifact as ea
+        import psycopg2
+
+        monkeypatch.setenv("MCP_INTERNAL_SECRET", "test-secret")
+        monkeypatch.setattr(execution_common, "read_artifact_bytes", lambda ref: b'{"id":1,"name":"a"}\n')
+        mock_cur = MagicMock()
+        mock_cur.rowcount = 1
+        mock_conn = MagicMock()
+        mock_conn.cursor.return_value = mock_cur
+        monkeypatch.setattr(psycopg2, "connect", lambda conn_str: mock_conn)
+
+        ddl = 'CREATE TABLE IF NOT EXISTS public.t_job_out ("id" INT, "name" TEXT);'
+        target = {"schema": "public", "table": "t_job_out", "bootstrap_sql": ddl}
+        sig = ea._trusted_bootstrap_signature(
+            tool_name="platform_2_local_postgres",
+            operation_type="append",
+            schema="public",
+            table="t_job_out",
+            bootstrap_sql=ddl,
+            secret="test-secret",
+        )
+        args = _artifact_args()
+        args["tool_name"] = "platform_2_local_postgres"
+        args["target"] = target
+        args["trusted_bootstrap"] = {"bootstrap_sql": ddl, "sig": sig}
+
+        out = execution.execute_artifact_write(
+            "postgres",
+            {"connection_string": "postgresql://u:p@localhost:5432/db"},
+            args,
+        )
+        assert "ok" in out
+        first_sql = mock_cur.execute.call_args_list[0][0][0]
+        assert "CREATE TABLE" in str(first_sql)
+
+    def test_postgres_bootstrap_sql_with_bad_signature_is_ignored(self, monkeypatch):
+        from unittest.mock import MagicMock
+        import psycopg2
+
+        monkeypatch.setenv("MCP_INTERNAL_SECRET", "test-secret")
+        monkeypatch.setattr(execution_common, "read_artifact_bytes", lambda ref: b'{"id":1,"name":"a"}\n')
+        mock_cur = MagicMock()
+        mock_cur.rowcount = 1
+        mock_conn = MagicMock()
+        mock_conn.cursor.return_value = mock_cur
+        monkeypatch.setattr(psycopg2, "connect", lambda conn_str: mock_conn)
+
+        ddl = 'CREATE TABLE IF NOT EXISTS public.t_job_out ("id" INT, "name" TEXT);'
+        args = _artifact_args()
+        args["tool_name"] = "platform_2_local_postgres"
+        args["target"] = {"schema": "public", "table": "t_job_out", "bootstrap_sql": ddl}
+        args["trusted_bootstrap"] = {"bootstrap_sql": ddl, "sig": "bad-signature"}
+        out = execution.execute_artifact_write(
+            "postgres",
+            {"connection_string": "postgresql://u:p@localhost:5432/db"},
+            args,
+        )
+        assert "ok" in out
+        first_sql = mock_cur.execute.call_args_list[0][0][0] if mock_cur.execute.call_args_list else ""
+        assert "CREATE TABLE" not in str(first_sql)
+
     def test_postgres_column_mapping_maps_artifact_keys(self, monkeypatch):
         from unittest.mock import MagicMock
 

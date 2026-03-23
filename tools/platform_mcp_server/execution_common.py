@@ -480,16 +480,82 @@ def parse_artifact_records(data: bytes, fmt: str) -> List[Dict[str, Any]]:
 
 def _sql_query_from_args(config: Dict[str, Any], arguments: Dict[str, Any]) -> str:
     """
-    Return SQL text for SQL-backed tools from trusted tool configuration only.
+    Return SQL text for SQL-backed tools.
 
-    Request arguments must not carry SQL text (no ad-hoc DDL/DML). Operators define
-    ``query`` / ``sql`` / ``statement`` on the tool record; use output_contract artifact
-    writes for table loads and controlled DML.
+    Priority:
+    1) trusted tool configuration (``query`` / ``sql`` / ``statement``)
+    2) runtime arguments (``query`` / ``sql`` / ``statement``) **only** when the runtime SQL
+       is a strict read-only single SELECT/WITH statement.
+
+    This keeps write SQL/DDL in trusted config or output_contract flows while allowing
+    agent-generated read queries per job.
 
     ``arguments`` may still supply ``params`` for bound placeholders (see execution_sql).
+    Invalid runtime SQL raises ``ValueError``.
     """
     if not isinstance(config, dict):
         return ""
-    return (
-        (config.get("query") or config.get("sql") or config.get("statement") or "").strip()
-    )
+
+    def _extract_query(d: Any) -> str:
+        if not isinstance(d, dict):
+            return ""
+        # Preferred top-level keys.
+        for key in ("query", "sql", "statement"):
+            v = d.get(key)
+            if isinstance(v, str) and v.strip():
+                return v.strip()
+            if isinstance(v, dict):
+                # Some backends store SQL under a nested value object.
+                for sub in ("query", "sql", "statement", "text", "value"):
+                    sv = v.get(sub)
+                    if isinstance(sv, str) and sv.strip():
+                        return sv.strip()
+        return ""
+
+    q = _extract_query(config)
+    if q:
+        return q
+    # Backward-compatible nested config containers seen in tool records.
+    for container_key in ("config", "settings", "options", "tool_config", "interactive_sql"):
+        q = _extract_query(config.get(container_key))
+        if q:
+            return q
+
+    # Fallback: runtime SQL (agent/user path) is allowed only for strict read-only queries.
+    runtime_q = ""
+    if isinstance(arguments, dict):
+        runtime_q = str(
+            arguments.get("query") or arguments.get("sql") or arguments.get("statement") or ""
+        ).strip()
+    if not runtime_q:
+        return ""
+    if not _is_safe_runtime_read_sql(runtime_q):
+        raise ValueError(
+            "Runtime SQL is allowed only for single read-only SELECT/WITH statements"
+        )
+    return runtime_q
+
+
+def _is_safe_runtime_read_sql(query: str) -> bool:
+    """Best-effort guard for runtime SQL: single read-only SELECT/WITH only."""
+    if not isinstance(query, str):
+        return False
+    q = query.strip()
+    if not q:
+        return False
+    # Disallow comments and stacked statements.
+    if "--" in q or "/*" in q or "*/" in q:
+        return False
+    if ";" in q.rstrip(";"):
+        return False
+    q = q.rstrip(";").strip()
+    upper = q.upper()
+    if not (upper.startswith("SELECT") or upper.startswith("WITH")):
+        return False
+    # Disallow common write/DDL/control keywords in runtime SQL.
+    if re.search(
+        r"\b(INSERT|UPDATE|DELETE|MERGE|UPSERT|REPLACE|TRUNCATE|DROP|ALTER|CREATE|GRANT|REVOKE|CALL|EXEC|EXECUTE|DO|COPY)\b",
+        upper,
+    ):
+        return False
+    return True

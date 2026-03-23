@@ -42,3 +42,30 @@ def test_interactive_readonly_allows_select(monkeypatch):
     )
     assert "Error" not in out or "read-only" not in out.lower()
     assert mock_cur.execute.called
+
+
+def test_runtime_query_allows_readonly_select(monkeypatch):
+    import psycopg2
+    from unittest.mock import MagicMock
+
+    mock_conn = MagicMock()
+    mock_cur = MagicMock()
+    mock_cur.fetchall.return_value = []
+    mock_cur.description = None
+    mock_conn.cursor.return_value = mock_cur
+    monkeypatch.setattr(psycopg2, "connect", lambda conn_str: mock_conn)
+
+    out = execute_postgres(
+        {"connection_string": "postgresql://u:p@localhost:5432/db"},
+        {"query": "SELECT 1"},
+    )
+    assert "Error: Runtime SQL is allowed only" not in out
+    assert mock_cur.execute.called
+
+
+def test_runtime_query_rejects_write_sql():
+    out = execute_postgres(
+        {"connection_string": "postgresql://u:p@localhost:5432/db"},
+        {"query": "UPDATE jobs SET status='x'"},
+    )
+    assert "Runtime SQL is allowed only" in out
