@@ -1,5 +1,6 @@
 # CodeQL configuration for code scanning.
 # See: https://docs.github.com/en/code-security/code-scanning/automatically-scanning-your-code-for-vulnerabilities/configuring-code-scanning
+# Single config for this repo. Advanced workflows must set init `config-file: ./.github/codeql-config.yml` if not using default setup.
 name: "Sandhi AI CodeQL config"
 
 # Exclude local-dev-only script that intentionally writes secrets to .env (gitignored).

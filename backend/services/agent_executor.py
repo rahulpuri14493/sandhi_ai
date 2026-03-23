@@ -505,12 +505,10 @@ class AgentExecutor:
         
         except Exception as e:
             # Mark job as failed with reason
+            logger.exception("Job execution failed job_id=%s", job_id)
             job.status = JobStatus.FAILED
             job.execution_token = None
-            error_message = str(e)
-            # Truncate very long error messages
-            if len(error_message) > 500:
-                error_message = error_message[:500] + "..."
+            error_message = type(e).__name__
             job.failure_reason = error_message
             self.db.commit()
             
@@ -1223,7 +1221,7 @@ END DOCUMENT {i+1}: {doc_name}
                 )
             except Exception as e:
                 logger.exception("BYO MCP tools/call failed connection_id=%s tool=%s", meta.get("connection_id"), ext_name)
-                return json.dumps({"error": str(e)})
+                return json.dumps({"error": type(e).__name__})
             return self._mcp_tool_result_to_text(result)
         args = arguments if isinstance(arguments, dict) else {}
         if meta.get("source") == "platform":
@@ -1248,7 +1246,8 @@ END DOCUMENT {i+1}: {doc_name}
                 extra_headers=extra_headers,
             )
         except Exception as e:
-            return json.dumps({"error": str(e)})
+            logger.exception("Platform MCP tools/call failed tool_name=%s", tool_name)
+            return json.dumps({"error": type(e).__name__})
         return self._mcp_tool_result_to_text(result)
 
     def _log_action(self, entity_type: str, entity_id: int, action: str, details: Dict[str, Any]):

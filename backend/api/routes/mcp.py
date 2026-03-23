@@ -138,12 +138,20 @@ def _run_platform_write_operation(operation_id: str, user_id: int) -> None:
                 time.sleep(delay)
 
         if result is None:
-            raise RuntimeError(str(last_error) if last_error else "MCP write operation failed")
+            err = RuntimeError(
+                f"MCP write operation failed ({type(last_error).__name__})"
+                if last_error
+                else "MCP write operation failed"
+            )
+            if last_error:
+                raise err from last_error
+            raise err
         op.status = "success"
         op.response_payload = json.dumps(result)
         op.completed_at = datetime.utcnow()
         db.commit()
     except Exception as e:
+        logger.exception("Async platform write operation failed operation_id=%s", operation_id)
         try:
             op = db.query(MCPWriteOperation).filter(
                 MCPWriteOperation.operation_id == operation_id,
@@ -151,7 +159,7 @@ def _run_platform_write_operation(operation_id: str, user_id: int) -> None:
             ).first()
             if op:
                 op.status = "failure"
-                op.error_message = str(e)[:2000]
+                op.error_message = type(e).__name__[:2000]
                 op.completed_at = datetime.utcnow()
                 db.commit()
         except Exception:
@@ -657,7 +665,11 @@ async def call_platform_tool(
         )
         return result
     except Exception as e:
-        raise HTTPException(status_code=502, detail=str(e))
+        logger.exception("call_platform_tool failed tool_name=%s", body.tool_name)
+        raise HTTPException(
+            status_code=502,
+            detail=f"Platform tool call failed ({type(e).__name__})",
+        )
 
 
 @router.post("/call-platform-write")

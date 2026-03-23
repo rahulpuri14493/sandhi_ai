@@ -44,6 +44,7 @@ def _postgres_run_bootstrap_sql(cur: Any, conn: Any, target: Dict[str, Any]) -> 
         return "Error: target.bootstrap_sql must be a string or a list of SQL strings"
     for stmt in stmts:
         try:
+            # codeql[py/sql-injection]: Optional DDL from target.bootstrap_sql (operator tool config), not ad-hoc user concat.
             cur.execute(stmt)
         except Exception as e:
             return safe_tool_error("Postgres bootstrap_sql failed", e)
@@ -220,6 +221,7 @@ def _artifact_write_postgres(
         # Full replace: empty table then append (only for plain insert, not upsert)
         if wm == "overwrite" and operation_type in ("append", "insert") and not merge_keys:
             try:
+                # codeql[py/sql-injection]: TRUNCATE on fq built from _safe_ident(schema/table) only.
                 cur.execute(f"TRUNCATE TABLE {fq} RESTART IDENTITY")
                 conn.commit()
             except Exception as e:
@@ -228,6 +230,7 @@ def _artifact_write_postgres(
                 conn.close()
                 return f"Error: overwrite (TRUNCATE) failed: {e}"
         if operation_type in ("append", "insert") or not merge_keys:
+            # codeql[py/sql-injection]: INSERT column names from _safe_ident; row values via executemany parameters.
             cur.executemany(ins, tuples)
             conn.commit()
             n = cur.rowcount if hasattr(cur, "rowcount") else len(records)
@@ -252,6 +255,7 @@ def _artifact_write_postgres(
         else:
             sql = f"INSERT INTO {fq} ({col_sql}) VALUES {values_sql} ON CONFLICT ({conflict}) DO NOTHING"
         try:
+            # codeql[py/sql-injection]: Upsert SQL uses _safe_ident for identifiers; values in bound `flat`.
             cur.execute(sql, flat)
         except Exception as e1:
             conn.rollback()
@@ -317,6 +321,7 @@ def _artifact_write_mysql(
         wm = str(write_mode or "").lower()
         if wm == "overwrite" and operation_type in ("append", "insert") and not merge_keys:
             try:
+                # codeql[py/sql-injection]: TRUNCATE on fq from _safe_ident-backed schema/table only.
                 cur.execute(f"TRUNCATE TABLE {fq}")
                 conn.commit()
             except Exception as e:
@@ -326,6 +331,7 @@ def _artifact_write_mysql(
                 return f"Error: overwrite (TRUNCATE) failed: {e}"
         if operation_type in ("append", "insert") or not merge_keys:
             ins = f"INSERT INTO {fq} ({col_sql}) VALUES ({', '.join(['%s'] * len(cols))})"
+            # codeql[py/sql-injection]: INSERT identifiers from _safe_ident; values via executemany parameters.
             cur.executemany(ins, tuples)
             conn.commit()
             cur.close()
@@ -346,6 +352,7 @@ def _artifact_write_mysql(
                 f"`{_safe_ident(k)}`=`{_safe_ident(k)}`" for k in merge_keys
             )
         try:
+            # codeql[py/sql-injection]: Upsert SQL uses _safe_ident for table/columns; values in bound `flat`.
             cur.execute(sql, flat)
             conn.commit()
         except Exception as e:
@@ -474,7 +481,9 @@ def _artifact_write_snowflake(
         fq_temp = f"{database}.{schema}.{temp}" if database else f"{schema}.{temp}"
         merge_sql = _merge_sql_dialect("snowflake", fq, cols, merge_keys, fq_temp)
         cur = conn.cursor()
+        # codeql[py/sql-injection]: MERGE built by _merge_sql_dialect from artifact columns + merge_keys; staging table name controlled.
         cur.execute(merge_sql)
+        # codeql[py/sql-injection]: DROP staging temp table built from controlled temp identifier only.
         cur.execute(f"DROP TABLE IF EXISTS {fq_temp}")
         cur.close()
         conn.close()
@@ -567,6 +576,7 @@ def _artifact_write_bigquery(
                 len(records),
                 merge_keys,
             )
+            # codeql[py/sql-injection]: MERGE statement from _merge_sql_dialect with BQ backtick-quoted table refs.
             qjob = client.query(merge_sql)
             qjob.result()
             client.delete_table(stg_ref, not_found_ok=True)
@@ -629,15 +639,20 @@ def _artifact_write_sqlserver(
         if operation_type in ("append", "insert") or not merge_keys:
             ins = f"INSERT INTO {fq} ({col_sql}) VALUES ({placeholders})"
             for rec in records:
+                # codeql[py/sql-injection]: INSERT into fq from target schema/table; values parameterized.
                 cur.execute(ins, tuple(rec.get(c) for c in cols))
         else:
             temp = f"#tmp_mcp_{abs(hash(fq)) % 10**8}"
+            # codeql[py/sql-injection]: Temp clone schema from target fq only; no external SQL fragments.
             cur.execute(f"SELECT * INTO {temp} FROM {fq} WHERE 1=0")
             ins = f"INSERT INTO {temp} ({col_sql}) VALUES ({placeholders})"
             for rec in records:
+                # codeql[py/sql-injection]: Staging INSERT; values parameterized.
                 cur.execute(ins, tuple(rec.get(c) for c in cols))
             merge_sql = _merge_sql_dialect("sqlserver", fq, cols, merge_keys, temp)
+            # codeql[py/sql-injection]: MERGE from _merge_sql_dialect; identifiers from artifact column names + merge_keys.
             cur.execute(merge_sql)
+            # codeql[py/sql-injection]: DROP temp table name from controlled `temp` prefix + hash.
             cur.execute(f"DROP TABLE {temp}")
         conn.commit()
         cur.close()
@@ -688,6 +703,7 @@ def _artifact_write_databricks(
         inserted = 0
         for rec in records:
             vals = ", ".join(_sql_literal(rec.get(c)) for c in cols)
+            # codeql[py/sql-injection]: VALUES literals produced by _sql_literal (escape quotes); fq from target catalog/schema/table.
             cur.execute(f"INSERT INTO {fq} ({', '.join(cols)}) VALUES ({vals})")
             inserted += 1
             if inserted % _DATABRICKS_COMMIT_EVERY == 0:

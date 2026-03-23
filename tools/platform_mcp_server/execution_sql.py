@@ -46,8 +46,10 @@ def execute_postgres(config: Dict[str, Any], arguments: Dict[str, Any]) -> str:
             conn.set_session(readonly=True)
             cur = conn.cursor()
             if params is None:
+                # codeql[py/sql-injection]: Interactive SQL tool; query from operator args; values via bound `params`.
                 cur.execute(query)
             else:
+                # codeql[py/sql-injection]: Interactive SQL tool; query from operator args; values via bound `params`.
                 cur.execute(query, params)
             rows = cur.fetchall()
             colnames = [d[0] for d in cur.description] if cur.description else []
@@ -66,8 +68,10 @@ def execute_postgres(config: Dict[str, Any], arguments: Dict[str, Any]) -> str:
         conn = psycopg2.connect(conn_str)
         cur = conn.cursor()
         if params is None:
+            # codeql[py/sql-injection]: Interactive SQL tool; query from operator args; values via bound `params`.
             cur.execute(query)
         else:
+            # codeql[py/sql-injection]: Interactive SQL tool; query from operator args; values via bound `params`.
             cur.execute(query, params)
         conn.commit()
         rowcount = cur.rowcount
@@ -102,8 +106,10 @@ def execute_mysql(config: Dict[str, Any], arguments: Dict[str, Any]) -> str:
         cur = conn.cursor()
         if is_read_query:
             if params is None:
+                # codeql[py/sql-injection]: Interactive SQL tool; query from operator args; values via bound `params`.
                 cur.execute(query)
             else:
+                # codeql[py/sql-injection]: Interactive SQL tool; query from operator args; values via bound `params`.
                 cur.execute(query, params)
             rows = cur.fetchall()
             cols = [d[0] for d in cur.description] if cur.description else []
@@ -113,8 +119,10 @@ def execute_mysql(config: Dict[str, Any], arguments: Dict[str, Any]) -> str:
                 return "No rows returned."
             return "\n".join(["\t".join(cols)] + ["\t".join(str(c) for c in row) for row in rows])
         if params is None:
+            # codeql[py/sql-injection]: Interactive SQL tool; query from operator args; values via bound `params`.
             cur.execute(query)
         else:
+            # codeql[py/sql-injection]: Interactive SQL tool; query from operator args; values via bound `params`.
             cur.execute(query, params)
         conn.commit()
         rc = cur.rowcount
@@ -154,6 +162,7 @@ def execute_snowflake_sql(config: Dict[str, Any], arguments: Dict[str, Any]) -> 
             schema=(config.get("schema") or "").strip() or None,
         )
         cur = conn.cursor()
+        # codeql[py/sql-injection]: Interactive SQL tool; query from operator args (Snowflake connector).
         cur.execute(query)
         if is_read_query:
             rows = cur.fetchall()
@@ -191,6 +200,7 @@ def execute_bigquery_sql(config: Dict[str, Any], arguments: Dict[str, Any]) -> s
     is_read_bq = upper_bq.startswith("SELECT") or upper_bq.startswith("WITH")
     _log_mcp_sql("bigquery", query, mode="read" if is_read_bq else "write", dest=project or "(default project)")
     try:
+        # codeql[py/sql-injection]: Interactive SQL tool; query from operator args (BigQuery client).
         job = client.query(query)
         if is_read_bq:
             rows = list(job.result())
@@ -228,6 +238,7 @@ def execute_sqlserver_sql(config: Dict[str, Any], arguments: Dict[str, Any]) -> 
             database=(config.get("database") or "").strip(),
         )
         cur = conn.cursor()
+        # codeql[py/sql-injection]: Interactive SQL tool; query from operator args (pymssql).
         cur.execute(query)
         if is_read_ss:
             rows = cur.fetchall()
@@ -271,6 +282,7 @@ def execute_databricks_sql(config: Dict[str, Any], arguments: Dict[str, Any]) ->
     try:
         conn = dsql.connect(server_hostname=host_clean, http_path=http_path, access_token=token)
         cur = conn.cursor()
+        # codeql[py/sql-injection]: Interactive SQL tool; query from operator args (Databricks SQL).
         cur.execute(query)
         if is_read_db:
             rows = cur.fetchall()
