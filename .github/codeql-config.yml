@@ -7,6 +7,10 @@ paths-ignore:
   - "tools/platform_mcp_server/tests/**"
   - "backend/tests/**"
   - "frontend/tests/**"
+  # Intentional operator-controlled SQL (MCP tools); static analysis cannot prove safety of dynamic SQL.
+  # Path fixes in execution_common.py address path alerts; these files remain excluded for py/sql-injection noise.
+  - "tools/platform_mcp_server/execution_sql.py"
+  - "tools/platform_mcp_server/execution_artifact.py"
 
 # Operator-scoped MCP tools (tenant + encrypted creds), not anonymous HTTP input.
 query-filters:

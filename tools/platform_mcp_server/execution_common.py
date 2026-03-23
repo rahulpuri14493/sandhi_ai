@@ -225,45 +225,46 @@ def _merge_sql_dialect(
     raise ValueError(f"Unsupported merge dialect: {dialect}")
 
 
+def _artifact_path_segments(path: str) -> Optional[List[str]]:
+    """
+    Extract path segments after .../uploads/jobs/ using path splitting only (no realpath on user string).
+    Rejects .. and . segment names.
+    """
+    p = str(path).strip().replace("\\", "/")
+    segments = [x for x in p.split("/") if x]
+    for i in range(len(segments) - 1):
+        if segments[i] == "uploads" and segments[i + 1] == "jobs":
+            rest = segments[i + 2 :]
+            if not rest:
+                return None
+            if any(x in ("..", ".") for x in rest):
+                return None
+            return rest
+    return None
+
+
 def resolve_local_artifact_path(path: str) -> Optional[str]:
     """
-    Map backend-relative path to container path when uploads volume is mounted.
-    Uses os.path.realpath + root prefix checks (avoid Path(user_string); satisfies CodeQL path-injection).
+    Resolve a file under ARTIFACT_UPLOAD_ROOT using only os.path.join(root, *segments).
+    Never passes the raw user path to realpath(), open(), or Path().
     """
-    if not path or not str(path).strip():
+    parts = _artifact_path_segments(path)
+    if not parts:
         return None
-    p = str(path).strip().replace("\\", "/")
     try:
         root_real = os.path.realpath(_ARTIFACT_ROOT)
     except OSError:
         return None
-
-    def _file_if_under_root(candidate_path: str) -> Optional[str]:
-        """Return realpath only if it is a file under root_real (no Path() from untrusted full string)."""
-        try:
-            real = os.path.realpath(candidate_path)
-        except OSError:
-            return None
-        if real != root_real and not real.startswith(root_real + os.sep):
-            return None
-        if not os.path.isfile(real):
-            return None
-        return real
-
-    if p.startswith("/"):
-        return _file_if_under_root(p)
-
-    if p.startswith("uploads/jobs/"):
-        tail = p[len("uploads/jobs/") :].strip()
-        if not tail:
-            return None
-        parts = [x for x in tail.split("/") if x]
-        if not parts or any(x in ("..", ".") for x in parts):
-            return None
-        joined = os.path.join(root_real, *parts)
-        return _file_if_under_root(joined)
-
-    return None
+    joined = os.path.join(root_real, *parts)
+    try:
+        real = os.path.realpath(joined)
+    except OSError:
+        return None
+    if real != root_real and not real.startswith(root_real + os.sep):
+        return None
+    if not os.path.isfile(real):
+        return None
+    return real
 
 
 def _s3_artifact_bucket_key_ok(bucket: str, key: str) -> bool:
@@ -294,9 +295,7 @@ def read_artifact_bytes(artifact_ref: Dict[str, Any]) -> bytes:
 
     local = resolve_local_artifact_path(path) if path else None
     if local:
-        # local is already realpath-validated under artifact root
-        with open(local, "rb") as fh:
-            return fh.read()
+        return Path(local).read_bytes()
 
     if storage in ("s3", "minio", "ceph", "aws_s3") and bucket and key:
         if not _s3_artifact_bucket_key_ok(bucket, key):
