@@ -21,6 +21,65 @@ from execution_common import (
 logger = logging.getLogger(__name__)
 
 
+def _redact_target_for_log(target: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Return a log-safe target snapshot with non-sensitive metadata only.
+    Never include credential/token/secret-like values.
+    """
+    if not isinstance(target, dict):
+        return {"target_redacted": True, "keys": []}
+    keep_fields = {
+        "target_type",
+        "operation_type",
+        "write_mode",
+        "database",
+        "schema",
+        "schema_name",
+        "table",
+        "name",
+        "dataset",
+        "project",
+        "project_id",
+        "bucket",
+        "key",
+        "path",
+        "prefix",
+        "merge_keys",
+        "column_mapping",
+        "jsonb_columns",
+        "json_columns",
+        "allow_truncate_overwrite",
+    }
+    sensitive_markers = (
+        "password",
+        "secret",
+        "token",
+        "key_id",
+        "private_key",
+        "credential",
+        "connection_string",
+        "api_key",
+        "webhook",
+        "auth",
+    )
+    out: Dict[str, Any] = {"target_redacted": True}
+    for k, v in target.items():
+        ks = str(k)
+        ksl = ks.lower()
+        if any(m in ksl for m in sensitive_markers):
+            continue
+        if ks in keep_fields:
+            if isinstance(v, (str, int, float, bool)) or v is None:
+                out[ks] = v
+            elif isinstance(v, list):
+                out[ks] = [str(x)[:80] for x in v[:20]]
+            elif isinstance(v, dict):
+                # Keep only top-level keys to avoid leaking nested values.
+                out[ks] = {"keys": sorted(str(x) for x in v.keys())[:30], "redacted_values": True}
+    out["keys"] = sorted(str(k) for k in target.keys())[:80]
+    return out
+
+
 def _is_safe_bootstrap_sql(stmt: str) -> bool:
     """
     Allow only a restricted set of DDL prefixes for bootstrap_sql (operator config).
@@ -167,18 +226,19 @@ def execute_artifact_write(tool_type: str, config: Dict[str, Any], arguments: Di
         return "Error: artifact contained no records"
 
     tgt_type = (resolved_target.get("target_type") or tool_type).strip().lower()
+    safe_target_for_log = _redact_target_for_log(resolved_target)
     logger.info(
         "MCP artifact_write tool_type=%s target_type=%s operation_type=%s write_mode=%s "
         "record_count=%s merge_keys=%s artifact_storage=%s artifact_path=%s target=%s",
         tool_type,
-        tgt_type,
+        _truncate_for_log(str(tgt_type), 64),
         operation_type,
         write_mode,
         len(records),
         merge_keys,
         artifact_ref.get("storage"),
         artifact_ref.get("path") or artifact_ref.get("key"),
-        _truncate_for_log(json.dumps(resolved_target, default=str), 800),
+        _truncate_for_log(json.dumps(safe_target_for_log, default=str), 800),
     )
 
     if tool_type in ("s3", "minio", "ceph", "aws_s3") or tgt_type in ("s3", "minio", "ceph", "aws_s3"):
@@ -255,10 +315,8 @@ def _artifact_write_postgres(
         for rec in records
     ]
     logger.info(
-        "MCP artifact Postgres write dest=%s schema=%s table=%s rows=%s operation_type=%s write_mode=%s sample_sql=%s",
+        "MCP artifact Postgres write dest=%s rows=%s operation_type=%s write_mode=%s sample_sql=%s",
         _postgres_dest_hint(conn_str),
-        schema,
-        table,
         len(records),
         operation_type,
         write_mode,
@@ -381,16 +439,14 @@ def _artifact_write_mysql(
     fq = f"`{db_si}`.`{table_si}`"
     col_sql = ", ".join(f"`{_safe_ident(c)}`" for c in cols)
     tuples = [tuple(rec.get(c) for c in cols) for rec in records]
-    preview_ins = f"INSERT INTO {fq} ({col_sql}) VALUES ({', '.join(['%s'] * len(cols))})"
     logger.info(
-        "MCP artifact MySQL write dest=%s:%s/%s rows=%s operation_type=%s write_mode=%s sample_sql=%s",
+        "MCP artifact MySQL write dest=%s:%s/%s rows=%s operation_type=%s write_mode=%s",
         (config.get("host") or "localhost").strip(),
         int(config.get("port") or 3306),
-        database,
+        "<redacted>",
         len(records),
         operation_type,
         write_mode,
-        _truncate_for_log(preview_ins, 500),
     )
     try:
         conn = pymysql.connect(
@@ -486,6 +542,10 @@ def _artifact_write_object_store(
     ext = ".json" if fmt == "json" else ".jsonl"
     safe_id = _artifact_object_storage_basename(str(artifact_ref.get("path") or "artifact"), ext)
     dest_key = f"{prefix}/{safe_id}" if prefix else safe_id
+    safe_dest_key = _truncate_for_log(dest_key)
+    safe_bucket = (
+        f"{bucket[:3]}...{bucket[-3:]}" if len(bucket) > 6 else bucket
+    )
     endpoint = _resolve_s3_compatible_endpoint(tool_type, config)
     ak = (config.get("access_key") or config.get("access_key_id") or "").strip()
     sk = (config.get("secret_key") or config.get("secret_access_key") or "").strip()
@@ -503,8 +563,8 @@ def _artifact_write_object_store(
             "MCP object_store_put tool_type=%s endpoint=%s bucket=%s key=%s bytes=%s operation_type=%s write_mode=%s",
             tool_type,
             endpoint or "(default)",
-            bucket,
-            dest_key,
+            safe_bucket,
+            safe_dest_key,
             len(body),
             operation_type,
             write_mode,
@@ -664,7 +724,7 @@ def _artifact_write_bigquery(
             merge_sql = _merge_sql_dialect("bigquery", fq_target, cols, merge_keys, fq_stg)
             logger.info(
                 "MCP artifact BigQuery MERGE dest=%s rows=%s merge_keys=%s",
-                table_ref,
+                _truncate_for_log(table_ref),
                 len(records),
                 merge_keys,
             )
@@ -711,19 +771,35 @@ def _artifact_write_sqlserver(
     table = (target.get("table") or "").strip()
     if not table:
         return "Error: target.table is required"
+    cols = list(records[0].keys())
+    if not cols:
+        return "Error: artifact contained no row data"
     try:
         schema_ident = _safe_ident(schema)
         table_ident = _safe_ident(table)
+        cols_ident = [_safe_ident(str(c)) for c in cols]
     except ValueError:
-        return "Error: invalid schema or table name (must be safe SQL identifiers)"
+        return "Error: invalid schema, table, or column name (must be safe SQL identifiers)"
+    cols_by_name = {str(c): c for c in cols}
+    safe_merge_keys: List[str] = []
+    for raw_k in merge_keys or []:
+        k = str(raw_k).strip()
+        try:
+            k_ident = _safe_ident(k)
+        except ValueError:
+            return f"Error: invalid merge key identifier {k!r}"
+        if k_ident not in cols_by_name:
+            return f"Error: merge_keys must be columns of the artifact; missing {k_ident!r}"
+        safe_merge_keys.append(k_ident)
+    if operation_type not in ("append", "insert") and merge_keys and not safe_merge_keys:
+        return "Error: merge operation requires at least one valid merge key"
     try:
         import pymssql
     except ImportError:
         return "Error: pymssql is not installed"
     fq = f"[{schema_ident}].[{table_ident}]"
-    cols = list(records[0].keys())
     placeholders = ", ".join(["%s"] * len(cols))
-    col_sql = ", ".join(f"[{c}]" for c in cols)
+    col_sql = ", ".join(f"[{c}]" for c in cols_ident)
     try:
         conn = pymssql.connect(
             server=(config.get("host") or "localhost").strip(),
@@ -733,7 +809,7 @@ def _artifact_write_sqlserver(
             database=database,
         )
         cur = conn.cursor()
-        if operation_type in ("append", "insert") or not merge_keys:
+        if operation_type in ("append", "insert") or not safe_merge_keys:
             ins = f"INSERT INTO {fq} ({col_sql}) VALUES ({placeholders})"
             for rec in records:
                 # codeql[py/sql-injection]: INSERT into fq from target schema/table; values parameterized.
@@ -746,7 +822,7 @@ def _artifact_write_sqlserver(
             for rec in records:
                 # codeql[py/sql-injection]: Staging INSERT; values parameterized.
                 cur.execute(ins, tuple(rec.get(c) for c in cols))
-            merge_sql = _merge_sql_dialect("sqlserver", fq, cols, merge_keys, temp)
+            merge_sql = _merge_sql_dialect("sqlserver", fq, cols_ident, safe_merge_keys, temp)
             # codeql[py/sql-injection]: MERGE from _merge_sql_dialect; identifiers from artifact column names + merge_keys.
             cur.execute(merge_sql)
             # codeql[py/sql-injection]: DROP temp table name from controlled `temp` prefix + hash.
@@ -785,8 +861,21 @@ def _artifact_write_databricks(
     table = (target.get("table") or "").strip()
     if not table:
         return "Error: target.table is required"
-    fq = f"{catalog}.{schema}.{table}" if catalog else f"{schema}.{table}"
+    try:
+        schema_si = _safe_ident(schema)
+        table_si = _safe_ident(table)
+        if catalog:
+            catalog_si = _safe_ident(catalog)
+            fq = f"{catalog_si}.{schema_si}.{table_si}"
+        else:
+            fq = f"{schema_si}.{table_si}"
+    except ValueError:
+        return "Error: invalid catalog/schema/table for Databricks write"
     cols = list(records[0].keys())
+    try:
+        cols_si = [_safe_ident(str(c)) for c in cols]
+    except ValueError:
+        return "Error: invalid column name in artifact row keys"
     # Serialize records as JSON for inline insert via VALUES from_json
     try:
         conn = dsql.connect(
@@ -798,10 +887,11 @@ def _artifact_write_databricks(
         # Insert every row; commit periodically so very large artifacts do not rely on one huge transaction.
         _DATABRICKS_COMMIT_EVERY = 5000
         inserted = 0
+        placeholders = ", ".join(["?"] * len(cols))
+        ins = f"INSERT INTO {fq} ({', '.join(cols_si)}) VALUES ({placeholders})"
         for rec in records:
-            vals = ", ".join(_sql_literal(rec.get(c)) for c in cols)
-            # codeql[py/sql-injection]: VALUES literals produced by _sql_literal (escape quotes); fq from target catalog/schema/table.
-            cur.execute(f"INSERT INTO {fq} ({', '.join(cols)}) VALUES ({vals})")
+            # codeql[py/sql-injection]: table/column identifiers from _safe_ident; row values via bound parameters.
+            cur.execute(ins, tuple(rec.get(c) for c in cols))
             inserted += 1
             if inserted % _DATABRICKS_COMMIT_EVERY == 0:
                 conn.commit()
@@ -811,17 +901,6 @@ def _artifact_write_databricks(
         return json.dumps({"status": "ok", "rows": inserted})
     except Exception as e:
         return safe_tool_error("Databricks artifact write", e)
-
-
-def _sql_literal(v: Any) -> str:
-    if v is None:
-        return "NULL"
-    if isinstance(v, bool):
-        return "true" if v else "false"
-    if isinstance(v, (int, float)):
-        return str(v)
-    s = str(v).replace("'", "''")
-    return f"'{s}'"
 
 
 def _artifact_write_azure_blob(

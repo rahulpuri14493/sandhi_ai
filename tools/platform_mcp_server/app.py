@@ -7,7 +7,6 @@ Implements Vector DB, PostgreSQL, and File system tools using tenant-stored conf
 """
 from execution_common import safe_tool_error
 from execution import (
-    _truncate_for_log,
     execute_artifact_write,
     execute_azure_blob,
     execute_bigquery_sql,
@@ -105,11 +104,15 @@ def _fetch_tool_config(business_id: int, tool_id: int) -> Dict[str, Any]:
 
 
 def _tool_result_for_log(text: str, max_len: int = 12000) -> str:
-    """Single-line, log-safe snippet of MCP tool text output (same string returned to the client)."""
+    """Redacted summary for MCP tool output logs (never includes tool result content)."""
+    _ = max_len  # backward-compatible signature; output content is always redacted
     if text is None:
-        return ""
-    t = _truncate_for_log(text, max_len)
-    return t.replace("\\", "\\\\").replace("\r", "\\r").replace("\n", "\\n").replace("\t", "\\t")
+        length = 0
+        is_err = False
+    else:
+        length = len(text)
+        is_err = str(text).startswith("Error:")
+    return f"[redacted tool output] len={length} is_error={is_err}"
 
 
 def _to_json_safe(obj: Any) -> Any:

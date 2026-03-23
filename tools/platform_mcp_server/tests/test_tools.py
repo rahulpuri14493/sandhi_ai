@@ -263,6 +263,26 @@ class TestArtifactWriteDatabases:
         assert data["rows"] == n
         assert mock_cur.execute.call_count == n
 
+    def test_databricks_artifact_rejects_invalid_identifiers(self, monkeypatch):
+        import execution_artifact as ea
+
+        mock_cur = MagicMock()
+        mock_conn = MagicMock()
+        mock_conn.cursor.return_value = mock_cur
+        sql_mod = types.ModuleType("databricks.sql")
+        sql_mod.connect = MagicMock(return_value=mock_conn)
+        monkeypatch.setitem(sys.modules, "databricks", types.ModuleType("databricks"))
+        monkeypatch.setitem(sys.modules, "databricks.sql", sql_mod)
+
+        out = ea._artifact_write_databricks(
+            {"host": "https://x.cloud.databricks.com", "token": "t", "http_path": "/sql/1.0/warehouses/w"},
+            {"catalog": "bad;cat", "schema": "s", "table": "t"},
+            [{"id": 1}],
+            [],
+            "append",
+        )
+        assert "invalid catalog/schema/table" in out.lower()
+
     def test_sqlserver_artifact_rejects_invalid_identifiers(self):
         import execution_artifact as ea
 
@@ -273,7 +293,40 @@ class TestArtifactWriteDatabases:
             [],
             "append",
         )
-        assert "invalid schema or table name" in out.lower()
+        assert "invalid schema" in out.lower()
+
+    def test_sqlserver_artifact_rejects_invalid_merge_key(self):
+        import execution_artifact as ea
+
+        out = ea._artifact_write_sqlserver(
+            {"host": "localhost", "user": "u", "password": "p", "database": "d"},
+            {"schema": "dbo", "table": "t"},
+            [{"id": 1, "name": "a"}],
+            ["id;drop"],
+            "upsert",
+        )
+        assert "invalid merge key identifier" in out.lower()
+
+    def test_redact_target_for_log_hides_sensitive_values(self):
+        import execution_artifact as ea
+
+        red = ea._redact_target_for_log(
+            {
+                "target_type": "postgres",
+                "schema": "public",
+                "table": "orders",
+                "password": "super-secret",
+                "connection_string": "postgresql://u:pw@db:5432/x",
+                "api_key": "k-123",
+                "column_mapping": {"content": "result_json"},
+            }
+        )
+        s = json.dumps(red)
+        assert "super-secret" not in s
+        assert "postgresql://" not in s
+        assert "k-123" not in s
+        assert red.get("schema") == "public"
+        assert red.get("table") == "orders"
 
 
 class TestFilesystem:

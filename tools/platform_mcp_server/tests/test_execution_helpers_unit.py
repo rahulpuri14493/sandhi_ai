@@ -36,15 +36,21 @@ class TestPostgresDestHint:
 
 
 class TestToolResultForLog:
-    def test_escapes_newlines_and_tabs(self):
+    def test_redacts_output_content_and_includes_metadata(self):
         t = 'line1\nline2\t"q"'
         out = _tool_result_for_log(t, max_len=500)
-        assert "\\n" in out
-        assert "\\t" in out
-        assert "\n" not in out or out.count("\n") <= 1  # single log line
+        assert out.startswith("[redacted tool output]")
+        assert "len=" in out
+        assert "is_error=False" in out
+        assert "line1" not in out
 
-    def test_none_returns_empty(self):
-        assert _tool_result_for_log(None) == ""  # type: ignore[arg-type]
+    def test_none_returns_redacted_zero_length(self):
+        out = _tool_result_for_log(None)  # type: ignore[arg-type]
+        assert out == "[redacted tool output] len=0 is_error=False"
+
+    def test_error_prefix_sets_error_flag(self):
+        out = _tool_result_for_log("Error: secret details")
+        assert "is_error=True" in out
 
 
 class TestParsePlatformToolId:

@@ -16,7 +16,6 @@ from execution_artifact import (
     _artifact_write_postgres,
     _artifact_write_snowflake,
     _artifact_write_sqlserver,
-    _sql_literal,
     execute_artifact_write,
 )
 from execution_common import (
@@ -70,7 +69,6 @@ __all__ = [
     "_s3_client_for_config",
     "_s3_get_object_bytes",
     "_safe_ident",
-    "_sql_literal",
     "_sql_query_from_args",
     "_truncate_for_log",
     "execute_artifact_write",

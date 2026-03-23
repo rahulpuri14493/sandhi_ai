@@ -65,9 +65,11 @@ class TestMcpProtocolSequence:
         assert body["result"]["content"][0]["text"] == "e2e-data"
         assert body["result"]["isError"] is False
 
-        # tools/call logging includes result summary for debugging
+        # tools/call logging includes only a redacted output summary
         assert any(
-            "result_output=" in r.message and "e2e-data" in r.message
+            "result_output=[redacted tool output]" in r.message
+            and "len=8" in r.message
+            and "is_error=False" in r.message
             for r in caplog.records
             if r.levelno == logging.INFO
         )
