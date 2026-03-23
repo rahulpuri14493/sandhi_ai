@@ -35,6 +35,7 @@ from core.encryption import encrypt_json, decrypt_json
 from db.database import SessionLocal
 
 router = APIRouter(prefix="/api/mcp", tags=["mcp"])
+logger = logging.getLogger(__name__)
 
 
 def _estimate_json_size_bytes(data: dict) -> int:
@@ -282,7 +283,8 @@ async def certify_connection_for_production(
         )
         checks.append({"name": "initialize", "passed": True})
     except Exception as e:
-        checks.append({"name": "initialize", "passed": False, "error": str(e)})
+        logger.exception("MCP certify: initialize failed")
+        checks.append({"name": "initialize", "passed": False, "error": type(e).__name__})
         return {"certified": False, "checks": checks, "recommended_policy": "fix_connection"}
 
     try:
@@ -296,7 +298,8 @@ async def certify_connection_for_production(
         tools = tools_result.get("tools", []) if isinstance(tools_result, dict) else []
         checks.append({"name": "tools_list", "passed": True, "tool_count": len(tools)})
     except Exception as e:
-        checks.append({"name": "tools_list", "passed": False, "error": str(e)})
+        logger.exception("MCP certify: tools/list failed")
+        checks.append({"name": "tools_list", "passed": False, "error": type(e).__name__})
         return {"certified": False, "checks": checks, "recommended_policy": "fix_tools_list"}
 
     write_capable = [t for t in tools if _is_write_capable_tool_descriptor(t)]

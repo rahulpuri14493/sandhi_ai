@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import json
-import logging
 import os
 from typing import Any, Dict
 
@@ -10,9 +9,8 @@ from execution_common import (
     _log_mcp_sql,
     _postgres_dest_hint,
     _sql_query_from_args,
+    safe_tool_error,
 )
-
-logger = logging.getLogger(__name__)
 
 def execute_postgres(config: Dict[str, Any], arguments: Dict[str, Any]) -> str:
     import psycopg2
@@ -62,8 +60,7 @@ def execute_postgres(config: Dict[str, Any], arguments: Dict[str, Any]) -> str:
                 lines.append("\t".join(str(c) for c in row))
             return "\n".join(lines)
         except Exception as e:
-            logger.exception("Postgres read error")
-            return f"Error: {e}"
+            return safe_tool_error("Postgres read error", e)
     # write path (INSERT/UPDATE/DELETE/MERGE/DDL)
     try:
         conn = psycopg2.connect(conn_str)
@@ -78,8 +75,7 @@ def execute_postgres(config: Dict[str, Any], arguments: Dict[str, Any]) -> str:
         conn.close()
         return json.dumps({"status": "ok", "rowcount": rowcount})
     except Exception as e:
-        logger.exception("Postgres write error")
-        return f"Error: {e}"
+        return safe_tool_error("Postgres write error", e)
 
 
 def execute_mysql(config: Dict[str, Any], arguments: Dict[str, Any]) -> str:
@@ -126,8 +122,7 @@ def execute_mysql(config: Dict[str, Any], arguments: Dict[str, Any]) -> str:
         conn.close()
         return json.dumps({"status": "ok", "rowcount": rc})
     except Exception as e:
-        logger.exception("MySQL error")
-        return f"Error: {e}"
+        return safe_tool_error("MySQL error", e)
 
 
 def execute_snowflake_sql(config: Dict[str, Any], arguments: Dict[str, Any]) -> str:
@@ -172,8 +167,7 @@ def execute_snowflake_sql(config: Dict[str, Any], arguments: Dict[str, Any]) -> 
         conn.close()
         return json.dumps({"status": "ok"})
     except Exception as e:
-        logger.exception("Snowflake SQL error")
-        return f"Error: {e}"
+        return safe_tool_error("Snowflake SQL error", e)
 
 
 def execute_bigquery_sql(config: Dict[str, Any], arguments: Dict[str, Any]) -> str:
@@ -210,8 +204,7 @@ def execute_bigquery_sql(config: Dict[str, Any], arguments: Dict[str, Any]) -> s
         job.result()
         return json.dumps({"status": "ok", "job_id": job.job_id})
     except Exception as e:
-        logger.exception("BigQuery error")
-        return f"Error: {e}"
+        return safe_tool_error("BigQuery error", e)
 
 
 def execute_sqlserver_sql(config: Dict[str, Any], arguments: Dict[str, Any]) -> str:
@@ -249,8 +242,7 @@ def execute_sqlserver_sql(config: Dict[str, Any], arguments: Dict[str, Any]) -> 
         conn.close()
         return json.dumps({"status": "ok"})
     except Exception as e:
-        logger.exception("SQL Server error")
-        return f"Error: {e}"
+        return safe_tool_error("SQL Server error", e)
 
 
 def execute_databricks_sql(config: Dict[str, Any], arguments: Dict[str, Any]) -> str:
@@ -292,8 +284,7 @@ def execute_databricks_sql(config: Dict[str, Any], arguments: Dict[str, Any]) ->
         conn.close()
         return json.dumps({"status": "ok"})
     except Exception as e:
-        logger.exception("Databricks error")
-        return f"Error: {e}"
+        return safe_tool_error("Databricks error", e)
 
 
 def execute_elasticsearch(config: Dict[str, Any], arguments: Dict[str, Any]) -> str:
@@ -316,7 +307,6 @@ def execute_elasticsearch(config: Dict[str, Any], arguments: Dict[str, Any]) -> 
             r = client.post(path, json=body, headers=headers)
             if r.status_code == 200:
                 return json.dumps(r.json(), indent=2)
-            return f"Elasticsearch error: {r.status_code} {r.text}"
+            return f"Elasticsearch error: HTTP {r.status_code}"
     except Exception as e:
-        logger.exception("Elasticsearch error")
-        return f"Error: {e}"
+        return safe_tool_error("Elasticsearch error", e)

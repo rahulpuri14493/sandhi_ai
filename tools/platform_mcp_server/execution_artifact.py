@@ -15,6 +15,7 @@ from execution_common import (
     _resolve_s3_compatible_endpoint,
     _safe_ident,
     _truncate_for_log,
+    safe_tool_error,
 )
 
 logger = logging.getLogger(__name__)
@@ -45,8 +46,7 @@ def _postgres_run_bootstrap_sql(cur: Any, conn: Any, target: Dict[str, Any]) -> 
         try:
             cur.execute(stmt)
         except Exception as e:
-            logger.exception("Postgres bootstrap_sql failed")
-            return f"Error: bootstrap_sql failed: {e}"
+            return safe_tool_error("Postgres bootstrap_sql failed", e)
     conn.commit()
     return None
 
@@ -257,17 +257,17 @@ def _artifact_write_postgres(
             conn.rollback()
             cur.close()
             conn.close()
+            logger.exception("Postgres upsert ON CONFLICT failed")
             return (
                 f"Error: Postgres upsert requires a UNIQUE or PRIMARY KEY on ({conflict}). "
-                f"Details: {e1}"
+                f"({type(e1).__name__})"
             )
         conn.commit()
         cur.close()
         conn.close()
         return json.dumps({"status": "ok", "rows": len(records), "mode": "upsert"})
     except Exception as e:
-        logger.exception("Postgres artifact write")
-        return f"Error: {e}"
+        return safe_tool_error("Postgres artifact write", e)
 
 
 def _artifact_write_mysql(
@@ -360,8 +360,7 @@ def _artifact_write_mysql(
         conn.close()
         return json.dumps({"status": "ok", "rows": len(records), "mode": "upsert"})
     except Exception as e:
-        logger.exception("MySQL artifact write")
-        return f"Error: {e}"
+        return safe_tool_error("MySQL artifact write", e)
 
 
 def _artifact_write_object_store(
@@ -420,8 +419,7 @@ def _artifact_write_object_store(
         client.put_object(Bucket=bucket, Key=dest_key, Body=body, ContentType="application/x-ndjson")
         return json.dumps({"status": "ok", "bucket": bucket, "key": dest_key, "bytes": len(body)})
     except Exception as e:
-        logger.exception("Object store artifact write")
-        return f"Error: {e}"
+        return safe_tool_error("Object store artifact write", e)
 
 
 def _artifact_write_snowflake(
@@ -482,8 +480,7 @@ def _artifact_write_snowflake(
         conn.close()
         return json.dumps({"status": "ok", "operation": "merge"})
     except Exception as e:
-        logger.exception("Snowflake artifact write")
-        return f"Error: {e}"
+        return safe_tool_error("Snowflake artifact write", e)
 
 
 def _bq_fq_table(project: str, dataset: str, table: str) -> str:
@@ -577,12 +574,11 @@ def _artifact_write_bigquery(
                 {"status": "ok", "rows": len(records), "table": table_ref, "operation": "merge"}
             )
         except Exception as e:
-            logger.exception("BigQuery MERGE artifact write")
             try:
                 client.delete_table(stg_ref, not_found_ok=True)
             except Exception:
                 pass
-            return f"Error: {e}"
+            return safe_tool_error("BigQuery MERGE artifact write", e)
 
     # Append / insert only: append, or explicit full replace via overwrite + no merge_keys.
     try:
@@ -598,8 +594,7 @@ def _artifact_write_bigquery(
         job.result()
         return json.dumps({"status": "ok", "rows": len(records), "table": table_ref})
     except Exception as e:
-        logger.exception("BigQuery artifact write")
-        return f"Error: {e}"
+        return safe_tool_error("BigQuery artifact write", e)
 
 
 def _artifact_write_sqlserver(
@@ -649,8 +644,7 @@ def _artifact_write_sqlserver(
         conn.close()
         return json.dumps({"status": "ok", "rows": len(records)})
     except Exception as e:
-        logger.exception("SQL Server artifact write")
-        return f"Error: {e}"
+        return safe_tool_error("SQL Server artifact write", e)
 
 
 def _artifact_write_databricks(
@@ -703,8 +697,7 @@ def _artifact_write_databricks(
         conn.close()
         return json.dumps({"status": "ok", "rows": inserted})
     except Exception as e:
-        logger.exception("Databricks artifact write")
-        return f"Error: {e}"
+        return safe_tool_error("Databricks artifact write", e)
 
 
 def _sql_literal(v: Any) -> str:
@@ -746,7 +739,7 @@ def _artifact_write_azure_blob(
         bc.upload_blob(raw, overwrite=True)
         return json.dumps({"status": "ok", "container": container, "blob": blob_name})
     except Exception as e:
-        return f"Error: {e}"
+        return safe_tool_error("Azure blob artifact write", e)
 
 
 def _artifact_write_gcs_blob(
@@ -780,4 +773,4 @@ def _artifact_write_gcs_blob(
         b.blob(blob_name).upload_from_string(raw, content_type="application/x-ndjson")
         return json.dumps({"status": "ok", "bucket": bucket_name, "object": blob_name})
     except Exception as e:
-        return f"Error: {e}"
+        return safe_tool_error("GCS blob artifact write", e)

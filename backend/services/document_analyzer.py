@@ -46,17 +46,17 @@ class DocumentAnalyzer:
             # PDF files
             elif file_ext == '.pdf':
                 try:
-                    import PyPDF2
+                    from pypdf import PdfReader
                     content = []
                     with open(path, 'rb') as f:
-                        pdf_reader = PyPDF2.PdfReader(f)
+                        pdf_reader = PdfReader(f)
                         for page_num, page in enumerate(pdf_reader.pages):
                             text = page.extract_text()
                             if text.strip():
                                 content.append(f"--- Page {page_num + 1} ---\n{text}")
                     return '\n\n'.join(content) if content else "[PDF file contains no extractable text]"
                 except ImportError:
-                    return f"[PDF extraction requires PyPDF2 library. File: {path.name}]"
+                    return f"[PDF extraction requires pypdf library. File: {path.name}]"
                 except Exception as e:
                     return f"[Error extracting PDF content: {str(e)}]"
             

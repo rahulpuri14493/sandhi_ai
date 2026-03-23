@@ -57,16 +57,16 @@ def execute_github(config: Dict[str, Any], arguments: Dict[str, Any]) -> str:
     if not token:
         return "Error: API token not configured"
     base = (config.get("base_url") or "https://api.github.com").rstrip("/")
-    if _github_host_is_api_github_com(base):
-        g = Github(login_or_token=token)
-    else:
-        g = Github(base_url=base + "/", login_or_token=token)
     action = (arguments.get("action") or "get_file").strip().lower()
     repo_s = (arguments.get("repo") or "").strip()
     if not repo_s:
         return "Error: repo (owner/name) is required"
-    repo = g.get_repo(repo_s)
     try:
+        if _github_host_is_api_github_com(base):
+            g = Github(login_or_token=token)
+        else:
+            g = Github(base_url=base + "/", login_or_token=token)
+        repo = g.get_repo(repo_s)
         if action == "get_file":
             path = (arguments.get("path") or "").strip()
             if not path:

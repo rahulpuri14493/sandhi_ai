@@ -36,6 +36,14 @@ except ImportError:
 logger = logging.getLogger(__name__)
 
 
+def safe_tool_error(event: str, exc: BaseException) -> str:
+    """
+    Return a tool response safe for clients (no exception text / paths). Full details go to logs only.
+    Mitigates CodeQL py/stack-trace-exposure on user-facing returns.
+    """
+    logger.exception("%s", event)
+    return f"Error: {event} ({type(exc).__name__})"
+
 
 def _truncate_for_log(text: str, max_len: int = 2000) -> str:
     if not text:
@@ -218,42 +226,48 @@ def _merge_sql_dialect(
 
 
 def resolve_local_artifact_path(path: str) -> Optional[str]:
-    """Map backend-relative path to container path when uploads volume is mounted."""
+    """
+    Map backend-relative path to container path when uploads volume is mounted.
+    Uses os.path.realpath + commonpath containment (CodeQL path-injection sanitizer pattern).
+    """
     if not path or not str(path).strip():
         return None
     p = str(path).strip().replace("\\", "/")
     try:
-        root = Path(_ARTIFACT_ROOT).resolve()
+        root = os.path.realpath(_ARTIFACT_ROOT)
     except OSError:
         return None
 
-    def _is_under_artifact_root(resolved: Path) -> bool:
+    def _is_under_root(candidate: str) -> bool:
         try:
-            resolved.relative_to(root)
-            return True
+            return os.path.commonpath([candidate, root]) == root
         except ValueError:
             return False
 
     if p.startswith("/"):
         try:
-            candidate = Path(p).resolve()
+            cand = os.path.realpath(p)
         except OSError:
             return None
-        if not _is_under_artifact_root(candidate) or not candidate.is_file():
+        if not _is_under_root(cand) or not os.path.isfile(cand):
             return None
-        return str(candidate)
+        return cand
 
     if p.startswith("uploads/jobs/"):
         tail = p[len("uploads/jobs/") :].strip()
-        if not tail or ".." in Path(tail).parts:
+        if not tail:
+            return None
+        parts = [x for x in tail.split("/") if x]
+        if not parts or any(x in ("..", ".") for x in parts):
             return None
         try:
-            candidate = (root / tail).resolve()
+            joined = os.path.join(root, *parts)
+            cand = os.path.realpath(joined)
         except OSError:
             return None
-        if not _is_under_artifact_root(candidate) or not candidate.is_file():
+        if not _is_under_root(cand) or not os.path.isfile(cand):
             return None
-        return str(candidate)
+        return cand
     return None
 
 
@@ -285,7 +299,8 @@ def read_artifact_bytes(artifact_ref: Dict[str, Any]) -> bytes:
 
     local = resolve_local_artifact_path(path) if path else None
     if local and os.path.isfile(local):
-        return Path(local).read_bytes()
+        with open(local, "rb") as fh:
+            return fh.read()
 
     if storage in ("s3", "minio", "ceph", "aws_s3") and bucket and key:
         if not _s3_artifact_bucket_key_ok(bucket, key):
