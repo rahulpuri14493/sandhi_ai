@@ -267,6 +267,46 @@ _SQLSERVER_STAGING_TEMP_RE = re.compile(r"^#tmp_mcp_[0-9a-f]{32}$")
 _SQLSERVER_FQ_BRACKETED_RE = re.compile(
     r"^\[[A-Za-z_][A-Za-z0-9_$]*\]\.\[[A-Za-z_][A-Za-z0-9_$]*\]$"
 )
+# Staging temp as it appears inside a MERGE statement (not whole-string anchored).
+_SQLSERVER_STAGING_TEMP_SUB_RE = re.compile(r"#tmp_mcp_[0-9a-f]{32}")
+_SQLSERVER_MERGE_INTO_FQ_RE = re.compile(
+    r"MERGE\s+INTO\s+(\[[A-Za-z_][A-Za-z0-9_$]*\]\.\[[A-Za-z_][A-Za-z0-9_$]*\])\s+AS\s+tgt\s+USING",
+    re.IGNORECASE,
+)
+
+
+def _sqlserver_validate_merge_sql(merge_sql: str) -> None:
+    """
+    Reject MERGE text that does not match the shape produced by _merge_sql_dialect("sqlserver", ...).
+    Validates structure, disallows SQL comments, and checks temp + fq fragments against the same
+    regexes used at the pymssql sink so dynamic SQL is only executed when identifiers match expectations.
+    """
+    if not isinstance(merge_sql, str):
+        raise ValueError("Invalid MERGE SQL (not a string)")
+    sql = merge_sql.strip()
+    if not sql:
+        raise ValueError("Invalid MERGE SQL (empty)")
+    if "--" in sql or "/*" in sql or "*/" in sql:
+        raise ValueError("Invalid MERGE SQL (comment markers not allowed)")
+    lowered = re.sub(r"\s+", " ", sql).strip().lower()
+    required_fragments = (
+        "merge into ",
+        " using ",
+        " on ",
+        " when matched then update set ",
+        " when not matched then insert ",
+    )
+    if not all(fragment in lowered for fragment in required_fragments):
+        raise ValueError("Invalid MERGE SQL shape")
+    temp_hits = _SQLSERVER_STAGING_TEMP_SUB_RE.findall(sql)
+    if len(temp_hits) != 1 or not _SQLSERVER_STAGING_TEMP_RE.fullmatch(temp_hits[0]):
+        raise ValueError("Invalid MERGE SQL temp table reference")
+    m_fq = _SQLSERVER_MERGE_INTO_FQ_RE.search(sql)
+    if not m_fq or not _SQLSERVER_FQ_BRACKETED_RE.fullmatch(m_fq.group(1)):
+        raise ValueError("Invalid MERGE SQL table reference")
+    # Only characters that can appear in our MERGE template (identifiers, punctuation, whitespace).
+    if not re.fullmatch(r"[A-Za-z0-9_$\[\].,#=():; \t\n\r>#]+", sql):
+        raise ValueError("Invalid MERGE SQL (unexpected character)")
 
 
 def _sqlserver_staging_temp_name() -> str:
@@ -294,7 +334,9 @@ def _pymssql_sqlserver_execute_merge_artifact(cur: Any, merge_sql: str) -> None:
     """
     Run MERGE built by _merge_sql_dialect("sqlserver", ...).
     Dynamic SQL only concatenates _safe_ident outputs and a staging name matching _SQLSERVER_STAGING_TEMP_RE.
+    _sqlserver_validate_merge_sql enforces the expected statement shape before execute (SQL injection sink).
     """
+    _sqlserver_validate_merge_sql(merge_sql)
     cur.execute(merge_sql)
 
 

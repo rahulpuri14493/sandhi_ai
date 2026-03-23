@@ -191,3 +191,30 @@ class TestMergeSqlDialect:
                 ["id"],
                 "#tmp",
             )
+
+
+class TestSqlserverValidateMergeSql:
+    def test_accepts_merge_from_dialect(self):
+        sql = execution_common._merge_sql_dialect(
+            "sqlserver",
+            "[dbo].[orders]",
+            ["id", "name", "qty"],
+            ["id"],
+            "#tmp_mcp_" + "a" * 32,
+        )
+        execution_common._sqlserver_validate_merge_sql(sql)
+
+    def test_rejects_comment_markers(self):
+        base = execution_common._merge_sql_dialect(
+            "sqlserver",
+            "[dbo].[t]",
+            ["id"],
+            ["id"],
+            "#tmp_mcp_" + "a" * 32,
+        )
+        with pytest.raises(ValueError, match="comment"):
+            execution_common._sqlserver_validate_merge_sql(base.replace("USING", "USING --x"))
+
+    def test_rejects_wrong_shape(self):
+        with pytest.raises(ValueError, match="shape"):
+            execution_common._sqlserver_validate_merge_sql("SELECT 1")
