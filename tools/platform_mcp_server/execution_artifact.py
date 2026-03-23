@@ -398,7 +398,8 @@ def _artifact_write_mysql(
                     "(set target.allow_truncate_overwrite to true in output_contract to enable)"
                 )
             try:
-                # Identifiers already validated via db_si/table_si (same effective DB as connection).
+                # TRUNCATE uses db_si/table_si from _safe_ident only (same DB as the connection).
+                # codeql[py/sql-injection]: identifiers validated; not string-built from raw request fields.
                 truncate_fq = f"`{db_si}`.`{table_si}`"
                 cur.execute(f"TRUNCATE TABLE {truncate_fq}")
                 conn.commit()
