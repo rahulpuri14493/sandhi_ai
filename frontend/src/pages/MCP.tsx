@@ -425,14 +425,17 @@ function ConnectFlow({
     }
   }, [connection])
 
-  const getCredentials = () =>
-    authType === 'bearer' && token
-      ? { token }
-      : authType === 'api_key' && apiKey
-        ? { api_key: apiKey }
-        : authType === 'basic' && (username || password)
-          ? { username, password }
-          : undefined
+  const getCredentials = (): Record<string, string> | undefined => {
+    if (authType === 'bearer' && token) return { token }
+    if (authType === 'api_key' && apiKey) return { api_key: apiKey }
+    if (authType === 'basic' && (username || password)) {
+      return {
+        username: username ?? '',
+        password: password ?? '',
+      }
+    }
+    return undefined
+  }
 
   const handleValidate = async () => {
     onError(null)
@@ -466,21 +469,29 @@ function ConnectFlow({
     const credentials = getCredentials()
     setSubmitting(true)
     try {
+      const payload: Partial<{
+        name: string
+        base_url: string
+        endpoint_path: string
+        auth_type: string
+        credentials: Record<string, string>
+      }> = {
+        name,
+        base_url: baseUrl,
+        endpoint_path: endpointPath || '/mcp',
+        auth_type: authType,
+      }
+      if (credentials) payload.credentials = credentials
+
       if (connection) {
-        await mcpAPI.updateConnection(connection.id, {
-          name,
-          base_url: baseUrl,
-          endpoint_path: endpointPath || '/mcp',
-          auth_type: authType,
-          ...(credentials && { credentials }),
-        })
+        await mcpAPI.updateConnection(connection.id, payload)
       } else {
-        await mcpAPI.createConnection({
-          name,
-          base_url: baseUrl,
-          endpoint_path: endpointPath || '/mcp',
-          auth_type: authType,
-          credentials,
+        await mcpAPI.createConnection(payload as {
+          name: string
+          base_url: string
+          endpoint_path?: string
+          auth_type?: string
+          credentials?: Record<string, string>
         })
       }
       onSaved()
