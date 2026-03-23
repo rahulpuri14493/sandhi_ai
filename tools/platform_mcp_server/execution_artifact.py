@@ -204,6 +204,7 @@ def _artifact_write_postgres(
     """Load JSONL/JSON artifact rows into PostgreSQL (append insert or upsert via ON CONFLICT / MERGE)."""
     try:
         import psycopg2
+        from psycopg2 import sql as psql
     except ImportError:
         return "Error: psycopg2 is not installed"
     conn_str = (config.get("connection_string") or "").strip()
@@ -225,10 +226,16 @@ def _artifact_write_postgres(
     for k in merge_keys:
         if k not in cols:
             return f"Error: merge_keys must be columns of the artifact; missing {k!r}"
-    fq = f'"{schema_si}"."{table_si}"'
-    col_sql = ", ".join(f'"{_safe_ident(c)}"' for c in cols)
-    placeholders = ", ".join(["%s"] * len(cols))
-    ins = f"INSERT INTO {fq} ({col_sql}) VALUES ({placeholders})"
+    try:
+        cols_safe = [_safe_ident(str(c)) for c in cols]
+    except ValueError:
+        return "Error: invalid column name in artifact row keys"
+    table_ref = psql.Identifier(schema_si, table_si)
+    col_list = psql.SQL(", ").join(psql.Identifier(c) for c in cols_safe)
+    placeholders_row = psql.SQL(", ").join([psql.Placeholder()] * len(cols_safe))
+    ins_stmt = psql.SQL("INSERT INTO {} ({}) VALUES ({})").format(
+        table_ref, col_list, placeholders_row
+    )
     jsonb_cols = _jsonb_column_set(target)
     tuples = [
         tuple(_postgres_adapt_cell(c, rec.get(c), jsonb_cols) for c in cols)
@@ -242,7 +249,7 @@ def _artifact_write_postgres(
         len(records),
         operation_type,
         write_mode,
-        _truncate_for_log(ins, 500),
+        _truncate_for_log(repr(ins_stmt), 500),
     )
     try:
         conn = psycopg2.connect(conn_str)
@@ -263,7 +270,8 @@ def _artifact_write_postgres(
                     "(set target.allow_truncate_overwrite to true in output_contract to enable)"
                 )
             try:
-                cur.execute(f"TRUNCATE TABLE {fq} RESTART IDENTITY")
+                trunc_stmt = psql.SQL("TRUNCATE TABLE {} RESTART IDENTITY").format(table_ref)
+                cur.execute(trunc_stmt)
                 conn.commit()
             except Exception as e:
                 logger.exception("Postgres TRUNCATE for overwrite")
@@ -271,8 +279,7 @@ def _artifact_write_postgres(
                 conn.close()
                 return f"Error: overwrite (TRUNCATE) failed: {e}"
         if operation_type in ("append", "insert") or not merge_keys:
-            # codeql[py/sql-injection]: INSERT column names from _safe_ident; row values via executemany parameters.
-            cur.executemany(ins, tuples)
+            cur.executemany(ins_stmt, tuples)
             conn.commit()
             n = cur.rowcount if hasattr(cur, "rowcount") else len(records)
             cur.close()
@@ -280,31 +287,48 @@ def _artifact_write_postgres(
             return json.dumps({"status": "ok", "rows": len(records), "rowcount": n})
         # Upsert / merge: multi-row INSERT ... ON CONFLICT (requires UNIQUE/PK on merge_keys)
         non_keys = [c for c in cols if c not in merge_keys]
-        value_rows = []
         flat: List[Any] = []
         for rec in records:
-            value_rows.append("(" + ",".join(["%s"] * len(cols)) + ")")
             flat.extend([_postgres_adapt_cell(c, rec.get(c), jsonb_cols) for c in cols])
-        values_sql = ", ".join(value_rows)
-        conflict = ", ".join(f'"{_safe_ident(k)}"' for k in merge_keys)
-        if non_keys:
-            update_set = ", ".join(f'"{_safe_ident(c)}" = EXCLUDED."{_safe_ident(c)}"' for c in non_keys)
-            sql = (
-                f"INSERT INTO {fq} ({col_sql}) VALUES {values_sql} "
-                f"ON CONFLICT ({conflict}) DO UPDATE SET {update_set}"
-            )
-        else:
-            sql = f"INSERT INTO {fq} ({col_sql}) VALUES {values_sql} ON CONFLICT ({conflict}) DO NOTHING"
         try:
-            # codeql[py/sql-injection]: Upsert SQL uses _safe_ident for identifiers; values in bound `flat`.
-            cur.execute(sql, flat)
+            mk_safe = [_safe_ident(str(k)) for k in merge_keys]
+        except ValueError:
+            cur.close()
+            conn.close()
+            return "Error: invalid merge_keys column name"
+        conflict_clause = psql.SQL(", ").join(psql.Identifier(k) for k in mk_safe)
+        row_tpl = psql.SQL("({})").format(
+            psql.SQL(", ").join([psql.Placeholder()] * len(cols_safe))
+        )
+        values_block = psql.SQL(", ").join([row_tpl] * len(records))
+        conflict_human = ", ".join(f'"{k}"' for k in mk_safe)
+        if non_keys:
+            try:
+                nk_safe = [_safe_ident(str(c)) for c in non_keys]
+            except ValueError:
+                cur.close()
+                conn.close()
+                return "Error: invalid column name in upsert update set"
+            update_set = psql.SQL(", ").join(
+                psql.SQL("{} = EXCLUDED.{}").format(psql.Identifier(c), psql.Identifier(c))
+                for c in nk_safe
+            )
+            upsert_stmt = psql.SQL(
+                "INSERT INTO {} ({}) VALUES {} ON CONFLICT ({}) DO UPDATE SET {}"
+            ).format(table_ref, col_list, values_block, conflict_clause, update_set)
+        else:
+            upsert_stmt = psql.SQL(
+                "INSERT INTO {} ({}) VALUES {} ON CONFLICT ({}) DO NOTHING"
+            ).format(table_ref, col_list, values_block, conflict_clause)
+        try:
+            cur.execute(upsert_stmt, flat)
         except Exception as e1:
             conn.rollback()
             cur.close()
             conn.close()
             logger.exception("Postgres upsert ON CONFLICT failed")
             return (
-                f"Error: Postgres upsert requires a UNIQUE or PRIMARY KEY on ({conflict}). "
+                f"Error: Postgres upsert requires a UNIQUE or PRIMARY KEY on ({conflict_human}). "
                 f"({type(e1).__name__})"
             )
         conn.commit()
@@ -374,8 +398,8 @@ def _artifact_write_mysql(
                     "(set target.allow_truncate_overwrite to true in output_contract to enable)"
                 )
             try:
-                truncate_db = (config.get("database") or database or "").strip()
-                truncate_fq = f"`{_safe_ident(truncate_db)}`.`{table_si}`"
+                # Identifiers already validated via db_si/table_si (same effective DB as connection).
+                truncate_fq = f"`{db_si}`.`{table_si}`"
                 cur.execute(f"TRUNCATE TABLE {truncate_fq}")
                 conn.commit()
             except Exception as e:

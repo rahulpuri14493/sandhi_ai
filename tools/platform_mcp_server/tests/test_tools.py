@@ -140,9 +140,10 @@ class TestArtifactWriteDatabases:
             args,
         )
         assert "ok" in out
-        ins_sql = mock_cur.executemany.call_args[0][0]
-        assert "result_json" in ins_sql
-        assert "content" not in ins_sql
+        ins_comp = mock_cur.executemany.call_args[0][0]
+        ins_repr = repr(ins_comp)
+        assert "result_json" in ins_repr
+        assert "content" not in ins_repr
 
     def test_postgres_jsonb_columns_wraps_plain_text(self, monkeypatch):
         """Plain text in a JSONB column must use Json() — raw strings are invalid JSON for JSONB."""
