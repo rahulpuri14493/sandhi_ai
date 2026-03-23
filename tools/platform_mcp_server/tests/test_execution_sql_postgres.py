@@ -9,8 +9,11 @@ pytestmark = pytest.mark.unit
 def test_interactive_readonly_blocks_insert(monkeypatch):
     monkeypatch.setenv("MCP_POSTGRES_INTERACTIVE_READONLY", "true")
     out = execute_postgres(
-        {"connection_string": "postgresql://u:p@localhost:5432/db"},
-        {"query": "INSERT INTO daily_job_creation VALUES (1)"},
+        {
+            "connection_string": "postgresql://u:p@localhost:5432/db",
+            "query": "INSERT INTO daily_job_creation VALUES (1)",
+        },
+        {},
     )
     assert "read-only" in out.lower()
     assert "output_contract" in out.lower()
@@ -31,8 +34,11 @@ def test_interactive_readonly_allows_select(monkeypatch):
     monkeypatch.setattr(psycopg2, "connect", lambda conn_str: mock_conn)
 
     out = execute_postgres(
-        {"connection_string": "postgresql://u:p@localhost:5432/db"},
-        {"query": "SELECT 1 AS x"},
+        {
+            "connection_string": "postgresql://u:p@localhost:5432/db",
+            "query": "SELECT 1 AS x",
+        },
+        {},
     )
     assert "Error" not in out or "read-only" not in out.lower()
     assert mock_cur.execute.called

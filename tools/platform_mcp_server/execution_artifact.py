@@ -132,7 +132,20 @@ def _postgres_adapt_cell(col: str, val: Any, jsonb_cols: set) -> Any:
 
 def execute_artifact_write(tool_type: str, config: Dict[str, Any], arguments: Dict[str, Any]) -> str:
     artifact_ref = arguments.get("artifact_ref") or {}
-    target = arguments.get("target") or {}
+    runtime_target = arguments.get("target") or {}
+    trusted_target = {}
+    if isinstance(config, dict):
+        cfg_target = config.get("target")
+        if isinstance(cfg_target, dict):
+            trusted_target = dict(cfg_target)
+    resolved_target = dict(trusted_target)
+    if isinstance(runtime_target, dict):
+        if "bootstrap_sql" in runtime_target:
+            logger.warning("Ignoring user-supplied target.bootstrap_sql; bootstrap_sql is config-only")
+        for k, v in runtime_target.items():
+            if k == "bootstrap_sql":
+                continue
+            resolved_target[k] = v
     operation_type = str(arguments.get("operation_type") or "upsert").lower()
     write_mode = str(arguments.get("write_mode") or "upsert").lower()
     merge_keys: List[str] = list(arguments.get("merge_keys") or [])
@@ -153,7 +166,7 @@ def execute_artifact_write(tool_type: str, config: Dict[str, Any], arguments: Di
     if not records:
         return "Error: artifact contained no records"
 
-    tgt_type = (target.get("target_type") or tool_type).strip().lower()
+    tgt_type = (resolved_target.get("target_type") or tool_type).strip().lower()
     logger.info(
         "MCP artifact_write tool_type=%s target_type=%s operation_type=%s write_mode=%s "
         "record_count=%s merge_keys=%s artifact_storage=%s artifact_path=%s target=%s",
@@ -165,27 +178,27 @@ def execute_artifact_write(tool_type: str, config: Dict[str, Any], arguments: Di
         merge_keys,
         artifact_ref.get("storage"),
         artifact_ref.get("path") or artifact_ref.get("key"),
-        _truncate_for_log(json.dumps(target, default=str), 800),
+        _truncate_for_log(json.dumps(resolved_target, default=str), 800),
     )
 
     if tool_type in ("s3", "minio", "ceph", "aws_s3") or tgt_type in ("s3", "minio", "ceph", "aws_s3"):
-        return _artifact_write_object_store(tool_type, config, target, records, raw, artifact_ref, operation_type, write_mode)
+        return _artifact_write_object_store(tool_type, config, resolved_target, records, raw, artifact_ref, operation_type, write_mode)
     if tool_type == "snowflake" or tgt_type == "snowflake":
-        return _artifact_write_snowflake(config, target, records, merge_keys, operation_type, idem)
+        return _artifact_write_snowflake(config, resolved_target, records, merge_keys, operation_type, idem)
     if tool_type == "bigquery" or tgt_type == "bigquery":
-        return _artifact_write_bigquery(config, target, records, merge_keys, operation_type, write_mode)
+        return _artifact_write_bigquery(config, resolved_target, records, merge_keys, operation_type, write_mode)
     if tool_type in ("sqlserver",) or tgt_type == "sqlserver":
-        return _artifact_write_sqlserver(config, target, records, merge_keys, operation_type)
+        return _artifact_write_sqlserver(config, resolved_target, records, merge_keys, operation_type)
     if tool_type in ("postgres",) or tgt_type == "postgres":
-        return _artifact_write_postgres(config, target, records, merge_keys, operation_type, write_mode)
+        return _artifact_write_postgres(config, resolved_target, records, merge_keys, operation_type, write_mode)
     if tool_type in ("mysql",) or tgt_type == "mysql":
-        return _artifact_write_mysql(config, target, records, merge_keys, operation_type, write_mode)
+        return _artifact_write_mysql(config, resolved_target, records, merge_keys, operation_type, write_mode)
     if tool_type in ("databricks",) or tgt_type == "databricks":
-        return _artifact_write_databricks(config, target, records, merge_keys, operation_type)
+        return _artifact_write_databricks(config, resolved_target, records, merge_keys, operation_type)
     if tool_type in ("azure_blob",) or tgt_type == "azure_blob":
-        return _artifact_write_azure_blob(config, target, raw, artifact_ref, operation_type)
+        return _artifact_write_azure_blob(config, resolved_target, raw, artifact_ref, operation_type)
     if tool_type in ("gcs",) or tgt_type == "gcs":
-        return _artifact_write_gcs_blob(config, target, raw, artifact_ref, operation_type)
+        return _artifact_write_gcs_blob(config, resolved_target, raw, artifact_ref, operation_type)
 
     return (
         f"Error: artifact-based platform write is not implemented for tool_type={tool_type!r} "
@@ -693,16 +706,21 @@ def _artifact_write_sqlserver(
     merge_keys: List[str],
     operation_type: str,
 ) -> str:
-    try:
-        import pymssql
-    except ImportError:
-        return "Error: pymssql is not installed"
     database = (target.get("database") or config.get("database") or "").strip()
     schema = (target.get("schema") or target.get("schema_name") or "dbo").strip()
     table = (target.get("table") or "").strip()
     if not table:
         return "Error: target.table is required"
-    fq = f"[{schema}].[{table}]"
+    try:
+        schema_ident = _safe_ident(schema)
+        table_ident = _safe_ident(table)
+    except ValueError:
+        return "Error: invalid schema or table name (must be safe SQL identifiers)"
+    try:
+        import pymssql
+    except ImportError:
+        return "Error: pymssql is not installed"
+    fq = f"[{schema_ident}].[{table_ident}]"
     cols = list(records[0].keys())
     placeholders = ", ".join(["%s"] * len(cols))
     col_sql = ", ".join(f"[{c}]" for c in cols)

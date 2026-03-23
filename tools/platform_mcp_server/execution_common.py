@@ -202,11 +202,13 @@ def _merge_sql_dialect(
             f"WHEN NOT MATCHED THEN INSERT ({ins_cols}) VALUES ({ins_vals});"
         )
     if dialect == "sqlserver":
-        # T-SQL MERGE
-        on_clause = " AND ".join(f"tgt.[{k}] = src.[{k}]" for k in merge_keys)
-        updates = ", ".join(f"tgt.[{c}] = src.[{c}]" for c in non_keys) or f"tgt.[{merge_keys[0]}] = src.[{merge_keys[0]}]"
-        ins_cols = ", ".join(f"[{c}]" for c in cols)
-        ins_vals = ", ".join(f"src.[{c}]" for c in cols)
+        # T-SQL MERGE; bracket-quoted identifiers from _safe_ident only (same pattern as Snowflake/BQ).
+        on_clause = " AND ".join(f"tgt.[{k}] = src.[{k}]" for k in mk)
+        nk_safe = [_safe_ident(str(c)) for c in non_keys]
+        updates = ", ".join(f"tgt.[{c}] = src.[{c}]" for c in nk_safe) or f"tgt.[{mk[0]}] = src.[{mk[0]}]"
+        cols_safe = [_safe_ident(str(c)) for c in cols]
+        ins_cols = ", ".join(f"[{c}]" for c in cols_safe)
+        ins_vals = ", ".join(f"src.[{c}]" for c in cols_safe)
         return (
             f"MERGE INTO {fq_table} AS tgt USING {temp_name} AS src ON {on_clause} "
             f"WHEN MATCHED THEN UPDATE SET {updates} "
@@ -359,19 +361,16 @@ def parse_artifact_records(data: bytes, fmt: str) -> List[Dict[str, Any]]:
 
 def _sql_query_from_args(config: Dict[str, Any], arguments: Dict[str, Any]) -> str:
     """
-    Return the SQL statement for a tool.
+    Return SQL text for SQL-backed tools from trusted tool configuration only.
 
-    Security note: the query text must come from trusted tool configuration, not from
-    request-supplied arguments. Callers may still supply parameter values in
-    arguments["params"], which are safely bound by the DB driver.
+    Request arguments must not carry SQL text (no ad-hoc DDL/DML). Operators define
+    ``query`` / ``sql`` / ``statement`` on the tool record; use output_contract artifact
+    writes for table loads and controlled DML.
+
+    ``arguments`` may still supply ``params`` for bound placeholders (see execution_sql).
     """
     if not isinstance(config, dict):
         return ""
     return (
-        (
-            config.get("query")
-            or config.get("sql")
-            or config.get("statement")
-            or ""
-        ).strip()
+        (config.get("query") or config.get("sql") or config.get("statement") or "").strip()
     )

@@ -20,9 +20,10 @@ def execute_postgres(config: Dict[str, Any], arguments: Dict[str, Any]) -> str:
         return "Error: connection_string not configured"
     query = _sql_query_from_args(config, arguments)
     if not query:
-        # Only allow SQL text from trusted tool configuration; callers may pass
-        # parameter values via arguments["params"] but not arbitrary SQL.
-        return "Error: query must be defined in tool configuration"
+        return (
+            "Error: query is required in tool configuration "
+            "(SQL cannot be supplied in request arguments; use output_contract artifact writes for loads/DDL)"
+        )
     params = arguments.get("params")
     upper = query.lstrip().upper()
     is_read_query = upper.startswith("SELECT") or upper.startswith("WITH")
@@ -91,9 +92,10 @@ def execute_mysql(config: Dict[str, Any], arguments: Dict[str, Any]) -> str:
         return "Error: pymysql not installed"
     query = _sql_query_from_args(config, arguments)
     if not query:
-        # Only allow SQL text from trusted tool configuration; callers may pass
-        # parameter values via arguments["params"] but not arbitrary SQL.
-        return "Error: query must be defined in tool configuration"
+        return (
+            "Error: query is required in tool configuration "
+            "(SQL cannot be supplied in request arguments; use output_contract artifact writes for loads/DDL)"
+        )
     upper = query.lstrip().upper()
     is_read_query = upper.startswith("SELECT") or upper.startswith("WITH")
     interactive_readonly = bool(config.get("interactive_readonly")) or (
@@ -154,9 +156,10 @@ def execute_snowflake_sql(config: Dict[str, Any], arguments: Dict[str, Any]) -> 
         return "Error: snowflake-connector-python is not installed"
     query = _sql_query_from_args(config, arguments)
     if not query:
-        # Only allow SQL text from trusted tool configuration; callers may pass
-        # parameter values via arguments["params"] but not arbitrary SQL.
-        return "Error: query must be defined in tool configuration"
+        return (
+            "Error: query is required in tool configuration "
+            "(SQL cannot be supplied in request arguments; use output_contract artifact writes for loads/DDL)"
+        )
     upper = query.lstrip().upper()
     is_read_query = upper.startswith("SELECT") or upper.startswith("WITH")
     sf_dest = "/".join(
@@ -198,9 +201,10 @@ def execute_snowflake_sql(config: Dict[str, Any], arguments: Dict[str, Any]) -> 
 def execute_bigquery_sql(config: Dict[str, Any], arguments: Dict[str, Any]) -> str:
     query = _sql_query_from_args(config, arguments)
     if not query:
-        # Only allow SQL text from trusted tool configuration; callers may pass
-        # parameter values via arguments["params"] but not arbitrary SQL.
-        return "Error: query must be defined in tool configuration"
+        return (
+            "Error: query is required in tool configuration "
+            "(SQL cannot be supplied in request arguments; use output_contract artifact writes for loads/DDL)"
+        )
     try:
         from google.cloud import bigquery
         from google.oauth2 import service_account
@@ -238,9 +242,10 @@ def execute_bigquery_sql(config: Dict[str, Any], arguments: Dict[str, Any]) -> s
 def execute_sqlserver_sql(config: Dict[str, Any], arguments: Dict[str, Any]) -> str:
     query = _sql_query_from_args(config, arguments)
     if not query:
-        # Only allow SQL text from trusted tool configuration; callers may pass
-        # parameter values via arguments["params"] but not arbitrary SQL.
-        return "Error: query must be defined in tool configuration"
+        return (
+            "Error: query is required in tool configuration "
+            "(SQL cannot be supplied in request arguments; use output_contract artifact writes for loads/DDL)"
+        )
     try:
         import pymssql
     except ImportError:
@@ -289,9 +294,10 @@ def execute_sqlserver_sql(config: Dict[str, Any], arguments: Dict[str, Any]) -> 
 def execute_databricks_sql(config: Dict[str, Any], arguments: Dict[str, Any]) -> str:
     query = _sql_query_from_args(config, arguments)
     if not query:
-        # Only allow SQL text from trusted tool configuration; callers may pass
-        # parameter values via arguments["params"] but not arbitrary SQL.
-        return "Error: query must be defined in tool configuration"
+        return (
+            "Error: query is required in tool configuration "
+            "(SQL cannot be supplied in request arguments; use output_contract artifact writes for loads/DDL)"
+        )
     try:
         from databricks import sql as dsql
     except ImportError:

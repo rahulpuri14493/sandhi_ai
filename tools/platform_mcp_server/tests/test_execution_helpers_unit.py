@@ -137,3 +137,27 @@ class TestS3FamilyWritePrefix:
             {"action": "put", "key": "other.txt", "body": b"x"},
         )
         assert "Error" in out
+
+
+class TestMergeSqlDialect:
+    def test_sqlserver_merge_uses_safe_identifiers(self):
+        sql = execution_common._merge_sql_dialect(
+            "sqlserver",
+            "[dbo].[orders]",
+            ["id", "name", "qty"],
+            ["id"],
+            "#tmp_mcp_1",
+        )
+        assert "tgt.[id] = src.[id]" in sql
+        assert "[name]" in sql and "[qty]" in sql
+        assert "MERGE INTO [dbo].[orders]" in sql
+
+    def test_sqlserver_merge_rejects_bad_column_name(self):
+        with pytest.raises(ValueError, match="Invalid SQL identifier"):
+            execution_common._merge_sql_dialect(
+                "sqlserver",
+                "[dbo].[t]",
+                ["id", "bad;drop"],
+                ["id"],
+                "#tmp",
+            )

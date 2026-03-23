@@ -122,7 +122,7 @@ class TestInternalMCPListTools:
         assert t["id"] == platform_tool.id
         assert "platform_" in t["name"]
         assert "inputSchema" in t
-        assert t["inputSchema"]["required"] == ["query"]
+        assert t["inputSchema"]["required"] == []
 
     def test_list_tools_excludes_inactive(self, db_session, client_internal, internal_secret, business_user):
         from core.encryption import encrypt_json

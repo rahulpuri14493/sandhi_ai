@@ -5,12 +5,10 @@ Single source of truth for:
 - GET /api/internal/mcp/tools (platform MCP server tools/list)
 - Agent executor → A2A metadata openai_tools
 
-Postgres/MySQL use a minimal schema (query + optional params) so strict validators do not
-reject models that send invalid enum values for artifact-only fields like write_mode.
-
-Job output contracts that load artifacts into Postgres/MySQL/SQL Server do not use this
-schema: the executor calls tools/call with artifact_ref + target + merge_keys (platform MCP
-artifact write path). Interactive SQL (SELECT or hand-written DML) still uses query/params.
+Postgres/MySQL/SQL backends use a minimal arguments schema (optional ``params`` only) so
+strict validators do not reject artifact-only calls. SQL text is defined on the tool
+configuration (operator-controlled), not in request arguments; use job ``output_contract``
+artifact writes for table loads and controlled DML.
 """
 from __future__ import annotations
 
@@ -31,17 +29,13 @@ def input_schema_for_platform_tool_type(tool_type: str) -> Dict[str, Any]:
     sql_schema_interactive: Dict[str, Any] = {
         "type": "object",
         "properties": {
-            "query": {
-                "type": "string",
-                "description": "SQL to run. SELECT/WITH use a read-only session; other statements commit (writes).",
-            },
             "params": {
                 "type": "array",
-                "description": "Optional bound parameters for parameterized queries",
+                "description": "Optional bound parameters for the SQL statement stored in tool configuration (query/sql/statement).",
                 "items": {},
             },
         },
-        "required": ["query"],
+        "required": [],
         "additionalProperties": False,
     }
     sql_schema: Dict[str, Any] = {
@@ -51,7 +45,10 @@ def input_schema_for_platform_tool_type(tool_type: str) -> Dict[str, Any]:
                 "type": "string",
                 "description": "For artifact/job writes: read | insert | update | upsert | merge",
             },
-            "query": {"type": "string", "description": "SQL query (read or write as allowed by policy)"},
+            "query": {
+                "type": "string",
+                "description": "Deprecated in arguments; define SQL on the tool configuration. Optional for legacy clients.",
+            },
             "artifact_ref": {
                 "type": "object",
                 "properties": {
@@ -76,7 +73,7 @@ def input_schema_for_platform_tool_type(tool_type: str) -> Dict[str, Any]:
             "merge_keys": {"type": "array", "items": {"type": "string"}},
             "idempotency_key": {"type": "string"},
         },
-        "required": ["query"],
+        "required": [],
         "additionalProperties": True,
     }
     tt = (tool_type or "").strip().lower()

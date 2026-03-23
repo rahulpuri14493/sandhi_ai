@@ -40,14 +40,16 @@ class TestPostgres:
     def test_postgres_missing_query(self):
         out = execute_platform_tool("postgres", {"connection_string": "postgresql://x/y"}, {})
         assert "Error:" in out
-        assert "query" in out.lower() and ("not configured" in out.lower() or "required" in out.lower())
+        low = out.lower()
+        assert "query" in low and "tool configuration" in low and "required" in low
 
 
 class TestMysql:
     def test_mysql_missing_query(self):
         out = execute_platform_tool("mysql", {"host": "localhost", "user": "u", "password": "p", "database": "d"}, {})
         assert "Error:" in out
-        assert "query" in out.lower() and ("not configured" in out.lower() or "required" in out.lower())
+        low = out.lower()
+        assert "query" in low and "tool configuration" in low and "required" in low
 
 
 def _artifact_args(**kwargs):
@@ -99,11 +101,13 @@ class TestArtifactWriteDatabases:
         args["target"] = {
             "schema": "public",
             "table": "t_job_out",
-            "bootstrap_sql": ddl,
         }
         out = execution.execute_artifact_write(
             "postgres",
-            {"connection_string": "postgresql://u:p@localhost:5432/db"},
+            {
+                "connection_string": "postgresql://u:p@localhost:5432/db",
+                "target": {"bootstrap_sql": ddl},
+            },
             args,
         )
         assert "ok" in out
@@ -111,6 +115,34 @@ class TestArtifactWriteDatabases:
         assert mock_cur.executemany.call_count >= 1
         first_sql = mock_cur.execute.call_args_list[0][0][0]
         assert "CREATE TABLE" in first_sql
+
+    def test_postgres_bootstrap_sql_in_arguments_is_ignored(self, monkeypatch):
+        from unittest.mock import MagicMock
+
+        import psycopg2
+
+        monkeypatch.setattr(execution_common, "read_artifact_bytes", lambda ref: b'{"id":1,"name":"a"}\n')
+        mock_cur = MagicMock()
+        mock_cur.rowcount = 1
+        mock_conn = MagicMock()
+        mock_conn.cursor.return_value = mock_cur
+        monkeypatch.setattr(psycopg2, "connect", lambda conn_str: mock_conn)
+
+        args = _artifact_args()
+        args["target"] = {
+            "schema": "public",
+            "table": "t_job_out",
+            "bootstrap_sql": 'CREATE TABLE IF NOT EXISTS public.t_job_out ("id" INT, "name" TEXT);',
+        }
+        out = execution.execute_artifact_write(
+            "postgres",
+            {"connection_string": "postgresql://u:p@localhost:5432/db"},
+            args,
+        )
+        assert "ok" in out
+        # runtime target.bootstrap_sql must be ignored; first execute should be upsert/insert path, not CREATE TABLE
+        first_sql = mock_cur.execute.call_args_list[0][0][0] if mock_cur.execute.call_args_list else ""
+        assert "CREATE TABLE" not in str(first_sql)
 
     def test_postgres_column_mapping_maps_artifact_keys(self, monkeypatch):
         from unittest.mock import MagicMock
@@ -230,6 +262,18 @@ class TestArtifactWriteDatabases:
         assert data["status"] == "ok"
         assert data["rows"] == n
         assert mock_cur.execute.call_count == n
+
+    def test_sqlserver_artifact_rejects_invalid_identifiers(self):
+        import execution_artifact as ea
+
+        out = ea._artifact_write_sqlserver(
+            {"host": "localhost", "user": "u", "password": "p", "database": "d"},
+            {"schema": "dbo;drop", "table": "t"},
+            [{"id": 1}],
+            [],
+            "append",
+        )
+        assert "invalid schema or table name" in out.lower()
 
 
 class TestFilesystem:
