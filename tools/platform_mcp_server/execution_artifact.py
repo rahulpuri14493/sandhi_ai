@@ -439,9 +439,27 @@ def _artifact_write_mysql(
     except ValueError:
         return "Error: invalid database or table name (must be safe SQL identifiers)"
     cols = [str(c) for c in records[0].keys()]
-    for k in merge_keys:
+    # Requested merge key names (validated); SQL fragments use identifiers taken only from `cols` below.
+    wanted_mysql: set[str] = set()
+    for raw_k in merge_keys or []:
+        k = str(raw_k).strip()
         if k not in cols:
             return f"Error: merge_keys must be columns of the artifact; missing {k!r}"
+        try:
+            wanted_mysql.add(_safe_ident(k))
+        except ValueError:
+            return f"Error: invalid merge key identifier {k!r}"
+    safe_merge_keys_mysql: List[str] = []
+    for c in cols:
+        try:
+            ci = _safe_ident(c)
+        except ValueError:
+            continue
+        if ci in wanted_mysql:
+            safe_merge_keys_mysql.append(ci)
+    for w in wanted_mysql:
+        if w not in safe_merge_keys_mysql:
+            return f"Error: merge_keys must be columns of the artifact; missing {w!r}"
     fq = f"`{db_si}`.`{table_si}`"
     col_sql = ", ".join(f"`{_safe_ident(c)}`" for c in cols)
     tuples = [tuple(rec.get(c) for c in cols) for rec in records]
@@ -491,22 +509,20 @@ def _artifact_write_mysql(
             cur.close()
             conn.close()
             return json.dumps({"status": "ok", "rows": len(records)})
-        non_keys = [c for c in cols if c not in merge_keys]
+        non_keys = [c for c in cols if _safe_ident(c) not in wanted_mysql]
         value_rows = []
         flat: List[Any] = []
         for rec in records:
             value_rows.append("(" + ",".join(["%s"] * len(cols)) + ")")
             flat.extend(rec.get(c) for c in cols)
         values_sql = ", ".join(value_rows)
-        # Only keys that exist as artifact columns participate in ON DUPLICATE KEY UPDATE (breaks taint from stray merge_keys).
-        safe_merge_keys = [c for c in merge_keys if c in cols]
         if non_keys:
             upd = ", ".join(f"`{_safe_ident(c)}`=VALUES(`{_safe_ident(c)}`)" for c in non_keys)
             sql = f"INSERT INTO {fq} ({col_sql}) VALUES {values_sql} ON DUPLICATE KEY UPDATE {upd}"
         else:
             sql = (
                 f"INSERT INTO {fq} ({col_sql}) VALUES {values_sql} ON DUPLICATE KEY UPDATE "
-                + ", ".join(f"`{_safe_ident(k)}`=`{_safe_ident(k)}`" for k in safe_merge_keys)
+                + ", ".join(f"`{_safe_ident(k)}`=`{_safe_ident(k)}`" for k in safe_merge_keys_mysql)
             )
         try:
             # codeql[py/sql-injection]: Upsert SQL uses _safe_ident for table/columns; values in bound `flat`.
@@ -784,17 +800,26 @@ def _artifact_write_sqlserver(
         cols_ident = [_safe_ident(str(c)) for c in cols]
     except ValueError:
         return "Error: invalid schema, table, or column name (must be safe SQL identifiers)"
-    cols_by_name = {str(c): c for c in cols}
-    safe_merge_keys: List[str] = []
+    # Requested merge key names (validated); used only for membership, not as SQL fragments.
+    wanted: set[str] = set()
     for raw_k in merge_keys or []:
         k = str(raw_k).strip()
         try:
-            k_ident = _safe_ident(k)
+            wanted.add(_safe_ident(k))
         except ValueError:
             return f"Error: invalid merge key identifier {k!r}"
-        if k_ident not in cols_by_name:
-            return f"Error: merge_keys must be columns of the artifact; missing {k_ident!r}"
-        safe_merge_keys.append(k_ident)
+    # Identifier strings for SQL come only from artifact columns (same order as cols / cols_ident).
+    safe_merge_keys: List[str] = []
+    for c in cols:
+        try:
+            ci = _safe_ident(str(c))
+        except ValueError:
+            continue
+        if ci in wanted:
+            safe_merge_keys.append(ci)
+    for w in wanted:
+        if w not in safe_merge_keys:
+            return f"Error: merge_keys must be columns of the artifact; missing {w!r}"
     if operation_type not in ("append", "insert") and merge_keys and not safe_merge_keys:
         return "Error: merge operation requires at least one valid merge key"
     try:
