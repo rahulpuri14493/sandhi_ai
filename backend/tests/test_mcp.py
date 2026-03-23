@@ -500,7 +500,7 @@ class TestMCPCallPlatformTool:
                 "operation_type": "upsert",
                 "write_mode": "upsert",
                 "merge_keys": [],
-                "idempotency_key": "run-1-step-1-shard-1",
+                "idempotency_key": "idemkey1",
             },
         )
         assert r.status_code == 422
@@ -530,7 +530,7 @@ class TestMCPCallPlatformTool:
                         "operation_type": "upsert",
                         "write_mode": "upsert",
                         "merge_keys": ["customer_id", "as_of_date"],
-                        "idempotency_key": "run-1-step-1-shard-1",
+                        "idempotency_key": "idemkey1",
                     },
                 )
             assert r.status_code == 200, r.text
@@ -538,7 +538,7 @@ class TestMCPCallPlatformTool:
             assert called_kwargs["tool_name"] == "platform_1_snowflake"
             assert called_kwargs["arguments"]["operation_type"] == "upsert"
             assert called_kwargs["arguments"]["merge_keys"] == ["customer_id", "as_of_date"]
-            assert called_kwargs["arguments"]["idempotency_key"] == "run-1-step-1-shard-1"
+            assert called_kwargs["arguments"]["idempotency_key"] == "idemkey1"
         finally:
             config.settings.PLATFORM_MCP_SERVER_URL = orig_url
             config.settings.MCP_INTERNAL_SECRET = orig_secret
@@ -562,7 +562,7 @@ class TestMCPCallPlatformTool:
                         "operation_type": "upsert",
                         "write_mode": "upsert",
                         "merge_keys": ["customer_id"],
-                        "idempotency_key": "job-1-step-1-shard-1",
+                        "idempotency_key": "idemkey2",
                     },
                 )
             assert r.status_code == 202, r.text
@@ -593,7 +593,7 @@ class TestMCPCallPlatformTool:
                     "operation_type": "upsert",
                     "write_mode": "upsert",
                     "merge_keys": ["customer_id"],
-                    "idempotency_key": "same-idempotency-key-12345",
+                    "idempotency_key": "idemsame",
                 }
                 r1 = client_mcp.post("/api/mcp/call-platform-write-async", headers=business_user["headers"], json=payload)
                 r2 = client_mcp.post("/api/mcp/call-platform-write-async", headers=business_user["headers"], json=payload)
@@ -625,7 +625,7 @@ class TestMCPCallPlatformTool:
                         "operation_type": "upsert",
                         "write_mode": "upsert",
                         "merge_keys": ["customer_id"],
-                        "idempotency_key": "retry-idempotency-key-123",
+                        "idempotency_key": "idemretry",
                     },
                 )
             assert r.status_code == 202

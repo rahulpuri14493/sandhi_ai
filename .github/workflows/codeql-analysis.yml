@@ -7,6 +7,7 @@ on:
     branches: ["main"]
   schedule:
     - cron: "0 3 * * 1"
+  workflow_dispatch:
 
 permissions:
   actions: read
@@ -15,6 +16,7 @@ permissions:
 
 jobs:
   analyze:
+    if: ${{ vars.CODEQL_ADVANCED_ENABLED == 'true' }}
     name: Analyze (${{ matrix.language }})
     runs-on: ubuntu-latest
     strategy:
