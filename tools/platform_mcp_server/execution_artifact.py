@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+import uuid
 from typing import Any, Dict, List, Optional
 
 import execution_common
@@ -141,7 +142,7 @@ def execute_artifact_write(tool_type: str, config: Dict[str, Any], arguments: Di
     if tool_type == "snowflake" or tgt_type == "snowflake":
         return _artifact_write_snowflake(config, target, records, merge_keys, operation_type, idem)
     if tool_type == "bigquery" or tgt_type == "bigquery":
-        return _artifact_write_bigquery(config, target, records, merge_keys, operation_type)
+        return _artifact_write_bigquery(config, target, records, merge_keys, operation_type, write_mode)
     if tool_type in ("sqlserver",) or tgt_type == "sqlserver":
         return _artifact_write_sqlserver(config, target, records, merge_keys, operation_type)
     if tool_type in ("postgres",) or tgt_type == "postgres":
@@ -485,23 +486,59 @@ def _artifact_write_snowflake(
         return f"Error: {e}"
 
 
+def _bq_fq_table(project: str, dataset: str, table: str) -> str:
+    """Backtick-quoted table id for BigQuery SQL (MERGE)."""
+    if project:
+        return f"`{project}.{dataset}.{table}`"
+    return f"`{dataset}.{table}`"
+
+
+def _bq_table_ref(project: str, dataset: str, table: str) -> str:
+    """Table id string for load_table_from_json."""
+    if project:
+        return f"{project}.{dataset}.{table}"
+    return f"{dataset}.{table}"
+
+
 def _artifact_write_bigquery(
     config: Dict[str, Any],
     target: Dict[str, Any],
     records: List[Dict[str, Any]],
     merge_keys: List[str],
     operation_type: str,
+    write_mode: str,
 ) -> str:
-    try:
-        from google.cloud import bigquery
-        from google.oauth2 import service_account
-    except ImportError:
-        return "Error: google-cloud-bigquery is not installed"
     project = (config.get("project_id") or "").strip()
     dataset = (target.get("schema") or target.get("schema_name") or config.get("dataset") or "").strip()
     table = (target.get("table") or "").strip()
     if not dataset or not table:
         return "Error: target schema (dataset) and table are required for BigQuery"
+
+    records = _apply_postgres_column_mapping(records, target)
+    if not records or not isinstance(records[0], dict):
+        return "Error: artifact contained no row data after column_mapping"
+    cols = [str(c) for c in records[0].keys()]
+    ot = (operation_type or "upsert").lower()
+    wm = (write_mode or "upsert").lower()
+
+    if ot not in ("append", "insert", "upsert", "merge"):
+        return f"Error: unsupported operation_type for BigQuery: {operation_type!r}"
+    if ot in ("upsert", "merge") and not merge_keys:
+        return (
+            "Error: BigQuery upsert/merge requires merge_keys in the output contract. "
+            "The destination table is not truncated for upsert/merge (that would delete unrelated rows). "
+            "For a full table replace, use operation_type append or insert with write_mode overwrite and no merge_keys."
+        )
+    for k in merge_keys:
+        if k not in cols:
+            return f"Error: merge_keys must be columns of the artifact; missing {k!r}"
+
+    try:
+        from google.cloud import bigquery
+        from google.oauth2 import service_account
+    except ImportError:
+        return "Error: google-cloud-bigquery is not installed"
+
     creds_json = config.get("credentials_json")
     if creds_json:
         info = json.loads(creds_json) if isinstance(creds_json, str) else creds_json
@@ -509,14 +546,52 @@ def _artifact_write_bigquery(
         client = bigquery.Client(project=project, credentials=creds)
     else:
         client = bigquery.Client(project=project or None)
-    table_ref = f"{project}.{dataset}.{table}" if project else f"{dataset}.{table}"
+
+    table_ref = _bq_table_ref(project, dataset, table)
+    fq_target = _bq_fq_table(project, dataset, table)
+
+    # Keyed upsert: load to a staging table, then MERGE into the target (no blind TRUNCATE).
+    if ot in ("upsert", "merge"):
+        stg = f"_mcp_stg_{uuid.uuid4().hex[:16]}"
+        stg_ref = _bq_table_ref(project, dataset, stg)
+        fq_stg = _bq_fq_table(project, dataset, stg)
+        try:
+            job_config = bigquery.LoadJobConfig(
+                write_disposition=bigquery.WriteDisposition.WRITE_TRUNCATE,
+                create_disposition=bigquery.CreateDisposition.CREATE_IF_NEEDED,
+                schema_update_options=[bigquery.SchemaUpdateOption.ALLOW_FIELD_ADDITION],
+            )
+            load_job = client.load_table_from_json(records, stg_ref, job_config=job_config)
+            load_job.result()
+            merge_sql = _merge_sql_dialect("bigquery", fq_target, cols, merge_keys, fq_stg)
+            logger.info(
+                "MCP artifact BigQuery MERGE dest=%s rows=%s merge_keys=%s",
+                table_ref,
+                len(records),
+                merge_keys,
+            )
+            qjob = client.query(merge_sql)
+            qjob.result()
+            client.delete_table(stg_ref, not_found_ok=True)
+            return json.dumps(
+                {"status": "ok", "rows": len(records), "table": table_ref, "operation": "merge"}
+            )
+        except Exception as e:
+            logger.exception("BigQuery MERGE artifact write")
+            try:
+                client.delete_table(stg_ref, not_found_ok=True)
+            except Exception:
+                pass
+            return f"Error: {e}"
+
+    # Append / insert only: append, or explicit full replace via overwrite + no merge_keys.
     try:
+        if wm == "overwrite" and ot in ("append", "insert") and not merge_keys:
+            wd = bigquery.WriteDisposition.WRITE_TRUNCATE
+        else:
+            wd = bigquery.WriteDisposition.WRITE_APPEND
         job_config = bigquery.LoadJobConfig(
-            write_disposition=(
-                bigquery.WriteDisposition.WRITE_APPEND
-                if operation_type in ("append", "insert")
-                else bigquery.WriteDisposition.WRITE_TRUNCATE
-            ),
+            write_disposition=wd,
             schema_update_options=[bigquery.SchemaUpdateOption.ALLOW_FIELD_ADDITION],
         )
         job = client.load_table_from_json(records, table_ref, job_config=job_config)
@@ -614,14 +689,19 @@ def _artifact_write_databricks(
             access_token=token,
         )
         cur = conn.cursor()
-        # Simple: INSERT multiple VALUES — limit size
-        for rec in records[:5000]:
+        # Insert every row; commit periodically so very large artifacts do not rely on one huge transaction.
+        _DATABRICKS_COMMIT_EVERY = 5000
+        inserted = 0
+        for rec in records:
             vals = ", ".join(_sql_literal(rec.get(c)) for c in cols)
             cur.execute(f"INSERT INTO {fq} ({', '.join(cols)}) VALUES ({vals})")
+            inserted += 1
+            if inserted % _DATABRICKS_COMMIT_EVERY == 0:
+                conn.commit()
         conn.commit()
         cur.close()
         conn.close()
-        return json.dumps({"status": "ok", "rows": len(records)})
+        return json.dumps({"status": "ok", "rows": inserted})
     except Exception as e:
         logger.exception("Databricks artifact write")
         return f"Error: {e}"

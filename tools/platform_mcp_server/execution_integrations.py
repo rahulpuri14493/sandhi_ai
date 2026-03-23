@@ -4,8 +4,20 @@ from __future__ import annotations
 import json
 import logging
 from typing import Any, Dict
+from urllib.parse import urlparse
 
 logger = logging.getLogger(__name__)
+
+
+def _github_host_is_api_github_com(base: str) -> bool:
+    """True when base URL targets GitHub.com API (not substring match on arbitrary text)."""
+    s = (base or "").strip()
+    if not s:
+        return True
+    if "://" not in s:
+        s = "https://" + s
+    u = urlparse(s)
+    return (u.hostname or "").lower() == "api.github.com"
 
 def execute_slack(config: Dict[str, Any], arguments: Dict[str, Any]) -> str:
     try:
@@ -45,7 +57,7 @@ def execute_github(config: Dict[str, Any], arguments: Dict[str, Any]) -> str:
     if not token:
         return "Error: API token not configured"
     base = (config.get("base_url") or "https://api.github.com").rstrip("/")
-    if base.rstrip("/").endswith("api.github.com"):
+    if _github_host_is_api_github_com(base):
         g = Github(login_or_token=token)
     else:
         g = Github(base_url=base + "/", login_or_token=token)

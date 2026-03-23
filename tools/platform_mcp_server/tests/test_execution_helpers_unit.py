@@ -6,6 +6,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 import execution
+import execution_common
 from app import _parse_platform_tool_id, _tool_result_for_log
 from execution_object_storage import execute_s3_family
 
@@ -28,9 +29,7 @@ class TestPostgresDestHint:
     def test_no_password_in_output(self):
         hint = execution._postgres_dest_hint("postgresql://user:secret@db.example.com:5432/mydb")
         assert "secret" not in hint
-        assert "db.example.com" in hint
-        assert "5432" in hint
-        assert "mydb" in hint
+        assert hint == "db.example.com:5432/mydb"
 
     def test_malformed_returns_fallback(self):
         assert execution._postgres_dest_hint("") == "postgresql"
@@ -60,6 +59,42 @@ class TestParsePlatformToolId:
 
     def test_rejects_invalid(self):
         assert _parse_platform_tool_id("platform_abc_x") is None
+
+
+class TestResolveLocalArtifactPath:
+    def test_rejects_path_with_parent_segments(self, monkeypatch):
+        monkeypatch.setattr(execution_common, "_ARTIFACT_ROOT", "/uploads/jobs")
+        assert (
+            execution_common.resolve_local_artifact_path(
+                "uploads/jobs/foo/../../../etc/passwd"
+            )
+            is None
+        )
+
+    def test_resolves_uploads_jobs_under_root(self, monkeypatch, tmp_path):
+        root = tmp_path / "jobs"
+        root.mkdir()
+        f = root / "1" / "a.jsonl"
+        f.parent.mkdir(parents=True)
+        f.write_text("{}\n")
+        monkeypatch.setattr(execution_common, "_ARTIFACT_ROOT", str(root))
+        p = execution_common.resolve_local_artifact_path("uploads/jobs/1/a.jsonl")
+        assert p == str(f.resolve())
+
+    def test_rejects_absolute_outside_root(self, monkeypatch):
+        monkeypatch.setattr(execution_common, "_ARTIFACT_ROOT", "/uploads/jobs")
+        assert execution_common.resolve_local_artifact_path("/etc/passwd") is None
+
+    def test_read_artifact_rejects_unsafe_s3_key(self):
+        with pytest.raises(ValueError, match="unsafe"):
+            execution_common.read_artifact_bytes(
+                {
+                    "storage": "s3",
+                    "bucket": "my-bucket",
+                    "key": "jobs/../../etc/passwd",
+                    "path": "",
+                }
+            )
 
 
 class TestLogMcpSql:

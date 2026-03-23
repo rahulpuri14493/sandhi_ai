@@ -3,8 +3,11 @@ Unit tests for platform MCP server tool execution (execute_platform_tool).
 Tests each tool type with minimal/invalid config to assert error messages or stub behavior.
 No real DBs or external services required.
 """
+import json
 import sys
+import types
 from pathlib import Path
+from unittest.mock import MagicMock
 
 # Allow importing app from parent
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -181,6 +184,51 @@ class TestArtifactWriteDatabases:
         args["target"] = {"table": "t"}
         out = execution.execute_artifact_write("mysql", {"host": "localhost", "user": "u", "password": "p"}, args)
         assert "database" in out.lower() and "table" in out.lower()
+
+    def test_bigquery_upsert_without_merge_keys_rejected(self, monkeypatch):
+        """Upsert/merge must not fall back to WRITE_TRUNCATE (destructive)."""
+        monkeypatch.setattr(execution_common, "read_artifact_bytes", lambda ref: b'{"id":1}\n')
+        args = _artifact_args()
+        args["target"] = {"schema": "ds", "table": "t"}
+        args["operation_type"] = "upsert"
+        args["merge_keys"] = []
+        out = execution.execute_artifact_write("bigquery", {"project_id": "p"}, args)
+        assert "Error:" in out
+        assert "merge_keys" in out.lower()
+
+    def test_bigquery_unsupported_operation_type(self, monkeypatch):
+        monkeypatch.setattr(execution_common, "read_artifact_bytes", lambda ref: b'{"id":1}\n')
+        args = _artifact_args()
+        args["target"] = {"schema": "ds", "table": "t"}
+        args["operation_type"] = "truncate"
+        out = execution.execute_artifact_write("bigquery", {"project_id": "p"}, args)
+        assert "unsupported operation_type" in out.lower()
+
+    def test_databricks_artifact_inserts_all_rows_not_capped_at_5000(self, monkeypatch):
+        """Regression: writer must not stop at 5000 rows while reporting len(records)."""
+        import execution_artifact as ea
+
+        mock_cur = MagicMock()
+        mock_conn = MagicMock()
+        mock_conn.cursor.return_value = mock_cur
+        sql_mod = types.ModuleType("databricks.sql")
+        sql_mod.connect = MagicMock(return_value=mock_conn)
+        monkeypatch.setitem(sys.modules, "databricks", types.ModuleType("databricks"))
+        monkeypatch.setitem(sys.modules, "databricks.sql", sql_mod)
+
+        n = 6001
+        records = [{"id": i, "v": "x"} for i in range(n)]
+        out = ea._artifact_write_databricks(
+            {"host": "https://x.cloud.databricks.com", "token": "t", "http_path": "/sql/1.0/warehouses/w"},
+            {"catalog": "c", "schema": "s", "table": "t"},
+            records,
+            [],
+            "append",
+        )
+        data = json.loads(out)
+        assert data["status"] == "ok"
+        assert data["rows"] == n
+        assert mock_cur.execute.call_count == n
 
 
 class TestFilesystem:

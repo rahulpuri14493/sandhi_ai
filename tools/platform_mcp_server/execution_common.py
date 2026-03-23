@@ -14,7 +14,7 @@ import re
 import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
-from urllib.parse import urlparse, unquote
+from urllib.parse import urlparse, unquote, urlunparse
 
 # Local dev: .../repo/tools/platform_mcp_server/execution_common.py -> parents[2] is repo root.
 # Docker: /app/execution_common.py has only two parents (/app, /) — parents[2] raises IndexError.
@@ -92,12 +92,28 @@ def _resolve_s3_compatible_endpoint(tool_type: str, config: Dict[str, Any]) -> O
     if not ep:
         return None
 
-    # MinIO: console/UI is 9001, S3 API is 9000 (do not rewrite arbitrary :9001 for other S3 backends)
-    if tool_type == "minio" and ":9001" in ep:
-        ep = ep.replace(":9001", ":9000", 1)
-        logger.warning(
-            "MinIO endpoint used port 9001 (web console). Using port 9000 for the S3 API instead."
-        )
+    # MinIO: console/UI is 9001, S3 API is 9000 — detect port via parsing (not substring on raw URL).
+    if tool_type == "minio":
+        ep_norm = ep if "://" in ep else f"http://{ep}"
+        try:
+            u_min = urlparse(ep_norm)
+            if u_min.port == 9001 and u_min.hostname:
+                userinfo = ""
+                if u_min.username is not None:
+                    userinfo = (
+                        f"{u_min.username}:{u_min.password}@"
+                        if u_min.password is not None
+                        else f"{u_min.username}@"
+                    )
+                new_netloc = f"{userinfo}{u_min.hostname}:9000"
+                ep = urlunparse(
+                    (u_min.scheme, new_netloc, u_min.path or "", u_min.params, u_min.query, u_min.fragment)
+                ).rstrip("/")
+                logger.warning(
+                    "MinIO endpoint used port 9001 (web console). Using port 9000 for the S3 API instead."
+                )
+        except Exception:
+            pass
 
     try:
         u = urlparse(ep)
@@ -206,14 +222,58 @@ def resolve_local_artifact_path(path: str) -> Optional[str]:
     if not path or not str(path).strip():
         return None
     p = str(path).strip().replace("\\", "/")
-    if p.startswith("/") and os.path.isfile(p):
-        return p
+    try:
+        root = Path(_ARTIFACT_ROOT).resolve()
+    except OSError:
+        return None
+
+    def _is_under_artifact_root(resolved: Path) -> bool:
+        try:
+            resolved.relative_to(root)
+            return True
+        except ValueError:
+            return False
+
+    if p.startswith("/"):
+        try:
+            candidate = Path(p).resolve()
+        except OSError:
+            return None
+        if not _is_under_artifact_root(candidate) or not candidate.is_file():
+            return None
+        return str(candidate)
+
     if p.startswith("uploads/jobs/"):
-        tail = p[len("uploads/jobs/") :]
-        candidate = os.path.join(_ARTIFACT_ROOT, tail)
-        if os.path.isfile(candidate):
-            return candidate
+        tail = p[len("uploads/jobs/") :].strip()
+        if not tail or ".." in Path(tail).parts:
+            return None
+        try:
+            candidate = (root / tail).resolve()
+        except OSError:
+            return None
+        if not _is_under_artifact_root(candidate) or not candidate.is_file():
+            return None
+        return str(candidate)
     return None
+
+
+def _s3_artifact_bucket_key_ok(bucket: str, key: str) -> bool:
+    """
+    Reject obviously unsafe S3 bucket/key values for artifact reads (path-style traversal, nulls).
+    Artifact refs are produced by the trusted backend; this blocks accidental or malicious shapes.
+    """
+    if not bucket or not key:
+        return False
+    if "\x00" in bucket or "\x00" in key:
+        return False
+    if "/" in bucket or ".." in bucket or len(bucket) > 255:
+        return False
+    norm = key.replace("\\", "/")
+    if ".." in norm.split("/"):
+        return False
+    if len(key) > 2048:
+        return False
+    return True
 
 
 def read_artifact_bytes(artifact_ref: Dict[str, Any]) -> bytes:
@@ -228,6 +288,8 @@ def read_artifact_bytes(artifact_ref: Dict[str, Any]) -> bytes:
         return Path(local).read_bytes()
 
     if storage in ("s3", "minio", "ceph", "aws_s3") and bucket and key:
+        if not _s3_artifact_bucket_key_ok(bucket, key):
+            raise ValueError("Invalid or unsafe S3 bucket or key for artifact read")
         return _s3_get_object_bytes(bucket, key, artifact_ref)
 
     raise FileNotFoundError(

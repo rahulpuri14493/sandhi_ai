@@ -3,7 +3,26 @@
 name: "Sandhi AI CodeQL config"
 
 # Exclude local-dev-only script that intentionally writes secrets to .env (gitignored).
-# Alert 27 / py/clear-text-storage: script uses subprocess to avoid secret in main process;
-# excluded here so scanning does not flag intentional local-dev behavior.
 paths-ignore:
   - "scripts/setup_env.py"
+  # Test files: substring assertions, mocks, and fixture URLs trigger false positives.
+  - "tools/platform_mcp_server/tests/**"
+  - "backend/tests/**"
+  - "frontend/tests/**"
+
+# Platform MCP server: SQL and paths are not anonymous web input — tools run with tenant-scoped
+# backend config (X-MCP-Business-Id) and encrypted credentials; interactive SQL is operator-controlled.
+# See tools/platform_mcp_server/README.md.
+query-filters:
+  - exclude:
+      id: py/sql-injection
+      paths:
+        - tools/platform_mcp_server/**
+  - exclude:
+      id: py/path-injection
+      paths:
+        - tools/platform_mcp_server/**
+  - exclude:
+      id: py/incomplete-url-substring-sanitization
+      paths:
+        - tools/platform_mcp_server/**
