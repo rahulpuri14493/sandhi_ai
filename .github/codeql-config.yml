@@ -1,5 +1,4 @@
-# CodeQL: GitHub default setup looks for this path under .github/
-# Workflow `.github/workflows/codeql.yml` uses the same file via config-file.
+# CodeQL config for GitHub default Code Scanning only (do not add a separate CodeQL workflow while default setup is enabled).
 # https://docs.github.com/en/code-security/code-scanning/automatically-scanning-your-code-for-vulnerabilities/configuring-code-scanning
 name: "Sandhi AI CodeQL config"
 
