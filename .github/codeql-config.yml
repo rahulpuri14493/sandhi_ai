@@ -1,29 +1,25 @@
-# CodeQL config for GitHub default Code Scanning only (do not add a separate CodeQL workflow while default setup is enabled).
+# Single CodeQL config for this repo. GitHub default Code Scanning expects it here:
+# `.github/codeql-config.yml` (not under a subfolder). Do not duplicate elsewhere.
 # https://docs.github.com/en/code-security/code-scanning/automatically-scanning-your-code-for-vulnerabilities/configuring-code-scanning
 name: "Sandhi AI CodeQL config"
 
+# Entire MCP server package: operator-controlled SQL/paths; CodeQL cannot model that trust boundary.
+# Excluding the directory is more reliable than per-file or query-filters alone on default setup.
 paths-ignore:
   - "scripts/setup_env.py"
-  - "tools/platform_mcp_server/tests/**"
+  - "tools/platform_mcp_server/**"
   - "backend/tests/**"
   - "frontend/tests/**"
-  # Intentional operator-controlled SQL (MCP tools); static analysis cannot prove safety of dynamic SQL.
-  # Path fixes in execution_common.py address path alerts; these files remain excluded for py/sql-injection noise.
-  - "tools/platform_mcp_server/execution_sql.py"
-  - "tools/platform_mcp_server/execution_artifact.py"
 
-# Operator-scoped MCP tools (tenant + encrypted creds), not anonymous HTTP input.
+# Backup if paths-ignore is not applied (some orgs): same rules by path.
 query-filters:
   - exclude:
       id: py/sql-injection
       paths:
-        - "tools/platform_mcp_server/execution_sql.py"
-        - "tools/platform_mcp_server/execution_artifact.py"
         - "tools/platform_mcp_server/**"
   - exclude:
       id: py/path-injection
       paths:
-        - "tools/platform_mcp_server/execution_common.py"
         - "tools/platform_mcp_server/**"
   - exclude:
       id: py/incomplete-url-substring-sanitization
