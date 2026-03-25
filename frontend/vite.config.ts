@@ -4,6 +4,8 @@ import path from 'path'
 
 // https://vitejs.dev/config/
 export default defineConfig({
+  // GitHub Pages project sites are served under /<repo-name>/.
+  base: '/sandhi_ai/',
   plugins: [react()],
   resolve: {
     alias: {

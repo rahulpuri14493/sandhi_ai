@@ -52,6 +52,8 @@ jobs:
     env:
       ETHICALCHECK_OAS_URL: ${{ vars.ETHICALCHECK_OAS_URL }}
       APISEC_PROJECT: ${{ vars.APISEC_PROJECT }}
+      APISEC_REGION: ${{ vars.APISEC_REGION }}
+      APISEC_HOST: ${{ vars.APISEC_HOST }}
       APISEC_USERNAME: ${{ secrets.APISEC_USERNAME }}
       APISEC_PASSWORD: ${{ secrets.APISEC_PASSWORD }}
 
@@ -67,15 +69,98 @@ jobs:
             exit 1
           fi
 
-      - name: EthicalCheck Free & Automated API Security Testing Service
-        uses: apisec-inc/apisec-run-scan@v1.0.7
-        with:
-          apisec-username: ${{ env.APISEC_USERNAME }}
-          apisec-password: ${{ env.APISEC_PASSWORD }}
-          apisec-project: ${{ env.APISEC_PROJECT }}
-          apisec-oas: "true"
-          apisec-openapi-spec-url: ${{ env.ETHICALCHECK_OAS_URL }}
-          sarif-result-file: "ethicalcheck-results.sarif"
+          # Guard against accidental trailing spaces/newlines in secrets/vars.
+          for v in APISEC_USERNAME APISEC_PASSWORD APISEC_PROJECT ETHICALCHECK_OAS_URL; do
+            value="${!v}"
+            if [ "${value}" != "$(printf "%s" "${value}" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')" ]; then
+              echo "${v} contains leading/trailing whitespace. Please re-save it in GitHub Secrets/Variables."
+              exit 1
+            fi
+          done
+
+          echo "EthicalCheck inputs detected (values masked)."
+          if [ -n "${APISEC_REGION}" ]; then
+            echo "APISEC_REGION is set."
+          else
+            echo "APISEC_REGION is not set (optional)."
+          fi
+
+      - name: APIsec login preflight
+        shell: bash
+        run: |
+          host="${APISEC_HOST:-https://cloud.apisec.ai}"
+          host="${host%/}"
+          if [ -z "${APISEC_HOST}" ]; then
+            echo "APISEC_HOST is not set; using default https://cloud.apisec.ai ."
+            echo "Set APISEC_HOST to your UI origin if different (e.g. https://cloud.apisecapps.com)."
+          fi
+          payload=$(jq -n --arg u "${APISEC_USERNAME}" --arg p "${APISEC_PASSWORD}" '{username:$u,password:$p}')
+          ok=false
+          for path in /auth/login /login; do
+            echo "Trying APIsec JWT login: ${host}${path}"
+            tmp=$(mktemp)
+            code=$(curl -sS -o "$tmp" -w "%{http_code}" \
+              -H "Accept: application/json" \
+              -H "Content-Type: application/json" \
+              -X POST -d "$payload" "${host}${path}")
+            resp=$(cat "$tmp")
+            rm -f "$tmp"
+            echo "HTTP status: ${code}"
+            if ! echo "$resp" | jq -e . >/dev/null 2>&1; then
+              echo "Non-JSON response; preview (200 chars):"
+              printf '%s' "$resp" | head -c 200
+              echo
+              continue
+            fi
+            key=$(echo "$resp" | jq -r 'if has("token") then "token" elif has("message") then "message" else "unknown" end')
+            if [ "$key" = "token" ]; then
+              echo "APIsec login OK via ${path} (JWT in response)."
+              ok=true
+              break
+            fi
+            msg=$(echo "$resp" | jq -r '.message // empty')
+            echo "No token from ${path}: ${msg}"
+          done
+          if [ "$ok" != "true" ]; then
+            echo "JWT login failed on both /auth/login and /login."
+            echo "Set APISEC_HOST to your app origin (e.g. https://cloud.apisecapps.com). API docs: https://apisec-inc.github.io/documentation/Call%20APIsec%20APIs/"
+            exit 1
+          fi
+
+      - name: EthicalCheck scan (script mode)
+        shell: bash
+        run: |
+          curl -fsSL "https://raw.githubusercontent.com/apisec-inc/apisec-run-scan/v1.0.7/apisec-run-scan.sh" -o apisec-run-scan.sh
+          chmod +x apisec-run-scan.sh
+          # Vendor script posts to /login; SaaS JWT is documented at /auth/login (HTML is served for POST /login on some hosts).
+          sed -i 's|/login )|/auth/login )|g' apisec-run-scan.sh
+          host="${APISEC_HOST:-https://cloud.apisec.ai}"
+          host="${host%/}"
+          ./apisec-run-scan.sh \
+            --username "${APISEC_USERNAME}" \
+            --password "${APISEC_PASSWORD}" \
+            --project "${APISEC_PROJECT}" \
+            --profile "Master" \
+            --scanner "${APISEC_REGION}" \
+            --outputfile "ethicalcheck-results.sarif" \
+            --refresh-playbooks "" \
+            --host "${host}" \
+            --emailReport "" \
+            --fail-on-vuln-severity "" \
+            --openAPISpecUrl "${ETHICALCHECK_OAS_URL}" \
+            --openAPISpecFile "" \
+            --internal_OpenAPISpecUrl "" \
+            --specType "" \
+            --profileScanner "" \
+            --envName "" \
+            --authName "" \
+            --app_username "" \
+            --app_password "" \
+            --app_endPointUrl "" \
+            --app_token_param "" \
+            --header_1 "" \
+            --baseUrl "" \
+            --category ""
 
       - name: Upload sarif file to repository
         uses: github/codeql-action/upload-sarif@v3
