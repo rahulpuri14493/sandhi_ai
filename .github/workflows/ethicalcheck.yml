@@ -97,19 +97,27 @@ jobs:
             echo "If your tenant uses a different base URL, set repo variable APISEC_HOST to that origin (check the browser address bar or network tab on login)."
           fi
           payload=$(jq -n --arg u "${APISEC_USERNAME}" --arg p "${APISEC_PASSWORD}" '{username:$u,password:$p}')
-          resp=$(curl -sS -H "Content-Type: application/json" -X POST -d "$payload" "${host}/login")
+          tmp=$(mktemp)
+          code=$(curl -sS -o "$tmp" -w "%{http_code}" -H "Content-Type: application/json" -X POST -d "$payload" "${host}/login")
+          resp=$(cat "$tmp")
+          rm -f "$tmp"
+          echo "HTTP status from login: ${code}"
+          if ! echo "$resp" | jq -e . >/dev/null 2>&1; then
+            echo "APIsec login returned non-JSON from ${host}/login (HTTP ${code})."
+            echo "Preview (first 400 chars):"
+            printf '%s' "$resp" | head -c 400
+            echo
+            echo "APISEC_HOST must be the same origin your browser uses for POST /login (usually https://cloud.apisec.ai)."
+            echo "https://api.apisecapps.com is often a separate API surface, not the interactive login endpoint."
+            exit 1
+          fi
           key=$(echo "$resp" | jq -r 'if has("token") then "token" elif has("message") then "message" else "unknown" end')
           if [ "$key" != "token" ]; then
             msg=$(echo "$resp" | jq -r '.message // "Unknown login response from APIsec"')
             echo "APIsec login preflight failed: ${msg}"
-            if ! echo "$resp" | jq -e . >/dev/null 2>&1; then
-              echo "Response was not JSON (first 240 chars):"
-              echo "$resp" | head -c 240
-              echo
-            fi
             echo "Use the same email/username and password you use for APIsec password login (not GitHub)."
             echo "If you only sign in with Google/Microsoft SSO, set a password in APIsec or use an account that has password login."
-            echo "Re-save secrets APISEC_USERNAME / APISEC_PASSWORD (no quotes). Optional: APISEC_HOST if your tenant is not on cloud.apisec.ai ."
+            echo "Re-save secrets APISEC_USERNAME / APISEC_PASSWORD (no quotes)."
             exit 1
           fi
           echo "APIsec login preflight passed against ${host}."
