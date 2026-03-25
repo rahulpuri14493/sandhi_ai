@@ -73,7 +73,6 @@ jobs:
           apisec-username: ${{ env.APISEC_USERNAME }}
           apisec-password: ${{ env.APISEC_PASSWORD }}
           apisec-project: ${{ env.APISEC_PROJECT }}
-          apisec-oas: "true"
           apisec-openapi-spec-url: ${{ env.ETHICALCHECK_OAS_URL }}
           sarif-result-file: "ethicalcheck-results.sarif"
 
