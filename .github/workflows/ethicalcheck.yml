@@ -78,7 +78,11 @@ jobs:
           done
 
           echo "EthicalCheck inputs detected (values masked)."
-          [ -n "${APISEC_REGION}" ] && echo "APISEC_REGION is set."
+          if [ -n "${APISEC_REGION}" ]; then
+            echo "APISEC_REGION is set."
+          else
+            echo "APISEC_REGION is not set (optional)."
+          fi
 
       - name: APIsec login preflight
         shell: bash
