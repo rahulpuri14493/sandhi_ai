@@ -89,44 +89,51 @@ jobs:
         shell: bash
         run: |
           host="${APISEC_HOST:-https://cloud.apisec.ai}"
-          # Trim accidental trailing slash so /login is not double-slashed.
           host="${host%/}"
-          echo "APIsec login URL: ${host}/login"
           if [ -z "${APISEC_HOST}" ]; then
             echo "APISEC_HOST is not set; using default https://cloud.apisec.ai ."
-            echo "If your tenant uses a different base URL, set repo variable APISEC_HOST to that origin (check the browser address bar or network tab on login)."
+            echo "Set APISEC_HOST to your UI origin if different (e.g. https://cloud.apisecapps.com)."
           fi
           payload=$(jq -n --arg u "${APISEC_USERNAME}" --arg p "${APISEC_PASSWORD}" '{username:$u,password:$p}')
-          tmp=$(mktemp)
-          code=$(curl -sS -o "$tmp" -w "%{http_code}" -H "Content-Type: application/json" -X POST -d "$payload" "${host}/login")
-          resp=$(cat "$tmp")
-          rm -f "$tmp"
-          echo "HTTP status from login: ${code}"
-          if ! echo "$resp" | jq -e . >/dev/null 2>&1; then
-            echo "APIsec login returned non-JSON from ${host}/login (HTTP ${code})."
-            echo "Preview (first 400 chars):"
-            printf '%s' "$resp" | head -c 400
-            echo
-            echo "APISEC_HOST must be the same origin your browser uses for POST /login (usually https://cloud.apisec.ai)."
-            echo "https://api.apisecapps.com is often a separate API surface, not the interactive login endpoint."
+          ok=false
+          for path in /auth/login /login; do
+            echo "Trying APIsec JWT login: ${host}${path}"
+            tmp=$(mktemp)
+            code=$(curl -sS -o "$tmp" -w "%{http_code}" \
+              -H "Accept: application/json" \
+              -H "Content-Type: application/json" \
+              -X POST -d "$payload" "${host}${path}")
+            resp=$(cat "$tmp")
+            rm -f "$tmp"
+            echo "HTTP status: ${code}"
+            if ! echo "$resp" | jq -e . >/dev/null 2>&1; then
+              echo "Non-JSON response; preview (200 chars):"
+              printf '%s' "$resp" | head -c 200
+              echo
+              continue
+            fi
+            key=$(echo "$resp" | jq -r 'if has("token") then "token" elif has("message") then "message" else "unknown" end')
+            if [ "$key" = "token" ]; then
+              echo "APIsec login OK via ${path} (JWT in response)."
+              ok=true
+              break
+            fi
+            msg=$(echo "$resp" | jq -r '.message // empty')
+            echo "No token from ${path}: ${msg}"
+          done
+          if [ "$ok" != "true" ]; then
+            echo "JWT login failed on both /auth/login and /login."
+            echo "Set APISEC_HOST to your app origin (e.g. https://cloud.apisecapps.com). API docs: https://apisec-inc.github.io/documentation/Call%20APIsec%20APIs/"
             exit 1
           fi
-          key=$(echo "$resp" | jq -r 'if has("token") then "token" elif has("message") then "message" else "unknown" end')
-          if [ "$key" != "token" ]; then
-            msg=$(echo "$resp" | jq -r '.message // "Unknown login response from APIsec"')
-            echo "APIsec login preflight failed: ${msg}"
-            echo "Use the same email/username and password you use for APIsec password login (not GitHub)."
-            echo "If you only sign in with Google/Microsoft SSO, set a password in APIsec or use an account that has password login."
-            echo "Re-save secrets APISEC_USERNAME / APISEC_PASSWORD (no quotes)."
-            exit 1
-          fi
-          echo "APIsec login preflight passed against ${host}."
 
       - name: EthicalCheck scan (script mode)
         shell: bash
         run: |
           curl -fsSL "https://raw.githubusercontent.com/apisec-inc/apisec-run-scan/v1.0.7/apisec-run-scan.sh" -o apisec-run-scan.sh
           chmod +x apisec-run-scan.sh
+          # Vendor script posts to /login; SaaS JWT is documented at /auth/login (HTML is served for POST /login on some hosts).
+          sed -i 's|/login )|/auth/login )|g' apisec-run-scan.sh
           host="${APISEC_HOST:-https://cloud.apisec.ai}"
           host="${host%/}"
           ./apisec-run-scan.sh \
