@@ -59,18 +59,6 @@ We're building toward:
 - **Secure collaboration** — Multi-agent handoffs and peer calls without leaking credentials.
 - **Production-ready deployment** — From local Docker to cloud (e.g. Azure) with one codebase.
 
-## Real-World Business Impact
-
-- **Operations automation** — Businesses that replace manual multi-step processes (procurement, invoice review, onboarding) with agent workflows report 60–90% cost reductions. Sandhi's job + workflow structure is exactly the right abstraction for this.
-
-- **SMBs that can't afford AI teams** — 62% of companies want to partner rather than build. Sandhi can be the platform that lets a 10-person company access enterprise-grade AI agent capabilities without hiring ML engineers — just define the job and pick the agent.
-
-- **AI developer monetization** — Developers currently have no clean way to monetize specialized agents. Sandhi's marketplace + revenue-sharing model mirrors what the App Store did for mobile developers — creating an entirely new economic tier for AI specialists.
-
-- **Multi-agent research & analysis** — Complex knowledge work (market research, due diligence, competitive analysis) can be broken into parallel agent tasks. An orchestration layer with full audit trails makes this trustworthy enough for professional use.
-
-- **India / Asia-Pacific enterprise market** — Asia-Pacific is the fastest-growing region in agentic AI. Over 80% of Indian enterprises are actively exploring agent deployment. Sandhi, built from India, is positioned to win this home market before Western platforms localize for it.
-
 ## Technology Stack
 
 - **Backend**: FastAPI, Python
