@@ -53,6 +53,7 @@ jobs:
       ETHICALCHECK_OAS_URL: ${{ vars.ETHICALCHECK_OAS_URL }}
       APISEC_PROJECT: ${{ vars.APISEC_PROJECT }}
       APISEC_REGION: ${{ vars.APISEC_REGION }}
+      APISEC_HOST: ${{ vars.APISEC_HOST }}
       APISEC_USERNAME: ${{ secrets.APISEC_USERNAME }}
       APISEC_PASSWORD: ${{ secrets.APISEC_PASSWORD }}
 
@@ -87,27 +88,48 @@ jobs:
       - name: APIsec login preflight
         shell: bash
         run: |
-          host="https://cloud.apisec.ai"
+          host="${APISEC_HOST:-https://cloud.apisec.ai}"
           payload=$(jq -n --arg u "${APISEC_USERNAME}" --arg p "${APISEC_PASSWORD}" '{username:$u,password:$p}')
           resp=$(curl -sS -H "Content-Type: application/json" -X POST -d "$payload" "${host}/login")
           key=$(echo "$resp" | jq -r 'if has("token") then "token" elif has("message") then "message" else "unknown" end')
           if [ "$key" != "token" ]; then
             msg=$(echo "$resp" | jq -r '.message // "Unknown login response from APIsec"')
             echo "APIsec login preflight failed: ${msg}"
-            echo "Check APISEC_USERNAME/APISEC_PASSWORD secret values and account region/tenant."
+            echo "Check APISEC_USERNAME/APISEC_PASSWORD and APISEC_HOST/APISEC_REGION values."
             exit 1
           fi
-          echo "APIsec login preflight passed."
+          echo "APIsec login preflight passed against ${host}."
 
-      - name: EthicalCheck Free & Automated API Security Testing Service
-        uses: apisec-inc/apisec-run-scan@v1.0.7
-        with:
-          apisec-username: ${{ env.APISEC_USERNAME }}
-          apisec-password: ${{ env.APISEC_PASSWORD }}
-          apisec-project: ${{ env.APISEC_PROJECT }}
-          apisec-region: ${{ env.APISEC_REGION }}
-          apisec-openapi-spec-url: ${{ env.ETHICALCHECK_OAS_URL }}
-          sarif-result-file: "ethicalcheck-results.sarif"
+      - name: EthicalCheck scan (script mode)
+        shell: bash
+        run: |
+          curl -fsSL "https://raw.githubusercontent.com/apisec-inc/apisec-run-scan/v1.0.7/apisec-run-scan.sh" -o apisec-run-scan.sh
+          chmod +x apisec-run-scan.sh
+          ./apisec-run-scan.sh \
+            --username "${APISEC_USERNAME}" \
+            --password "${APISEC_PASSWORD}" \
+            --project "${APISEC_PROJECT}" \
+            --profile "Master" \
+            --scanner "${APISEC_REGION}" \
+            --outputfile "ethicalcheck-results.sarif" \
+            --refresh-playbooks "" \
+            --host "${APISEC_HOST}" \
+            --emailReport "" \
+            --fail-on-vuln-severity "" \
+            --openAPISpecUrl "${ETHICALCHECK_OAS_URL}" \
+            --openAPISpecFile "" \
+            --internal_OpenAPISpecUrl "" \
+            --specType "" \
+            --profileScanner "" \
+            --envName "" \
+            --authName "" \
+            --app_username "" \
+            --app_password "" \
+            --app_endPointUrl "" \
+            --app_token_param "" \
+            --header_1 "" \
+            --baseUrl "" \
+            --category ""
 
       - name: Upload sarif file to repository
         uses: github/codeql-action/upload-sarif@v3
