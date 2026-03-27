@@ -1,19 +1,31 @@
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 from typing import Optional, List
 from datetime import datetime
 from models.hiring import HiringStatus, NominationStatus
 
 
 class HiringPositionCreate(BaseModel):
-    title: str
-    description: Optional[str] = None
-    requirements: Optional[str] = None
+    model_config = ConfigDict(extra="forbid")
+
+    title: str = Field(min_length=2, max_length=200)
+    description: Optional[str] = Field(default=None, max_length=4000)
+    requirements: Optional[str] = Field(default=None, max_length=4000)
+
+    @field_validator("title")
+    @classmethod
+    def normalize_title(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("title must not be blank")
+        return value
 
 
 class HiringPositionUpdate(BaseModel):
-    title: Optional[str] = None
-    description: Optional[str] = None
-    requirements: Optional[str] = None
+    model_config = ConfigDict(extra="forbid")
+
+    title: Optional[str] = Field(default=None, min_length=2, max_length=200)
+    description: Optional[str] = Field(default=None, max_length=4000)
+    requirements: Optional[str] = Field(default=None, max_length=4000)
     status: Optional[HiringStatus] = None
 
 
@@ -33,14 +45,18 @@ class HiringPositionResponse(BaseModel):
 
 
 class AgentNominationCreate(BaseModel):
-    hiring_position_id: int
-    agent_id: int
-    cover_letter: Optional[str] = None
+    model_config = ConfigDict(extra="forbid")
+
+    hiring_position_id: int = Field(gt=0)
+    agent_id: int = Field(gt=0)
+    cover_letter: Optional[str] = Field(default=None, max_length=3000)
 
 
 class AgentNominationUpdate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     status: Optional[NominationStatus] = None
-    review_notes: Optional[str] = None
+    review_notes: Optional[str] = Field(default=None, max_length=3000)
 
 
 class AgentNominationResponse(BaseModel):

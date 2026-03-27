@@ -16,6 +16,7 @@ from middleware.error_handler import (
     http_exception_handler,
     general_exception_handler,
 )
+from middleware.rate_limiter import InMemoryRateLimitMiddleware
 from core.encryption import ensure_encryption_key_for_production
 from core.logging_config import configure_logging
 from services.job_file_storage import verify_s3_connectivity
@@ -131,6 +132,7 @@ class RequestLoggingMiddleware(BaseHTTPMiddleware):
 
 # Log every API request/response (helps debugging in Docker).
 app.add_middleware(RequestLoggingMiddleware)
+app.add_middleware(InMemoryRateLimitMiddleware)
 
 # CORS middleware
 app.add_middleware(
