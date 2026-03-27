@@ -42,9 +42,10 @@ def list_agents(
     capability: Optional[str] = Query(None, description="Filter by capability"),
     limit: Optional[int] = Query(None, ge=1, le=500, description="Max agents to return (pagination); omit for all"),
     offset: int = Query(0, ge=0, description="Pagination offset"),
+    current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
-    """List agents (marketplace). Optional limit/offset for scale (e.g. 200+ agents). X-Total-Count header set with total matching count."""
+    """List agents (authenticated). Public marketplace uses /api/public/agents."""
     query = db.query(Agent)
 
     if status:

@@ -79,3 +79,10 @@ class AgentResponse(BaseModel):
             obj_dict.pop('api_key', None)
             obj = type(obj)(**{k: v for k, v in obj_dict.items() if k in obj.__table__.columns.keys()})
         return super().model_validate(obj, **kwargs)
+
+
+"""
+Note: If we later reintroduce a public marketplace endpoint, use a dedicated response
+model with non-enumerable IDs. For now, APIsec findings are addressed by enforcing
+authentication on the flagged endpoints.
+"""

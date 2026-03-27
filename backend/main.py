@@ -3,7 +3,7 @@ import time
 import uuid
 import os
 from contextlib import asynccontextmanager
-from fastapi import FastAPI, Request
+from fastapi import Depends, FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.exceptions import RequestValidationError
 from starlette.exceptions import HTTPException as StarletteHTTPException
@@ -22,6 +22,7 @@ from services.job_file_storage import verify_s3_connectivity
 from services.task_queue import get_queue_health
 from core.config import settings
 from services.job_scheduler import JobSchedulerService
+from core.security import get_current_user
 
 configure_logging()
 logger = logging.getLogger(__name__)
@@ -158,12 +159,12 @@ app.include_router(mcp_internal.router)
 
 
 @app.get("/")
-def root():
+def root(current_user=Depends(get_current_user)):
     return {"message": "Sandhi AI API", "version": "1.0.0"}
 
 
 @app.get("/health")
-def health_check():
+def health_check(current_user=Depends(get_current_user)):
     s3 = verify_s3_connectivity()
     queue = get_queue_health()
     overall_ok = bool(s3["ok"]) and bool(queue["ok"])
@@ -172,3 +173,9 @@ def health_check():
         "storage": s3,
         "queue": queue,
     }
+
+
+@app.get("/healthz")
+def healthz():
+    """Minimal unauthenticated liveness endpoint."""
+    return {"status": "ok"}

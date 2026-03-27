@@ -228,7 +228,7 @@ class UserResponseRequest(BaseModel):
 
 
 @router.get("/output-contract/template", status_code=status.HTTP_200_OK)
-def get_output_contract_template():
+def get_output_contract_template(current_user=Depends(get_current_user)):
     """
     Universal output contract template for artifact-first write execution.
 
