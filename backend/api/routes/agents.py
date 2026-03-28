@@ -23,6 +23,27 @@ import logging
 
 logger = logging.getLogger(__name__)
 
+
+def _safe_test_connection_error_preview(exc: BaseException) -> Optional[str]:
+    """
+    Map exceptions to short hints for the test-connection JSON body.
+    Never echo str(exc) — avoids leaking stack fragments, paths, or host details (CodeQL / CWE-209).
+    """
+    if isinstance(exc, httpx.TimeoutException):
+        return "Request timed out (10s)."
+    if isinstance(exc, httpx.ConnectError):
+        return "Could not connect to host."
+    if isinstance(exc, httpx.HTTPStatusError):
+        if exc.response is not None:
+            return f"HTTP status {exc.response.status_code} from upstream."
+        return "HTTP error from upstream."
+    if isinstance(exc, httpx.RequestError):
+        return "Network request failed."
+    if isinstance(exc, ValueError):
+        return "Invalid URL or blocked by policy."
+    return None
+
+
 router = APIRouter(prefix="/api/agents", tags=["agents"])
 
 
@@ -559,7 +580,7 @@ async def test_agent_connection(
                 "success": False,
                 "message": "A2A connection failed",
                 "status_code": 500,
-                "response_preview": str(exc)[:500],
+                "response_preview": _safe_test_connection_error_preview(exc),
             }
 
     # OpenAI-compatible: route through platform adapter so test uses same A2A path as execution
@@ -594,7 +615,7 @@ async def test_agent_connection(
                 "success": False,
                 "message": "Connection failed (via adapter)",
                 "status_code": 500,
-                "response_preview": str(exc)[:500],
+                "response_preview": _safe_test_connection_error_preview(exc),
             }
 
     # SSRF protection: validate URL before direct request (fallback path)
