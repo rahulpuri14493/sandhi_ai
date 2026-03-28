@@ -1,9 +1,11 @@
 """Unit tests for A2A client."""
 import json
+import socket
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from services.a2a_client import (
+    _a2a_urls_equivalent,
     _extract_result_from_send_message_response,
     _message_parts_from_input,
     _text_part,
@@ -14,6 +16,12 @@ from services.a2a_client import (
 
 def test_text_part():
     assert _text_part("hello") == {"text": "hello"}
+
+
+def test_a2a_urls_equivalent_normalizes_scheme_host_port():
+    assert _a2a_urls_equivalent("http://foo:8080/", "HTTP://foo:8080")
+    assert not _a2a_urls_equivalent("http://foo:8080", "http://foo:8081")
+    assert not _a2a_urls_equivalent("http://foo:8080", "https://foo:8080")
 
 
 def test_message_parts_from_input():
@@ -82,7 +90,10 @@ def test_extract_result_from_jsonrpc_error_raises():
 @pytest.mark.asyncio
 async def test_send_message_calls_httpx():
     # Mock URL validation so agent.example.com doesn't need to resolve (CI has no DNS for it)
-    with patch("services.a2a_client._validate_public_http_url", side_effect=lambda u: u), patch(
+    with patch(
+        "services.a2a_client._validate_public_http_url",
+        side_effect=lambda u, *, allow_private_resolve=False: u,
+    ), patch(
         "services.a2a_client.httpx.AsyncClient"
     ) as mock_client:
         mock_response = MagicMock()
@@ -100,6 +111,33 @@ async def test_send_message_calls_httpx():
             api_key="secret",
         )
         assert result["content"] == "OK"
+
+
+@pytest.mark.asyncio
+async def test_send_message_allows_private_resolve_when_target_is_configured_adapter(monkeypatch):
+    """Docker/internal adapter host resolves to a private IP; must not be blocked as SSRF."""
+    from core import config
+
+    monkeypatch.setattr(config.settings, "A2A_ADAPTER_URL", "http://a2a-openai-adapter:8080")
+    monkeypatch.setattr(config.settings, "ALLOW_PRIVATE_AGENT_ENDPOINTS", False)
+    monkeypatch.setattr(
+        "services.a2a_client.socket.getaddrinfo",
+        lambda *a, **k: [(socket.AF_INET, None, None, None, ("172.18.0.5", 0))],
+    )
+    with patch("services.a2a_client.httpx.AsyncClient") as mock_client:
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.json.return_value = {
+            "result": {"message": {"parts": [{"text": "adapter-ok"}]}}
+        }
+        mock_client.return_value.__aenter__.return_value.post = AsyncMock(
+            return_value=mock_response
+        )
+        result = await send_message(
+            "http://a2a-openai-adapter:8080",
+            [{"text": "ping"}],
+        )
+    assert result["content"] == "adapter-ok"
 
 
 @pytest.mark.asyncio

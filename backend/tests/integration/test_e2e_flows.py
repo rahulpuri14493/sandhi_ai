@@ -71,7 +71,6 @@ class TestE2EAgents:
             json={
                 "name": "New E2E Agent",
                 "description": "Created in e2e",
-                "status": "active",
                 "price_per_task": 5.0,
                 "price_per_communication": 0.5,
             },
@@ -80,6 +79,60 @@ class TestE2EAgents:
         assert r.status_code == 201
         data = r.json()
         assert data["name"] == "New E2E Agent"
+
+    def test_create_agent_as_developer_publish_flow(self, integration_client: TestClient):
+        """
+        E2E: developer (publisher) registers, logs in, creates an agent, then loads it by id.
+        Payload matches what the publish UI sends: no client-supplied status (AgentCreate forbids it).
+        """
+        email = f"publisher-e2e-{uuid.uuid4().hex[:8]}@test.com"
+        password = "Publish1a"  # letters + digits, min 8 chars
+
+        reg = integration_client.post(
+            "/api/auth/register",
+            json={"email": email, "password": password, "role": "developer"},
+        )
+        assert reg.status_code == 201, reg.text
+        publisher = reg.json()
+        assert publisher["role"] == "developer"
+        publisher_id = publisher["id"]
+
+        login = integration_client.post(
+            "/api/auth/login",
+            json={"email": email, "password": password},
+        )
+        assert login.status_code == 200, login.text
+        token = login.json()["access_token"]
+        headers = {"Authorization": f"Bearer {token}"}
+
+        payload = {
+            "name": "E2E Published Agent",
+            "description": "Created via full developer publish flow",
+            "capabilities": ["nlp", "automation"],
+            "pricing_model": "pay_per_use",
+            "price_per_task": 1.5,
+            "price_per_communication": 0.25,
+            "llm_model": "gpt-4o-mini",
+            "temperature": 0.7,
+            "api_endpoint": "https://api.example.com/v1/chat/completions",
+            "a2a_enabled": False,
+        }
+        create = integration_client.post("/api/agents", json=payload, headers=headers)
+        assert create.status_code == 201, create.text
+        body = create.json()
+        assert body["name"] == payload["name"]
+        assert body["developer_id"] == publisher_id
+        assert body.get("status") == "pending"
+        assert body.get("pricing_model") == "pay_per_use"
+        assert body.get("capabilities") == ["nlp", "automation"]
+
+        agent_id = body["id"]
+        fetched = integration_client.get(f"/api/agents/{agent_id}", headers=headers)
+        assert fetched.status_code == 200, fetched.text
+        again = fetched.json()
+        assert again["id"] == agent_id
+        assert again["name"] == payload["name"]
+        assert again["developer_id"] == publisher_id
 
     def test_update_agent(
         self, integration_client: TestClient, developer_user, sample_agent

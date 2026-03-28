@@ -60,7 +60,7 @@ def test_register_duplicate_email(client_with_auth):
         "/api/auth/register",
         json={
             "email": user.email,
-            "password": "otherpass",
+            "password": "otherpass1",
             "role": "developer",
         },
     )

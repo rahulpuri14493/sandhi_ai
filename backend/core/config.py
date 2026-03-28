@@ -91,5 +91,17 @@ class Settings(BaseSettings):
     HTTPX_CA_BUNDLE_PATH: str = ""  # optional path to CA bundle (corporate proxy / custom roots)
     # When set, task/tool splitters retry once with this model after 429 or 5xx from the LLM endpoint
     LLM_HTTP_FALLBACK_MODEL: str = ""
+    # In-process rate limiting (per client IP + route group). Tune via env for your deployment.
+    # Many users behind one NAT share one IP — use higher values in production or Redis-backed limits at scale.
+    RATE_LIMIT_ENABLED: bool = True
+    # POST /api/auth/login, /api/auth/register (per IP; brute-force still mitigated at app layer)
+    RATE_LIMIT_AUTH_PER_MINUTE: int = 300
+    # GET /api/agents* — dashboards, marketplace, polling (per IP)
+    RATE_LIMIT_AGENT_READS_PER_MINUTE: int = 1200
+    # POST|PUT|PATCH|DELETE /api/jobs* (per IP)
+    RATE_LIMIT_JOB_MUTATIONS_PER_MINUTE: int = 600
+    # When True, use leftmost X-Forwarded-For for the client IP (trusted reverse proxy only).
+    # Default False: ignore X-Forwarded-For so clients cannot spoof IPs and bypass limits.
+    RATE_LIMIT_TRUST_PROXY_HEADERS: bool = False
 
 settings = Settings()

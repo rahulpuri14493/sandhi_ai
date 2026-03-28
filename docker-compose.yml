@@ -36,6 +36,7 @@ services:
       context: ./backend
       dockerfile: Dockerfile
     container_name: sandhi-backend
+    init: true
     restart: unless-stopped
     command: python run.py
     volumes:
@@ -95,6 +96,7 @@ services:
       context: ./backend
       dockerfile: Dockerfile
     container_name: sandhi-celery-worker
+    init: true
     restart: unless-stopped
     command: celery -A services.task_queue.celery_app worker --loglevel=info --concurrency=${CELERY_WORKER_CONCURRENCY:-4} --autoscale=${CELERY_WORKER_AUTOSCALE_MAX:-16},${CELERY_WORKER_AUTOSCALE_MIN:-2}
     volumes:
@@ -130,6 +132,7 @@ services:
       context: ./tools/a2a_openai_adapter
       dockerfile: Dockerfile
     container_name: a2a-openai-adapter
+    init: true
     restart: unless-stopped
     ports:
       - "8080:8080"
@@ -140,6 +143,7 @@ services:
       context: .
       dockerfile: tools/platform_mcp_server/Dockerfile
     container_name: platform-mcp-server
+    init: true
     restart: unless-stopped
     ports:
       - "8081:8081"
@@ -165,6 +169,7 @@ services:
       context: ./frontend
       dockerfile: Dockerfile
     container_name: sandhi-frontend
+    init: true
     env_file:
       - .env
     environment:

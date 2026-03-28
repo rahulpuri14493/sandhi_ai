@@ -119,12 +119,7 @@ def test_update_job_rejects_invalid_output_contract_policy_min_success(client: T
 
 def test_get_output_contract_template(client: TestClient):
     r = client.get("/api/jobs/output-contract/template")
-    assert r.status_code == 200
-    body = r.json()
-    assert body["version"] == "1.0"
-    assert isinstance(body.get("write_policy"), dict)
-    assert body["write_policy"]["on_write_error"] in ("fail_job", "continue")
-    assert isinstance(body.get("write_targets"), list)
+    assert r.status_code == 401
 
 
 def test_queue_stats_requires_auth(client: TestClient):

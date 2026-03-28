@@ -71,8 +71,8 @@ def get_current_user_info(current_user: User = Depends(get_current_user)):
 
 
 @router.get("/debug/token")
-def debug_token(request: Request):
-    """Debug endpoint to check token extraction"""
+def debug_token(request: Request, current_user: User = Depends(get_current_user)):
+    """Debug endpoint to check token extraction (authenticated)."""
     auth_header = request.headers.get("Authorization")
     if not auth_header:
         return {"error": "No Authorization header"}

@@ -24,9 +24,11 @@ def _auth_headers(user) -> dict:
 
 def test_core_health_endpoint(integration_client: TestClient):
     r = integration_client.get("/health")
-    assert r.status_code == 200
-    body = r.json()
-    assert body.get("status") in ("ok", "healthy")
+    assert r.status_code == 401
+
+    r2 = integration_client.get("/healthz")
+    assert r2.status_code == 200
+    assert r2.json().get("status") == "ok"
 
 
 def test_core_auth_register_login_me(integration_client: TestClient):
