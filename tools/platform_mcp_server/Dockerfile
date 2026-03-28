@@ -8,4 +8,4 @@ COPY backend/core/artifact_contract.py ./artifact_contract.py
 
 ENV PYTHONUNBUFFERED=1
 EXPOSE 8081
-CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8081"]
+CMD ["python", "run.py"]

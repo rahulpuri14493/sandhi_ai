@@ -232,6 +232,187 @@ _MSG_ADD_OPENAI_IN_CONFIG = (
     "(optional field 'OpenAI API key for embedding'). The platform does not provide an API key."
 )
 
+# --- Pinecone only -----------------------------------------------------------------
+# All `_pinecone_*` helpers and `_parse_pinecone_fields_argument` are used exclusively
+# by `_execute_pinecone`. Chroma, Weaviate, Qdrant, `vector_db`, and PageIndex keep
+# their own code paths—do not route those tools through these helpers. After edits here,
+# run: pytest tests/ -q (from tools/platform_mcp_server; skip test_mcp_live_e2e if offline).
+# ------------------------------------------------------------------------------------
+
+
+def _pinecone_coerce_response_dict(result: Any, _depth: int = 0) -> Optional[Dict[str, Any]]:
+    """Turn Pinecone OpenAPI / Pydantic responses into a plain dict so we can find nested hits."""
+    if result is None or _depth > 4:
+        return None
+    if isinstance(result, dict):
+        return result
+    for attr in ("actual_instance", "value", "data"):
+        inner = getattr(result, attr, None)
+        if inner is not None and inner is not result:
+            d = _pinecone_coerce_response_dict(inner, _depth + 1)
+            if d is not None:
+                return d
+    model_dump = getattr(result, "model_dump", None)
+    if callable(model_dump):
+        for kwargs in ({"by_alias": True, "mode": "python"}, {"mode": "python"}, {}):
+            try:
+                dumped = model_dump(**kwargs)
+            except TypeError:
+                continue
+            except Exception:
+                break
+            if isinstance(dumped, dict):
+                return dumped
+    to_dict = getattr(result, "to_dict", None)
+    if callable(to_dict):
+        try:
+            dumped = to_dict()
+        except Exception:
+            dumped = None
+        if isinstance(dumped, dict):
+            return dumped
+    return None
+
+
+def _pinecone_hits_from_plain_dict(d: Any, _depth: int = 0) -> List[Any]:
+    """Recursively find the first non-empty hits / matches / records list (prefer result.* subtree)."""
+    if not isinstance(d, dict) or _depth > 10:
+        return []
+    for nest_key in ("result", "data", "response", "body"):
+        nested = d.get(nest_key)
+        if isinstance(nested, dict):
+            got = _pinecone_hits_from_plain_dict(nested, _depth + 1)
+            if got:
+                return got
+    for list_key in ("hits", "matches", "records"):
+        v = d.get(list_key)
+        if isinstance(v, list) and len(v) > 0:
+            return v
+    return []
+
+
+def _pinecone_collect_hits(result: Any) -> List[Any]:
+    """Collect hit/match objects from Pinecone search() or query() (SDK return shapes differ)."""
+    if result is None:
+        return []
+
+    plain = _pinecone_coerce_response_dict(result)
+    if plain is not None:
+        from_dict = _pinecone_hits_from_plain_dict(plain)
+        if from_dict:
+            return from_dict
+
+    def as_list_nonempty(v: Any) -> Optional[List[Any]]:
+        if v is None:
+            return None
+        try:
+            lst = list(v)
+        except TypeError:
+            return None
+        return lst if lst else None
+
+    def from_obj(obj: Any) -> Optional[List[Any]]:
+        if obj is None:
+            return None
+        for key in ("hits", "matches", "records"):
+            if isinstance(obj, dict):
+                lst = as_list_nonempty(obj.get(key))
+            else:
+                lst = as_list_nonempty(getattr(obj, key, None))
+            if lst is not None:
+                return lst
+        return None
+
+    inner = getattr(result, "result", None)
+    if inner is None and isinstance(result, dict):
+        inner = result.get("result")
+    for node in (inner, result):
+        lst = from_obj(node)
+        if lst is not None:
+            return lst
+    return []
+
+
+def _pinecone_hit_to_metadata_dict(hit: Any) -> Dict[str, Any]:
+    """Merge `fields` and `metadata` from integrated search hits or query matches."""
+    out: Dict[str, Any] = {}
+    if isinstance(hit, dict):
+        fields = hit.get("fields")
+        meta = hit.get("metadata")
+        if isinstance(fields, dict):
+            out.update(fields)
+        if isinstance(meta, dict):
+            for k, v in meta.items():
+                if k not in out:
+                    out[k] = v
+        if not out:
+            skip = {"id", "_id", "score", "_score", "metadata", "fields"}
+            for k, v in hit.items():
+                if k not in skip:
+                    out[k] = v
+        return out
+    for attr in ("fields", "metadata"):
+        src = getattr(hit, attr, None)
+        if src is None:
+            continue
+        if isinstance(src, dict):
+            for k, v in src.items():
+                if k not in out:
+                    out[k] = v
+        elif hasattr(src, "items"):
+            try:
+                for k, v in src.items():
+                    kk = str(k)
+                    if kk not in out:
+                        out[kk] = v
+            except Exception:
+                pass
+    return out
+
+
+def _pinecone_normalize_result(result: Any, ns: Optional[str]) -> str:
+    """JSON string with matches[{id, score, metadata?}] for agents."""
+    matches = _pinecone_collect_hits(result)
+    namespace_out: Optional[str] = ns
+    if hasattr(result, "namespace"):
+        n = getattr(result, "namespace", None)
+        if n is not None and n != "":
+            namespace_out = n
+    if isinstance(result, dict):
+        n = result.get("namespace")
+        if n is not None and n != "":
+            namespace_out = n
+    out: Dict[str, Any] = {"matches": [], "namespace": namespace_out}
+    for m in matches:
+        mid = getattr(m, "id", None) or getattr(m, "_id", None)
+        if mid is None and isinstance(m, dict):
+            mid = m.get("id") or m.get("_id")
+        score = getattr(m, "score", None) or getattr(m, "_score", None)
+        if score is None and isinstance(m, dict):
+            score = m.get("score") or m.get("_score")
+        meta_dict = _pinecone_hit_to_metadata_dict(m)
+        entry: Dict[str, Any] = {"id": mid, "score": score}
+        if meta_dict:
+            entry["metadata"] = meta_dict
+        out["matches"].append(entry)
+    return json.dumps(out, indent=2, default=str)
+
+
+def _parse_pinecone_fields_argument(raw: Any) -> Optional[List[str]]:
+    if raw is None:
+        return None
+    if isinstance(raw, list):
+        return [str(x).strip() for x in raw if str(x).strip()]
+    if isinstance(raw, str) and raw.strip():
+        try:
+            parsed = json.loads(raw)
+            if isinstance(parsed, list):
+                return [str(x).strip() for x in parsed if str(x).strip()]
+        except Exception:
+            pass
+        return [s.strip() for s in raw.split(",") if s.strip()]
+    return None
+
 
 def _execute_pinecone(config: Dict[str, Any], arguments: Dict[str, Any]) -> str:
     """Query Pinecone index. Prefer integrated text search (no OpenAI). Fall back to OpenAI embed + vector query if needed."""
@@ -252,35 +433,7 @@ def _execute_pinecone(config: Dict[str, Any], arguments: Dict[str, Any]) -> str:
         return "Error: Pinecone host (URL) is not configured. Use the index host from Pinecone console."
 
     index_host = host.replace("https://", "").replace("http://", "").split("/")[0].strip()
-
-    def _normalize_result(result: Any, ns: Optional[str]) -> str:
-        """Build a consistent JSON response from Pinecone search/query result.
-        search() returns result.result.hits with _id, _score, fields; query() returns matches with id, score, metadata."""
-        matches = getattr(result, "matches", None) or getattr(result, "hits", None)
-        if matches is None:
-            inner = getattr(result, "result", None) or (result.get("result") if isinstance(result, dict) else None)
-            if inner is not None:
-                matches = getattr(inner, "hits", None) or (inner.get("hits") if isinstance(inner, dict) else None)
-        if matches is None and isinstance(result, dict):
-            matches = result.get("matches") or result.get("hits") or []
-        matches = matches or []
-        namespace_out = getattr(result, "namespace", None) or (getattr(result, "namespace", None) if hasattr(result, "namespace") else None) or ns
-        out = {"matches": [], "namespace": namespace_out}
-        for m in matches:
-            mid = getattr(m, "id", None) or getattr(m, "_id", None)
-            if mid is None and isinstance(m, dict):
-                mid = m.get("id") or m.get("_id")
-            score = getattr(m, "score", None) or getattr(m, "_score", None)
-            if score is None and isinstance(m, dict):
-                score = m.get("score") or m.get("_score")
-            meta = getattr(m, "metadata", None) or getattr(m, "fields", None)
-            if meta is None and isinstance(m, dict):
-                meta = m.get("metadata") or m.get("fields") or {k: v for k, v in m.items() if k not in ("id", "_id", "score", "_score")}
-            entry = {"id": mid, "score": score}
-            if meta:
-                entry["metadata"] = dict(meta) if hasattr(meta, "items") else meta
-            out["matches"].append(entry)
-        return json.dumps(out, indent=2)
+    fields_list = _parse_pinecone_fields_argument(arguments.get("fields"))
 
     try:
         from pinecone import Pinecone
@@ -289,11 +442,20 @@ def _execute_pinecone(config: Dict[str, Any], arguments: Dict[str, Any]) -> str:
 
         # 1) Try integrated text search first (no OpenAI key required)
         try:
-            search_result = index.search(
-                namespace=namespace,
-                query={"inputs": {"text": query_text}, "top_k": top_k},
-            )
-            return _normalize_result(search_result, namespace)
+            search_kw: Dict[str, Any] = {
+                "namespace": namespace,
+                "query": {"inputs": {"text": query_text}, "top_k": top_k},
+                # Explicit default: some SDK/API combos omit field payloads if `fields` is unset
+                "fields": fields_list if fields_list else ["*"],
+            }
+            search_result = index.search(**search_kw)
+            normalized = _pinecone_normalize_result(search_result, namespace)
+            if json.loads(normalized).get("matches") == []:
+                logger.debug(
+                    "Pinecone search returned 0 matches after normalize; coerced keys=%s",
+                    list((_pinecone_coerce_response_dict(search_result) or {}).keys()),
+                )
+            return normalized
         except Exception as text_err:
             err_msg = str(text_err).lower()
             fallback = (
@@ -316,9 +478,21 @@ def _execute_pinecone(config: Dict[str, Any], arguments: Dict[str, Any]) -> str:
                 "This Pinecone index does not support query-by-text (integrated embedding). "
                 + _MSG_ADD_OPENAI_IN_CONFIG
             )
-        payload = {"vector": vector, "topK": top_k, "includeMetadata": True, "namespace": namespace}
-        result = index.query(**payload)
-        return _normalize_result(result, namespace)
+        try:
+            result = index.query(
+                vector=vector,
+                top_k=top_k,
+                namespace=namespace,
+                include_metadata=True,
+            )
+        except TypeError:
+            result = index.query(
+                vector=vector,
+                topK=top_k,
+                namespace=namespace,
+                includeMetadata=True,
+            )
+        return _pinecone_normalize_result(result, namespace)
     except Exception as e:
         logger.error("Pinecone query error (%s)", type(e).__name__)
         return "Pinecone query error"

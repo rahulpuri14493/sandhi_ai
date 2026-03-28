@@ -127,3 +127,55 @@ async def test_get_available_mcp_tools_async_expands_byo_tools():
     assert len(byo) == 2
     assert {t["external_tool_name"] for t in byo} == {"read_doc", "write_doc"}
     fake_list.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_get_available_mcp_tools_async_empty_platform_ids_means_no_platform_tools():
+    """Regression: [] must not fall through to 'all platform tools' (security / wrong corpus)."""
+    from models.mcp_server import MCPToolConfig, MCPServerConnection, MCPToolType
+
+    pine = MagicMock(spec=MCPToolConfig)
+    pine.id = 7
+    pine.name = "Corp Pinecone"
+    pine.tool_type = MCPToolType.PINECONE
+    pine.schema_metadata = None
+    pine.business_description = None
+
+    def _query_side_effect(model):
+        m = MagicMock()
+        if model is MCPToolConfig:
+            m.filter.return_value.order_by.return_value.all.return_value = [pine]
+        elif model is MCPServerConnection:
+            m.filter.return_value.order_by.return_value.all.return_value = []
+        else:
+            m.filter.return_value.all.return_value = []
+        return m
+
+    mock_session = MagicMock()
+    mock_session.query.side_effect = _query_side_effect
+    ex = AgentExecutor(mock_session)
+    tools = await ex._get_available_mcp_tools_async(99, platform_tool_ids=[], connection_ids=None)
+    assert not any(t.get("source") == "platform" for t in tools)
+
+
+@pytest.mark.asyncio
+async def test_get_available_mcp_tools_async_empty_connection_ids_means_no_byo_tools():
+    from services import agent_executor as ae
+    from models.mcp_server import MCPToolConfig, MCPServerConnection
+
+    def _query_side_effect(model):
+        m = MagicMock()
+        if model is MCPToolConfig:
+            m.filter.return_value.order_by.return_value.all.return_value = []
+        elif model is MCPServerConnection:
+            m.filter.return_value.order_by.return_value.all.return_value = []
+        return m
+
+    mock_session = MagicMock()
+    mock_session.query.side_effect = _query_side_effect
+    ex = AgentExecutor(mock_session)
+    fake_list = AsyncMock()
+    with patch.object(ae, "mcp_list_tools", fake_list):
+        tools = await ex._get_available_mcp_tools_async(42, platform_tool_ids=None, connection_ids=[])
+    assert tools == []
+    fake_list.assert_not_called()

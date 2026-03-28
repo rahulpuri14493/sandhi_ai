@@ -24,6 +24,11 @@ from core.artifact_contract import normalize_agent_output_for_artifact
 
 logger = logging.getLogger(__name__)
 
+# Tool types that fetch text from an external corpus (vector DB, PageIndex, etc.)
+_RETRIEVAL_MCP_TOOL_TYPES = frozenset(
+    {"pinecone", "vector_db", "weaviate", "qdrant", "chroma", "elasticsearch", "pageindex"}
+)
+
 
 def _sign_trusted_bootstrap_payload(
     *,
@@ -863,6 +868,19 @@ class AgentExecutor:
             for t in available_mcp_tools:
                 system_content += f"  - {t.get('name', '')}: {t.get('description', '')}\n"
             system_content += "\n"
+            retrieval_tools = [
+                t
+                for t in available_mcp_tools
+                if str(t.get("tool_type", "")).lower() in _RETRIEVAL_MCP_TOOL_TYPES
+            ]
+            if len(retrieval_tools) > 1:
+                system_content += (
+                    "CRITICAL — Multiple search/retrieval tools are enabled (e.g. a vector store and PageIndex). "
+                    "They are different corpora. Use ONLY the tool that matches the assigned task and job wording "
+                    "(e.g. Pinecone for the tenant’s vector index). Do not call PageIndex or another retrieval API "
+                    "as a substitute for a Pinecone query unless the task explicitly names that source. "
+                    "Never present documents from one backend as results for another.\n\n"
+                )
             if any(str(t.get("tool_type", "")).lower() in ("postgres", "mysql") for t in available_mcp_tools):
                 system_content += (
                     "CRITICAL — PostgreSQL/MySQL platform tools: call with ONLY the arguments allowed by the tool schema: "
@@ -1134,9 +1152,18 @@ END DOCUMENT {i+1}: {doc_name}
             MCPToolConfig.user_id == business_id,
             MCPToolConfig.is_active == True,
         )
-        if platform_tool_ids:
-            platform_query = platform_query.filter(MCPToolConfig.id.in_(platform_tool_ids))
-        platform = platform_query.order_by(MCPToolConfig.name).all()
+        # [] must mean "no platform tools" — `if platform_tool_ids` wrongly treated [] as "no filter" (all tools).
+        if platform_tool_ids is not None:
+            if len(platform_tool_ids) == 0:
+                platform = []
+            else:
+                platform = (
+                    platform_query.filter(MCPToolConfig.id.in_(platform_tool_ids))
+                    .order_by(MCPToolConfig.name)
+                    .all()
+                )
+        else:
+            platform = platform_query.order_by(MCPToolConfig.name).all()
         for t in platform:
             name = f"platform_{t.id}_{_safe_slug(t.name)}" if _safe_slug(t.name) else f"platform_{t.id}"
             desc = TOOL_TYPE_DESC.get(t.tool_type.value, t.tool_type.value)
@@ -1156,9 +1183,17 @@ END DOCUMENT {i+1}: {doc_name}
             MCPServerConnection.user_id == business_id,
             MCPServerConnection.is_active == True,
         )
-        if connection_ids:
-            conn_query = conn_query.filter(MCPServerConnection.id.in_(connection_ids))
-        conns = conn_query.order_by(MCPServerConnection.name).all()
+        if connection_ids is not None:
+            if len(connection_ids) == 0:
+                conns = []
+            else:
+                conns = (
+                    conn_query.filter(MCPServerConnection.id.in_(connection_ids))
+                    .order_by(MCPServerConnection.name)
+                    .all()
+                )
+        else:
+            conns = conn_query.order_by(MCPServerConnection.name).all()
         for c in conns:
             creds = None
             if c.encrypted_credentials:

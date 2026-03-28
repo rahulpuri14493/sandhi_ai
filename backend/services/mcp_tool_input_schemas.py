@@ -25,6 +25,24 @@ def input_schema_for_platform_tool_type(tool_type: str) -> Dict[str, Any]:
         },
         "required": ["query"],
     }
+    pinecone_schema: Dict[str, Any] = {
+        "type": "object",
+        "properties": {
+            **dict(vector_schema["properties"]),
+            "namespace": {
+                "type": "string",
+                "description": "Pinecone namespace (omit for __default__).",
+            },
+            "fields": {
+                "description": "Field names to return from integrated text search (e.g. text, chunk_text). JSON array or comma-separated.",
+                "oneOf": [
+                    {"type": "array", "items": {"type": "string"}},
+                    {"type": "string"},
+                ],
+            },
+        },
+        "required": ["query"],
+    }
     # Strict: no extra keys — models often confuse job output_contract fields (write_mode, target) with SQL tools.
     sql_schema_interactive: Dict[str, Any] = {
         "type": "object",
@@ -91,7 +109,7 @@ def input_schema_for_platform_tool_type(tool_type: str) -> Dict[str, Any]:
     tt = (tool_type or "").strip().lower()
     schemas: Dict[str, Dict[str, Any]] = {
         "vector_db": vector_schema,
-        "pinecone": vector_schema,
+        "pinecone": pinecone_schema,
         "weaviate": vector_schema,
         "qdrant": vector_schema,
         "chroma": vector_schema,

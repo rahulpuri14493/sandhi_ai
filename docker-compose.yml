@@ -1,15 +1,36 @@
 services:
+  # Redis does not log individual GET/SET by default (would be extremely noisy).
+  # Set REDIS_LOGLEVEL=verbose in .env for more server messages, or enable profile redis-trace below.
   redis:
     image: redis:7-alpine
     container_name: sandhi-redis
     restart: unless-stopped
     ports:
       - "6379:6379"
+    environment:
+      REDIS_LOGLEVEL: ${REDIS_LOGLEVEL:-notice}
+    command: ["redis-server", "--loglevel", "${REDIS_LOGLEVEL:-notice}"]
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 5s
       timeout: 5s
       retries: 10
+
+  # Streams every Redis command to container logs (dev/debug only). Start with:
+  #   docker compose --profile redis-trace up -d
+  # Then: docker compose logs -f redis-command-trace
+  redis-command-trace:
+    image: redis:7-alpine
+    container_name: sandhi-redis-command-trace
+    profiles: ["redis-trace"]
+    restart: unless-stopped
+    depends_on:
+      redis:
+        condition: service_healthy
+    command:
+      - sh
+      - -c
+      - until redis-cli -h redis ping 2>/dev/null; do sleep 1; done; exec redis-cli -h redis MONITOR
 
   db:
     image: postgres:15-alpine
@@ -45,7 +66,8 @@ services:
       - "8000:8000"
     environment:
       DATABASE_URL: postgresql://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@db:5432/${POSTGRES_DB:-agent_marketplace}
-      UVICORN_RELOAD: ${UVICORN_RELOAD:-false}
+      # Hot-reload API when ./backend is bind-mounted (set UVICORN_RELOAD=false for production)
+      UVICORN_RELOAD: ${UVICORN_RELOAD:-true}
       A2A_ADAPTER_URL: http://a2a-openai-adapter:8080
       PLATFORM_MCP_SERVER_URL: http://platform-mcp-server:8081
       # Document storage backend: s3 (default) or local
@@ -98,11 +120,13 @@ services:
     container_name: sandhi-celery-worker
     init: true
     restart: unless-stopped
-    command: celery -A services.task_queue.celery_app worker --loglevel=info --concurrency=${CELERY_WORKER_CONCURRENCY:-4} --autoscale=${CELERY_WORKER_AUTOSCALE_MAX:-16},${CELERY_WORKER_AUTOSCALE_MIN:-2}
+    command: python run_celery_worker.py
     volumes:
       - ./backend:/app
     environment:
       DATABASE_URL: postgresql://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@db:5432/${POSTGRES_DB:-agent_marketplace}
+      # Restart worker when ./backend changes (set CELERY_AUTORELOAD=false for production)
+      CELERY_AUTORELOAD: ${CELERY_AUTORELOAD:-true}
       JOB_EXECUTION_BACKEND: ${JOB_EXECUTION_BACKEND:-celery}
       JOB_EXECUTION_STRICT_QUEUE: ${JOB_EXECUTION_STRICT_QUEUE:-false}
       CELERY_BROKER_URL: ${CELERY_BROKER_URL:-redis://redis:6379/0}
@@ -145,14 +169,21 @@ services:
     container_name: platform-mcp-server
     init: true
     restart: unless-stopped
+    command: python run.py
     ports:
       - "8081:8081"
     volumes:
+      # Live code (matches backend pattern); image COPY is overwritten at runtime
+      - ./tools/platform_mcp_server:/app
+      # Dockerfile copies this into /app; keep in sync when bind-mounting platform_mcp_server only
+      - ./backend/core/artifact_contract.py:/app/artifact_contract.py:ro
       # Same job artifact files as backend (local OBJECT_STORAGE_BACKEND) for platform writes
       - ./backend/uploads/jobs:/uploads/jobs:ro
     environment:
       BACKEND_INTERNAL_URL: http://backend:8000
       MCP_INTERNAL_SECRET: ${MCP_INTERNAL_SECRET:-dev-mcp-internal-secret}
+      PORT: "8081"
+      UVICORN_RELOAD: ${UVICORN_RELOAD:-true}
       ARTIFACT_UPLOAD_ROOT: /uploads/jobs
       S3_ENDPOINT_URL: ${S3_ENDPOINT_URL:-}
       S3_ACCESS_KEY_ID: ${S3_ACCESS_KEY_ID:-}
