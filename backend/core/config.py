@@ -100,5 +100,8 @@ class Settings(BaseSettings):
     RATE_LIMIT_AGENT_READS_PER_MINUTE: int = 1200
     # POST|PUT|PATCH|DELETE /api/jobs* (per IP)
     RATE_LIMIT_JOB_MUTATIONS_PER_MINUTE: int = 600
+    # When True, use leftmost X-Forwarded-For for the client IP (trusted reverse proxy only).
+    # Default False: ignore X-Forwarded-For so clients cannot spoof IPs and bypass limits.
+    RATE_LIMIT_TRUST_PROXY_HEADERS: bool = False
 
 settings = Settings()

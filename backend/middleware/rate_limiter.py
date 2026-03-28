@@ -22,9 +22,10 @@ class InMemoryRateLimitMiddleware(BaseHTTPMiddleware):
         self._buckets: Dict[str, Deque[float]] = defaultdict(deque)
 
     def _client_ip(self, request: Request) -> str:
-        forwarded = request.headers.get("x-forwarded-for")
-        if forwarded:
-            return forwarded.split(",")[0].strip()
+        if settings.RATE_LIMIT_TRUST_PROXY_HEADERS:
+            forwarded = request.headers.get("x-forwarded-for")
+            if forwarded:
+                return forwarded.split(",")[0].strip()
         if request.client and request.client.host:
             return request.client.host
         return "unknown"
@@ -49,6 +50,9 @@ class InMemoryRateLimitMiddleware(BaseHTTPMiddleware):
         q = self._buckets[bucket_key]
         while q and q[0] < window_start:
             q.popleft()
+        if not q:
+            self._buckets.pop(bucket_key, None)
+            q = self._buckets[bucket_key]
         if len(q) >= limit_per_minute:
             return True
         q.append(now)

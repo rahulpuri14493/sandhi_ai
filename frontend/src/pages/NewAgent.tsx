@@ -18,7 +18,6 @@ export default function NewAgentPage() {
     llm_model: 'gpt-4o-mini',
     temperature: 0.7,
     a2a_enabled: false,
-    status: 'pending',
   })
   const [newCapability, setNewCapability] = useState('')
   const [isLoading, setIsLoading] = useState(false)
@@ -82,7 +81,9 @@ export default function NewAgentPage() {
     setIsLoading(true)
     setError('')
     try {
-      await agentsAPI.create(formData)
+      // POST /api/agents uses AgentCreate — no `status` (server sets pending/active).
+      const { status: _ignored, ...payload } = formData
+      await agentsAPI.create(payload)
       navigate('/dashboard')
     } catch (err: any) {
       setError(err.response?.data?.detail || 'Failed to create agent')

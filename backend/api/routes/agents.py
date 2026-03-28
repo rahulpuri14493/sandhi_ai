@@ -551,7 +551,7 @@ async def test_agent_connection(
                 "status_code": 200,
                 "response_preview": None,
             }
-        except Exception:
+        except Exception as exc:
             logger.exception(
                 "A2A connection test failed for endpoint %s", test_request.api_endpoint
             )
@@ -559,7 +559,7 @@ async def test_agent_connection(
                 "success": False,
                 "message": "A2A connection failed",
                 "status_code": 500,
-                "response_preview": None,
+                "response_preview": str(exc)[:500],
             }
 
     # OpenAI-compatible: route through platform adapter so test uses same A2A path as execution
@@ -585,7 +585,7 @@ async def test_agent_connection(
                 "status_code": 200,
                 "response_preview": None,
             }
-        except Exception:
+        except Exception as exc:
             logger.exception(
                 "Connection test via adapter failed for endpoint %s",
                 test_request.api_endpoint,
@@ -594,7 +594,7 @@ async def test_agent_connection(
                 "success": False,
                 "message": "Connection failed (via adapter)",
                 "status_code": 500,
-                "response_preview": None,
+                "response_preview": str(exc)[:500],
             }
 
     # SSRF protection: validate URL before direct request (fallback path)

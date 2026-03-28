@@ -71,7 +71,6 @@ class TestE2EAgents:
             json={
                 "name": "New E2E Agent",
                 "description": "Created in e2e",
-                "status": "active",
                 "price_per_task": 5.0,
                 "price_per_communication": 0.5,
             },
