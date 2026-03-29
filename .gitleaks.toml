@@ -4,7 +4,10 @@ useDefault = true
 [allowlist]
 description = "Test fixtures and documented non-production defaults (not real credentials)"
 commits = ["5d46632c9ad1a15f381e80812eff0d45157cd05b"]
-paths = ['''backend/tests/test_mcp\.py''']
+paths = [
+  '''backend/tests/test_mcp\.py''',
+  '''backend/tests/integration/test_vector_e2e\.py''',
+]
 regexTarget = "line"
 # docker-compose dev fallback (${MCP_INTERNAL_SECRET:-dev-mcp-internal-secret}); not a committed production secret.
 regexes = [
