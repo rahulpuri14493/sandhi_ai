@@ -2,6 +2,8 @@
 import uuid
 from unittest.mock import AsyncMock, patch
 
+from core.config import settings as app_settings
+
 import pytest
 from fastapi.testclient import TestClient
 
@@ -9,6 +11,24 @@ from core.security import create_access_token, get_password_hash
 from db.database import get_db
 from main import app
 from models.user import User, UserRole
+from models.mcp_server import MCPToolConfig, MCPToolType
+from core.encryption import encrypt_json
+
+
+@pytest.fixture
+def mcp_snowflake_platform_tool(db_session, business_user):
+    """Snowflake MCP row for business_user; use platform_{id}_snowflake in payloads (id is not always 1)."""
+    row = MCPToolConfig(
+        user_id=business_user["user"].id,
+        name="snowflake",
+        tool_type=MCPToolType.SNOWFLAKE,
+        encrypted_config=encrypt_json({"account": "a", "user": "u", "password": "p"}),
+        is_active=True,
+    )
+    db_session.add(row)
+    db_session.commit()
+    db_session.refresh(row)
+    return row
 
 
 @pytest.fixture
@@ -452,12 +472,9 @@ class TestMCPCallPlatformTool:
 
     def test_call_platform_tool_not_configured_returns_503(self, client_mcp: TestClient, business_user):
         """When PLATFORM_MCP_SERVER_URL or MCP_INTERNAL_SECRET unset, returns 503."""
-        from core import config
-        orig_url = config.settings.PLATFORM_MCP_SERVER_URL
-        orig_secret = config.settings.MCP_INTERNAL_SECRET
-        config.settings.PLATFORM_MCP_SERVER_URL = ""
-        config.settings.MCP_INTERNAL_SECRET = ""
-        try:
+        with patch.object(app_settings, "PLATFORM_MCP_SERVER_URL", ""), patch.object(
+            app_settings, "MCP_INTERNAL_SECRET", ""
+        ):
             r = client_mcp.post(
                 "/api/mcp/call-platform-tool",
                 headers=business_user["headers"],
@@ -465,29 +482,17 @@ class TestMCPCallPlatformTool:
             )
             assert r.status_code == 503
             assert "not configured" in r.json().get("detail", "").lower()
-        finally:
-            config.settings.PLATFORM_MCP_SERVER_URL = orig_url
-            config.settings.MCP_INTERNAL_SECRET = orig_secret
 
     def test_call_platform_tool_rejects_oversized_arguments(self, client_mcp: TestClient, business_user):
-        from core import config
-        orig_url = config.settings.PLATFORM_MCP_SERVER_URL
-        orig_secret = config.settings.MCP_INTERNAL_SECRET
-        orig_max = getattr(config.settings, "MCP_TOOL_MAX_ARGUMENT_BYTES", 5242880)
-        config.settings.PLATFORM_MCP_SERVER_URL = "http://platform-mcp-server:8081"
-        config.settings.MCP_INTERNAL_SECRET = "x"
-        config.settings.MCP_TOOL_MAX_ARGUMENT_BYTES = 32
-        try:
+        with patch.object(app_settings, "PLATFORM_MCP_SERVER_URL", "http://platform-mcp-server:8081"), patch.object(
+            app_settings, "MCP_INTERNAL_SECRET", "x"
+        ), patch.object(app_settings, "MCP_TOOL_MAX_ARGUMENT_BYTES", 32):
             r = client_mcp.post(
                 "/api/mcp/call-platform-tool",
                 headers=business_user["headers"],
                 json={"tool_name": "platform_1_t", "arguments": {"payload": "x" * 1024}},
             )
             assert r.status_code == 413
-        finally:
-            config.settings.PLATFORM_MCP_SERVER_URL = orig_url
-            config.settings.MCP_INTERNAL_SECRET = orig_secret
-            config.settings.MCP_TOOL_MAX_ARGUMENT_BYTES = orig_max
 
     def test_call_platform_write_requires_merge_keys_for_upsert(self, client_mcp: TestClient, business_user):
         r = client_mcp.post(
@@ -505,20 +510,20 @@ class TestMCPCallPlatformTool:
         )
         assert r.status_code == 422
 
-    def test_call_platform_write_success_passes_normalized_arguments(self, client_mcp: TestClient, business_user):
-        from core import config
-        orig_url = config.settings.PLATFORM_MCP_SERVER_URL
-        orig_secret = config.settings.MCP_INTERNAL_SECRET
-        config.settings.PLATFORM_MCP_SERVER_URL = "http://platform-mcp-server:8081"
-        config.settings.MCP_INTERNAL_SECRET = "x"
-        try:
+    def test_call_platform_write_success_passes_normalized_arguments(
+        self, client_mcp: TestClient, business_user, mcp_snowflake_platform_tool
+    ):
+        pn = f"platform_{mcp_snowflake_platform_tool.id}_snowflake"
+        with patch.object(app_settings, "PLATFORM_MCP_SERVER_URL", "http://platform-mcp-server:8081"), patch.object(
+            app_settings, "MCP_INTERNAL_SECRET", "x"
+        ):
             with patch("services.mcp_client.call_tool", new_callable=AsyncMock) as mock_call:
                 mock_call.return_value = {"content": [{"type": "text", "text": "ok"}], "isError": False}
                 r = client_mcp.post(
                     "/api/mcp/call-platform-write",
                     headers=business_user["headers"],
                     json={
-                        "tool_name": "platform_1_snowflake",
+                        "tool_name": pn,
                         "artifact_ref": {"storage": "s3", "path": "jobs/1/out.parquet", "format": "parquet"},
                         "target": {
                             "target_type": "snowflake",
@@ -533,30 +538,27 @@ class TestMCPCallPlatformTool:
                         "idempotency_key": "idemkey1",
                     },
                 )
-            assert r.status_code == 200, r.text
-            called_kwargs = mock_call.await_args.kwargs
-            assert called_kwargs["tool_name"] == "platform_1_snowflake"
-            assert called_kwargs["arguments"]["operation_type"] == "upsert"
-            assert called_kwargs["arguments"]["merge_keys"] == ["customer_id", "as_of_date"]
-            assert called_kwargs["arguments"]["idempotency_key"] == "idemkey1"
-        finally:
-            config.settings.PLATFORM_MCP_SERVER_URL = orig_url
-            config.settings.MCP_INTERNAL_SECRET = orig_secret
+                assert r.status_code == 200, r.text
+                called_kwargs = mock_call.await_args.kwargs
+                assert called_kwargs["tool_name"] == pn
+                assert called_kwargs["arguments"]["operation_type"] == "upsert"
+                assert called_kwargs["arguments"]["merge_keys"] == ["customer_id", "as_of_date"]
+                assert called_kwargs["arguments"]["idempotency_key"] == "idemkey1"
 
-    def test_call_platform_write_async_returns_operation(self, client_mcp: TestClient, business_user):
-        from core import config
-        orig_url = config.settings.PLATFORM_MCP_SERVER_URL
-        orig_secret = config.settings.MCP_INTERNAL_SECRET
-        config.settings.PLATFORM_MCP_SERVER_URL = "http://platform-mcp-server:8081"
-        config.settings.MCP_INTERNAL_SECRET = "x"
-        try:
+    def test_call_platform_write_async_returns_operation(
+        self, client_mcp: TestClient, business_user, mcp_snowflake_platform_tool
+    ):
+        pn = f"platform_{mcp_snowflake_platform_tool.id}_snowflake"
+        with patch.object(app_settings, "PLATFORM_MCP_SERVER_URL", "http://platform-mcp-server:8081"), patch.object(
+            app_settings, "MCP_INTERNAL_SECRET", "x"
+        ):
             with patch("services.mcp_client.call_tool", new_callable=AsyncMock) as mock_call:
                 mock_call.return_value = {"content": [{"type": "text", "text": "ok"}], "isError": False}
                 r = client_mcp.post(
                     "/api/mcp/call-platform-write-async",
                     headers=business_user["headers"],
                     json={
-                        "tool_name": "platform_1_snowflake",
+                        "tool_name": pn,
                         "artifact_ref": {"storage": "s3", "path": "jobs/1/out.parquet", "format": "parquet"},
                         "target": {"target_type": "snowflake", "name": "analytics.kyc_decisions"},
                         "operation_type": "upsert",
@@ -565,29 +567,26 @@ class TestMCPCallPlatformTool:
                         "idempotency_key": "idemkey2",
                     },
                 )
-            assert r.status_code == 202, r.text
-            body = r.json()
-            assert body["operation_id"].startswith("op_")
-            assert body["status"] in ("accepted", "in_progress", "success")
-            # Poll operation endpoint
-            r2 = client_mcp.get(f"/api/mcp/operations/{body['operation_id']}", headers=business_user["headers"])
-            assert r2.status_code == 200
-            assert r2.json()["operation_id"] == body["operation_id"]
-        finally:
-            config.settings.PLATFORM_MCP_SERVER_URL = orig_url
-            config.settings.MCP_INTERNAL_SECRET = orig_secret
+                assert r.status_code == 202, r.text
+                body = r.json()
+                assert body["operation_id"].startswith("op_")
+                assert body["status"] in ("accepted", "in_progress", "success")
+                # Poll operation endpoint
+                r2 = client_mcp.get(f"/api/mcp/operations/{body['operation_id']}", headers=business_user["headers"])
+                assert r2.status_code == 200
+                assert r2.json()["operation_id"] == body["operation_id"]
 
-    def test_call_platform_write_async_idempotency_reuses_operation(self, client_mcp: TestClient, business_user):
-        from core import config
-        orig_url = config.settings.PLATFORM_MCP_SERVER_URL
-        orig_secret = config.settings.MCP_INTERNAL_SECRET
-        config.settings.PLATFORM_MCP_SERVER_URL = "http://platform-mcp-server:8081"
-        config.settings.MCP_INTERNAL_SECRET = "x"
-        try:
+    def test_call_platform_write_async_idempotency_reuses_operation(
+        self, client_mcp: TestClient, business_user, mcp_snowflake_platform_tool
+    ):
+        pn = f"platform_{mcp_snowflake_platform_tool.id}_snowflake"
+        with patch.object(app_settings, "PLATFORM_MCP_SERVER_URL", "http://platform-mcp-server:8081"), patch.object(
+            app_settings, "MCP_INTERNAL_SECRET", "x"
+        ):
             with patch("services.mcp_client.call_tool", new_callable=AsyncMock) as mock_call:
                 mock_call.return_value = {"content": [{"type": "text", "text": "ok"}], "isError": False}
                 payload = {
-                    "tool_name": "platform_1_snowflake",
+                    "tool_name": pn,
                     "artifact_ref": {"storage": "s3", "path": "jobs/1/out.parquet", "format": "parquet"},
                     "target": {"target_type": "snowflake", "name": "analytics.kyc_decisions"},
                     "operation_type": "upsert",
@@ -597,29 +596,24 @@ class TestMCPCallPlatformTool:
                 }
                 r1 = client_mcp.post("/api/mcp/call-platform-write-async", headers=business_user["headers"], json=payload)
                 r2 = client_mcp.post("/api/mcp/call-platform-write-async", headers=business_user["headers"], json=payload)
-            assert r1.status_code == 202
-            assert r2.status_code == 202
-            assert r1.json()["operation_id"] == r2.json()["operation_id"]
-        finally:
-            config.settings.PLATFORM_MCP_SERVER_URL = orig_url
-            config.settings.MCP_INTERNAL_SECRET = orig_secret
+                assert r1.status_code == 202
+                assert r2.status_code == 202
+                assert r1.json()["operation_id"] == r2.json()["operation_id"]
 
-    def test_call_platform_write_async_retries_then_succeeds(self, client_mcp: TestClient, business_user):
-        from core import config
-        orig_url = config.settings.PLATFORM_MCP_SERVER_URL
-        orig_secret = config.settings.MCP_INTERNAL_SECRET
-        orig_attempts = getattr(config.settings, "MCP_WRITE_OPERATION_MAX_ATTEMPTS", 3)
-        config.settings.PLATFORM_MCP_SERVER_URL = "http://platform-mcp-server:8081"
-        config.settings.MCP_INTERNAL_SECRET = "x"
-        config.settings.MCP_WRITE_OPERATION_MAX_ATTEMPTS = 3
-        try:
+    def test_call_platform_write_async_retries_then_succeeds(
+        self, client_mcp: TestClient, business_user, mcp_snowflake_platform_tool
+    ):
+        pn = f"platform_{mcp_snowflake_platform_tool.id}_snowflake"
+        with patch.object(app_settings, "PLATFORM_MCP_SERVER_URL", "http://platform-mcp-server:8081"), patch.object(
+            app_settings, "MCP_INTERNAL_SECRET", "x"
+        ), patch.object(app_settings, "MCP_WRITE_OPERATION_MAX_ATTEMPTS", 3):
             with patch("services.mcp_client.call_tool", new_callable=AsyncMock) as mock_call:
                 mock_call.side_effect = [RuntimeError("transient"), {"content": [{"type": "text", "text": "ok"}], "isError": False}]
                 r = client_mcp.post(
                     "/api/mcp/call-platform-write-async",
                     headers=business_user["headers"],
                     json={
-                        "tool_name": "platform_1_snowflake",
+                        "tool_name": pn,
                         "artifact_ref": {"storage": "s3", "path": "jobs/1/out.parquet", "format": "parquet"},
                         "target": {"target_type": "snowflake", "name": "analytics.kyc_decisions"},
                         "operation_type": "upsert",
@@ -628,23 +622,19 @@ class TestMCPCallPlatformTool:
                         "idempotency_key": "idemretry",
                     },
                 )
-            assert r.status_code == 202
-            op_id = r.json()["operation_id"]
-            r2 = client_mcp.get(f"/api/mcp/operations/{op_id}", headers=business_user["headers"])
-            assert r2.status_code == 200
-            assert r2.json()["status"] in ("success", "in_progress", "accepted")
-        finally:
-            config.settings.PLATFORM_MCP_SERVER_URL = orig_url
-            config.settings.MCP_INTERNAL_SECRET = orig_secret
-            config.settings.MCP_WRITE_OPERATION_MAX_ATTEMPTS = orig_attempts
+                assert r.status_code == 202
+                op_id = r.json()["operation_id"]
+                r2 = client_mcp.get(f"/api/mcp/operations/{op_id}", headers=business_user["headers"])
+                assert r2.status_code == 200
+                assert r2.json()["status"] in ("success", "in_progress", "accepted")
 
-    def test_call_platform_write_async_high_volume_submit_smoke(self, client_mcp: TestClient, business_user):
-        from core import config
-        orig_url = config.settings.PLATFORM_MCP_SERVER_URL
-        orig_secret = config.settings.MCP_INTERNAL_SECRET
-        config.settings.PLATFORM_MCP_SERVER_URL = "http://platform-mcp-server:8081"
-        config.settings.MCP_INTERNAL_SECRET = "x"
-        try:
+    def test_call_platform_write_async_high_volume_submit_smoke(
+        self, client_mcp: TestClient, business_user, mcp_snowflake_platform_tool
+    ):
+        pn = f"platform_{mcp_snowflake_platform_tool.id}_snowflake"
+        with patch.object(app_settings, "PLATFORM_MCP_SERVER_URL", "http://platform-mcp-server:8081"), patch.object(
+            app_settings, "MCP_INTERNAL_SECRET", "x"
+        ):
             with patch("services.mcp_client.call_tool", new_callable=AsyncMock) as mock_call:
                 mock_call.return_value = {"content": [{"type": "text", "text": "ok"}], "isError": False}
                 op_ids = set()
@@ -653,7 +643,7 @@ class TestMCPCallPlatformTool:
                         "/api/mcp/call-platform-write-async",
                         headers=business_user["headers"],
                         json={
-                            "tool_name": "platform_1_snowflake",
+                            "tool_name": pn,
                             "artifact_ref": {"storage": "s3", "path": f"jobs/1/out_{i}.parquet", "format": "parquet"},
                             "target": {"target_type": "snowflake", "name": "analytics.kyc_decisions"},
                             "operation_type": "upsert",
@@ -665,12 +655,9 @@ class TestMCPCallPlatformTool:
                     assert r.status_code == 202
                     op_ids.add(r.json()["operation_id"])
                 assert len(op_ids) == 20
-        finally:
-            config.settings.PLATFORM_MCP_SERVER_URL = orig_url
-            config.settings.MCP_INTERNAL_SECRET = orig_secret
 
     def test_call_platform_write_async_burst_submissions_with_mixed_idempotency(
-        self, client_mcp: TestClient, business_user
+        self, client_mcp: TestClient, business_user, mcp_snowflake_platform_tool
     ):
         """
         Burst submission resilience:
@@ -678,13 +665,10 @@ class TestMCPCallPlatformTool:
         - some share idempotency keys (should dedupe)
         - some have unique keys (should create unique ops)
         """
-        from core import config
-
-        orig_url = config.settings.PLATFORM_MCP_SERVER_URL
-        orig_secret = config.settings.MCP_INTERNAL_SECRET
-        config.settings.PLATFORM_MCP_SERVER_URL = "http://platform-mcp-server:8081"
-        config.settings.MCP_INTERNAL_SECRET = "x"
-        try:
+        pn = f"platform_{mcp_snowflake_platform_tool.id}_snowflake"
+        with patch.object(app_settings, "PLATFORM_MCP_SERVER_URL", "http://platform-mcp-server:8081"), patch.object(
+            app_settings, "MCP_INTERNAL_SECRET", "x"
+        ):
             with patch("services.mcp_client.call_tool", new_callable=AsyncMock) as mock_call:
                 mock_call.return_value = {"content": [{"type": "text", "text": "ok"}], "isError": False}
 
@@ -694,7 +678,7 @@ class TestMCPCallPlatformTool:
                 for i in range(10):
                     payloads.append(
                         {
-                            "tool_name": "platform_1_snowflake",
+                            "tool_name": pn,
                             "artifact_ref": {"storage": "s3", "path": f"jobs/1/shared_{i}.parquet", "format": "parquet"},
                             "target": {"target_type": "snowflake", "name": "analytics.kyc_decisions"},
                             "operation_type": "upsert",
@@ -706,7 +690,7 @@ class TestMCPCallPlatformTool:
                 for i in range(20):
                     payloads.append(
                         {
-                            "tool_name": "platform_1_snowflake",
+                            "tool_name": pn,
                             "artifact_ref": {"storage": "s3", "path": f"jobs/1/unique_{i}.parquet", "format": "parquet"},
                             "target": {"target_type": "snowflake", "name": "analytics.kyc_decisions"},
                             "operation_type": "upsert",
@@ -744,9 +728,6 @@ class TestMCPCallPlatformTool:
 
                 assert len(shared_op_ids) == 1
                 assert len(unique_op_ids) == 20
-        finally:
-            config.settings.PLATFORM_MCP_SERVER_URL = orig_url
-            config.settings.MCP_INTERNAL_SECRET = orig_secret
 
 
 

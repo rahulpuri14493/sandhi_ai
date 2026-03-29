@@ -1074,47 +1074,48 @@ def _execute_chroma(config: Dict[str, Any], arguments: Dict[str, Any]) -> str:
                         f"HTTP embed fallback: {embed_err}. "
                         "**chroma_embed_model** must be a Chroma Cloud id (e.g. Qwen/Qwen3-Embedding-0.6B), not an OpenAI model name."
                     )
-            # Self-hosted: optional local embed via OpenAI when the server has no embedding for query_texts
-            want_dim = None
-            try:
-                raw = config.get("embedding_dimension")
-                if raw is not None and str(raw).strip():
-                    want_dim = int(str(raw).strip())
-            except (TypeError, ValueError):
-                pass
-            vector = _embed_with_user_key(query_text, config, dimensions=want_dim)
-            if not vector:
-                reason = str(text_err).strip() or "collection may have no embedding function"
-                return (
-                    "Chroma (self-hosted): `query_texts` failed and no **OpenAI API key** is set for local embedding. "
-                    f"Details: {reason}. "
-                    "Add **OpenAI API key (for query embedding)** in this tool's config, or configure a default embedding on the collection in Chroma."
-                )
-            try:
-                result = coll.query(
-                    query_embeddings=[vector], n_results=top_k, include=_CHROMA_QUERY_INCLUDE
-                )
-            except Exception as dim_err:  # e.g. InvalidArgumentError: dimension 1024 vs 1536
-                err_str = str(dim_err)
-                match = re.search(r"dimension\s+of\s+(\d+)", err_str, re.IGNORECASE) or re.search(
-                    r"expecting\s+embedding\s+with\s+dimension\s+of\s+(\d+)", err_str, re.IGNORECASE
-                )
-                if match:
-                    want_dim = int(match.group(1))
-                    vector = _embed_with_user_key(query_text, config, dimensions=want_dim)
-                    if vector and len(vector) == want_dim:
-                        result = coll.query(
-                            query_embeddings=[vector],
-                            n_results=top_k,
-                            include=_CHROMA_QUERY_INCLUDE,
-                        )
+            else:
+                # Self-hosted only: optional local embed via OpenAI when the server has no embedding for query_texts
+                want_dim = None
+                try:
+                    raw = config.get("embedding_dimension")
+                    if raw is not None and str(raw).strip():
+                        want_dim = int(str(raw).strip())
+                except (TypeError, ValueError):
+                    pass
+                vector = _embed_with_user_key(query_text, config, dimensions=want_dim)
+                if not vector:
+                    reason = str(text_err).strip() or "collection may have no embedding function"
+                    return (
+                        "Chroma (self-hosted): `query_texts` failed and no **OpenAI API key** is set for local embedding. "
+                        f"Details: {reason}. "
+                        "Add **OpenAI API key (for query embedding)** in this tool's config, or configure a default embedding on the collection in Chroma."
+                    )
+                try:
+                    result = coll.query(
+                        query_embeddings=[vector], n_results=top_k, include=_CHROMA_QUERY_INCLUDE
+                    )
+                except Exception as dim_err:  # e.g. InvalidArgumentError: dimension 1024 vs 1536
+                    err_str = str(dim_err)
+                    match = re.search(r"dimension\s+of\s+(\d+)", err_str, re.IGNORECASE) or re.search(
+                        r"expecting\s+embedding\s+with\s+dimension\s+of\s+(\d+)", err_str, re.IGNORECASE
+                    )
+                    if match:
+                        want_dim = int(match.group(1))
+                        vector = _embed_with_user_key(query_text, config, dimensions=want_dim)
+                        if vector and len(vector) == want_dim:
+                            result = coll.query(
+                                query_embeddings=[vector],
+                                n_results=top_k,
+                                include=_CHROMA_QUERY_INCLUDE,
+                            )
+                        else:
+                            return (
+                                f"Chroma dimension mismatch: collection expects {want_dim}-dim embeddings. "
+                                f"Set **embedding_model** to a model that supports dimensions (e.g. text-embedding-3-small) and optionally **embedding_dimension** to {want_dim} in this tool's config."
+                            )
                     else:
-                        return (
-                            f"Chroma dimension mismatch: collection expects {want_dim}-dim embeddings. "
-                            f"Set **embedding_model** to a model that supports dimensions (e.g. text-embedding-3-small) and optionally **embedding_dimension** to {want_dim} in this tool's config."
-                        )
-                else:
-                    raise
+                        raise
         out = {
             "ids": result.get("ids", [[]])[0],
             "metadatas": result.get("metadatas", [[]])[0],

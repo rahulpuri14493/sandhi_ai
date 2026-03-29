@@ -843,7 +843,8 @@ function isChromaTrycloudUrl(raw: string | undefined): boolean {
     const h = parsed.hostname.toLowerCase()
     return h === 'trychroma.com' || h.endsWith('.trychroma.com')
   } catch {
-    return u.includes('trychroma.com')
+    // Unparseable input must not match via substring (CodeQL: incomplete URL substring sanitization).
+    return false
   }
 }
 

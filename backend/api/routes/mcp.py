@@ -112,6 +112,55 @@ def _normalize_platform_write_arguments(body: MCPPlatformWriteRequest) -> dict:
     }
 
 
+async def _invoke_platform_tool_call(
+    body: MCPPlatformToolCallRequest,
+    user_id: int,
+    db: Session,
+):
+    """
+    Shared implementation for platform tool invocation (HTTP route and call_platform_write).
+    Uses an explicit Session so callers never pass FastAPI Depends() placeholders by mistake.
+    """
+    from core.config import settings
+    if not settings.PLATFORM_MCP_SERVER_URL or not settings.MCP_INTERNAL_SECRET:
+        raise HTTPException(status_code=503, detail="Platform MCP server not configured")
+    payload_bytes = _estimate_json_size_bytes(body.arguments or {})
+    max_payload = max(1024, int(getattr(settings, "MCP_TOOL_MAX_ARGUMENT_BYTES", 5 * 1024 * 1024)))
+    if payload_bytes > max_payload:
+        raise HTTPException(
+            status_code=413,
+            detail=f"Tool arguments exceed max payload size ({payload_bytes} > {max_payload} bytes)",
+        )
+    _require_platform_tool_for_user(db, user_id, body.tool_name)
+    default_timeout = float(getattr(settings, "MCP_TOOL_DEFAULT_TIMEOUT_SECONDS", 60.0))
+    timeout = float(body.timeout_seconds or default_timeout)
+    max_timeout = float(getattr(settings, "MCP_TOOL_MAX_TIMEOUT_SECONDS", 300.0))
+    if timeout <= 0 or timeout > max_timeout:
+        raise HTTPException(
+            status_code=400,
+            detail=f"timeout_seconds must be > 0 and <= {max_timeout}",
+        )
+    from services.mcp_client import call_tool
+    base = settings.PLATFORM_MCP_SERVER_URL.rstrip("/")
+    extra_headers = {"X-MCP-Business-Id": str(user_id)}
+    try:
+        result = await call_tool(
+            base_url=base,
+            tool_name=body.tool_name,
+            arguments=body.arguments,
+            endpoint_path="/mcp",
+            extra_headers=extra_headers,
+            timeout=timeout,
+        )
+        return result
+    except Exception as e:
+        logger.exception("call_platform_tool failed tool_name=%s", body.tool_name)
+        raise HTTPException(
+            status_code=502,
+            detail=f"Platform tool call failed ({type(e).__name__})",
+        )
+
+
 def _run_platform_write_operation(operation_id: str, user_id: int) -> None:
     from services.mcp_client import call_tool
     from core.config import settings
@@ -684,50 +733,14 @@ async def call_platform_tool(
     Invoke a platform MCP tool by name (e.g. platform_1_MyDB).
     Backend calls the platform MCP server with X-MCP-Business-Id so tools are scoped to the current user.
     """
-    from core.config import settings
-    _require_platform_tool_for_user(db, current_user.id, body.tool_name)
-    if not settings.PLATFORM_MCP_SERVER_URL or not settings.MCP_INTERNAL_SECRET:
-        raise HTTPException(status_code=503, detail="Platform MCP server not configured")
-    payload_bytes = _estimate_json_size_bytes(body.arguments or {})
-    max_payload = max(1024, int(getattr(settings, "MCP_TOOL_MAX_ARGUMENT_BYTES", 5 * 1024 * 1024)))
-    if payload_bytes > max_payload:
-        raise HTTPException(
-            status_code=413,
-            detail=f"Tool arguments exceed max payload size ({payload_bytes} > {max_payload} bytes)",
-        )
-    default_timeout = float(getattr(settings, "MCP_TOOL_DEFAULT_TIMEOUT_SECONDS", 60.0))
-    timeout = float(body.timeout_seconds or default_timeout)
-    max_timeout = float(getattr(settings, "MCP_TOOL_MAX_TIMEOUT_SECONDS", 300.0))
-    if timeout <= 0 or timeout > max_timeout:
-        raise HTTPException(
-            status_code=400,
-            detail=f"timeout_seconds must be > 0 and <= {max_timeout}",
-        )
-    from services.mcp_client import call_tool
-    base = settings.PLATFORM_MCP_SERVER_URL.rstrip("/")
-    extra_headers = {"X-MCP-Business-Id": str(current_user.id)}
-    try:
-        result = await call_tool(
-            base_url=base,
-            tool_name=body.tool_name,
-            arguments=body.arguments,
-            endpoint_path="/mcp",
-            extra_headers=extra_headers,
-            timeout=timeout,
-        )
-        return result
-    except Exception as e:
-        logger.exception("call_platform_tool failed tool_name=%s", body.tool_name)
-        raise HTTPException(
-            status_code=502,
-            detail=f"Platform tool call failed ({type(e).__name__})",
-        )
+    return await _invoke_platform_tool_call(body, current_user.id, db)
 
 
 @router.post("/call-platform-write")
 async def call_platform_write(
     body: MCPPlatformWriteRequest,
     current_user: User = Depends(get_current_business_user),
+    db: Session = Depends(get_db),
 ):
     """
     Invoke a platform MCP write-capable tool with a normalized artifact-first contract.
@@ -745,7 +758,7 @@ async def call_platform_write(
         arguments=arguments,
         timeout_seconds=body.timeout_seconds,
     )
-    return await call_platform_tool(tool_call_body, current_user)
+    return await _invoke_platform_tool_call(tool_call_body, current_user.id, db)
 
 
 @router.post("/call-platform-write-async", response_model=MCPWriteOperationResponse, status_code=status.HTTP_202_ACCEPTED)
@@ -757,9 +770,9 @@ async def call_platform_write_async(
 ):
     """Submit write request as async operation and return operation_id for polling."""
     from core.config import settings
-    _require_platform_tool_for_user(db, current_user.id, body.tool_name)
     if not settings.PLATFORM_MCP_SERVER_URL or not settings.MCP_INTERNAL_SECRET:
         raise HTTPException(status_code=503, detail="Platform MCP server not configured")
+    _require_platform_tool_for_user(db, current_user.id, body.tool_name)
     if body.operation_type in ("upsert", "merge") and not body.merge_keys:
         raise HTTPException(status_code=422, detail="merge_keys are required when operation_type is upsert or merge")
 

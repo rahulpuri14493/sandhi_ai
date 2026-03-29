@@ -14,18 +14,11 @@ Flow:
 Run:
   pytest tests/integration/test_vector_e2e.py -m vector_e2e -v
 
-Env — Pinecone:
-  PINECONE_E2E_API_KEY, PINECONE_E2E_HOST (full https host URL)
-Env — Qdrant:
-  QDRANT_E2E_URL, QDRANT_E2E_COLLECTION, QDRANT_E2E_API_KEY,
-  optional QDRANT_E2E_EMBEDDING_MODEL (default text-embedding-3-small)
-Env — Chroma Cloud:
-  CHROMA_E2E_URL, CHROMA_E2E_API_KEY, CHROMA_E2E_COLLECTION (collection name in Chroma; stored as index_name in MCP config),
-  CHROMA_E2E_TENANT, CHROMA_E2E_DATABASE
-  Aliases: CHROMA_E2E_COLLECTION_NAME, CHROMA_E2E_INDEX_NAME
-Env — Weaviate:
-  WEAVIATE_E2E_URL, WEAVIATE_E2E_CLASS, WEAVIATE_E2E_API_KEY (for WCD)
-  optional WEAVIATE_E2E_CLUSTER_NAME
+Env (names only; values never belong in git — use `.env` or CI secrets):
+  Pinecone: host URL + provider credential under PINECONE_E2E_* (see repo `.env.example`).
+  Qdrant: URL, collection, credential, optional embedding model (QDRANT_E2E_*).
+  Chroma Cloud: URL, tenant, database, credential; collection via CHROMA_E2E_ + COLLECTION / COLLECTION_NAME / INDEX_NAME.
+  Weaviate: URL, class, credential for WCD (WEAVIATE_E2E_*); optional cluster name.
 
 Shared for API tests:
   monkeypatch sets PLATFORM_MCP_SERVER_URL / MCP_INTERNAL_SECRET so the route is allowed (values unused when call_tool is patched).
@@ -37,6 +30,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import secrets
 import sys
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -196,7 +190,7 @@ def _patch_platform_settings(monkeypatch):
     import core.config as cc
 
     monkeypatch.setattr(cc.settings, "PLATFORM_MCP_SERVER_URL", "http://vector-e2e-placeholder", raising=False)
-    monkeypatch.setattr(cc.settings, "MCP_INTERNAL_SECRET", "e2e-test-secret", raising=False)
+    monkeypatch.setattr(cc.settings, "MCP_INTERNAL_SECRET", secrets.token_hex(16), raising=False)
 
 
 @pytest.fixture
