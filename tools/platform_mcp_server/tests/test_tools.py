@@ -16,7 +16,44 @@ import pytest
 
 import execution
 import execution_common
-from app import execute_platform_tool
+from app import (
+    _chroma_sender_from_metadata,
+    _host_is_weaviate_cloud,
+    _pinecone_normalize_result,
+    _resolve_chroma_cloud_http_embed_model,
+    execute_platform_tool,
+)
+
+
+class TestChromaSenderMetadata:
+    def test_from_field_case_insensitive(self):
+        v, k = _chroma_sender_from_metadata({"From": "a@b.com"})
+        assert v == "a@b.com"
+        assert k == "from"
+
+    def test_priority_prefers_from_over_user_id(self):
+        v, k = _chroma_sender_from_metadata({"user_id": "99", "from": "x@y.com"})
+        assert v == "x@y.com"
+        assert k == "from"
+
+
+class TestChromaCloudHttpEmbedModel:
+    def test_defaults_to_qwen_when_openai_name_in_config(self):
+        assert (
+            _resolve_chroma_cloud_http_embed_model(
+                {"chroma_embed_model": "text-embedding-3-small"}
+            )
+            == "Qwen/Qwen3-Embedding-0.6B"
+        )
+
+    def test_whitespace_only_chroma_field_ignored(self):
+        assert _resolve_chroma_cloud_http_embed_model({"chroma_embed_model": "   "}) == "Qwen/Qwen3-Embedding-0.6B"
+
+    def test_valid_bge_from_embedding_model_field(self):
+        assert (
+            _resolve_chroma_cloud_http_embed_model({"embedding_model": "BAAI/bge-m3"})
+            == "BAAI/bge-m3"
+        )
 
 
 class TestArtifactObjectBasename:
@@ -445,6 +482,93 @@ class TestPinecone:
         out = execute_platform_tool("pinecone", {"api_key": "x", "host": "https://x.pinecone.io"}, {})
         assert "Error:" in out
         assert "query is required" in out.lower()
+
+
+class TestPineconeNormalizeResult:
+    """Integrated search often nests hits under .result; metadata lives in .fields."""
+
+    def test_sdk_object_nested_result_hits_with_fields(self):
+        class Hit:
+            _id = "1"
+            _score = 0.3422
+            fields = {"text": "How are you Rahul"}
+
+        class Inner:
+            hits = [Hit()]
+
+        class Resp:
+            result = Inner()
+            namespace = "__default__"
+
+        data = json.loads(_pinecone_normalize_result(Resp(), "__default__"))
+        assert len(data["matches"]) == 1
+        assert data["matches"][0]["id"] == "1"
+        assert data["matches"][0]["score"] == 0.3422
+        assert data["matches"][0]["metadata"]["text"] == "How are you Rahul"
+
+    def test_dict_nested_result_hits(self):
+        payload = {
+            "result": {
+                "hits": [{"_id": "1", "_score": 0.5, "fields": {"text": "hello"}}],
+            },
+            "namespace": "__default__",
+        }
+        data = json.loads(_pinecone_normalize_result(payload, None))
+        assert data["matches"][0]["metadata"]["text"] == "hello"
+
+    def test_query_style_matches_with_metadata(self):
+        class Match:
+            id = "a"
+            score = 0.9
+            metadata = {"title": "doc"}
+
+        class Resp:
+            matches = [Match()]
+
+        data = json.loads(_pinecone_normalize_result(Resp(), "ns"))
+        assert data["namespace"] == "ns"
+        assert data["matches"][0]["id"] == "a"
+        assert data["matches"][0]["metadata"]["title"] == "doc"
+
+    def test_sdk_model_dump_nested_result_hits(self):
+        """OpenAPI-style objects often only expose hits after model_dump()."""
+
+        class FakeSearchRecordsResponse:
+            def model_dump(self, **kwargs):
+                return {
+                    "usage": {"read_units": 1},
+                    "result": {
+                        "hits": [
+                            {
+                                "_id": "1",
+                                "_score": 0.3422,
+                                "fields": {"text": "How are you Rahul"},
+                            }
+                        ]
+                    },
+                }
+
+        data = json.loads(_pinecone_normalize_result(FakeSearchRecordsResponse(), "__default__"))
+        assert len(data["matches"]) == 1
+        assert data["matches"][0]["metadata"]["text"] == "How are you Rahul"
+
+    def test_openapi_actual_instance_unwrap(self):
+        class Inner:
+            def model_dump(self, **kwargs):
+                return {"result": {"hits": [{"_id": "z", "_score": 0.1, "fields": {"text": "x"}}]}}
+
+        class Wrapper:
+            actual_instance = Inner()
+
+        data = json.loads(_pinecone_normalize_result(Wrapper(), None))
+        assert data["matches"][0]["id"] == "z"
+
+
+class TestWeaviateCloudHostDetection:
+    def test_gcp_weaviate_cloud_hostname(self):
+        assert _host_is_weaviate_cloud("lnpwt5uask2gdni7dvowng.c0.asia-southeast1.gcp.weaviate.cloud")
+        assert _host_is_weaviate_cloud("xxx.weaviate.io")
+        assert not _host_is_weaviate_cloud("localhost")
 
 
 class TestWeaviate:

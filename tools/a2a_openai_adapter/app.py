@@ -23,6 +23,7 @@ import logging
 import os
 import socket
 import sys
+import time
 from contextlib import asynccontextmanager
 from typing import Any, Dict, List
 from urllib.parse import urlparse, urlunparse
@@ -94,6 +95,46 @@ def health():
     return {"status": "ok", "openai_configured": bool(OPENAI_URL_DEFAULT)}
 
 
+def _is_transient_dns_error(exc: BaseException) -> bool:
+    """True for resolver blips (Docker / flaky DNS); false for unknown host, etc."""
+    if not isinstance(exc, socket.gaierror):
+        return False
+    msg = str(exc).lower()
+    if "temporary failure" in msg or "try again" in msg:
+        return True
+    errno = getattr(exc, "errno", None)
+    if errno == -3:
+        return True
+    eai_again = getattr(socket, "EAI_AGAIN", None)
+    return eai_again is not None and errno == eai_again
+
+
+def _getaddrinfo_with_retry(hostname: str, *, attempts: int = 4) -> list:
+    """
+    Resolve hostname for SSRF checks. Retries transient failures — getaddrinfo
+    can raise EAI_AGAIN / -3 in containers when DNS is momentarily unavailable.
+    """
+    last: socket.gaierror | None = None
+    for attempt in range(attempts):
+        try:
+            return socket.getaddrinfo(hostname, None)
+        except socket.gaierror as e:
+            last = e
+            if attempt < attempts - 1 and _is_transient_dns_error(e):
+                # Log only attempt/errno — never log hostname or full exception (CodeQL: clear-text sensitive data).
+                logger.info(
+                    "DNS lookup retry after transient resolver error (attempt %s/%s, errno=%s)",
+                    attempt + 1,
+                    attempts,
+                    getattr(e, "errno", None),
+                )
+                time.sleep(0.12 * (2**attempt))
+                continue
+            raise
+    assert last is not None
+    raise last
+
+
 def _validate_openai_url(url: str) -> str:
     """
     SSRF mitigation: http/https only; when OPENAI_COMPATIBLE_URL is set, hostname must
@@ -121,7 +162,7 @@ def _validate_openai_url(url: str) -> str:
             raise ValueError("OpenAI URL hostname is not allowed")
 
     try:
-        addrinfo = socket.getaddrinfo(hostname, None)
+        addrinfo = _getaddrinfo_with_retry(hostname)
     except socket.gaierror:
         raise ValueError("Unable to resolve OpenAI URL hostname.")
 
@@ -163,7 +204,7 @@ def _validate_outbound_url(url: str) -> str:
         raise ValueError("Outbound URL must include a hostname")
 
     try:
-        addrinfo = socket.getaddrinfo(parsed.hostname, None)
+        addrinfo = _getaddrinfo_with_retry(parsed.hostname)
     except socket.gaierror:
         raise ValueError("Unable to resolve outbound URL hostname")
 

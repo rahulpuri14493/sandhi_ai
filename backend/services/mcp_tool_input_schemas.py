@@ -25,6 +25,56 @@ def input_schema_for_platform_tool_type(tool_type: str) -> Dict[str, Any]:
         },
         "required": ["query"],
     }
+    weaviate_schema: Dict[str, Any] = {
+        "type": "object",
+        "properties": {
+            "query": {
+                "type": "string",
+                "description": (
+                    "Search text: uses Weaviate near_text when the collection has a server vectorizer, "
+                    "else BM25 keyword search when text properties are indexed, "
+                    "else near_vector if openai_api_key is set on this tool."
+                ),
+            },
+            "top_k": dict(vector_schema["properties"]["top_k"]),
+        },
+        "required": ["query"],
+    }
+    pinecone_schema: Dict[str, Any] = {
+        "type": "object",
+        "properties": {
+            **dict(vector_schema["properties"]),
+            "namespace": {
+                "type": "string",
+                "description": "Pinecone namespace (omit for __default__).",
+            },
+            "fields": {
+                "description": "Field names to return from integrated text search (e.g. text, chunk_text). JSON array or comma-separated.",
+                "oneOf": [
+                    {"type": "array", "items": {"type": "string"}},
+                    {"type": "string"},
+                ],
+            },
+        },
+        "required": ["query"],
+    }
+    chroma_schema: Dict[str, Any] = {
+        "type": "object",
+        "properties": {
+            "query": {
+                "type": "string",
+                "description": (
+                    "Text to search for (vector similarity, not guaranteed exact keyword/email match). "
+                    "In the tool result, use each match's **sender** and **metadata** to identify who a message is from. "
+                    "On **Chroma Cloud**, the server embeds the query (same as the dashboard; e.g. Qwen)—no OpenAI key needed "
+                    "for that path. On **self-hosted** Chroma without server embedding, configure **openai_api_key** on this tool. "
+                    "Ensure the tool's collection name matches the Chroma UI exactly."
+                ),
+            },
+            "top_k": dict(vector_schema["properties"]["top_k"]),
+        },
+        "required": ["query"],
+    }
     # Strict: no extra keys — models often confuse job output_contract fields (write_mode, target) with SQL tools.
     sql_schema_interactive: Dict[str, Any] = {
         "type": "object",
@@ -91,10 +141,10 @@ def input_schema_for_platform_tool_type(tool_type: str) -> Dict[str, Any]:
     tt = (tool_type or "").strip().lower()
     schemas: Dict[str, Dict[str, Any]] = {
         "vector_db": vector_schema,
-        "pinecone": vector_schema,
-        "weaviate": vector_schema,
+        "pinecone": pinecone_schema,
+        "weaviate": weaviate_schema,
         "qdrant": vector_schema,
-        "chroma": vector_schema,
+        "chroma": chroma_schema,
         "postgres": sql_schema_interactive,
         "mysql": sql_schema_interactive,
         "sqlserver": sql_schema,

@@ -33,9 +33,30 @@ from schemas.mcp import (
 from core.security import get_current_business_user
 from core.encryption import encrypt_json, decrypt_json
 from db.database import SessionLocal
+from services.mcp_platform_naming import platform_tool_id_from_mcp_function_name
 
 router = APIRouter(prefix="/api/mcp", tags=["mcp"])
 logger = logging.getLogger(__name__)
+
+
+def _require_platform_tool_for_user(db: Session, user_id: int, tool_name: str) -> None:
+    """Reject tool calls unless the platform tool id in tool_name belongs to this tenant."""
+    pid = platform_tool_id_from_mcp_function_name(tool_name)
+    if pid is None:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="tool_name must be a platform tool (e.g. platform_5_MyIndex)",
+        )
+    t = db.query(MCPToolConfig).filter(
+        MCPToolConfig.id == pid,
+        MCPToolConfig.user_id == user_id,
+        MCPToolConfig.is_active == True,
+    ).first()
+    if not t:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Platform tool not found for this account",
+        )
 
 
 def _estimate_json_size_bytes(data: dict) -> int:
@@ -89,6 +110,55 @@ def _normalize_platform_write_arguments(body: MCPPlatformWriteRequest) -> dict:
         "idempotency_key": body.idempotency_key,
         "options": body.options or {},
     }
+
+
+async def _invoke_platform_tool_call(
+    body: MCPPlatformToolCallRequest,
+    user_id: int,
+    db: Session,
+):
+    """
+    Shared implementation for platform tool invocation (HTTP route and call_platform_write).
+    Uses an explicit Session so callers never pass FastAPI Depends() placeholders by mistake.
+    """
+    from core.config import settings
+    if not settings.PLATFORM_MCP_SERVER_URL or not settings.MCP_INTERNAL_SECRET:
+        raise HTTPException(status_code=503, detail="Platform MCP server not configured")
+    payload_bytes = _estimate_json_size_bytes(body.arguments or {})
+    max_payload = max(1024, int(getattr(settings, "MCP_TOOL_MAX_ARGUMENT_BYTES", 5 * 1024 * 1024)))
+    if payload_bytes > max_payload:
+        raise HTTPException(
+            status_code=413,
+            detail=f"Tool arguments exceed max payload size ({payload_bytes} > {max_payload} bytes)",
+        )
+    _require_platform_tool_for_user(db, user_id, body.tool_name)
+    default_timeout = float(getattr(settings, "MCP_TOOL_DEFAULT_TIMEOUT_SECONDS", 60.0))
+    timeout = float(body.timeout_seconds or default_timeout)
+    max_timeout = float(getattr(settings, "MCP_TOOL_MAX_TIMEOUT_SECONDS", 300.0))
+    if timeout <= 0 or timeout > max_timeout:
+        raise HTTPException(
+            status_code=400,
+            detail=f"timeout_seconds must be > 0 and <= {max_timeout}",
+        )
+    from services.mcp_client import call_tool
+    base = settings.PLATFORM_MCP_SERVER_URL.rstrip("/")
+    extra_headers = {"X-MCP-Business-Id": str(user_id)}
+    try:
+        result = await call_tool(
+            base_url=base,
+            tool_name=body.tool_name,
+            arguments=body.arguments,
+            endpoint_path="/mcp",
+            extra_headers=extra_headers,
+            timeout=timeout,
+        )
+        return result
+    except Exception as e:
+        logger.exception("call_platform_tool failed tool_name=%s", body.tool_name)
+        raise HTTPException(
+            status_code=502,
+            detail=f"Platform tool call failed ({type(e).__name__})",
+        )
 
 
 def _run_platform_write_operation(operation_id: str, user_id: int) -> None:
@@ -500,7 +570,30 @@ def get_tool(
     ).first()
     if not t:
         raise HTTPException(status_code=404, detail="Tool config not found")
-    return _tool_to_response(t)
+    base = _tool_to_response(t)
+    if not t.encrypted_config:
+        return base
+    try:
+        cfg = decrypt_json(t.encrypted_config)
+    except Exception:
+        return base
+    if not isinstance(cfg, dict):
+        return base
+    updates: dict = {}
+    if t.tool_type == MCPToolType.CHROMA:
+        url = cfg.get("url")
+        if isinstance(url, str) and url.strip():
+            updates["chroma_url_preview"] = url.strip()[:2048]
+    if t.tool_type == MCPToolType.WEAVIATE:
+        c = cfg.get("weaviate_cluster_name") or cfg.get("cluster_name")
+        if isinstance(c, str) and c.strip():
+            updates["weaviate_cluster_preview"] = c.strip()[:256]
+        idx = cfg.get("index_name") or cfg.get("class_name")
+        if isinstance(idx, str) and idx.strip():
+            updates["weaviate_class_preview"] = idx.strip()[:512]
+    if updates:
+        return base.model_copy(update=updates)
+    return base
 
 
 @router.patch("/tools/{tool_id}", response_model=MCPToolConfigResponse)
@@ -634,54 +727,20 @@ async def mcp_proxy(
 async def call_platform_tool(
     body: MCPPlatformToolCallRequest,
     current_user: User = Depends(get_current_business_user),
+    db: Session = Depends(get_db),
 ):
     """
     Invoke a platform MCP tool by name (e.g. platform_1_MyDB).
     Backend calls the platform MCP server with X-MCP-Business-Id so tools are scoped to the current user.
     """
-    from core.config import settings
-    if not settings.PLATFORM_MCP_SERVER_URL or not settings.MCP_INTERNAL_SECRET:
-        raise HTTPException(status_code=503, detail="Platform MCP server not configured")
-    payload_bytes = _estimate_json_size_bytes(body.arguments or {})
-    max_payload = max(1024, int(getattr(settings, "MCP_TOOL_MAX_ARGUMENT_BYTES", 5 * 1024 * 1024)))
-    if payload_bytes > max_payload:
-        raise HTTPException(
-            status_code=413,
-            detail=f"Tool arguments exceed max payload size ({payload_bytes} > {max_payload} bytes)",
-        )
-    default_timeout = float(getattr(settings, "MCP_TOOL_DEFAULT_TIMEOUT_SECONDS", 60.0))
-    timeout = float(body.timeout_seconds or default_timeout)
-    max_timeout = float(getattr(settings, "MCP_TOOL_MAX_TIMEOUT_SECONDS", 300.0))
-    if timeout <= 0 or timeout > max_timeout:
-        raise HTTPException(
-            status_code=400,
-            detail=f"timeout_seconds must be > 0 and <= {max_timeout}",
-        )
-    from services.mcp_client import call_tool
-    base = settings.PLATFORM_MCP_SERVER_URL.rstrip("/")
-    extra_headers = {"X-MCP-Business-Id": str(current_user.id)}
-    try:
-        result = await call_tool(
-            base_url=base,
-            tool_name=body.tool_name,
-            arguments=body.arguments,
-            endpoint_path="/mcp",
-            extra_headers=extra_headers,
-            timeout=timeout,
-        )
-        return result
-    except Exception as e:
-        logger.exception("call_platform_tool failed tool_name=%s", body.tool_name)
-        raise HTTPException(
-            status_code=502,
-            detail=f"Platform tool call failed ({type(e).__name__})",
-        )
+    return await _invoke_platform_tool_call(body, current_user.id, db)
 
 
 @router.post("/call-platform-write")
 async def call_platform_write(
     body: MCPPlatformWriteRequest,
     current_user: User = Depends(get_current_business_user),
+    db: Session = Depends(get_db),
 ):
     """
     Invoke a platform MCP write-capable tool with a normalized artifact-first contract.
@@ -699,7 +758,7 @@ async def call_platform_write(
         arguments=arguments,
         timeout_seconds=body.timeout_seconds,
     )
-    return await call_platform_tool(tool_call_body, current_user)
+    return await _invoke_platform_tool_call(tool_call_body, current_user.id, db)
 
 
 @router.post("/call-platform-write-async", response_model=MCPWriteOperationResponse, status_code=status.HTTP_202_ACCEPTED)
@@ -713,6 +772,7 @@ async def call_platform_write_async(
     from core.config import settings
     if not settings.PLATFORM_MCP_SERVER_URL or not settings.MCP_INTERNAL_SECRET:
         raise HTTPException(status_code=503, detail="Platform MCP server not configured")
+    _require_platform_tool_for_user(db, current_user.id, body.tool_name)
     if body.operation_type in ("upsert", "merge") and not body.merge_keys:
         raise HTTPException(status_code=422, detail="merge_keys are required when operation_type is upsert or merge")
 

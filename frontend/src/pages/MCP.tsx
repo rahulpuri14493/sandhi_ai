@@ -383,7 +383,18 @@ export default function MCPPage() {
           tools={tools}
           onBack={() => setView('choose')}
           onAdd={() => { setEditTool(null); setView('configure'); setError(null); }}
-          onEdit={(tool) => { setEditTool(tool); setView('configure'); setError(null); }}
+          onEdit={async (tool) => {
+            setError(null)
+            try {
+              const full = await mcpAPI.getTool(tool.id)
+              setEditTool(full)
+            } catch (err: unknown) {
+              const detail = (err as { response?: { data?: { detail?: string } } })?.response?.data?.detail
+              setError(detail ?? 'Could not load tool details; open the form to re-enter the Chroma URL.')
+              setEditTool(tool)
+            }
+            setView('configure')
+          }}
           onRefresh={loadTools}
           onError={setError}
         />
@@ -823,6 +834,20 @@ const TOOL_OPTIONS_GROUPS: { label: string; options: { value: string; label: str
   ]},
 ]
 
+/** True when Chroma URL points at Chroma Cloud (aligns with platform MCP server). */
+function isChromaTrycloudUrl(raw: string | undefined): boolean {
+  const u = (raw ?? '').trim().toLowerCase()
+  if (!u) return false
+  try {
+    const parsed = u.includes('://') ? new URL(u) : new URL(`https://${u}`)
+    const h = parsed.hostname.toLowerCase()
+    return h === 'trychroma.com' || h.endsWith('.trychroma.com')
+  } catch {
+    // Unparseable input must not match via substring (CodeQL: incomplete URL substring sanitization).
+    return false
+  }
+}
+
 function ConfigureFlow({
   editTool,
   onBack,
@@ -865,7 +890,19 @@ function ConfigureFlow({
       setName(editTool.name)
       setToolType(editTool.tool_type)
       setBusinessDescription(editTool.business_description ?? '')
-      setConfig({})
+      const init: Record<string, string> = {}
+      if (editTool.tool_type === 'chroma' && editTool.chroma_url_preview?.trim()) {
+        init.url = editTool.chroma_url_preview.trim()
+      }
+      if (editTool.tool_type === 'weaviate') {
+        if (editTool.weaviate_cluster_preview?.trim()) {
+          init.weaviate_cluster_name = editTool.weaviate_cluster_preview.trim()
+        }
+        if (editTool.weaviate_class_preview?.trim()) {
+          init.index_name = editTool.weaviate_class_preview.trim()
+        }
+      }
+      setConfig(init)
     } else {
       setName('')
       setBusinessDescription('')
@@ -889,9 +926,47 @@ function ConfigureFlow({
       { key: 'embedding_model', label: 'Embedding model (optional)', placeholder: 'text-embedding-3-small' },
     ],
     weaviate: [
-      { key: 'api_key', label: 'Weaviate API key (optional)', placeholder: '', secret: true },
-      { key: 'url', label: 'Weaviate URL', placeholder: 'http://localhost:8080' },
-      { key: 'index_name', label: 'Class name (optional)', placeholder: 'Document' },
+      {
+        key: 'api_key',
+        label: 'Weaviate API key',
+        placeholder: 'Required for Weaviate Cloud (*.weaviate.cloud); optional for local Docker',
+        secret: true,
+      },
+      {
+        key: 'url',
+        label: 'Weaviate URL',
+        placeholder:
+          'Docker: http://host.docker.internal:8080 if Weaviate runs on host; or https://xxx.weaviate.cloud for WCD',
+      },
+      {
+        key: 'weaviate_cluster_name',
+        label: 'Cluster name (Weaviate Cloud)',
+        placeholder:
+          'Optional: WCD sandbox/display name (e.g. rahul). Does not replace collection name — for your reference and agent context only.',
+      },
+      {
+        key: 'index_name',
+        label: 'Collection / class name',
+        placeholder: 'Exact Weaviate class, e.g. SampleWebsites (from console or GET /v1/schema)',
+      },
+      {
+        key: 'weaviate_skip_init_checks',
+        label: 'Skip startup readiness check (optional)',
+        placeholder: 'true — if queries fail with WeaviateStartUpError from this server',
+        secret: false,
+      },
+      {
+        key: 'weaviate_init_timeout_seconds',
+        label: 'Connection init timeout seconds (optional)',
+        placeholder: 'Default 45 — increase if Docker/cloud is slow (max 180)',
+        secret: false,
+      },
+      {
+        key: 'weaviate_trust_env',
+        label: 'Trust HTTP_PROXY from environment (optional)',
+        placeholder: 'true — if Weaviate is reached via corporate proxy',
+        secret: false,
+      },
       { key: 'openai_api_key', label: 'OpenAI API key (optional, for embedding)', placeholder: 'If collection has no vectorizer', secret: true },
       { key: 'embedding_model', label: 'Embedding model (optional)', placeholder: 'text-embedding-3-small' },
     ],
@@ -903,13 +978,48 @@ function ConfigureFlow({
       { key: 'embedding_model', label: 'Model (must match collection)', placeholder: 'e.g. sentence-transformers/all-minilm-l6-v2 or intfloat/multilingual-e5-small', secret: false },
     ],
     chroma: [
-      { key: 'url', label: 'Chroma URL', placeholder: 'http://localhost:8000 or https://api.trychroma.com for Cloud', secret: false },
-      { key: 'api_key', label: 'Chroma API key (for Cloud)', placeholder: 'Create in Chroma Cloud → Settings', secret: true },
+      {
+        key: 'url',
+        label: 'Chroma URL',
+        placeholder:
+          'Self-hosted: http://host:8000 (HTTPS respected). Chroma Cloud: use host api.trychroma.com (HTTPS) so the platform uses CloudClient.',
+        secret: false,
+      },
+      {
+        key: 'api_key',
+        label: 'Chroma API key',
+        placeholder: 'Chroma Cloud key, or self-hosted X-Chroma-Token if auth is enabled',
+        secret: true,
+      },
       { key: 'tenant', label: 'Tenant ID (Chroma Cloud)', placeholder: 'e.g. c555ee60-feab-4407-82b2-c272fcf9fbd0', secret: false },
       { key: 'database', label: 'Database name (Chroma Cloud)', placeholder: 'e.g. dev', secret: false },
-      { key: 'index_name', label: 'Collection name (optional)', placeholder: 'default' },
-      { key: 'openai_api_key', label: 'OpenAI API key (optional, for embedding)', placeholder: 'If collection has no embedding function', secret: true },
-      { key: 'embedding_model', label: 'Embedding model (optional)', placeholder: 'text-embedding-3-small' },
+      {
+        key: 'index_name',
+        label: 'Collection name',
+        placeholder: 'Exact name from Chroma UI, e.g. customer-support-messages',
+        secret: false,
+      },
+      {
+        key: 'openai_api_key',
+        label: 'OpenAI API key (self-hosted fallback only)',
+        placeholder:
+          'Chroma Cloud: usually leave empty (dashboard uses server models like Qwen). Self-hosted without query embedding: add key here.',
+        secret: true,
+      },
+      {
+        key: 'embedding_model',
+        label: 'Embedding model (optional)',
+        placeholder:
+          'Self-hosted + OpenAI fallback only (e.g. text-embedding-3-small). Not used for Chroma Cloud HTTP embed.',
+        secret: false,
+      },
+      {
+        key: 'chroma_embed_model',
+        label: 'Chroma Cloud embed model id (optional)',
+        placeholder:
+          'HuggingFace id from Chroma UI only, e.g. Qwen/Qwen3-Embedding-0.6B — not OpenAI model names',
+        secret: false,
+      },
     ],
     postgres: [
       { key: 'connection_string', label: 'Connection string', placeholder: 'postgresql://user:pass@host:5432/db', secret: true },
@@ -1012,11 +1122,19 @@ function ConfigureFlow({
     ],
   }
 
-  const fields = configFields[toolType] ?? configFields.vector_db
+  const baseFields = configFields[toolType] ?? configFields.vector_db
+  const visibleFields =
+    toolType === 'chroma'
+      ? baseFields.filter(
+          (f) =>
+            !isChromaTrycloudUrl(config.url) ||
+            (f.key !== 'openai_api_key' && f.key !== 'embedding_model'),
+        )
+      : baseFields
 
   const buildConfigPayload = (): Record<string, unknown> => {
     const payload: Record<string, unknown> = {}
-    fields.forEach((f) => {
+    visibleFields.forEach((f) => {
       const v = config[f.key]?.trim()
       if (v !== undefined && v !== '') payload[f.key] = v
     })
@@ -1210,7 +1328,7 @@ function ConfigureFlow({
             />
             <p className="mt-1 text-xs text-white/50">Short context for the agent (e.g. what tables mean). Shown with schema so the agent can write correct queries.</p>
           </div>
-          {fields.map((f) => (
+          {visibleFields.map((f) => (
             <div key={f.key}>
               <label className="block text-sm font-medium text-white/80 mb-1">{f.label}</label>
               <input
@@ -1220,6 +1338,11 @@ function ConfigureFlow({
                 className="w-full px-4 py-2.5 rounded-xl bg-dark-50 border border-dark-200 text-white placeholder-white/40 focus:ring-2 focus:ring-primary-500"
                 placeholder={editTool && f.secret ? 'Leave blank to keep existing' : f.placeholder}
               />
+              {toolType === 'chroma' && f.key === 'url' && isChromaTrycloudUrl(config.url) && (
+                <p className="mt-1 text-xs text-white/50">
+                  Chroma Cloud: query embedding uses Chroma&apos;s models (e.g. Qwen). OpenAI key and OpenAI embedding model fields are hidden. Use &quot;Chroma Cloud embed model id&quot; below only if your dashboard shows a different HuggingFace id.
+                </p>
+              )}
               {toolType === 'postgres' && f.key === 'connection_string' && (
                 <p className="mt-1 text-xs text-white/50">If the app runs in Docker, use <code className="bg-dark-200/50 px-1 rounded">host.docker.internal</code> instead of localhost to reach PostgreSQL on your host.</p>
               )}

@@ -135,7 +135,7 @@ EXTERNAL_API_BASE_URL=http://localhost:8000  # Base URL for share links
 
 ```bash
 curl -X POST http://localhost:8000/api/external/jobs \
-  -H "X-API-Key: your-secret-api-key" \
+  -H "X-API-Key: <YOUR_EXTERNAL_API_KEY>" \
   -H "Content-Type: application/json" \
   -d '{"title": "My Job", "description": "Job description"}'
 ```
