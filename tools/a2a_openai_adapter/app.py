@@ -121,12 +121,12 @@ def _getaddrinfo_with_retry(hostname: str, *, attempts: int = 4) -> list:
         except socket.gaierror as e:
             last = e
             if attempt < attempts - 1 and _is_transient_dns_error(e):
+                # Log only attempt/errno — never log hostname or full exception (CodeQL: clear-text sensitive data).
                 logger.info(
-                    "DNS lookup retry for host %r (%s), attempt %s/%s",
-                    hostname,
-                    e,
+                    "DNS lookup retry after transient resolver error (attempt %s/%s, errno=%s)",
                     attempt + 1,
                     attempts,
+                    getattr(e, "errno", None),
                 )
                 time.sleep(0.12 * (2**attempt))
                 continue
