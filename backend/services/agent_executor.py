@@ -20,6 +20,7 @@ from services.db_schema_introspection import format_schema_for_prompt
 from services.job_file_storage import persist_file
 from core.config import settings
 from services.mcp_tool_input_schemas import input_schema_for_platform_tool_type
+from services.mcp_platform_naming import platform_tool_id_from_mcp_function_name
 from core.artifact_contract import normalize_agent_output_for_artifact
 
 logger = logging.getLogger(__name__)
@@ -1127,7 +1128,10 @@ END DOCUMENT {i+1}: {doc_name}
             "pinecone": "Pinecone vector store",
             "weaviate": "Weaviate vector store",
             "qdrant": "Qdrant vector store",
-            "chroma": "Chroma vector store",
+            "chroma": (
+                "Chroma vector store (per-user MCP config only; hits include sender/metadata for attribution; "
+                "similarity search is not exact email match; Chroma API key for Cloud; OpenAI on tool for self-hosted embed fallback)"
+            ),
             "postgres": "PostgreSQL database",
             "mysql": "MySQL database",
             "sqlserver": "SQL Server database",
@@ -1273,6 +1277,13 @@ END DOCUMENT {i+1}: {doc_name}
         meta = routing.get(tool_name) if routing else None
         if not meta:
             return json.dumps({"error": f"Unknown tool {tool_name!r}. Not in this job's MCP tool list."})
+        if meta.get("source") == "platform":
+            parsed_id = platform_tool_id_from_mcp_function_name(tool_name)
+            if parsed_id is None:
+                return json.dumps({"error": "Invalid platform tool name"})
+            reg_id = meta.get("platform_tool_id")
+            if reg_id is not None and int(reg_id) != parsed_id:
+                return json.dumps({"error": "Tool name does not match this job's registered MCP tool"})
         if meta.get("source") == "external":
             conn = self.db.query(MCPServerConnection).filter(
                 MCPServerConnection.id == meta["connection_id"],

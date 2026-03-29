@@ -314,6 +314,12 @@ export interface MCPToolConfigRes {
   business_description?: string | null
   schema_metadata?: string | null
   schema_table_count?: number | null
+  /** GET /mcp/tools/:id only — non-secret Chroma URL so the form can hide Cloud-only fields when editing. */
+  chroma_url_preview?: string | null
+  /** WCD cluster display name; GET /tools/{id} only */
+  weaviate_cluster_preview?: string | null
+  /** Weaviate class/collection name; GET /tools/{id} only */
+  weaviate_class_preview?: string | null
   created_at: string
   updated_at: string
 }

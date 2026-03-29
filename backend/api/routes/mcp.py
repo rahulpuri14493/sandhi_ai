@@ -33,9 +33,30 @@ from schemas.mcp import (
 from core.security import get_current_business_user
 from core.encryption import encrypt_json, decrypt_json
 from db.database import SessionLocal
+from services.mcp_platform_naming import platform_tool_id_from_mcp_function_name
 
 router = APIRouter(prefix="/api/mcp", tags=["mcp"])
 logger = logging.getLogger(__name__)
+
+
+def _require_platform_tool_for_user(db: Session, user_id: int, tool_name: str) -> None:
+    """Reject tool calls unless the platform tool id in tool_name belongs to this tenant."""
+    pid = platform_tool_id_from_mcp_function_name(tool_name)
+    if pid is None:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="tool_name must be a platform tool (e.g. platform_5_MyIndex)",
+        )
+    t = db.query(MCPToolConfig).filter(
+        MCPToolConfig.id == pid,
+        MCPToolConfig.user_id == user_id,
+        MCPToolConfig.is_active == True,
+    ).first()
+    if not t:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Platform tool not found for this account",
+        )
 
 
 def _estimate_json_size_bytes(data: dict) -> int:
@@ -500,7 +521,30 @@ def get_tool(
     ).first()
     if not t:
         raise HTTPException(status_code=404, detail="Tool config not found")
-    return _tool_to_response(t)
+    base = _tool_to_response(t)
+    if not t.encrypted_config:
+        return base
+    try:
+        cfg = decrypt_json(t.encrypted_config)
+    except Exception:
+        return base
+    if not isinstance(cfg, dict):
+        return base
+    updates: dict = {}
+    if t.tool_type == MCPToolType.CHROMA:
+        url = cfg.get("url")
+        if isinstance(url, str) and url.strip():
+            updates["chroma_url_preview"] = url.strip()[:2048]
+    if t.tool_type == MCPToolType.WEAVIATE:
+        c = cfg.get("weaviate_cluster_name") or cfg.get("cluster_name")
+        if isinstance(c, str) and c.strip():
+            updates["weaviate_cluster_preview"] = c.strip()[:256]
+        idx = cfg.get("index_name") or cfg.get("class_name")
+        if isinstance(idx, str) and idx.strip():
+            updates["weaviate_class_preview"] = idx.strip()[:512]
+    if updates:
+        return base.model_copy(update=updates)
+    return base
 
 
 @router.patch("/tools/{tool_id}", response_model=MCPToolConfigResponse)
@@ -634,12 +678,14 @@ async def mcp_proxy(
 async def call_platform_tool(
     body: MCPPlatformToolCallRequest,
     current_user: User = Depends(get_current_business_user),
+    db: Session = Depends(get_db),
 ):
     """
     Invoke a platform MCP tool by name (e.g. platform_1_MyDB).
     Backend calls the platform MCP server with X-MCP-Business-Id so tools are scoped to the current user.
     """
     from core.config import settings
+    _require_platform_tool_for_user(db, current_user.id, body.tool_name)
     if not settings.PLATFORM_MCP_SERVER_URL or not settings.MCP_INTERNAL_SECRET:
         raise HTTPException(status_code=503, detail="Platform MCP server not configured")
     payload_bytes = _estimate_json_size_bytes(body.arguments or {})
@@ -711,6 +757,7 @@ async def call_platform_write_async(
 ):
     """Submit write request as async operation and return operation_id for polling."""
     from core.config import settings
+    _require_platform_tool_for_user(db, current_user.id, body.tool_name)
     if not settings.PLATFORM_MCP_SERVER_URL or not settings.MCP_INTERNAL_SECRET:
         raise HTTPException(status_code=503, detail="Platform MCP server not configured")
     if body.operation_type in ("upsert", "merge") and not body.merge_keys:

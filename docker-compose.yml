@@ -169,6 +169,9 @@ services:
     container_name: platform-mcp-server
     init: true
     restart: unless-stopped
+    # Lets containers reach services on the Docker host (e.g. Weaviate at host.docker.internal:8080). Docker Desktop sets this by default; Linux needs host-gateway.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     command: python run.py
     ports:
       - "8081:8081"

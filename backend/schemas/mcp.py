@@ -68,6 +68,11 @@ class MCPToolConfigResponse(BaseModel):
     business_description: Optional[str] = None
     schema_metadata: Optional[str] = None  # JSON string; for list view prefer schema_table_count
     schema_table_count: Optional[int] = None  # Number of tables when schema_metadata is set (for UI)
+    # Non-secret: only set on GET /tools/{id} for Chroma so the UI can detect Cloud vs self-hosted.
+    chroma_url_preview: Optional[str] = None
+    # Non-secret: Weaviate WCD display name + class name for edit form (no API keys).
+    weaviate_cluster_preview: Optional[str] = None
+    weaviate_class_preview: Optional[str] = None
     created_at: datetime
     updated_at: datetime
 
