@@ -123,6 +123,8 @@ def _pymysql_connect_kwargs(config: Dict[str, Any], database: Optional[str] = No
             return v
         return str(v or "").strip().lower() in ("1", "true", "yes", "on", "required", "require")
 
+    if mode == "require":
+        mode = "required"
     want_tls = mode in ("preferred", "required", "verify_ca", "verify_identity")
     want_tls = want_tls or _truthy(config.get("ssl")) or _truthy(config.get("tls")) or _truthy(config.get("require_secure_transport"))
     if mode == "disabled":
@@ -169,13 +171,16 @@ def sqlserver_tool_error_response(event: str, exc: BaseException, config: Dict[s
             "If this tool has a default query in config, remove it for agent-driven queries. "
             "Refresh schema_metadata for this SQL Server tool so the agent can use real tables/columns."
         )
-    if exc_name == "OperationalError" and is_azure:
+    if exc_name == "OperationalError":
         msg += (
-            ". Azure SQL checklist: (1) Portal shows database Online not Paused. "
-            "(2) Firewall: add your public IP or Docker host egress IP (not 172.x). "
-            "(3) SQL login format: user@logicalServer (for example admin@logicalserver) — not @server.database.windows.net. "
-            "(4) In tool JSON set encryption require if needed; optional tds_version 7.4."
+            ". Connection/DDL hint: run the same bootstrap T-SQL in SSMS or sqlcmd using this tool’s SQL login "
+            "to see the full error; verify CREATE TABLE (or ALTER) permission on the target schema."
         )
+        if is_azure:
+            msg += (
+                " Azure SQL: database Online not Paused; firewall must allow the MCP host’s public egress IP "
+                "(not Docker 172.x); login as user@logicalServer; tool JSON may need encryption require."
+            )
     return msg
 
 
@@ -687,7 +692,7 @@ def _sql_query_from_args(config: Dict[str, Any], arguments: Dict[str, Any]) -> s
     if runtime_q:
         if not _is_safe_runtime_read_sql(runtime_q):
             raise ValueError(
-                "Runtime SQL is allowed only for single read-only SELECT/WITH statements"
+                "Runtime SQL is allowed only for a single read-only statement (SELECT/WITH/SHOW/DESCRIBE/EXPLAIN)"
             )
         return runtime_q
 
@@ -704,7 +709,7 @@ def _sql_query_from_args(config: Dict[str, Any], arguments: Dict[str, Any]) -> s
 
 
 def _is_safe_runtime_read_sql(query: str) -> bool:
-    """Best-effort guard for runtime SQL: single read-only SELECT/WITH only."""
+    """Best-effort guard for runtime SQL: single read-only statement (SELECT/WITH plus safe metadata)."""
     if not isinstance(query, str):
         return False
     q = query.strip()
@@ -717,7 +722,15 @@ def _is_safe_runtime_read_sql(query: str) -> bool:
         return False
     q = q.rstrip(";").strip()
     upper = q.upper()
-    if not (upper.startswith("SELECT") or upper.startswith("WITH")):
+    # Allow read-only metadata statements too (common for introspection).
+    if not (
+        upper.startswith("SELECT")
+        or upper.startswith("WITH")
+        or upper.startswith("SHOW")
+        or upper.startswith("DESCRIBE")
+        or upper.startswith("DESC")
+        or upper.startswith("EXPLAIN")
+    ):
         return False
     # Disallow common write/DDL/control keywords in runtime SQL.
     if re.search(

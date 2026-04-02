@@ -210,6 +210,8 @@ def _mysql_connect_kwargs(config: dict) -> dict:
             return v
         return str(v or "").strip().lower() in ("1", "true", "yes", "on", "required", "require")
 
+    if mode == "require":
+        mode = "required"
     want_tls = mode in ("preferred", "required", "verify_ca", "verify_identity")
     want_tls = want_tls or _truthy(config.get("ssl")) or _truthy(config.get("tls")) or _truthy(config.get("require_secure_transport"))
     if mode == "disabled":
@@ -362,6 +364,7 @@ def _validate_snowflake(config: dict) -> Tuple[bool, str]:
             user=user,
             password=password,
             account=account,
+            role=(config.get("role") or "").strip() or None,
             warehouse=(config.get("warehouse") or "").strip() or None,
             database=(config.get("database") or "").strip() or None,
             schema=(config.get("schema") or "").strip() or None,
@@ -393,7 +396,13 @@ def _validate_databricks(config: dict) -> Tuple[bool, str]:
     except ImportError:
         return False, "Databricks validation requires databricks-sql-connector (not installed in backend)"
     if not http_path and warehouse_id:
-        http_path = f"/sql/1.0/warehouses/{warehouse_id}"
+        wh = str(warehouse_id).strip()
+        # Users sometimes paste full HTTP paths (e.g. /sql/1.0/warehouses/<id>) into "SQL warehouse ID".
+        # Detect that and avoid double-prefixing.
+        if wh.startswith("/sql/") or "/sql/1.0/warehouses/" in wh:
+            http_path = wh if wh.startswith("/") else f"/{wh}"
+        else:
+            http_path = f"/sql/1.0/warehouses/{wh}"
     host_clean = host.replace("https://", "").replace("http://", "").split("/")[0].strip()
     try:
         conn = dsql.connect(server_hostname=host_clean, http_path=http_path, access_token=token)
@@ -405,7 +414,19 @@ def _validate_databricks(config: dict) -> Tuple[bool, str]:
         return True, "Databricks SQL connection successful"
     except Exception:
         logger.exception("Databricks validation failed")
-        return False, "Unable to connect to Databricks SQL warehouse; check host, token, and warehouse path."
+        msg = "Unable to connect to Databricks SQL warehouse; check host, token, and warehouse path."
+        if str(config.get("debug") or "").strip().lower() in ("1", "true", "yes", "on") or (
+            str(__import__("os").environ.get("MCP_DATABRICKS_INCLUDE_ERROR_DETAIL", "")).strip().lower()
+            in ("1", "true", "yes", "on")
+        ):
+            # Best-effort: include exception type + message (truncated). Should not contain the PAT.
+            import sys
+
+            exc = sys.exc_info()[1]
+            if exc is not None:
+                detail = (str(exc) or "").strip().replace("\n", " ")
+                msg += f" Details: {type(exc).__name__}: {detail[:300]}"
+        return False, msg
 
 
 def _validate_bigquery(config: dict) -> Tuple[bool, str]:

@@ -56,6 +56,78 @@ class TestSqlQueryFromArgs:
         with pytest.raises(ValueError, match="read-only"):
             execution_common._sql_query_from_args({}, {"query": "DELETE FROM jobs"})
 
+    @pytest.mark.parametrize(
+        "q",
+        [
+            "SHOW TABLES",
+            "SHOW TABLES IN samples.bakehouse",
+            "DESCRIBE samples.bakehouse.media_customer_reviews",
+            "DESC samples.bakehouse.media_customer_reviews",
+            "EXPLAIN SELECT 1",
+        ],
+    )
+    def test_runtime_query_allows_readonly_metadata_statements(self, q):
+        # The runtime SQL guard should allow safe metadata introspection statements.
+        out = execution_common._sql_query_from_args({}, {"query": q})
+        assert out == q
+
+
+class TestDatabricksReadDetection:
+    @pytest.mark.parametrize(
+        "q,expect_read",
+        [
+            ("SELECT 1", True),
+            ("WITH x AS (SELECT 1) SELECT * FROM x", True),
+            ("SHOW TABLES IN samples.bakehouse", True),
+            ("DESCRIBE samples.bakehouse.media_customer_reviews", True),
+            ("EXPLAIN SELECT 1", True),
+        ],
+    )
+    def test_databricks_fetches_for_metadata_statements(self, monkeypatch, q, expect_read):
+        # Ensure execute_databricks_sql fetches results for SHOW/DESCRIBE/EXPLAIN (not just SELECT/WITH).
+        import types
+        import sys
+        from execution_sql import execute_databricks_sql
+
+        calls: dict = {"fetchall": 0, "commit": 0}
+
+        class _Cur:
+            description = [("col",)]
+
+            def execute(self, _query):
+                return None
+
+            def fetchall(self):
+                calls["fetchall"] += 1
+                return [(1,)]
+
+            def close(self):
+                return None
+
+        class _Conn:
+            def cursor(self):
+                return _Cur()
+
+            def close(self):
+                return None
+
+            def commit(self):
+                calls["commit"] += 1
+                return None
+
+        sql_mod = types.ModuleType("databricks.sql")
+        sql_mod.connect = lambda **_kw: _Conn()
+        monkeypatch.setitem(sys.modules, "databricks", types.ModuleType("databricks"))
+        monkeypatch.setitem(sys.modules, "databricks.sql", sql_mod)
+
+        out = execute_databricks_sql(
+            {"host": "https://x.cloud.databricks.com", "token": "t", "http_path": "/sql/1.0/warehouses/w"},
+            {"query": q},
+        )
+        if expect_read:
+            assert calls["fetchall"] >= 1
+        assert out
+
     def test_config_query_used_as_fallback_when_runtime_missing(self):
         q = execution_common._sql_query_from_args(
             {"query": "SELECT from_config"},
@@ -72,6 +144,12 @@ class TestPyMysqlConnectKwargs:
         assert "ssl" in kw
         assert kw["ssl"].get("verify_mode") == "none"
         assert kw["ssl"].get("check_hostname") is False
+
+    def test_enables_tls_when_ssl_mode_require_alias(self):
+        kw = execution_common._pymysql_connect_kwargs(
+            {"host": "db", "user": "u", "password": "p", "database": "d", "ssl_mode": "require"}
+        )
+        assert "ssl" in kw
 
     def test_verify_identity_enables_hostname_and_ca_verification(self):
         kw = execution_common._pymysql_connect_kwargs(

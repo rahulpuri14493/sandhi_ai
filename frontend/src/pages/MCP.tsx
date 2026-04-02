@@ -1048,6 +1048,7 @@ function ConfigureFlow({
     ],
     snowflake: [
       { key: 'account', label: 'Account identifier', placeholder: 'xy12345.us-east-1.aws' },
+      { key: 'role', label: 'Role (optional)', placeholder: 'ACCOUNTADMIN' },
       { key: 'user', label: 'User', placeholder: 'SERVICE_USER' },
       { key: 'password', label: 'Password', placeholder: '', secret: true },
       { key: 'warehouse', label: 'Warehouse', placeholder: 'COMPUTE_WH' },

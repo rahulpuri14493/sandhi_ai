@@ -189,6 +189,7 @@ def execute_snowflake_sql(config: Dict[str, Any], arguments: Dict[str, Any]) -> 
             user=(config.get("user") or "").strip(),
             password=(config.get("password") or "").strip(),
             account=(config.get("account") or "").strip(),
+            role=(config.get("role") or "").strip() or None,
             warehouse=(config.get("warehouse") or "").strip() or None,
             database=(config.get("database") or "").strip() or None,
             schema=(config.get("schema") or "").strip() or None,
@@ -326,12 +327,25 @@ def execute_databricks_sql(config: Dict[str, Any], arguments: Dict[str, Any]) ->
         return "Error: host and token are required in tool configuration"
     # Prefer SQL warehouse HTTP path if provided; else build from warehouse id
     if not http_path and warehouse_id:
-        http_path = f"/sql/1.0/warehouses/{warehouse_id}"
+        wh = str(warehouse_id).strip()
+        # Users may paste full http_path into "sql_warehouse_id" by mistake.
+        if wh.startswith("/sql/") or "/sql/1.0/warehouses/" in wh:
+            http_path = wh
+        else:
+            http_path = f"/sql/1.0/warehouses/{wh}"
     if not http_path:
         return "Error: sql_warehouse_id or http_path is required for Databricks"
     host_clean = host.replace("https://", "").replace("http://", "").split("/")[0].strip()
     upper_db = query.lstrip().upper()
-    is_read_db = upper_db.startswith("SELECT") or upper_db.startswith("WITH")
+    # Treat metadata/introspection statements as "read" so we fetch and return results.
+    is_read_db = (
+        upper_db.startswith("SELECT")
+        or upper_db.startswith("WITH")
+        or upper_db.startswith("SHOW")
+        or upper_db.startswith("DESCRIBE")
+        or upper_db.startswith("DESC")
+        or upper_db.startswith("EXPLAIN")
+    )
     _log_mcp_sql("databricks", query, mode="read" if is_read_db else "write", dest=host_clean)
     try:
         conn = dsql.connect(server_hostname=host_clean, http_path=http_path, access_token=token)

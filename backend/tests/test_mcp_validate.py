@@ -62,6 +62,12 @@ class TestMySqlConnectKwargs:
         assert kw["ssl"].get("verify_mode") == "none"
         assert kw["ssl"].get("check_hostname") is False
 
+    def test_require_ssl_mode_alias_builds_truthy_ssl_dict(self):
+        kw = _mysql_connect_kwargs(
+            {"host": "db", "user": "u", "password": "p", "database": "d", "ssl_mode": "require"}
+        )
+        assert "ssl" in kw
+
 
 @pytest.mark.parametrize(
     "tool_type,config,expected_fragment",
@@ -141,3 +147,81 @@ class TestSqlServerValidationHints:
             )
         assert valid is False
         assert "multiple '@'" in msg.lower()
+
+
+class TestDatabricksHttpPathNormalization:
+    @staticmethod
+    def _fake_databricks_sql():
+        captured: dict = {}
+
+        class _FakeCursor:
+            def execute(self, _q):
+                return None
+
+            def fetchall(self):
+                return [(1,)]
+
+            def close(self):
+                return None
+
+        class _FakeConn:
+            def __init__(self, http_path: str):
+                self._http_path = http_path
+
+            def cursor(self):
+                return _FakeCursor()
+
+            def close(self):
+                return None
+
+        class _FakeDsql:
+            @staticmethod
+            def connect(**kwargs):
+                # Validate must pass http_path and access_token through.
+                captured["server_hostname"] = kwargs.get("server_hostname")
+                captured["http_path"] = kwargs.get("http_path")
+                captured["access_token"] = kwargs.get("access_token")
+                return _FakeConn(kwargs.get("http_path"))
+
+        return captured, _FakeDsql
+
+    def test_sql_warehouse_id_plain_builds_http_path(self, monkeypatch):
+        captured, _FakeDsql = self._fake_databricks_sql()
+
+        class _FakeDatabricksModule:
+            sql = _FakeDsql
+
+        monkeypatch.setitem(sys.modules, "databricks", _FakeDatabricksModule())
+        monkeypatch.setitem(sys.modules, "databricks.sql", _FakeDsql)
+
+        valid, _msg = validate_tool_config(
+            "databricks",
+            {
+                "host": "dbc.example.cloud.databricks.com",
+                "token": "dapi-xxx",
+                "sql_warehouse_id": "9d7d0d29a2c3a3414",
+            },
+        )
+        assert valid is True
+        assert captured["http_path"] == "/sql/1.0/warehouses/9d7d0d29a2c3a3414"
+
+    def test_sql_warehouse_id_full_http_path_is_not_double_prefixed(self, monkeypatch):
+        captured, _FakeDsql = self._fake_databricks_sql()
+
+        class _FakeDatabricksModule:
+            sql = _FakeDsql
+
+        monkeypatch.setitem(sys.modules, "databricks", _FakeDatabricksModule())
+        monkeypatch.setitem(sys.modules, "databricks.sql", _FakeDsql)
+
+        full = "/sql/1.0/warehouses/9d7d0d29a2c3a3414"
+        valid, _msg = validate_tool_config(
+            "databricks",
+            {
+                "host": "dbc.example.cloud.databricks.com",
+                "token": "dapi-xxx",
+                "sql_warehouse_id": full,
+            },
+        )
+        assert valid is True
+        assert captured["http_path"] == full

@@ -15,6 +15,7 @@ from execution_common import (
     _artifact_object_storage_basename,
     _merge_sql_dialect,
     _postgres_dest_hint,
+    _pymysql_connect_kwargs,
     _pymssql_connect_kwargs,
     _pymssql_sqlserver_drop_staging,
     _pymssql_sqlserver_execute_merge_artifact,
@@ -156,7 +157,8 @@ def _bootstrap_sql_from_signed_runtime(arguments: Dict[str, Any], runtime_target
     tool_name = str(arguments.get("tool_name") or "").strip()
     schema = str((runtime_target or {}).get("schema") or (runtime_target or {}).get("schema_name") or "").strip()
     table = str((runtime_target or {}).get("table") or "").strip()
-    if not (sig and tool_name and schema and table):
+    # Some targets (e.g. MySQL) use database+table and may not have a schema value.
+    if not (sig and tool_name and table):
         return None
     expected = _trusted_bootstrap_signature(
         tool_name=tool_name,
@@ -200,6 +202,149 @@ def _postgres_run_bootstrap_sql(cur: Any, conn: Any, target: Dict[str, Any]) -> 
             cur.execute(stmt)
         except Exception as e:
             return safe_tool_error("Postgres bootstrap_sql failed", e)
+    conn.commit()
+    return None
+
+
+def _mysql_run_bootstrap_sql(cur: Any, conn: Any, target: Dict[str, Any]) -> Optional[str]:
+    raw = target.get("bootstrap_sql")
+    if raw is None:
+        return None
+    stmts: List[str]
+    if isinstance(raw, str):
+        s = raw.strip()
+        if not s:
+            return None
+        stmts = [s]
+    elif isinstance(raw, list):
+        stmts = [str(x).strip() for x in raw if str(x).strip()]
+        if not stmts:
+            return None
+    else:
+        return "Error: target.bootstrap_sql must be a string or a list of SQL strings"
+    for stmt in stmts:
+        if not _is_safe_bootstrap_sql(stmt):
+            return "Error: bootstrap_sql rejected (only allowlisted CREATE/ALTER/COMMENT DDL; no comments or multi-statement abuse)"
+        try:
+            cur.execute(stmt)
+        except Exception as e:
+            return safe_tool_error("MySQL bootstrap_sql failed", e)
+    conn.commit()
+    return None
+
+
+def _sqlserver_run_bootstrap_sql(
+    cur: Any, conn: Any, target: Dict[str, Any], config: Optional[Dict[str, Any]] = None
+) -> Optional[str]:
+    raw = target.get("bootstrap_sql")
+    if raw is None:
+        return None
+    stmts: List[str]
+    if isinstance(raw, str):
+        s = raw.strip()
+        if not s:
+            return None
+        stmts = [s]
+    elif isinstance(raw, list):
+        stmts = [str(x).strip() for x in raw if str(x).strip()]
+        if not stmts:
+            return None
+    else:
+        return "Error: target.bootstrap_sql must be a string or a list of SQL strings"
+    for stmt in stmts:
+        if not _is_safe_bootstrap_sql(stmt):
+            return "Error: bootstrap_sql rejected (only allowlisted CREATE/ALTER/COMMENT DDL; no comments or multi-statement abuse)"
+        try:
+            cur.execute(stmt)
+        except Exception as e:
+            return sqlserver_tool_error_response(
+                "SQL Server bootstrap_sql failed", e, config if isinstance(config, dict) else {}
+            )
+    conn.commit()
+    return None
+
+
+def _snowflake_run_bootstrap_sql(cur: Any, conn: Any, target: Dict[str, Any]) -> Optional[str]:
+    raw = target.get("bootstrap_sql")
+    if raw is None:
+        return None
+    stmts: List[str]
+    if isinstance(raw, str):
+        s = raw.strip()
+        if not s:
+            return None
+        stmts = [s]
+    elif isinstance(raw, list):
+        stmts = [str(x).strip() for x in raw if str(x).strip()]
+        if not stmts:
+            return None
+    else:
+        return "Error: target.bootstrap_sql must be a string or a list of SQL strings"
+    for stmt in stmts:
+        if not _is_safe_bootstrap_sql(stmt):
+            return "Error: bootstrap_sql rejected (only allowlisted CREATE/ALTER/COMMENT DDL; no comments or multi-statement abuse)"
+        try:
+            cur.execute(stmt)
+        except Exception as e:
+            return safe_tool_error("Snowflake bootstrap_sql failed", e)
+    conn.commit()
+    return None
+
+
+def _bigquery_run_bootstrap_sql(client: Any, target: Dict[str, Any]) -> Optional[str]:
+    raw = target.get("bootstrap_sql")
+    if raw is None:
+        return None
+    stmts: List[str]
+    if isinstance(raw, str):
+        s = raw.strip()
+        if not s:
+            return None
+        stmts = [s]
+    elif isinstance(raw, list):
+        stmts = [str(x).strip() for x in raw if str(x).strip()]
+        if not stmts:
+            return None
+    else:
+        return "Error: target.bootstrap_sql must be a string or a list of SQL strings"
+    for stmt in stmts:
+        if not _is_safe_bootstrap_sql(stmt):
+            return "Error: bootstrap_sql rejected (only allowlisted CREATE/ALTER/COMMENT DDL; no comments or multi-statement abuse)"
+        try:
+            client.query(stmt).result()
+        except Exception as e:
+            return safe_tool_error("BigQuery bootstrap_sql failed", e)
+    return None
+
+
+def _databricks_run_bootstrap_sql(cur: Any, conn: Any, target: Dict[str, Any]) -> Optional[str]:
+    """
+    Run optional DDL before Databricks artifact INSERT.
+    Set output_contract write_targets[].target.bootstrap_sql to one SQL string or a list of statements.
+    Returns an error string on failure, or None on success.
+    """
+    raw = target.get("bootstrap_sql")
+    if raw is None:
+        return None
+    stmts: List[str]
+    if isinstance(raw, str):
+        s = raw.strip()
+        if not s:
+            return None
+        stmts = [s]
+    elif isinstance(raw, list):
+        stmts = [str(x).strip() for x in raw if str(x).strip()]
+        if not stmts:
+            return None
+    else:
+        return "Error: target.bootstrap_sql must be a string or a list of SQL strings"
+    for stmt in stmts:
+        if not _is_safe_bootstrap_sql(stmt):
+            return "Error: bootstrap_sql rejected (only allowlisted CREATE/ALTER/COMMENT DDL; no comments or multi-statement abuse)"
+        try:
+            cur.execute(stmt)
+        except Exception as e:
+            return safe_tool_error("Databricks bootstrap_sql failed", e)
     conn.commit()
     return None
 
@@ -533,14 +678,16 @@ def _artifact_write_mysql(
         write_mode,
     )
     try:
-        conn = pymysql.connect(
-            host=(config.get("host") or "localhost").strip(),
-            port=int(config.get("port") or 3306),
-            user=(config.get("user") or "").strip(),
-            password=(config.get("password") or "").strip(),
-            database=database,
-        )
+        connect_kwargs = _pymysql_connect_kwargs(config, database)
+        # Keep artifact writes responsive under transient network issues.
+        connect_kwargs.setdefault("connect_timeout", 10)
+        conn = pymysql.connect(**connect_kwargs)
         cur = conn.cursor()
+        boot_err = _mysql_run_bootstrap_sql(cur, conn, target)
+        if boot_err:
+            cur.close()
+            conn.close()
+            return boot_err
         wm = str(write_mode or "").lower()
         if wm == "overwrite" and operation_type in ("append", "insert") and not merge_keys:
             if target.get("allow_truncate_overwrite") is False:
@@ -694,22 +841,46 @@ def _artifact_write_snowflake(
             user=(config.get("user") or "").strip(),
             password=(config.get("password") or "").strip(),
             account=(config.get("account") or "").strip(),
+            role=(config.get("role") or "").strip() or None,
             warehouse=(config.get("warehouse") or "").strip() or None,
             database=database or None,
             schema=schema or None,
         )
+        cur_boot = conn.cursor()
+        boot_err = _snowflake_run_bootstrap_sql(cur_boot, conn, target)
+        cur_boot.close()
+        if boot_err:
+            conn.close()
+            return boot_err
         df = pd.DataFrame(records)
         fq = f"{database}.{schema}.{table}" if database else f"{schema}.{table}"
         temp = f"TMP_MCP_{re.sub(r'[^A-Za-z0-9_]', '_', idem)[:50] or 'LOAD'}"
         if operation_type in ("append", "insert") or not merge_keys:
-            wp = write_pandas(conn, df, table_name=table, schema=schema, database=database)
+            wp = write_pandas(
+                conn,
+                df,
+                table_name=table,
+                schema=schema,
+                database=database,
+                # Snowflake objects/columns are usually unquoted (stored uppercase).
+                # Keep writes case-insensitive for payload keys like "total_jobs".
+                quote_identifiers=False,
+            )
             nrows = int(wp[2]) if isinstance(wp, tuple) and len(wp) > 2 else 0
             nchunks = int(wp[1]) if isinstance(wp, tuple) and len(wp) > 1 else 0
             ok = bool(wp[0]) if isinstance(wp, tuple) and len(wp) > 0 else True
             conn.close()
             return json.dumps({"status": "ok", "rows": nrows, "chunks": nchunks, "write_pandas": ok})
         # MERGE via staging table
-        write_pandas(conn, df, table_name=temp, schema=schema, database=database, auto_create_table=True)
+        write_pandas(
+            conn,
+            df,
+            table_name=temp,
+            schema=schema,
+            database=database,
+            auto_create_table=True,
+            quote_identifiers=False,
+        )
         cols = [str(c) for c in df.columns.tolist()]
         fq_temp = f"{database}.{schema}.{temp}" if database else f"{schema}.{temp}"
         merge_sql = _merge_sql_dialect("snowflake", fq, cols, merge_keys, fq_temp)
@@ -788,6 +959,9 @@ def _artifact_write_bigquery(
 
     table_ref = _bq_table_ref(project, dataset, table)
     fq_target = _bq_fq_table(project, dataset, table)
+    boot_err = _bigquery_run_bootstrap_sql(client, target)
+    if boot_err:
+        return boot_err
 
     # Keyed upsert: load to a staging table, then MERGE into the target (no blind TRUNCATE).
     if ot in ("upsert", "merge"):
@@ -795,10 +969,11 @@ def _artifact_write_bigquery(
         stg_ref = _bq_table_ref(project, dataset, stg)
         fq_stg = _bq_fq_table(project, dataset, stg)
         try:
+            # Staging load: new table, full replace — do not set schema_update_options with
+            # WRITE_TRUNCATE (BigQuery returns 400 BadRequest for that combination on normal tables).
             job_config = bigquery.LoadJobConfig(
                 write_disposition=bigquery.WriteDisposition.WRITE_TRUNCATE,
                 create_disposition=bigquery.CreateDisposition.CREATE_IF_NEEDED,
-                schema_update_options=[bigquery.SchemaUpdateOption.ALLOW_FIELD_ADDITION],
             )
             load_job = client.load_table_from_json(records, stg_ref, job_config=job_config)
             load_job.result()
@@ -828,10 +1003,15 @@ def _artifact_write_bigquery(
             wd = bigquery.WriteDisposition.WRITE_TRUNCATE
         else:
             wd = bigquery.WriteDisposition.WRITE_APPEND
-        job_config = bigquery.LoadJobConfig(
-            write_disposition=wd,
-            schema_update_options=[bigquery.SchemaUpdateOption.ALLOW_FIELD_ADDITION],
-        )
+        # ALLOW_FIELD_ADDITION is only valid with WRITE_APPEND. Combining it with WRITE_TRUNCATE
+        # on a normal (non-partitioned) table yields BigQuery 400 BadRequest.
+        load_kw: Dict[str, Any] = {
+            "write_disposition": wd,
+            "create_disposition": bigquery.CreateDisposition.CREATE_IF_NEEDED,
+        }
+        if wd == bigquery.WriteDisposition.WRITE_APPEND:
+            load_kw["schema_update_options"] = [bigquery.SchemaUpdateOption.ALLOW_FIELD_ADDITION]
+        job_config = bigquery.LoadJobConfig(**load_kw)
         job = client.load_table_from_json(records, table_ref, job_config=job_config)
         job.result()
         return json.dumps({"status": "ok", "rows": len(records), "table": table_ref})
@@ -892,6 +1072,11 @@ def _artifact_write_sqlserver(
     try:
         conn = pymssql.connect(**_pymssql_connect_kwargs(config, database))
         cur = conn.cursor()
+        boot_err = _sqlserver_run_bootstrap_sql(cur, conn, target, config)
+        if boot_err:
+            cur.close()
+            conn.close()
+            return boot_err
         if operation_type in ("append", "insert") or not safe_merge_keys:
             ins = f"INSERT INTO {fq} ({col_sql}) VALUES ({placeholders})"
             for rec in records:
@@ -963,6 +1148,11 @@ def _artifact_write_databricks(
             access_token=token,
         )
         cur = conn.cursor()
+        boot_err = _databricks_run_bootstrap_sql(cur, conn, target)
+        if boot_err:
+            cur.close()
+            conn.close()
+            return boot_err
         # Insert every row; commit periodically so very large artifacts do not rely on one huge transaction.
         _DATABRICKS_COMMIT_EVERY = 5000
         inserted = 0
