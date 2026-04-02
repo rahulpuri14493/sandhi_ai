@@ -245,7 +245,7 @@ class TestSqlserverToolErrorResponse:
         assert "default query" in msg
         assert "schema_metadata" in msg
 
-    def test_operational_error_keeps_azure_checklist(self):
+    def test_operational_error_includes_azure_checklist(self):
         class OperationalError(Exception):
             pass
 
@@ -256,6 +256,8 @@ class TestSqlserverToolErrorResponse:
         )
         assert "OperationalError" in msg
         assert "Azure SQL checklist" in msg
+        assert "user@logicalServer" in msg
+        assert "egress" in msg.lower()
 
 
 class TestMysqlToolErrorResponse:

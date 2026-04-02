@@ -173,12 +173,12 @@ def sqlserver_tool_error_response(event: str, exc: BaseException, config: Dict[s
         )
     if exc_name == "OperationalError":
         msg += (
-            ". Connection/DDL hint: run the same bootstrap T-SQL in SSMS or sqlcmd using this tool’s SQL login "
+            ". Connection/DDL hint: run the same bootstrap T-SQL in SSMS or sqlcmd using this tool's SQL login "
             "to see the full error; verify CREATE TABLE (or ALTER) permission on the target schema."
         )
         if is_azure:
             msg += (
-                " Azure SQL: database Online not Paused; firewall must allow the MCP host’s public egress IP "
+                " Azure SQL checklist: database Online not Paused; firewall must allow the MCP host's public egress IP "
                 "(not Docker 172.x); login as user@logicalServer; tool JSON may need encryption require."
             )
     return msg
