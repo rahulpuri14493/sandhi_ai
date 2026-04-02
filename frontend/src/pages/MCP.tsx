@@ -1032,6 +1032,10 @@ function ConfigureFlow({
       { key: 'user', label: 'User', placeholder: 'root', secret: false },
       { key: 'password', label: 'Password', placeholder: '', secret: true },
       { key: 'database', label: 'Database', placeholder: 'mydb' },
+      { key: 'ssl_mode', label: 'SSL mode (optional)', placeholder: 'required | preferred | verify_ca | verify_identity | disabled' },
+      { key: 'ssl_ca', label: 'SSL CA path (optional)', placeholder: '/app/certs/ca.pem' },
+      { key: 'ssl_cert', label: 'Client cert path (optional)', placeholder: '/app/certs/client-cert.pem' },
+      { key: 'ssl_key', label: 'Client key path (optional)', placeholder: '/app/certs/client-key.pem', secret: true },
       { key: 'query', label: 'Default SQL query (optional fallback)', placeholder: 'SELECT NOW()' },
     ],
     sqlserver: [
@@ -1346,6 +1350,16 @@ function ConfigureFlow({
               {toolType === 'postgres' && f.key === 'connection_string' && (
                 <p className="mt-1 text-xs text-white/50">If the app runs in Docker, use <code className="bg-dark-200/50 px-1 rounded">host.docker.internal</code> instead of localhost to reach PostgreSQL on your host.</p>
               )}
+              {toolType === 'mysql' && f.key === 'ssl_mode' && (
+                <p className="mt-1 text-xs text-white/50">
+                  If your provider enforces secure transport (for example Azure MySQL Flexible Server), set <code className="bg-dark-200/50 px-1 rounded">required</code>.
+                </p>
+              )}
+              {toolType === 'mysql' && f.key === 'ssl_ca' && (
+                <p className="mt-1 text-xs text-white/50">
+                  Usually optional. Leave SSL cert/key fields empty for standard TLS; only set CA/cert/key paths when your provider requires custom certificate verification.
+                </p>
+              )}
               {['postgres', 'mysql', 'sqlserver', 'snowflake', 'databricks', 'bigquery'].includes(toolType) && f.key === 'query' && (
                 <p className="mt-1 text-xs text-white/50">
                   Optional fallback query. Agents can provide per-job runtime read-only SELECT/WITH query; this value is used when runtime query is not supplied.
@@ -1358,7 +1372,7 @@ function ConfigureFlow({
               {validateMessage.text}
             </div>
           )}
-          {(editTool && (toolType === 'postgres' || toolType === 'mysql')) && (
+          {(editTool && (toolType === 'postgres' || toolType === 'mysql' || toolType === 'sqlserver')) && (
             <div className="p-3 rounded-xl bg-dark-50 border border-dark-200">
               <p className="text-sm text-white/80 mb-2">Load database schema so the agent can write correct SQL. Refresh after changing the connection.</p>
               <button
@@ -1508,7 +1522,7 @@ function ToolsList({
                       {TOOL_LABELS[t.tool_type] ?? t.tool_type}
                     </span>
                     <span className="font-semibold text-white truncate">{t.name}</span>
-                    {(t.tool_type === 'postgres' || t.tool_type === 'mysql') && (
+                    {(t.tool_type === 'postgres' || t.tool_type === 'mysql' || t.tool_type === 'sqlserver') && (
                       <span className="inline-flex items-center px-2 py-0.5 rounded text-xs font-medium bg-dark-200/80 text-white/70 border border-dark-200">
                         {t.schema_table_count != null ? `Schema: ${t.schema_table_count} table${t.schema_table_count !== 1 ? 's' : ''}` : 'Schema: not loaded'}
                       </span>

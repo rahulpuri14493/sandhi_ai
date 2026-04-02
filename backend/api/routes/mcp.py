@@ -636,7 +636,7 @@ def refresh_tool_schema(
     db: Session = Depends(get_db),
 ):
     """
-    Introspect the database for this tool (Postgres/MySQL only) and store schema metadata.
+    Introspect the database for this tool (Postgres/MySQL/SQL Server) and store schema metadata.
     Does not overwrite existing schema on connection failure.
     """
     from services.db_schema_introspection import introspect_sql_tool
@@ -648,10 +648,10 @@ def refresh_tool_schema(
     ).first()
     if not t:
         raise HTTPException(status_code=404, detail="Tool config not found")
-    if t.tool_type not in (MCPToolType.POSTGRES, MCPToolType.MYSQL):
+    if t.tool_type not in (MCPToolType.POSTGRES, MCPToolType.MYSQL, MCPToolType.SQLSERVER):
         raise HTTPException(
             status_code=400,
-            detail="Schema refresh is only available for PostgreSQL and MySQL tools",
+            detail="Schema refresh is only available for PostgreSQL, MySQL, and SQL Server tools",
         )
     config = decrypt_json(t.encrypted_config)
     schema_dict, error = introspect_sql_tool(t.tool_type.value, config)

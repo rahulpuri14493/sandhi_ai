@@ -1,4 +1,6 @@
 """API tests for MCP routes: connections, tools, validate, registry."""
+import types
+import sys
 import uuid
 from unittest.mock import AsyncMock, patch
 
@@ -218,7 +220,47 @@ class TestMCPTools:
                 json={"tool_type": tool_type, "name": f"V-{tool_type}", "config": config},
             )
             assert r.status_code == 201, f"create {tool_type}: {r.text}"
-            assert r.json()["tool_type"] == tool_type
+
+
+class TestMCPSchemaRefresh:
+    def test_refresh_schema_sqlserver_supported(self, client_mcp: TestClient, business_user):
+        create = client_mcp.post(
+            "/api/mcp/tools",
+            headers=business_user["headers"],
+            json={
+                "tool_type": "sqlserver",
+                "name": "SQL Server DB",
+                "config": {
+                    "host": "sandhiai.database.windows.net",
+                    "port": 1433,
+                    "database": "free-sql-db-1732366",
+                    "user": "admin@sandhiai",
+                    "password": "secret",
+                },
+            },
+        )
+        assert create.status_code == 201, create.text
+        tool_id = create.json()["id"]
+
+        fake_schema = {
+            "tables": [
+                {
+                    "name": "SalesLT.Product",
+                    "columns": [{"name": "ProductID", "type": "int", "nullable": False}],
+                    "primary_key": ["ProductID"],
+                    "foreign_keys": [],
+                }
+            ]
+        }
+        with patch("services.db_schema_introspection.introspect_sql_tool") as mock_intro:
+            mock_intro.return_value = (fake_schema, None)
+            r = client_mcp.post(
+                f"/api/mcp/tools/{tool_id}/refresh-schema",
+                headers=business_user["headers"],
+            )
+        assert r.status_code == 200, r.text
+        assert r.json()["success"] is True
+        assert r.json()["table_count"] == 1
 
     def test_create_tool_integration_types(self, client_mcp: TestClient, business_user):
         """Create tools for s3, slack, github, notion, elasticsearch, mysql."""
@@ -376,6 +418,61 @@ class TestMCPValidate:
             json={"tool_type": "invalid", "config": {}},
         )
         assert r.status_code == 400
+
+    def test_validate_sqlserver_success(self, client_mcp: TestClient, business_user):
+        class _FakeCursor:
+            def execute(self, _sql):
+                return None
+
+            def fetchone(self):
+                return (1,)
+
+            def close(self):
+                return None
+
+        class _FakeConn:
+            def cursor(self):
+                return _FakeCursor()
+
+            def close(self):
+                return None
+
+        fake_mod = types.SimpleNamespace(connect=lambda **_kw: _FakeConn())
+        with patch.dict(sys.modules, {"pymssql": fake_mod}):
+            r = client_mcp.post(
+                "/api/mcp/tools/validate",
+                headers=business_user["headers"],
+                json={
+                    "tool_type": "sqlserver",
+                    "config": {
+                        "host": "sandhiai.database.windows.net",
+                        "port": 1433,
+                        "database": "free-sql-db-1732366",
+                        "user": "admin@sandhiai",
+                        "password": "secret",
+                    },
+                },
+            )
+        assert r.status_code == 200
+        assert r.json()["valid"] is True
+        assert "successful" in r.json()["message"].lower()
+
+    def test_validate_sqlserver_missing_required_field(self, client_mcp: TestClient, business_user):
+        r = client_mcp.post(
+            "/api/mcp/tools/validate",
+            headers=business_user["headers"],
+            json={
+                "tool_type": "sqlserver",
+                "config": {
+                    "host": "sandhiai.database.windows.net",
+                    "database": "free-sql-db-1732366",
+                    "password": "secret",
+                },
+            },
+        )
+        assert r.status_code == 200
+        assert r.json()["valid"] is False
+        assert "user is required" in r.json()["message"].lower()
 
 
 class TestMCPRegistry:

@@ -21,7 +21,10 @@ from services.job_file_storage import persist_file
 from core.config import settings
 from services.mcp_tool_input_schemas import input_schema_for_platform_tool_type
 from services.mcp_platform_naming import platform_tool_id_from_mcp_function_name
-from core.artifact_contract import normalize_agent_output_for_artifact
+from core.artifact_contract import (
+    extract_record_rows_from_agent_output,
+    normalize_agent_output_for_artifact,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -153,12 +156,83 @@ def _input_schema_for_tool_type(tool_type: str) -> dict:
 
 
 def _sanitize_platform_sql_tool_arguments(tool_type: str, arguments: Dict[str, Any]) -> Dict[str, Any]:
-    """Strip artifact/output-contract keys models sometimes mix into interactive Postgres/MySQL calls."""
+    """Strip artifact/output-contract keys models sometimes mix into interactive SQL tool calls."""
     tt = (tool_type or "").strip().lower()
-    if tt not in ("postgres", "mysql") or not isinstance(arguments, dict):
+    if tt not in ("postgres", "mysql", "sqlserver") or not isinstance(arguments, dict):
         return arguments
     out = {k: v for k, v in arguments.items() if k in ("query", "params")}
     return out
+
+
+def _ensure_records_for_platform_write(
+    output_data: Any,
+    *,
+    write_mode: str,
+    write_targets: Any,
+) -> Any:
+    """
+    For platform write-target jobs, require tabular rows to avoid writing narrative fallback text.
+    Accepts empty records list, but rejects non-tabular prose payloads.
+    """
+    if write_mode != "platform" or not isinstance(write_targets, list) or not write_targets:
+        return output_data
+    rows = extract_record_rows_from_agent_output(output_data)
+    if rows is None:
+        raise ValueError(
+            "Output contract requires structured tabular output with top-level `records` array; "
+            "agent returned non-tabular content."
+        )
+    if isinstance(output_data, dict) and isinstance(output_data.get("records"), list):
+        return output_data
+    return {"records": rows}
+
+
+def _normalize_placeholder_error_values(output_data: Any) -> Any:
+    """
+    Normalize low-quality placeholder strings from model summaries to null.
+    Example: {"total_users": "Error retrieving data"} -> {"total_users": None}
+    """
+    if isinstance(output_data, dict):
+        return {k: _normalize_placeholder_error_values(v) for k, v in output_data.items()}
+    if isinstance(output_data, list):
+        return [_normalize_placeholder_error_values(v) for v in output_data]
+    if isinstance(output_data, str):
+        s = output_data.strip().lower()
+        if s in ("error retrieving data", "error retrieving"):
+            return None
+    return output_data
+
+
+def _is_sql_programming_error_tool_result(tool_result: str) -> bool:
+    t = str(tool_result or "")
+    return "ProgrammingError" in t and "Error:" in t
+
+
+def _sql_schema_discovery_query(tool_type: str) -> Optional[str]:
+    tt = (tool_type or "").strip().lower()
+    if tt == "sqlserver":
+        return (
+            "SELECT TOP 200 TABLE_SCHEMA, TABLE_NAME, COLUMN_NAME, DATA_TYPE "
+            "FROM INFORMATION_SCHEMA.COLUMNS "
+            "ORDER BY TABLE_SCHEMA, TABLE_NAME, ORDINAL_POSITION"
+        )
+    if tt == "postgres":
+        return (
+            "SELECT table_schema, table_name, column_name, data_type "
+            "FROM information_schema.columns "
+            "WHERE table_schema NOT IN ('information_schema', 'pg_catalog') "
+            "ORDER BY table_schema, table_name, ordinal_position "
+            "LIMIT 200"
+        )
+    if tt == "mysql":
+        return (
+            "SELECT TABLE_SCHEMA, TABLE_NAME, COLUMN_NAME, DATA_TYPE "
+            "FROM INFORMATION_SCHEMA.COLUMNS "
+            "WHERE TABLE_SCHEMA = DATABASE() "
+            "ORDER BY TABLE_SCHEMA, TABLE_NAME, ORDINAL_POSITION "
+            "LIMIT 200"
+        )
+    return None
 
 
 def _openai_tools_from_mcp(available_mcp_tools: list) -> list:
@@ -438,9 +512,18 @@ class AgentExecutor:
                 write_targets: List[Dict[str, Any]] = contract.get("write_targets") if isinstance(contract, dict) else []
                 write_policy = _parse_write_policy(contract, len(write_targets) if isinstance(write_targets, list) else 0)
                 write_results: List[Dict[str, Any]] = []
+                input_data["output_contract"] = contract
+                input_data["write_execution_mode"] = write_mode
+                input_data["write_targets"] = write_targets
                 try:
                     output_data = await self._execute_agent(agent, input_data)
                     output_data = normalize_agent_output_for_artifact(output_data)
+                    output_data = _normalize_placeholder_error_values(output_data)
+                    output_data = _ensure_records_for_platform_write(
+                        output_data,
+                        write_mode=write_mode,
+                        write_targets=write_targets,
+                    )
                     # ui_only: keep results in step.output_data (DB) for the UI only — no S3/local artifact file, no contract writes.
                     if write_mode == "ui_only":
                         output_format = (getattr(job, "output_artifact_format", None) or "jsonl").strip().lower()
@@ -629,6 +712,7 @@ class AgentExecutor:
         max_agent_rounds = 20
         round_idx = 0
         content = ""
+        auto_schema_retry_used = False
 
         while round_idx < max_agent_rounds:
             round_idx += 1
@@ -665,6 +749,15 @@ class AgentExecutor:
                 except (json.JSONDecodeError, TypeError):
                     args = {}
                 tool_result = await self._invoke_mcp_tool(business_id, tool_name, args, routing)
+                tool_meta = routing.get(tool_name) or {}
+                tool_result, used_now = await self._maybe_auto_discover_sql_schema_once(
+                    business_id=business_id,
+                    tool_name=tool_name,
+                    tool_meta=tool_meta,
+                    tool_result=tool_result,
+                    already_used=auto_schema_retry_used,
+                )
+                auto_schema_retry_used = auto_schema_retry_used or used_now
                 messages.append({"role": "tool", "tool_call_id": tc_id, "content": tool_result})
             logger.info("MCP tool round %s: %s tool call(s), continuing agent loop", round_idx, len(tool_calls))
 
@@ -882,13 +975,15 @@ class AgentExecutor:
                     "as a substitute for a Pinecone query unless the task explicitly names that source. "
                     "Never present documents from one backend as results for another.\n\n"
                 )
-            if any(str(t.get("tool_type", "")).lower() in ("postgres", "mysql") for t in available_mcp_tools):
+            if any(str(t.get("tool_type", "")).lower() in ("postgres", "mysql", "sqlserver") for t in available_mcp_tools):
                 system_content += (
-                    "CRITICAL — PostgreSQL/MySQL platform tools: call with ONLY the arguments allowed by the tool schema: "
+                    "CRITICAL — PostgreSQL/MySQL/SQL Server platform tools: call with ONLY the arguments allowed by the tool schema: "
                     "`query` (required) and optionally `params`. "
                     "Do NOT send write_mode, operation_type, target, artifact_ref, merge_keys, or idempotency_key with "
                     "these tools — those fields belong to the job output contract (e.g. MinIO/Snowflake artifact writes), "
                     "not to interactive SQL. "
+                    "For SQL Server, use T-SQL syntax (e.g. SELECT TOP 100, schema-qualified [schema].[table], bracketed identifiers like [column_name]); "
+                    "do NOT use LIMIT, backticks, or Postgres/MySQL-only syntax. "
                     "For a row count use only: {\"query\": \"SELECT COUNT(*) FROM your_table\"}.\n\n"
                 )
             if any(
@@ -902,6 +997,10 @@ class AgentExecutor:
                 )
             # Database schema and business context for SQL tools (so the agent can write correct queries)
             schema_tools = [t for t in available_mcp_tools if t.get("schema_metadata") or t.get("business_description")]
+            sql_tools_without_schema = [
+                t for t in available_mcp_tools
+                if str(t.get("tool_type", "")).lower() in ("postgres", "mysql", "sqlserver") and not t.get("schema_metadata")
+            ]
             if schema_tools:
                 system_content += "═══════════════════════════════════════════════════════\n"
                 system_content += "DATABASE SCHEMA AND CONTEXT (use this to write correct SQL)\n"
@@ -921,7 +1020,39 @@ class AgentExecutor:
                             pass
                     system_content += "\n"
                 system_content += "Use the schema above to write valid SQL for the corresponding tool. Do not guess table or column names. "
-                system_content += "Then invoke that tool with your SQL so the platform executes it and returns results; do not only show the SQL in your message.\n\n"
+                system_content += (
+                    "Then invoke that tool with your SQL so the platform executes it and returns results; do not only show the SQL in your message. "
+                    "Report only metrics you can compute from existing tables/columns in the discovered schema. "
+                    "If a requested metric is not derivable from available schema, return null (or omit that key) instead of placeholder text like "
+                    "'Error retrieving data'.\n\n"
+                )
+            elif sql_tools_without_schema:
+                system_content += (
+                    "CRITICAL — SQL schema metadata is not available for one or more SQL tools. "
+                    "Before generating analytical insights, first discover schema via tool calls, then run analysis queries. "
+                    "Start with INFORMATION_SCHEMA.TABLES and INFORMATION_SCHEMA.COLUMNS for the selected SQL tool. "
+                    "Do not guess table/column names.\n\n"
+                )
+                system_content += (
+                    "Example schema discovery (SQL Server): "
+                    "{\"query\": \"SELECT TABLE_SCHEMA, TABLE_NAME FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_TYPE='BASE TABLE' ORDER BY TABLE_SCHEMA, TABLE_NAME\"}\n\n"
+                )
+        write_mode = (input_data.get("write_execution_mode") or "").strip().lower()
+        write_targets = input_data.get("write_targets") or []
+        if write_mode == "platform" and isinstance(write_targets, list) and write_targets:
+            system_content += "═══════════════════════════════════════════════════════\n"
+            system_content += "OUTPUT CONTRACT (STRICT)\n"
+            system_content += "═══════════════════════════════════════════════════════\n\n"
+            system_content += (
+                "Your final answer MUST be valid JSON with top-level key `records` containing an array of objects. "
+                "Do not return prose, markdown, or `{ \"content\": ... }` for this job. "
+                "If a query fails, retry with corrected SQL using schema context. "
+                "If no rows match, return `{ \"records\": [] }`.\n\n"
+            )
+            system_content += (
+                "Example valid output:\n"
+                "{\"records\":[{\"product_id\":980,\"queried_at\":\"2026-04-01T18:40:00Z\"}]}\n\n"
+            )
         messages.append({"role": "system", "content": system_content})
         
         # Add document content to messages with clear formatting (if documents exist)
@@ -1315,6 +1446,53 @@ END DOCUMENT {i+1}: {doc_name}
         if meta.get("source") == "platform":
             args = _sanitize_platform_sql_tool_arguments(str(meta.get("tool_type") or ""), args)
         return await self._call_platform_mcp_tool(business_id, tool_name, args)
+
+    async def _maybe_auto_discover_sql_schema_once(
+        self,
+        *,
+        business_id: int,
+        tool_name: str,
+        tool_meta: Dict[str, Any],
+        tool_result: str,
+        already_used: bool,
+    ) -> tuple[str, bool]:
+        """
+        Generic one-time fallback:
+        on first SQL ProgrammingError from a platform SQL tool, run schema discovery query and
+        append discovery output so the model can retry with corrected SQL in the next round.
+        """
+        if already_used:
+            return tool_result, False
+        if not isinstance(tool_meta, dict) or tool_meta.get("source") != "platform":
+            return tool_result, False
+        tool_type = str(tool_meta.get("tool_type") or "").strip().lower()
+        if tool_type not in ("sqlserver", "postgres", "mysql"):
+            return tool_result, False
+        if not _is_sql_programming_error_tool_result(tool_result):
+            return tool_result, False
+        query = _sql_schema_discovery_query(tool_type)
+        if not query:
+            return tool_result, False
+        try:
+            discovery = await self._call_platform_mcp_tool(
+                business_id,
+                tool_name,
+                {"query": query},
+            )
+        except Exception:
+            logger.exception(
+                "Auto schema discovery failed tool=%s tool_type=%s",
+                tool_name,
+                tool_type,
+            )
+            discovery = "Error: auto schema discovery failed"
+        enriched = (
+            f"{tool_result}\n\n"
+            "[auto_schema_discovery_once]\n"
+            f"{discovery}\n\n"
+            "Retry with corrected SQL using the discovered schema above."
+        )
+        return enriched, True
 
     async def _call_platform_mcp_tool(
         self, business_id: int, tool_name: str, arguments: Dict[str, Any]

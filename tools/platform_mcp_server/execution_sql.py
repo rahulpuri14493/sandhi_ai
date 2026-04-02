@@ -8,8 +8,12 @@ from typing import Any, Dict
 from execution_common import (
     _log_mcp_sql,
     _postgres_dest_hint,
+    _pymysql_connect_kwargs,
+    _pymssql_connect_kwargs,
+    mysql_tool_error_response,
     _sql_query_from_args,
     safe_tool_error,
+    sqlserver_tool_error_response,
 )
 
 def execute_postgres(config: Dict[str, Any], arguments: Dict[str, Any]) -> str:
@@ -118,13 +122,7 @@ def execute_mysql(config: Dict[str, Any], arguments: Dict[str, Any]) -> str:
     mysql_dest = f"{config.get('host', 'localhost')}:{int(config.get('port', 3306))}/{config.get('database', '')}"
     _log_mcp_sql("mysql", query, mode="read" if is_read_query else "write", dest=mysql_dest)
     try:
-        conn = pymysql.connect(
-            host=config.get("host", "localhost"),
-            port=int(config.get("port", 3306)),
-            user=config.get("user", ""),
-            password=config.get("password", ""),
-            database=config.get("database", ""),
-        )
+        conn = pymysql.connect(**_pymysql_connect_kwargs(config))
         cur = conn.cursor()
         if is_read_query:
             if params is None:
@@ -152,7 +150,13 @@ def execute_mysql(config: Dict[str, Any], arguments: Dict[str, Any]) -> str:
         conn.close()
         return json.dumps({"status": "ok", "rowcount": rc})
     except Exception as e:
-        return safe_tool_error("MySQL error", e)
+        low = str(e).lower()
+        if "require_secure_transport" in low or "insecure transport" in low:
+            return (
+                "Error: MySQL requires secure transport (TLS). "
+                "Set tool config ssl_mode='required' (or ssl=true) and provide ssl_ca if your server requires CA verification."
+            )
+        return mysql_tool_error_response("MySQL error", e, config)
 
 
 def execute_snowflake_sql(config: Dict[str, Any], arguments: Dict[str, Any]) -> str:
@@ -280,13 +284,7 @@ def execute_sqlserver_sql(config: Dict[str, Any], arguments: Dict[str, Any]) -> 
     mssql_dest = f"{(config.get('host') or 'localhost').strip()}:{int(config.get('port') or 1433)}/{config.get('database', '')}"
     _log_mcp_sql("sqlserver", query, mode="read" if is_read_ss else "write", dest=mssql_dest)
     try:
-        conn = pymssql.connect(
-            server=(config.get("host") or "localhost").strip(),
-            port=int(config.get("port") or 1433),
-            user=(config.get("user") or "").strip(),
-            password=(config.get("password") or "").strip(),
-            database=(config.get("database") or "").strip(),
-        )
+        conn = pymssql.connect(**_pymssql_connect_kwargs(config))
         cur = conn.cursor()
         # codeql[py/sql-injection]: Interactive SQL tool; query from operator args (pymssql).
         cur.execute(query)
@@ -303,7 +301,7 @@ def execute_sqlserver_sql(config: Dict[str, Any], arguments: Dict[str, Any]) -> 
         conn.close()
         return json.dumps({"status": "ok"})
     except Exception as e:
-        return safe_tool_error("SQL Server error", e)
+        return sqlserver_tool_error_response("SQL Server error", e, config)
 
 
 def execute_databricks_sql(config: Dict[str, Any], arguments: Dict[str, Any]) -> str:

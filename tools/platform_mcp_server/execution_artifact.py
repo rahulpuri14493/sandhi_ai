@@ -15,6 +15,7 @@ from execution_common import (
     _artifact_object_storage_basename,
     _merge_sql_dialect,
     _postgres_dest_hint,
+    _pymssql_connect_kwargs,
     _pymssql_sqlserver_drop_staging,
     _pymssql_sqlserver_execute_merge_artifact,
     _pymssql_sqlserver_select_into_empty_clone,
@@ -25,6 +26,7 @@ from execution_common import (
     _sqlserver_staging_temp_name,
     _truncate_for_log,
     safe_tool_error,
+    sqlserver_tool_error_response,
 )
 
 logger = logging.getLogger(__name__)
@@ -888,13 +890,7 @@ def _artifact_write_sqlserver(
     placeholders = ", ".join(["%s"] * len(cols))
     col_sql = ", ".join(f"[{c}]" for c in cols_ident)
     try:
-        conn = pymssql.connect(
-            server=(config.get("host") or "localhost").strip(),
-            port=int(config.get("port") or 1433),
-            user=(config.get("user") or "").strip(),
-            password=(config.get("password") or "").strip(),
-            database=database,
-        )
+        conn = pymssql.connect(**_pymssql_connect_kwargs(config, database))
         cur = conn.cursor()
         if operation_type in ("append", "insert") or not safe_merge_keys:
             ins = f"INSERT INTO {fq} ({col_sql}) VALUES ({placeholders})"
@@ -915,7 +911,7 @@ def _artifact_write_sqlserver(
         conn.close()
         return json.dumps({"status": "ok", "rows": len(records)})
     except Exception as e:
-        return safe_tool_error("SQL Server artifact write", e)
+        return sqlserver_tool_error_response("SQL Server artifact write", e, config)
 
 
 def _artifact_write_databricks(
