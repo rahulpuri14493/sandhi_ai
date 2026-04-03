@@ -64,6 +64,15 @@ def test_platform_write_guard_accepts_tabular_records():
     assert out["records"][0]["product_id"] == 980
 
 
+def test_platform_write_guard_accepts_empty_records_list():
+    out = _ensure_records_for_platform_write(
+        {"records": []},
+        write_mode="platform",
+        write_targets=[{"tool_name": "platform_1_local_minio"}],
+    )
+    assert out["records"] == []
+
+
 def test_platform_write_guard_rejects_narrative_content():
     with pytest.raises(ValueError, match="top-level `records`"):
         _ensure_records_for_platform_write(

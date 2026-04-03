@@ -692,7 +692,8 @@ def _sql_query_from_args(config: Dict[str, Any], arguments: Dict[str, Any]) -> s
     if runtime_q:
         if not _is_safe_runtime_read_sql(runtime_q):
             raise ValueError(
-                "Runtime SQL is allowed only for a single read-only statement (SELECT/WITH/SHOW/DESCRIBE/EXPLAIN)"
+                "Runtime SQL is allowed only for a single read-only statement "
+                "(SELECT/WITH/SHOW/DESCRIBE/DESC/EXPLAIN)"
             )
         return runtime_q
 
@@ -709,7 +710,7 @@ def _sql_query_from_args(config: Dict[str, Any], arguments: Dict[str, Any]) -> s
 
 
 def _is_safe_runtime_read_sql(query: str) -> bool:
-    """Best-effort guard for runtime SQL: single read-only SELECT/WITH statement."""
+    """Best-effort guard for runtime SQL: single read-only SELECT/WITH or safe metadata statement."""
     if not isinstance(query, str):
         return False
     q = query.strip()
@@ -722,7 +723,14 @@ def _is_safe_runtime_read_sql(query: str) -> bool:
         return False
     q = q.rstrip(";").strip()
     upper = q.upper()
-    if not (upper.startswith("SELECT") or upper.startswith("WITH")):
+    if not (
+        upper.startswith("SELECT")
+        or upper.startswith("WITH")
+        or upper.startswith("SHOW")
+        or upper.startswith("DESCRIBE")
+        or upper.startswith("DESC")
+        or upper.startswith("EXPLAIN")
+    ):
         return False
     # Disallow common write/DDL/control keywords in runtime SQL.
     if re.search(

@@ -16,6 +16,7 @@ SQL Server:
 """
 from __future__ import annotations
 
+import socket
 import os
 from pathlib import Path
 
@@ -68,6 +69,17 @@ def _assert_ok_sql_output(text: str) -> None:
     assert not text.startswith("Error:"), text[:1500]
 
 
+def _can_connect_tcp(host: str, port: int, *, timeout_s: float = 2.0) -> bool:
+    host = (host or "").strip()
+    if not host:
+        return False
+    try:
+        with socket.create_connection((host, int(port)), timeout=timeout_s):
+            return True
+    except OSError:
+        return False
+
+
 def test_e2e_mysql_execute():
     cfg, missing = _env_or_dotenv(
         "MYSQL_E2E_HOST",
@@ -88,6 +100,8 @@ def test_e2e_mysql_execute():
     if ssl_mode:
         config["ssl_mode"] = ssl_mode
     query = (_dotenv_value("MYSQL_E2E_QUERY") or "SELECT 1 AS ok").strip()
+    if not _can_connect_tcp(config["host"], config["port"], timeout_s=2.0):
+        pytest.skip(f"TCP unreachable: {config['host']}:{config['port']}")
     out = execute_platform_tool("mysql", config, {"query": query})
     _assert_ok_sql_output(out)
 
@@ -116,5 +130,7 @@ def test_e2e_sqlserver_execute():
     if encryption:
         config["encryption"] = encryption
     query = (_dotenv_value("SQLSERVER_E2E_QUERY") or "SELECT 1 AS ok").strip()
+    if not _can_connect_tcp(config["host"], config["port"], timeout_s=2.0):
+        pytest.skip(f"TCP unreachable: {config['host']}:{config['port']}")
     out = execute_platform_tool("sqlserver", config, {"query": query})
     _assert_ok_sql_output(out)

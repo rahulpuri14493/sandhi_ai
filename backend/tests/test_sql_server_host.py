@@ -34,3 +34,23 @@ def test_azure_sql_true_for_logical_server():
 def test_azure_sql_false_for_on_prem_style():
     assert sql_server_host_is_azure_sql("sql.contoso.local") is False
     assert sql_server_host_is_azure_sql("localhost") is False
+
+
+def test_normalized_empty_host():
+    assert normalized_sql_server_hostname("") == ""
+    assert sql_server_host_is_azure_sql("") is False
+
+
+def test_normalized_https_url_with_path_lowercases_host():
+    assert (
+        normalized_sql_server_hostname("https://MY.database.windows.net/path")
+        == "my.database.windows.net"
+    )
+
+
+def test_normalized_ipv6_bracket_host():
+    assert normalized_sql_server_hostname("tcp:[2001:db8::1],1433") == "2001:db8::1"
+
+
+def test_normalized_bracket_without_closing_returns_empty():
+    assert normalized_sql_server_hostname("[2001:db8::1") == ""
