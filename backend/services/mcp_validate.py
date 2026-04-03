@@ -284,7 +284,7 @@ def _validate_sqlserver(config: dict) -> Tuple[bool, str]:
     encryption = (config.get("encryption") or config.get("encrypt") or "").strip().lower()
     if encryption in ("off", "request", "require"):
         kw["encryption"] = encryption
-    elif "database.windows.net" in host.lower():
+    elif sql_server_host_is_azure_sql(host):
         # Azure SQL Database requires TLS; "require" is the safest default.
         kw["encryption"] = "require"
         kw["login_timeout"] = 90
