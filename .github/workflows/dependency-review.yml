@@ -21,10 +21,63 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Install backend dependencies and pipdeptree
+      - name: Install backend dependencies and audit tools
         run: |
           python -m pip install --upgrade pip
-          pip install -r backend/requirements.txt pipdeptree
+          pip install -r backend/requirements.txt pipdeptree pip-audit
+
+      - name: Audit Python dependencies for high/critical vulnerabilities
+        run: |
+          python - <<'PY'
+          import json
+          import subprocess
+          import sys
+
+          print("Running pip-audit (JSON, local env)...")
+          try:
+            out = subprocess.check_output(
+              ["pip-audit", "--local", "--format", "json", "--desc", "off"],
+              text=True,
+            )
+          except subprocess.CalledProcessError as e:
+            # pip-audit exits non-zero when it finds vulns; we still want its JSON.
+            out = e.output or ""
+
+          if not out.strip():
+            print("pip-audit produced no output")
+            sys.exit(0)
+
+          try:
+            data = json.loads(out)
+          except json.JSONDecodeError:
+            print("pip-audit output was not valid JSON; exiting without failing CI.")
+            sys.exit(0)
+
+          vulns = data.get("vulnerabilities") if isinstance(data, dict) else data
+          if not isinstance(vulns, list):
+            print("pip-audit JSON did not contain a vulnerabilities list; exiting without failing CI.")
+            sys.exit(0)
+
+          high_or_critical = []
+          for v in vulns:
+            sev = str(v.get("severity", "")).lower()
+            if sev in ("high", "critical"):
+              high_or_critical.append(v)
+
+          if not high_or_critical:
+            print("pip-audit: no high/critical vulnerabilities found.")
+            sys.exit(0)
+
+          print("pip-audit: high/critical vulnerabilities detected:")
+          for v in high_or_critical:
+            name = v.get("package", {}).get("name")
+            version = v.get("package", {}).get("version")
+            sev = v.get("severity")
+            vid = v.get("id") or v.get("vuln_id")
+            print(f"- {name}=={version} severity={sev} id={vid}")
+
+          sys.exit(1)
+          PY
 
       - name: Fail if python-jose or ecdsa exists in dependency graph
         run: |

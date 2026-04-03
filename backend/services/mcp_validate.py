@@ -63,6 +63,11 @@ def _normalize_http_url(url: str) -> str:
     s = (url or "").strip()
     if not s:
         return ""
+    # Users (or agents) sometimes paste URLs with trailing punctuation from markdown
+    # or prose. Strip a small, safe set before normalization so that host parsing works.
+    s = s.rstrip(").],>")
+    if not s:
+        return ""
     if not s.startswith("http://") and not s.startswith("https://"):
         s = "https://" + s
     return s
