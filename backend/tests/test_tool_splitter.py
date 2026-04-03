@@ -1,5 +1,6 @@
 """Unit tests for BRD-aware platform tool assignment (tool_splitter)."""
 
+import json
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -182,3 +183,39 @@ async def test_suggest_tools_fills_llm_audit_on_agent_endpoint():
         )
     assert audit.get("raw_llm_response") == raw
     assert audit.get("source") == "agent_endpoint"
+
+
+@pytest.mark.asyncio
+async def test_suggest_tools_planner_uses_agent_planner_temperature(monkeypatch):
+    """Codex: planner path must use AGENT_PLANNER_TEMPERATURE, not splitter_agent.temperature."""
+    from core.config import settings
+
+    tools = [SimpleNamespace(id=7, name="W", tool_type="weaviate")]
+    agents = [SimpleNamespace(name="Only", description="d")]
+    splitter = SimpleNamespace(
+        name="Split",
+        description="d",
+        api_endpoint="",
+        api_key=None,
+        llm_model="gpt-4o-mini",
+        temperature=0.99,
+    )
+    monkeypatch.setattr(settings, "AGENT_PLANNER_TEMPERATURE", 0.22, raising=False)
+    raw = json.dumps(
+        [{"agent_index": 0, "platform_tool_ids": [7], "rationale": "search"}]
+    )
+    mock_planner = AsyncMock(return_value=raw)
+    with patch("services.tool_splitter.is_agent_planner_configured", return_value=True):
+        with patch("services.tool_splitter.planner_chat_completion", mock_planner):
+            await suggest_tool_assignments_for_agents(
+                job_title="t",
+                job_description="d",
+                documents_content=[{"id": "1", "name": "BRD", "content": "x"}],
+                conversation_data=None,
+                agents=agents,
+                platform_tools=tools,
+                splitter_agent=splitter,
+            )
+    mock_planner.assert_called_once()
+    _args, kwargs = mock_planner.call_args
+    assert kwargs.get("temperature") == 0.22

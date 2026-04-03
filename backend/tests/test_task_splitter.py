@@ -129,6 +129,44 @@ async def test_split_populates_llm_audit_when_planner_used(multi_agents):
     assert out[0]["task"] == "P0"
 
 
+@pytest.mark.asyncio
+async def test_split_planner_uses_agent_planner_temperature_not_splitter_agent(
+    monkeypatch, multi_agents
+):
+    """Codex: planner path must use AGENT_PLANNER_TEMPERATURE, not first agent temperature."""
+    from core.config import settings
+
+    splitter = multi_agents[0]
+    splitter.api_endpoint = ""
+    splitter.temperature = 0.99
+    monkeypatch.setattr(settings, "AGENT_PLANNER_TEMPERATURE", 0.11, raising=False)
+    raw_json = json.dumps(
+        [
+            {"agent_index": 0, "task": "P0", "assigned_document_ids": ["BRD1"]},
+            {"agent_index": 1, "task": "P1", "assigned_document_ids": ["BRD2"]},
+            {"agent_index": 2, "task": "P2", "assigned_document_ids": ["BRD3"]},
+        ]
+    )
+    mock_planner = AsyncMock(return_value=raw_json)
+    with patch("services.task_splitter.is_agent_planner_configured", return_value=True):
+        with patch("services.task_splitter.planner_chat_completion", mock_planner):
+            await split_job_for_agents(
+                job_title="P",
+                job_description="d",
+                documents_content=[
+                    {"id": "BRD1", "name": "a", "content": "a"},
+                    {"id": "BRD2", "name": "b", "content": "b"},
+                    {"id": "BRD3", "name": "c", "content": "c"},
+                ],
+                conversation_data=None,
+                agents=multi_agents,
+                splitter_agent=splitter,
+            )
+    mock_planner.assert_called_once()
+    _args, kwargs = mock_planner.call_args
+    assert kwargs.get("temperature") == 0.11
+
+
 def test_split_populates_llm_audit_when_api_succeeds(multi_agents):
     """Optional llm_audit dict receives raw model text and source."""
     splitter = multi_agents[0]

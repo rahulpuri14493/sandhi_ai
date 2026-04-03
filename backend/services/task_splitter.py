@@ -128,9 +128,13 @@ If user text explicitly says mappings like "BRD1 handled by Agent1", enforce the
 
     try:
         if use_planner:
+            # Platform planner must follow AGENT_PLANNER_* settings, not the splitter agent profile.
+            planner_temperature = float(
+                getattr(settings, "AGENT_PLANNER_TEMPERATURE", 0.3) or 0.3
+            )
             text = await planner_chat_completion(
                 payload["messages"],
-                temperature=temperature,
+                temperature=planner_temperature,
                 max_tokens=min(8192, int(getattr(settings, "AGENT_PLANNER_MAX_TOKENS", 4096) or 4096)),
             )
         else:
