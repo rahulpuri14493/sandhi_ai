@@ -4,6 +4,7 @@ import json
 import re
 from core.config import settings
 from services.llm_http_client import post_openai_compatible_raw
+from services.planner_llm import is_agent_planner_configured, planner_chat_completion
 from typing import List, Dict, Any, Optional
 from models.agent import Agent
 
@@ -17,11 +18,19 @@ async def split_job_for_agents(
     conversation_data: Optional[List[Dict]],
     agents: List[Agent],
     splitter_agent: Agent,
+    llm_audit: Optional[Dict[str, Any]] = None,
 ) -> List[Dict[str, Any]]:
     """
-    Use the first agent's API to split the job into N subtasks, one per agent.
+    Split the job into N subtasks, one per agent.
+
+    LLM backend: when the platform Agent Planner is configured (AGENT_PLANNER_API_KEY set and enabled),
+    completions use that model. Otherwise the first workflow agent's OpenAI-compatible endpoint is used
+    (same credentials/model fields as that agent). If neither is available, returns fallback tasks.
+
     Returns list of {"agent_index": int, "task": str, "assigned_document_ids": [..]?} for each agent.
-    Falls back to equal-share if split fails.
+
+    If llm_audit is a dict, it is filled with raw_llm_response and source when an LLM response
+    was received (before JSON parse), for persisting planner artifacts.
     """
     if len(agents) <= 1:
         all_doc_ids = [d.get("id") for d in documents_content if d.get("id")]
@@ -33,8 +42,9 @@ async def split_job_for_agents(
 
     doc_catalog = _build_document_catalog(documents_content)
 
+    use_planner = is_agent_planner_configured()
     url = (splitter_agent.api_endpoint or "").strip()
-    if not url:
+    if not use_planner and not url:
         return _fallback_tasks(agents, job_title, job_description, documents_content)
 
     # Build context for the splitter (BRD = documents; use larger excerpt so division is based on full requirements)
@@ -117,18 +127,28 @@ If user text explicitly says mappings like "BRD1 handled by Agent1", enforce the
         headers["Authorization"] = f"Bearer {(splitter_agent.api_key or '').strip()}"
 
     try:
-        fb = (getattr(settings, "LLM_HTTP_FALLBACK_MODEL", None) or "").strip() or None
-        resp = await post_openai_compatible_raw(
-            url, headers, payload, timeout=60.0, max_retries=2, fallback_model=fb
-        )
-        if resp.status_code >= 400:
-            return _fallback_tasks(agents, job_title, job_description, documents_content)
+        if use_planner:
+            text = await planner_chat_completion(
+                payload["messages"],
+                temperature=temperature,
+                max_tokens=min(8192, int(getattr(settings, "AGENT_PLANNER_MAX_TOKENS", 4096) or 4096)),
+            )
+        else:
+            fb = (getattr(settings, "LLM_HTTP_FALLBACK_MODEL", None) or "").strip() or None
+            resp = await post_openai_compatible_raw(
+                url, headers, payload, timeout=60.0, max_retries=2, fallback_model=fb
+            )
+            if resp.status_code >= 400:
+                return _fallback_tasks(agents, job_title, job_description, documents_content)
 
-        data = resp.json()
-        text = (
-            data.get("choices", [{}])[0].get("message", {}).get("content", "")
-            or ""
-        ).strip()
+            data = resp.json()
+            text = (
+                data.get("choices", [{}])[0].get("message", {}).get("content", "")
+                or ""
+            ).strip()
+        if llm_audit is not None:
+            llm_audit["raw_llm_response"] = text
+            llm_audit["source"] = "planner" if use_planner else "agent_endpoint"
         # Remove markdown code blocks if present
         if text.startswith("```"):
             text = text.split("```")[1]

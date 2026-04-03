@@ -315,6 +315,31 @@ class TestE2EJobs:
         )
         assert r9.status_code == 200
 
+    def test_planner_status_and_artifacts_list_for_job(
+        self, integration_client: TestClient, business_user
+    ):
+        """E2E: authenticated planner/status and empty planner-artifacts for a new job."""
+        token = business_user["token"]
+        headers = {"Authorization": f"Bearer {token}"}
+
+        r0 = integration_client.get("/api/jobs/planner/status", headers=headers)
+        assert r0.status_code == 200
+        st = r0.json()
+        assert "configured" in st
+        assert "provider" in st
+
+        r = integration_client.post(
+            "/api/jobs",
+            data={"title": "Planner audit job", "description": "e2e"},
+            headers=headers,
+        )
+        assert r.status_code == 201
+        job_id = r.json()["id"]
+
+        r2 = integration_client.get(f"/api/jobs/{job_id}/planner-artifacts", headers=headers)
+        assert r2.status_code == 200
+        assert r2.json().get("items") == []
+
 
 # ---------- Dashboards ----------
 class TestE2EDashboards:

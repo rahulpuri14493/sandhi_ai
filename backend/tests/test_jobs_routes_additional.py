@@ -661,7 +661,7 @@ def test_generate_workflow_questions_returns_added_questions_only(monkeypatch, c
     r = client.post(f"/api/jobs/{job.id}/generate-workflow-questions", headers=headers)
     assert r.status_code == 200, r.text
     out = r.json()
-    assert out["questions"] == [existing_q, "Should we round the result?"]
+    assert out["questions"] == ["Should we round the result?"]
     assert out["added_questions"] == ["Should we round the result?"]
     assert out["no_questions_needed"] is False
     assert sum(1 for i in out["conversation"] if i.get("type") == "question") == 2
@@ -740,4 +740,104 @@ def test_generate_workflow_questions_prunes_stale_unanswered_when_none_needed(mo
     assert out["added_questions"] == []
     assert out["removed_unanswered_questions"] == 1
     assert all(not (i.get("type") == "question" and not str(i.get("answer", "")).strip()) for i in out["conversation"])
+
+
+def test_analyze_documents_hired_agent_when_planner_disabled(monkeypatch, client: TestClient, db_session, tmp_path):
+    """With platform planner off, analyze-documents still uses the hired agent OpenAI-compatible path (regression)."""
+    from core.config import settings
+
+    import services.document_analyzer as da_mod
+
+    monkeypatch.setattr(da_mod, "is_agent_planner_configured", lambda: False)
+    monkeypatch.setattr(settings, "A2A_ADAPTER_URL", "")
+
+    class FakeAsyncClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return False
+
+        async def post(self, url, json=None, headers=None):
+            class R:
+                def raise_for_status(self):
+                    pass
+
+                def json(self):
+                    return {
+                        "choices": [
+                            {
+                                "message": {
+                                    "content": (
+                                        '{"analysis":"Legacy hired-agent analysis",'
+                                        '"questions":[],"recommendations":[],"solutions":[],"next_steps":[]}'
+                                    )
+                                }
+                            }
+                        ]
+                    }
+
+            return R()
+
+    monkeypatch.setattr(da_mod.httpx, "AsyncClient", FakeAsyncClient)
+
+    biz, headers = _make_business(db_session, "planner_off")
+    dev = User(
+        email=f"dev_planner_off_{uuid.uuid4().hex[:8]}@example.com",
+        password_hash=get_password_hash("pw123456"),
+        role=UserRole.DEVELOPER,
+    )
+    db_session.add(dev)
+    db_session.commit()
+    db_session.refresh(dev)
+
+    p = tmp_path / "req.txt"
+    p.write_text("Requirement body", encoding="utf-8")
+
+    job = Job(
+        business_id=biz.id,
+        title="T",
+        description="D",
+        status=JobStatus.DRAFT,
+        files=json.dumps(
+            [{"id": "f1", "name": "req.txt", "path": str(p), "type": "text/plain", "size": 20}]
+        ),
+        conversation=json.dumps([]),
+    )
+    db_session.add(job)
+    db_session.commit()
+    db_session.refresh(job)
+
+    agent = Agent(
+        developer_id=dev.id,
+        name="Hired",
+        description="d",
+        status=AgentStatus.ACTIVE,
+        price_per_task=1.0,
+        price_per_communication=0.1,
+        api_endpoint="https://hired.example/v1/chat/completions",
+        api_key=None,
+        a2a_enabled=False,
+    )
+    db_session.add(agent)
+    db_session.commit()
+    db_session.refresh(agent)
+
+    step = WorkflowStep(
+        job_id=job.id,
+        agent_id=agent.id,
+        step_order=1,
+        input_data="{}",
+        status="pending",
+    )
+    db_session.add(step)
+    db_session.commit()
+
+    r = client.post(f"/api/jobs/{job.id}/analyze-documents", headers=headers)
+    assert r.status_code == 200, r.text
+    data = r.json()
+    assert "Legacy hired-agent analysis" in (data.get("analysis") or "")
 

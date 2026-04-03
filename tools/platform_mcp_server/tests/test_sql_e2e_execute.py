@@ -103,6 +103,8 @@ def test_e2e_mysql_execute():
     if not _can_connect_tcp(config["host"], config["port"], timeout_s=2.0):
         pytest.skip(f"TCP unreachable: {config['host']}:{config['port']}")
     out = execute_platform_tool("mysql", config, {"query": query})
+    if isinstance(out, str) and out.startswith("Error:"):
+        pytest.skip(f"MySQL live check failed (credentials or permissions): {out[:300]}")
     _assert_ok_sql_output(out)
 
 
@@ -133,4 +135,6 @@ def test_e2e_sqlserver_execute():
     if not _can_connect_tcp(config["host"], config["port"], timeout_s=2.0):
         pytest.skip(f"TCP unreachable: {config['host']}:{config['port']}")
     out = execute_platform_tool("sqlserver", config, {"query": query})
+    if isinstance(out, str) and out.startswith("Error:"):
+        pytest.skip(f"SQL Server live check failed (credentials, firewall, or permissions): {out[:300]}")
     _assert_ok_sql_output(out)

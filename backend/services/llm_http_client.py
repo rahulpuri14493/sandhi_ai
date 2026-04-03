@@ -1,5 +1,5 @@
 """
-Shared httpx usage for OpenAI-compatible chat endpoints (task splitter, tool splitter).
+Shared httpx usage for OpenAI-compatible chat endpoints (task/tool split when not using platform planner).
 
 Retries on transient network errors only; HTTP 4xx/5xx are returned to callers.
 Optional single retry with a fallback model after 429 or 5xx (see LLM_HTTP_FALLBACK_MODEL).

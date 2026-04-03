@@ -217,5 +217,47 @@ def test_auto_split_workflow_filters_documents_per_agent_scope(mock_db, sample_j
     assert [d["id"] for d in step2_data.get("documents", [])] == ["BRD2"]
 
 
+def test_auto_split_persists_task_split_artifact_when_split_returns_raw_audit(mock_db, sample_job, sample_agents):
+    """When split_job_for_agents fills llm_audit.raw_llm_response, persist_json_planner_artifact is awaited."""
+    for a in sample_agents:
+        a.api_endpoint = ""
+
+    mock_db.query.return_value.filter.return_value.first.side_effect = [sample_job] + sample_agents
+    mock_db.query.return_value.filter.return_value.all.side_effect = [
+        sample_agents,
+        [],
+        [],
+        [],
+        [],
+    ]
+    mock_db.query.return_value.filter.return_value.order_by.return_value.all.return_value = []
+    mock_db.commit = MagicMock()
+
+    async def split_with_audit(*args, **kwargs):
+        audit = kwargs.get("llm_audit")
+        if audit is not None:
+            audit["raw_llm_response"] = "[]"
+            audit["source"] = "planner"
+        return [
+            {"agent_index": 0, "task": "T1"},
+            {"agent_index": 1, "task": "T2"},
+        ]
+
+    with patch("services.workflow_builder.is_agent_planner_configured", return_value=True):
+        with patch("services.workflow_builder.split_job_for_agents", new_callable=AsyncMock, side_effect=split_with_audit):
+            with patch("services.workflow_builder.persist_json_planner_artifact", new_callable=AsyncMock) as p_artifact:
+                with patch.object(WorkflowBuilder, "_get_workflow_collaboration_hint", return_value="sequential"):
+                    builder = WorkflowBuilder(mock_db)
+                    with patch.object(builder.payment_processor, "calculate_job_cost", return_value=MagicMock()):
+                        builder.auto_split_workflow(1, [1, 2], workflow_mode="sequential")
+    p_artifact.assert_awaited()
+    aa = p_artifact.await_args
+    assert aa.args[1] == 1
+    assert aa.args[2] == "task_split"
+    payload = aa.args[3]
+    assert payload.get("raw_llm_response") == "[]"
+    assert payload.get("source") == "planner"
+
+
 # ---------- Negative test cases (invalid inputs, expect ValueError) ----------
 # See also test_auto_split_workflow_job_not_found and test_auto_split_workflow_agents_not_found above.

@@ -146,3 +146,39 @@ async def test_suggest_tools_llm_success_parses_json_array():
     assert out["step_suggestions"][0]["platform_tool_ids"] == [7]
     assert "rationale" in out["step_suggestions"][0]
     assert out["output_contract_stub"] is not None
+
+
+@pytest.mark.asyncio
+async def test_suggest_tools_fills_llm_audit_on_agent_endpoint():
+    tools = [SimpleNamespace(id=7, name="W", tool_type="weaviate")]
+    agents = [SimpleNamespace(name="Only", description="d")]
+    splitter = SimpleNamespace(
+        name="Split",
+        description="d",
+        api_endpoint="https://llm.example/v1/chat/completions",
+        api_key="k",
+        llm_model="gpt-4o-mini",
+        temperature=0.2,
+    )
+    raw = '[{"agent_index": 0, "platform_tool_ids": [7], "rationale": "x"}]'
+    mock_resp = MagicMock()
+    mock_resp.status_code = 200
+    mock_resp.json.return_value = {"choices": [{"message": {"content": raw}}]}
+    audit: dict = {}
+    with patch(
+        "services.tool_splitter.post_openai_compatible_raw",
+        new_callable=AsyncMock,
+        return_value=mock_resp,
+    ):
+        await suggest_tool_assignments_for_agents(
+            job_title="t",
+            job_description="d",
+            documents_content=None,
+            conversation_data=None,
+            agents=agents,
+            platform_tools=tools,
+            splitter_agent=splitter,
+            llm_audit=audit,
+        )
+    assert audit.get("raw_llm_response") == raw
+    assert audit.get("source") == "agent_endpoint"

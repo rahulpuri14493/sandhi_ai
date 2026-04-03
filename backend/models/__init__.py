@@ -2,7 +2,7 @@ from .user import User
 from .agent import Agent
 from .agent_review import AgentReview
 from .job_qa import JobQuestion
-from .job import Job, WorkflowStep, JobSchedule, ScheduleStatus, ScheduleExecutionHistory
+from .job import Job, WorkflowStep, JobSchedule, ScheduleStatus, ScheduleExecutionHistory, JobPlannerArtifact
 from .communication import AgentCommunication
 from .transaction import Transaction, Earnings
 from .audit_log import AuditLog
@@ -19,6 +19,7 @@ __all__ = [
     "JobSchedule",
     "ScheduleStatus",
     "ScheduleExecutionHistory",
+    "JobPlannerArtifact",
     "AgentCommunication",
     "Transaction",
     "Earnings",

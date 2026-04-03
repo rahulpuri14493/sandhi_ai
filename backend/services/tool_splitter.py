@@ -3,6 +3,9 @@ BRD-aware suggestion of which platform MCP tools to assign to each workflow step
 
 Mirrors task_splitter.split_job_for_agents: same job title, description, BRD excerpts,
 and optional Q&A — but output is per-agent platform_tool_ids (subset of the business tool pool).
+
+LLM backend: platform Agent Planner when configured (AGENT_PLANNER_API_KEY), otherwise the splitter
+agent's OpenAI-compatible endpoint (same as task split).
 """
 from __future__ import annotations
 
@@ -14,6 +17,7 @@ from core.config import settings
 from models.agent import Agent
 from models.mcp_server import MCPToolConfig
 from services.llm_http_client import post_openai_compatible_raw
+from services.planner_llm import is_agent_planner_configured, planner_chat_completion
 from services.mcp_tool_capabilities import normalize_tool_type, partition_tools_for_fallback, tool_access_summary
 
 logger = logging.getLogger(__name__)
@@ -85,6 +89,7 @@ async def suggest_tool_assignments_for_agents(
     agents: List[Agent],
     platform_tools: List[MCPToolConfig],
     splitter_agent: Agent,
+    llm_audit: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """
     Returns:
@@ -100,8 +105,16 @@ async def suggest_tool_assignments_for_agents(
         for t in platform_tools
     ]
 
+    use_planner = is_agent_planner_configured()
     url = (splitter_agent.api_endpoint or "").strip()
-    if not url or len(agents) == 0:
+    if len(agents) == 0:
+        fb = partition_tools_for_fallback(tool_dicts, len(agents))
+        return {
+            "step_suggestions": fb,
+            "output_contract_stub": _build_write_stub(platform_tools),
+            "fallback_used": True,
+        }
+    if not use_planner and not url:
         fb = partition_tools_for_fallback(tool_dicts, len(agents))
         return {
             "step_suggestions": fb,
@@ -184,17 +197,27 @@ Assign tools to each of the {len(agents)} agents. Return JSON array only."""
     valid_id_set = {int(x) for x in valid_ids}
 
     try:
-        fb = (getattr(settings, "LLM_HTTP_FALLBACK_MODEL", None) or "").strip() or None
-        resp = await post_openai_compatible_raw(
-            url, headers, payload, timeout=60.0, max_retries=2, fallback_model=fb
-        )
-        if resp.status_code >= 400:
-            raise RuntimeError(f"splitter HTTP {resp.status_code}")
-        data = resp.json()
-        text = (
-            data.get("choices", [{}])[0].get("message", {}).get("content", "")
-            or ""
-        ).strip()
+        if use_planner:
+            text = await planner_chat_completion(
+                payload["messages"],
+                temperature=temperature,
+                max_tokens=min(8192, int(getattr(settings, "AGENT_PLANNER_MAX_TOKENS", 4096) or 4096)),
+            )
+        else:
+            fb = (getattr(settings, "LLM_HTTP_FALLBACK_MODEL", None) or "").strip() or None
+            resp = await post_openai_compatible_raw(
+                url, headers, payload, timeout=60.0, max_retries=2, fallback_model=fb
+            )
+            if resp.status_code >= 400:
+                raise RuntimeError(f"splitter HTTP {resp.status_code}")
+            data = resp.json()
+            text = (
+                data.get("choices", [{}])[0].get("message", {}).get("content", "")
+                or ""
+            ).strip()
+        if llm_audit is not None:
+            llm_audit["raw_llm_response"] = text
+            llm_audit["source"] = "planner" if use_planner else "agent_endpoint"
         if text.startswith("```"):
             text = text.split("```")[1]
             if text.startswith("json"):

@@ -6,13 +6,13 @@ import zipfile
 import random
 import uuid
 from pathlib import Path
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
 from fastapi import APIRouter, Depends, HTTPException, status, UploadFile, File, Form, Query
 from fastapi.responses import FileResponse, Response, StreamingResponse
 from sqlalchemy.orm import Session
 from pydantic import BaseModel
 from db.database import get_db
-from models.job import Job, JobStatus, WorkflowStep, JobSchedule, ScheduleStatus, ScheduleExecutionHistory
+from models.job import Job, JobStatus, WorkflowStep, JobSchedule, ScheduleStatus, ScheduleExecutionHistory, JobPlannerArtifact
 from models.agent import Agent
 from models.user import User, UserRole
 from schemas.job import (
@@ -22,6 +22,7 @@ from schemas.job import (
     JobScheduleWithJobResponse, ScheduleExecutionHistoryResponse,
     ScheduleListResponse, ScheduleActionResponse, RerunResponse,
     JobFilterOptions, ScheduleFilterOptions, EnumOption,
+    PlannerArtifactListResponse, PlannerArtifactResponse,
 )
 from core.security import get_current_user, get_current_business_user
 from core.config import settings
@@ -31,6 +32,12 @@ from services.workflow_builder import WorkflowBuilder
 from services.tool_splitter import suggest_tool_assignments_for_agents
 from services.payment_processor import PaymentProcessor
 from services.document_analyzer import DocumentAnalyzer
+from services.planner_artifact_cache import get_cached_planner_raw, set_cached_planner_raw
+from services.planner_artifact_storage import (
+    persist_brd_analysis_artifact,
+    persist_json_planner_artifact,
+    read_planner_artifact_bytes,
+)
 from models.transaction import Transaction, Earnings
 from core.external_token import create_job_token, get_share_url
 from datetime import datetime, timedelta
@@ -78,6 +85,18 @@ def _validate_allowed_tools(db: Session, business_id: int, platform_ids: Optiona
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=f"Invalid or unauthorized connection ids: {sorted(invalid)}")
         out_conn = list(valid_set)
     return (out_platform, out_conn)
+
+
+def _user_can_access_job(job: Job, current_user: User, db: Session) -> bool:
+    if current_user.role == UserRole.BUSINESS:
+        return job.business_id == current_user.id
+    return (
+        db.query(WorkflowStep)
+        .join(Agent)
+        .filter(WorkflowStep.job_id == job.id, Agent.developer_id == current_user.id)
+        .first()
+        is not None
+    )
 
 
 def _get_first_hired_agent_for_job(db: Session, job_id: int) -> Optional[tuple]:
@@ -526,7 +545,7 @@ async def analyze_documents(
     current_user: User = Depends(get_current_business_user),
     db: Session = Depends(get_db)
 ):
-    """Analyze uploaded documents and generate questions using the hired agent."""
+    """Analyze uploaded documents and generate questions. Uses platform planner when configured; else hired agent."""
     job = db.query(Job).filter(Job.id == job_id).first()
     if not job:
         raise HTTPException(
@@ -627,6 +646,7 @@ async def analyze_documents(
         
         # Update job conversation
         job.conversation = json.dumps(new_conversation)
+        await persist_brd_analysis_artifact(db, job.id, result)
         db.commit()
         
         return {
@@ -801,10 +821,9 @@ async def generate_workflow_questions(
     db: Session = Depends(get_db)
 ):
     """
-    Generate clarifying questions for the end user based on the workflow (assigned tasks),
-    BRD documents, and job prompt. Use this in the Q&A step after Build Workflow so
-    AI agents can get requirements clarified before execution. Appends new questions
-    to the job conversation.
+    Generate clarifying questions from each workflow step's assigned agent (their API/A2A),
+    using BRD documents and job context. Questions are tagged with workflow_step_id and agent_id.
+    Requires each assigned agent to have an api_endpoint. Platform Agent Planner is not used here.
     """
     job = db.query(Job).filter(Job.id == job_id).first()
     if not job:
@@ -823,23 +842,6 @@ async def generate_workflow_questions(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Job has no workflow. Build a workflow first, then generate clarification questions.",
         )
-
-    # Build workflow_tasks from steps (assigned_task, agent_name)
-    workflow_tasks = []
-    for step in steps:
-        agent = db.query(Agent).filter(Agent.id == step.agent_id).first()
-        agent_name = agent.name if agent else "Agent"
-        input_data = {}
-        if step.input_data:
-            try:
-                input_data = json.loads(step.input_data)
-            except (json.JSONDecodeError, TypeError):
-                pass
-        workflow_tasks.append({
-            "step_order": step.step_order,
-            "agent_name": agent_name,
-            "assigned_task": input_data.get("assigned_task", ""),
-        })
 
     # Document content for BRD (read from storage)
     documents_content = []
@@ -866,51 +868,91 @@ async def generate_workflow_questions(
         except (json.JSONDecodeError, TypeError):
             pass
 
-    hired = _get_first_hired_agent_for_job(db, job.id)
-    if hired:
-        agent_url, agent_key, agent_model, agent_temp, use_a2a = hired
-    else:
-        agent_url = agent_key = agent_model = agent_temp = None
-        use_a2a = False
-
-    try:
-        analyzer = DocumentAnalyzer()
-        result = await analyzer.generate_workflow_clarification_questions(
-            job_title=job.title or "",
-            job_description=job.description,
-            documents_content=documents_content,
-            workflow_tasks=workflow_tasks,
-            conversation_history=conversation_history,
-            agent_api_url=agent_url,
-            agent_api_key=agent_key,
-            agent_llm_model=agent_model,
-            agent_temperature=agent_temp,
-            use_a2a=use_a2a,
-        )
-    except Exception as e:
+    had_endpoint = False
+    for step in steps:
+        ag = db.query(Agent).filter(Agent.id == step.agent_id).first()
+        if ag and (ag.api_endpoint or "").strip():
+            had_endpoint = True
+            break
+    if not had_endpoint:
         raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to generate workflow questions: {str(e)}",
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="No assigned agents have an API endpoint. Configure each agent's endpoint so they can ask clarification questions for their task.",
         )
 
-    questions = result.get("questions") or []
     new_conversation = conversation_history.copy()
-    existing_questions = {str(item.get("question", "")).strip() for item in new_conversation if item.get("type") == "question" and item.get("question")}
+    existing_questions = {
+        str(item.get("question", "")).strip()
+        for item in new_conversation
+        if item.get("type") == "question" and item.get("question")
+    }
     seen_in_batch = set()
     added_questions = []
-    for q in questions:
-        qs = str(q).strip() if q else ""
-        if not qs or qs in existing_questions or qs in seen_in_batch:
+    analyzer = DocumentAnalyzer()
+
+    for step in steps:
+        agent = db.query(Agent).filter(Agent.id == step.agent_id).first()
+        if not agent or not (agent.api_endpoint or "").strip():
+            logger.info(
+                "Skipping workflow step %s: agent %s has no API endpoint for Q&A",
+                step.id,
+                step.agent_id,
+            )
             continue
-        seen_in_batch.add(qs)
-        existing_questions.add(qs)
-        added_questions.append(qs)
-        new_conversation.append({
-            "type": "question",
-            "question": qs,
-            "answer": None,
-            "timestamp": str(datetime.utcnow()),
-        })
+
+        input_data = {}
+        if step.input_data:
+            try:
+                input_data = json.loads(step.input_data)
+            except (json.JSONDecodeError, TypeError):
+                pass
+        only_step = {
+            "step_order": step.step_order,
+            "agent_name": agent.name if agent else "Agent",
+            "assigned_task": input_data.get("assigned_task", ""),
+        }
+
+        try:
+            result = await analyzer.generate_workflow_clarification_questions(
+                job_title=job.title or "",
+                job_description=job.description,
+                documents_content=documents_content,
+                workflow_tasks=[only_step],
+                conversation_history=new_conversation,
+                agent_api_url=(agent.api_endpoint or "").strip(),
+                agent_api_key=(agent.api_key or "").strip() or None,
+                agent_llm_model=getattr(agent, "llm_model", None),
+                agent_temperature=getattr(agent, "temperature", None),
+                use_a2a=bool(getattr(agent, "a2a_enabled", False)),
+                only_step=only_step,
+            )
+        except Exception as e:
+            logger.warning(
+                "Workflow clarification questions failed for step %s (agent %s): %s",
+                step.id,
+                step.agent_id,
+                e,
+            )
+            continue
+
+        for q in result.get("questions") or []:
+            qs = str(q).strip() if q else ""
+            if not qs or qs in existing_questions or qs in seen_in_batch:
+                continue
+            seen_in_batch.add(qs)
+            existing_questions.add(qs)
+            added_questions.append(qs)
+            new_conversation.append({
+                "type": "question",
+                "question": qs,
+                "answer": None,
+                "timestamp": str(datetime.utcnow()),
+                "workflow_step_id": step.id,
+                "agent_id": agent.id,
+                "agent_name": agent.name if agent else None,
+            })
+
+    questions = added_questions
 
     removed_unanswered_questions = 0
     if len(added_questions) == 0:
@@ -936,6 +978,75 @@ async def generate_workflow_questions(
         "removed_unanswered_questions": removed_unanswered_questions,
         "conversation": new_conversation,
     }
+
+
+@router.get("/planner/status")
+def get_agent_planner_status(current_user: User = Depends(get_current_user)):
+    """Platform Agent Planner configuration (Issue #62). No secrets returned."""
+    from services.planner_llm import get_planner_public_meta, is_agent_planner_configured
+
+    return {
+        "configured": is_agent_planner_configured(),
+        **get_planner_public_meta(),
+    }
+
+
+@router.get("/{job_id}/planner-artifacts", response_model=PlannerArtifactListResponse)
+def list_job_planner_artifacts(
+    job_id: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """List Postgres pointers to planner JSON in object storage (business job owner or assigned developer)."""
+    job = db.query(Job).filter(Job.id == job_id).first()
+    if not job:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Job not found")
+    if not _user_can_access_job(job, current_user, db):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Not authorized")
+    rows = (
+        db.query(JobPlannerArtifact)
+        .filter(JobPlannerArtifact.job_id == job_id)
+        .order_by(JobPlannerArtifact.created_at.desc())
+        .all()
+    )
+    return PlannerArtifactListResponse(
+        items=[PlannerArtifactResponse.model_validate(r, from_attributes=True) for r in rows]
+    )
+
+
+@router.get("/{job_id}/planner-artifacts/{artifact_id}/raw")
+async def download_job_planner_artifact_raw(
+    job_id: int,
+    artifact_id: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Return stored planner JSON (application/json). Business job owner or assigned developer only."""
+    job = db.query(Job).filter(Job.id == job_id).first()
+    if not job:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Job not found")
+    if not _user_can_access_job(job, current_user, db):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Not authorized")
+    row = (
+        db.query(JobPlannerArtifact)
+        .filter(JobPlannerArtifact.id == artifact_id, JobPlannerArtifact.job_id == job_id)
+        .first()
+    )
+    if not row:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Artifact not found")
+    cached = await asyncio.to_thread(get_cached_planner_raw, job_id, artifact_id)
+    if cached is not None:
+        return Response(content=cached, media_type="application/json")
+    try:
+        data = await asyncio.to_thread(read_planner_artifact_bytes, row)
+    except Exception as e:
+        logger.warning("Failed to read planner artifact id=%s job_id=%s: %s", artifact_id, job_id, e)
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Could not read artifact from storage",
+        )
+    await asyncio.to_thread(set_cached_planner_raw, job_id, artifact_id, data)
+    return Response(content=data, media_type="application/json")
 
 
 @router.get("/filter-options", response_model=JobFilterOptions)
@@ -1354,6 +1465,7 @@ async def update_job(
                 })
             
             job.conversation = json.dumps(new_conversation)
+            await persist_brd_analysis_artifact(db, job.id, result)
             db.commit()
             db.refresh(job)
             
@@ -1536,7 +1648,7 @@ async def auto_split_workflow(
 
 
 class SuggestWorkflowToolsBody(BaseModel):
-    """Agents in workflow order (same as auto-split). Used to suggest per-step platform tools from BRD + job prompt."""
+    """Agents in workflow order (same as auto-split). LLM: platform planner if configured, else first agent's endpoint."""
     agent_ids: List[int]
 
 
@@ -1618,6 +1730,7 @@ async def suggest_workflow_tools(
     documents_content = await wb.load_job_documents_content_async(job)
     splitter_agent = agents_ordered[0]
 
+    llm_audit: Dict[str, Any] = {}
     result = await suggest_tool_assignments_for_agents(
         job_title=job.title or "",
         job_description=job.description or "",
@@ -1626,7 +1739,27 @@ async def suggest_workflow_tools(
         agents=agents_ordered,
         platform_tools=platform_tools,
         splitter_agent=splitter_agent,
+        llm_audit=llm_audit,
     )
+    if llm_audit.get("raw_llm_response"):
+        aid = await persist_json_planner_artifact(
+            db,
+            job_id,
+            "tool_suggestion",
+            {
+                "raw_llm_response": llm_audit["raw_llm_response"],
+                "source": llm_audit.get("source"),
+                "job_title": job.title or "",
+                "job_description": job.description or "",
+                "parsed_result": {
+                    "step_suggestions": result.get("step_suggestions"),
+                    "output_contract_stub": result.get("output_contract_stub"),
+                    "fallback_used": result.get("fallback_used"),
+                },
+            },
+        )
+        if aid is not None:
+            db.commit()
     return result
 
 
