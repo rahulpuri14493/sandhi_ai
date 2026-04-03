@@ -21,3 +21,6 @@ jobs:
         with:
           comment-summary-in-pr: always
           fail-on-severity: high
+          # Wait for dependency-submission (or other SBOM) jobs so head SHA has a snapshot.
+          retry-on-snapshot-warnings: true
+          retry-on-snapshot-warnings-timeout: 180

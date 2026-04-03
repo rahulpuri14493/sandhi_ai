@@ -1,0 +1,35 @@
+# Submits resolved Python dependencies to GitHub's dependency graph so
+# dependency-review can diff base/head and reduce "no snapshot" / stale metadata
+# warnings. Fork PRs cannot submit (token is read-only); same-repo PRs and pushes
+# to main populate snapshots for Component Detection (pip + simple pip manifests).
+name: Dependency submission
+
+on:
+  pull_request:
+    branches: ["main"]
+  push:
+    branches: ["main"]
+
+permissions:
+  contents: write
+  id-token: write
+
+concurrency:
+  group: dependency-submission-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  submit:
+    name: Submit Python dependency snapshot
+    runs-on: ubuntu-latest
+    # Fork PRs: GITHUB_TOKEN cannot write dependency graph snapshots.
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Component detection (pip)
+        uses: advanced-security/component-detection-dependency-submission-action@v0.1.1
+        with:
+          filePath: "."
+          detectorArgs: Pip=EnableIfDefaultOff,SimplePip=EnableIfDefaultOff
