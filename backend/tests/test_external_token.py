@@ -1,5 +1,7 @@
 """Unit tests for external job token helpers."""
+import jwt
 from core.external_token import create_job_token, verify_job_token, get_share_url
+from core.security import SECRET_KEY, ALGORITHM
 
 
 def test_create_job_token_returns_jwt_string():
@@ -46,3 +48,16 @@ def test_get_share_url_uses_default_base():
     url = get_share_url(job_id=10)
     # Default is http://localhost:8000
     assert "localhost" in url or "api/external/jobs/10" in url
+
+
+def test_job_token_decodes_with_pyjwt_and_expected_claims():
+    """Job token should decode via PyJWT using configured algorithm and claims."""
+    token = create_job_token(job_id=123)
+
+    header = jwt.get_unverified_header(token)
+    assert header.get("alg") == ALGORITHM
+
+    payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+    assert payload.get("job_id") == 123
+    assert payload.get("type") == "external_view"
+    assert "exp" in payload

@@ -9,9 +9,124 @@ permissions:
   pull-requests: write
 
 jobs:
+  enforce-no-ecdsa:
+    name: Enforce no python-ecdsa
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install service dependencies and audit tools
+        run: |
+          python -m pip install --upgrade pip
+          pip install \
+            -r backend/requirements.txt \
+            -r tools/platform_mcp_server/requirements.txt \
+            -r tools/a2a_openai_adapter/requirements.txt \
+            pipdeptree pip-audit
+
+      - name: Audit Python dependencies (aggregate all vulnerabilities)
+        run: |
+          python - <<'PY'
+          import json
+          import subprocess
+          import sys
+
+          print("Running pip-audit (JSON, local env)...")
+          proc = subprocess.run(
+            ["pip-audit", "--local", "--format", "json", "--desc", "off"],
+            text=True,
+            capture_output=True,
+          )
+
+          raw = (proc.stdout or "").strip()
+          if not raw:
+            print("pip-audit produced no stdout; stderr follows:")
+            print((proc.stderr or "").strip())
+            # If pip-audit itself failed without JSON, fail the job so it is visible.
+            sys.exit(proc.returncode if proc.returncode else 1)
+
+          # pip-audit prepends a human line like "Found X known vulnerabilities..."
+          # before JSON. Parse from the first '{'.
+          json_start = raw.find("{")
+          payload = raw[json_start:] if json_start >= 0 else raw
+
+          try:
+            data = json.loads(payload)
+          except json.JSONDecodeError:
+            print("pip-audit stdout was not valid JSON payload:")
+            print(raw)
+            sys.exit(1)
+
+          deps = data.get("dependencies", []) if isinstance(data, dict) else []
+          findings = []
+          for dep in deps:
+            name = dep.get("name")
+            version = dep.get("version")
+            for v in dep.get("vulns", []) or []:
+              findings.append(
+                {
+                  "name": name,
+                  "version": version,
+                  "id": v.get("id"),
+                  "aliases": v.get("aliases") or [],
+                  "fix_versions": v.get("fix_versions") or [],
+                }
+              )
+
+          if not findings:
+            print("pip-audit: no vulnerabilities found across installed service dependencies.")
+            sys.exit(0)
+
+          print("pip-audit: vulnerabilities detected (full aggregated list):")
+          for f in findings:
+            alias_text = f" aliases={','.join(f['aliases'])}" if f["aliases"] else ""
+            fix_text = f" fix={','.join(f['fix_versions'])}" if f["fix_versions"] else ""
+            print(f"- {f['name']}=={f['version']} id={f['id']}{alias_text}{fix_text}")
+
+          # Fail once with the complete list (avoids one-at-a-time discovery loops).
+          sys.exit(1)
+          PY
+
+      - name: Fail if python-jose or ecdsa exists in dependency graph
+        run: |
+          python - <<'PY'
+          import json
+          import subprocess
+          import sys
+
+          tree = json.loads(subprocess.check_output(["pipdeptree", "--json"], text=True))
+          blocked = {"ecdsa", "python-jose"}
+          found = {}
+
+          for node in tree:
+            package = node.get("package", {})
+            key = package.get("key")
+            if key in blocked:
+              found[key] = package.get("installed_version", "unknown")
+            for dep in node.get("dependencies", []):
+              dkey = dep.get("key")
+              if dkey in blocked:
+                found[dkey] = dep.get("installed_version", "unknown")
+
+          if found:
+            print("Blocked packages detected in dependency graph:")
+            for name, version in sorted(found.items()):
+              print(f"- {name}=={version}")
+            sys.exit(1)
+
+          print("Dependency graph check passed: no python-jose/ecdsa present.")
+          PY
+
   dependency-review:
     name: Dependency review
     runs-on: ubuntu-latest
+    needs: enforce-no-ecdsa
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -21,3 +136,8 @@ jobs:
         with:
           comment-summary-in-pr: always
           fail-on-severity: high
+          # Block python-ecdsa from being introduced through dependency changes.
+          deny-packages: pkg:pypi/ecdsa
+          # Wait for dependency-submission (or other SBOM) jobs so head SHA has a snapshot.
+          retry-on-snapshot-warnings: true
+          retry-on-snapshot-warnings-timeout: 180

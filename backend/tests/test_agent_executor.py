@@ -1,11 +1,15 @@
 """Unit tests for AgentExecutor service."""
 import json
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from models.agent import Agent
 from services.agent_executor import (
     AgentExecutor,
+    _ensure_records_for_platform_write,
+    _is_sql_programming_error_tool_result,
+    _normalize_placeholder_error_values,
+    _sql_schema_discovery_query,
     _apply_tool_visibility,
     _get_workflow_collaboration_hint_from_job,
     normalize_agent_output_for_artifact,
@@ -49,6 +53,45 @@ def test_normalize_agent_output_unwraps_json_fence_inside_content():
     fenced = "```json\n" + json.dumps(inner, indent=2) + "\n```"
     out = normalize_agent_output_for_artifact({"content": fenced})
     assert out["records"][0]["job_count"] == 4
+
+
+def test_platform_write_guard_accepts_tabular_records():
+    out = _ensure_records_for_platform_write(
+        {"records": [{"product_id": 980}]},
+        write_mode="platform",
+        write_targets=[{"tool_name": "platform_1_local_minio"}],
+    )
+    assert out["records"][0]["product_id"] == 980
+
+
+def test_platform_write_guard_accepts_empty_records_list():
+    out = _ensure_records_for_platform_write(
+        {"records": []},
+        write_mode="platform",
+        write_targets=[{"tool_name": "platform_1_local_minio"}],
+    )
+    assert out["records"] == []
+
+
+def test_platform_write_guard_rejects_narrative_content():
+    with pytest.raises(ValueError, match="top-level `records`"):
+        _ensure_records_for_platform_write(
+            {"content": "Could not complete due to SQL errors"},
+            write_mode="platform",
+            write_targets=[{"tool_name": "platform_1_local_minio"}],
+        )
+
+
+def test_normalize_placeholder_error_values_replaces_error_strings_with_null():
+    raw = {
+        "total_orders": 2,
+        "total_users": "Error retrieving data",
+        "nested": [{"k": "Error retrieving"}],
+    }
+    out = _normalize_placeholder_error_values(raw)
+    assert out["total_orders"] == 2
+    assert out["total_users"] is None
+    assert out["nested"][0]["k"] is None
 
 
 def test_format_for_openai_includes_documents():
@@ -205,6 +248,122 @@ def test_positive_format_includes_available_mcp_tools():
     assert "AVAILABLE MCP TOOLS" in content_str
     assert "platform_1_my_db" in content_str
     assert "PostgreSQL" in content_str
+
+
+def test_format_for_openai_adds_schema_discovery_when_sql_schema_missing():
+    agent = MagicMock(spec=Agent)
+    agent.name = "Schema Discovery Agent"
+    input_data = {
+        "job_title": "Sales insights",
+        "job_description": "Generate top 3 insights",
+        "documents": [],
+        "conversation": [],
+        "available_mcp_tools": [
+            {
+                "name": "platform_8_sql_server",
+                "description": "SQL Server",
+                "tool_type": "sqlserver",
+                "schema_metadata": None,
+            }
+        ],
+    }
+    payload = _get_executor_format_input(agent, input_data)
+    content_str = json.dumps([m.get("content", "") for m in payload["messages"]])
+    assert "schema metadata is not available" in content_str.lower()
+    assert "INFORMATION_SCHEMA.TABLES" in content_str
+    assert "Do not guess table/column names" in content_str
+
+
+def test_format_for_openai_includes_no_placeholder_error_text_instruction_with_schema():
+    agent = MagicMock(spec=Agent)
+    agent.name = "Schema Agent"
+    input_data = {
+        "job_title": "Sales summary",
+        "job_description": "Summarize sales_orders only",
+        "documents": [],
+        "conversation": [],
+        "available_mcp_tools": [
+            {
+                "name": "platform_9_mysql",
+                "description": "MySQL",
+                "tool_type": "mysql",
+                "schema_metadata": json.dumps({
+                    "tables": [
+                        {
+                            "table_name": "sales_orders",
+                            "columns": [
+                                {"name": "order_id", "type": "bigint"},
+                                {"name": "product_id", "type": "int"},
+                            ],
+                        }
+                    ]
+                }),
+            }
+        ],
+    }
+    payload = _get_executor_format_input(agent, input_data)
+    content_str = json.dumps([m.get("content", "") for m in payload["messages"]])
+    assert "return null (or omit that key)" in content_str
+    assert "Error retrieving data" in content_str
+
+
+def test_sql_schema_discovery_query_is_generic_per_dialect():
+    assert "INFORMATION_SCHEMA.COLUMNS" in (_sql_schema_discovery_query("sqlserver") or "")
+    assert "information_schema.columns" in (_sql_schema_discovery_query("postgres") or "")
+    assert "INFORMATION_SCHEMA.COLUMNS" in (_sql_schema_discovery_query("mysql") or "")
+    assert _sql_schema_discovery_query("snowflake") is None
+
+
+def test_is_sql_programming_error_tool_result_detection():
+    assert _is_sql_programming_error_tool_result("Error: SQL Server error (ProgrammingError)") is True
+    assert _is_sql_programming_error_tool_result("Error: SQL Server error (OperationalError)") is False
+
+
+@pytest.mark.asyncio
+async def test_auto_schema_discovery_runs_once_on_first_programming_error():
+    ex = AgentExecutor(db=MagicMock())
+    ex._call_platform_mcp_tool = AsyncMock(return_value="TABLE_SCHEMA\tTABLE_NAME\tCOLUMN_NAME")
+    tool_meta = {"source": "platform", "tool_type": "sqlserver"}
+
+    out1, used1 = await ex._maybe_auto_discover_sql_schema_once(
+        business_id=1,
+        tool_name="platform_8_sql_server",
+        tool_meta=tool_meta,
+        tool_result="Error: SQL Server error (ProgrammingError)",
+        already_used=False,
+    )
+    assert used1 is True
+    assert "auto_schema_discovery_once" in out1
+    assert "Retry with corrected SQL" in out1
+    ex._call_platform_mcp_tool.assert_awaited_once()
+
+    out2, used2 = await ex._maybe_auto_discover_sql_schema_once(
+        business_id=1,
+        tool_name="platform_8_sql_server",
+        tool_meta=tool_meta,
+        tool_result="Error: SQL Server error (ProgrammingError)",
+        already_used=True,
+    )
+    assert used2 is False
+    assert out2 == "Error: SQL Server error (ProgrammingError)"
+
+
+def test_format_for_openai_includes_strict_output_contract_instructions():
+    agent = MagicMock(spec=Agent)
+    agent.name = "Contract Agent"
+    input_data = {
+        "job_title": "Distinct products",
+        "job_description": "Fetch distinct product IDs",
+        "documents": [],
+        "conversation": [],
+        "write_execution_mode": "platform",
+        "write_targets": [{"tool_name": "platform_1_local_minio"}],
+    }
+    payload = _get_executor_format_input(agent, input_data)
+    content_str = json.dumps([m.get("content", "") for m in payload["messages"]])
+    assert "OUTPUT CONTRACT (STRICT)" in content_str
+    assert "top-level key `records`" in content_str
+    assert "records" in content_str
 
 
 def test_positive_format_sequential_workflow_message_when_previous_output():

@@ -8,8 +8,12 @@ from typing import Any, Dict
 from execution_common import (
     _log_mcp_sql,
     _postgres_dest_hint,
+    _pymysql_connect_kwargs,
+    _pymssql_connect_kwargs,
+    mysql_tool_error_response,
     _sql_query_from_args,
     safe_tool_error,
+    sqlserver_tool_error_response,
 )
 
 def execute_postgres(config: Dict[str, Any], arguments: Dict[str, Any]) -> str:
@@ -29,7 +33,14 @@ def execute_postgres(config: Dict[str, Any], arguments: Dict[str, Any]) -> str:
         )
     params = arguments.get("params")
     upper = query.lstrip().upper()
-    is_read_query = upper.startswith("SELECT") or upper.startswith("WITH")
+    is_read_query = (
+        upper.startswith("SELECT")
+        or upper.startswith("WITH")
+        or upper.startswith("SHOW")
+        or upper.startswith("DESCRIBE")
+        or upper.startswith("DESC")
+        or upper.startswith("EXPLAIN")
+    )
     interactive_readonly = bool(config.get("interactive_readonly")) or (
         os.environ.get("MCP_POSTGRES_INTERACTIVE_READONLY", "").strip().lower() in ("1", "true", "yes")
     )
@@ -37,7 +48,7 @@ def execute_postgres(config: Dict[str, Any], arguments: Dict[str, Any]) -> str:
         return (
             "Error: interactive Postgres is read-only for this tool "
             "(set interactive_readonly on the MCP tool config or MCP_POSTGRES_INTERACTIVE_READONLY=1). "
-            "Only SELECT (and read-only WITH) queries are allowed. "
+            "Only SELECT/WITH (and metadata statements like SHOW/DESCRIBE/EXPLAIN) are allowed. "
             "Use output_contract platform writes for controlled INSERT/DDL to named tables."
         )
     _log_mcp_sql(
@@ -103,7 +114,14 @@ def execute_mysql(config: Dict[str, Any], arguments: Dict[str, Any]) -> str:
             "query in request arguments. Use output_contract artifact writes for loads/DDL."
         )
     upper = query.lstrip().upper()
-    is_read_query = upper.startswith("SELECT") or upper.startswith("WITH")
+    is_read_query = (
+        upper.startswith("SELECT")
+        or upper.startswith("WITH")
+        or upper.startswith("SHOW")
+        or upper.startswith("DESCRIBE")
+        or upper.startswith("DESC")
+        or upper.startswith("EXPLAIN")
+    )
     interactive_readonly = bool(config.get("interactive_readonly")) or (
         os.environ.get("MCP_MYSQL_INTERACTIVE_READONLY", "").strip().lower() in ("1", "true", "yes")
     )
@@ -111,20 +129,14 @@ def execute_mysql(config: Dict[str, Any], arguments: Dict[str, Any]) -> str:
         return (
             "Error: interactive MySQL is read-only for this tool "
             "(set interactive_readonly on the MCP tool config or MCP_MYSQL_INTERACTIVE_READONLY=1). "
-            "Only SELECT (and read-only WITH) queries are allowed. "
+            "Only SELECT/WITH (and metadata statements like SHOW/DESCRIBE/EXPLAIN) are allowed. "
             "Use output_contract platform writes for controlled INSERT/DDL to named tables."
         )
     params = arguments.get("params")
     mysql_dest = f"{config.get('host', 'localhost')}:{int(config.get('port', 3306))}/{config.get('database', '')}"
     _log_mcp_sql("mysql", query, mode="read" if is_read_query else "write", dest=mysql_dest)
     try:
-        conn = pymysql.connect(
-            host=config.get("host", "localhost"),
-            port=int(config.get("port", 3306)),
-            user=config.get("user", ""),
-            password=config.get("password", ""),
-            database=config.get("database", ""),
-        )
+        conn = pymysql.connect(**_pymysql_connect_kwargs(config))
         cur = conn.cursor()
         if is_read_query:
             if params is None:
@@ -152,7 +164,13 @@ def execute_mysql(config: Dict[str, Any], arguments: Dict[str, Any]) -> str:
         conn.close()
         return json.dumps({"status": "ok", "rowcount": rc})
     except Exception as e:
-        return safe_tool_error("MySQL error", e)
+        low = str(e).lower()
+        if "require_secure_transport" in low or "insecure transport" in low:
+            return (
+                "Error: MySQL requires secure transport (TLS). "
+                "Set tool config ssl_mode='required' (or ssl=true) and provide ssl_ca if your server requires CA verification."
+            )
+        return mysql_tool_error_response("MySQL error", e, config)
 
 
 def execute_snowflake_sql(config: Dict[str, Any], arguments: Dict[str, Any]) -> str:
@@ -170,7 +188,14 @@ def execute_snowflake_sql(config: Dict[str, Any], arguments: Dict[str, Any]) -> 
             "query in request arguments. Use output_contract artifact writes for loads/DDL."
         )
     upper = query.lstrip().upper()
-    is_read_query = upper.startswith("SELECT") or upper.startswith("WITH")
+    is_read_query = (
+        upper.startswith("SELECT")
+        or upper.startswith("WITH")
+        or upper.startswith("SHOW")
+        or upper.startswith("DESCRIBE")
+        or upper.startswith("DESC")
+        or upper.startswith("EXPLAIN")
+    )
     sf_dest = "/".join(
         x for x in [(config.get("database") or "").strip(), (config.get("schema") or "").strip()] if x
     )
@@ -185,6 +210,7 @@ def execute_snowflake_sql(config: Dict[str, Any], arguments: Dict[str, Any]) -> 
             user=(config.get("user") or "").strip(),
             password=(config.get("password") or "").strip(),
             account=(config.get("account") or "").strip(),
+            role=(config.get("role") or "").strip() or None,
             warehouse=(config.get("warehouse") or "").strip() or None,
             database=(config.get("database") or "").strip() or None,
             schema=(config.get("schema") or "").strip() or None,
@@ -231,7 +257,14 @@ def execute_bigquery_sql(config: Dict[str, Any], arguments: Dict[str, Any]) -> s
     else:
         client = bigquery.Client(project=project or None)
     upper_bq = query.lstrip().upper()
-    is_read_bq = upper_bq.startswith("SELECT") or upper_bq.startswith("WITH")
+    is_read_bq = (
+        upper_bq.startswith("SELECT")
+        or upper_bq.startswith("WITH")
+        or upper_bq.startswith("SHOW")
+        or upper_bq.startswith("DESCRIBE")
+        or upper_bq.startswith("DESC")
+        or upper_bq.startswith("EXPLAIN")
+    )
     _log_mcp_sql("bigquery", query, mode="read" if is_read_bq else "write", dest=project or "(default project)")
     try:
         # codeql[py/sql-injection]: Interactive SQL tool; query from operator args (BigQuery client).
@@ -266,7 +299,14 @@ def execute_sqlserver_sql(config: Dict[str, Any], arguments: Dict[str, Any]) -> 
     except ImportError:
         return "Error: pymssql is not installed"
     upper_ss = query.lstrip().upper()
-    is_read_ss = upper_ss.startswith("SELECT") or upper_ss.startswith("WITH")
+    is_read_ss = (
+        upper_ss.startswith("SELECT")
+        or upper_ss.startswith("WITH")
+        or upper_ss.startswith("SHOW")
+        or upper_ss.startswith("DESCRIBE")
+        or upper_ss.startswith("DESC")
+        or upper_ss.startswith("EXPLAIN")
+    )
     interactive_readonly_ss = bool(config.get("interactive_readonly")) or (
         os.environ.get("MCP_SQLSERVER_INTERACTIVE_READONLY", "").strip().lower() in ("1", "true", "yes")
     )
@@ -274,19 +314,13 @@ def execute_sqlserver_sql(config: Dict[str, Any], arguments: Dict[str, Any]) -> 
         return (
             "Error: interactive SQL Server is read-only for this tool "
             "(set interactive_readonly on the MCP tool config or MCP_SQLSERVER_INTERACTIVE_READONLY=1). "
-            "Only SELECT (and read-only WITH) queries are allowed. "
+            "Only SELECT/WITH (and metadata statements like SHOW/DESCRIBE/EXPLAIN) are allowed. "
             "Use output_contract platform writes for controlled INSERT/DDL to named tables."
         )
     mssql_dest = f"{(config.get('host') or 'localhost').strip()}:{int(config.get('port') or 1433)}/{config.get('database', '')}"
     _log_mcp_sql("sqlserver", query, mode="read" if is_read_ss else "write", dest=mssql_dest)
     try:
-        conn = pymssql.connect(
-            server=(config.get("host") or "localhost").strip(),
-            port=int(config.get("port") or 1433),
-            user=(config.get("user") or "").strip(),
-            password=(config.get("password") or "").strip(),
-            database=(config.get("database") or "").strip(),
-        )
+        conn = pymssql.connect(**_pymssql_connect_kwargs(config))
         cur = conn.cursor()
         # codeql[py/sql-injection]: Interactive SQL tool; query from operator args (pymssql).
         cur.execute(query)
@@ -303,7 +337,7 @@ def execute_sqlserver_sql(config: Dict[str, Any], arguments: Dict[str, Any]) -> 
         conn.close()
         return json.dumps({"status": "ok"})
     except Exception as e:
-        return safe_tool_error("SQL Server error", e)
+        return sqlserver_tool_error_response("SQL Server error", e, config)
 
 
 def execute_databricks_sql(config: Dict[str, Any], arguments: Dict[str, Any]) -> str:
@@ -328,12 +362,25 @@ def execute_databricks_sql(config: Dict[str, Any], arguments: Dict[str, Any]) ->
         return "Error: host and token are required in tool configuration"
     # Prefer SQL warehouse HTTP path if provided; else build from warehouse id
     if not http_path and warehouse_id:
-        http_path = f"/sql/1.0/warehouses/{warehouse_id}"
+        wh = str(warehouse_id).strip()
+        # Users may paste full http_path into "sql_warehouse_id" by mistake.
+        if wh.startswith("/sql/") or "/sql/1.0/warehouses/" in wh:
+            http_path = wh
+        else:
+            http_path = f"/sql/1.0/warehouses/{wh}"
     if not http_path:
         return "Error: sql_warehouse_id or http_path is required for Databricks"
     host_clean = host.replace("https://", "").replace("http://", "").split("/")[0].strip()
     upper_db = query.lstrip().upper()
-    is_read_db = upper_db.startswith("SELECT") or upper_db.startswith("WITH")
+    # Treat metadata/introspection statements as "read" so we fetch and return results.
+    is_read_db = (
+        upper_db.startswith("SELECT")
+        or upper_db.startswith("WITH")
+        or upper_db.startswith("SHOW")
+        or upper_db.startswith("DESCRIBE")
+        or upper_db.startswith("DESC")
+        or upper_db.startswith("EXPLAIN")
+    )
     _log_mcp_sql("databricks", query, mode="read" if is_read_db else "write", dest=host_clean)
     try:
         conn = dsql.connect(server_hostname=host_clean, http_path=http_path, access_token=token)

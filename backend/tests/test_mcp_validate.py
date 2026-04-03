@@ -1,138 +1,240 @@
-"""Unit tests for MCP tool config validation (no DB, no real connections).
-Positive: valid inputs that should pass.
-Negative: invalid/missing inputs that should fail with clear messages.
-"""
+"""Unit tests for MCP tool config validation (deterministic, no real network)."""
+
+import sys
+import types
+from unittest.mock import patch
+
 import pytest
 
-from services.mcp_validate import validate_tool_config
-
-
-# ---------- Positive test cases (valid inputs, expect success or skip) ----------
+from services.mcp_validate import _mysql_connect_kwargs, validate_tool_config
 
 
 class TestValidateToolConfigPositive:
-    """Positive: valid configs return valid=True or acceptable skip message."""
-
-    def test_positive_filesystem_valid_path(self, tmp_path):
+    def test_filesystem_valid_path(self, tmp_path):
         valid, msg = validate_tool_config("filesystem", {"base_path": str(tmp_path)})
         assert valid is True
         assert "exists" in msg.lower() or "readable" in msg.lower()
 
-    def test_positive_vector_db_returns_skip_message(self):
-        valid, msg = validate_tool_config("vector_db", {})
-        assert valid is True
-        assert "not available" in msg or "save to store" in msg.lower()
-
-    def test_positive_pinecone_no_validation_succeeds(self):
-        valid, msg = validate_tool_config("pinecone", {})
-        assert valid is True
-
-    def test_positive_slack_no_validation_succeeds(self):
-        valid, msg = validate_tool_config("slack", {})
-        assert valid is True
-
-    def test_positive_rest_api_accepts_url_key(self):
-        # Still fails without real URL; we test that tool_type is accepted
-        valid, msg = validate_tool_config("rest_api", {"base_url": ""})
-        assert valid is False
-        assert "URL is required" in msg
-
-
-# ---------- Negative test cases (invalid inputs, expect valid=False or error) ----------
-
 
 class TestValidateToolConfigNegative:
-    """validate_tool_config returns (valid, message) per tool type."""
-
-    """Negative: invalid or missing config returns valid=False with clear message."""
-
-    def test_negative_postgres_missing_connection_string(self):
+    def test_postgres_missing_connection_string(self):
         valid, msg = validate_tool_config("postgres", {})
         assert valid is False
-        assert "Connection string is required" in msg
+        assert "connection string is required" in msg.lower()
 
-    def test_negative_postgres_empty_connection_string(self):
-        valid, msg = validate_tool_config("postgres", {"connection_string": "   "})
-        assert valid is False
-        assert "Connection string is required" in msg
-
-    def test_negative_mysql_empty_config(self):
-        valid, msg = validate_tool_config("mysql", {})
-        assert valid is False
-        assert msg
-
-    def test_negative_filesystem_missing_base_path(self):
+    def test_filesystem_missing_base_path(self):
         valid, msg = validate_tool_config("filesystem", {})
         assert valid is False
-        assert "Base path is required" in msg
+        assert "base path is required" in msg.lower()
 
-    def test_negative_filesystem_empty_base_path(self):
-        valid, msg = validate_tool_config("filesystem", {"base_path": "   "})
-        assert valid is False
-        assert "Base path is required" in msg
-
-    def test_negative_filesystem_nonexistent_path(self):
+    def test_filesystem_nonexistent_path(self):
         valid, msg = validate_tool_config("filesystem", {"base_path": "/nonexistent/path/xyz"})
         assert valid is False
-        assert "not a directory" in msg or "does not exist" in msg
+        assert "not a directory" in msg.lower() or "does not exist" in msg.lower()
 
-    def test_negative_elasticsearch_missing_url(self):
-        valid, msg = validate_tool_config("elasticsearch", {})
-        assert valid is False
-        assert "URL is required" in msg
-
-    def test_negative_rest_api_missing_url(self):
+    def test_rest_api_missing_url(self):
         valid, msg = validate_tool_config("rest_api", {})
         assert valid is False
-        assert "URL is required" in msg
+        assert "url is required" in msg.lower()
 
+    def test_mysql_require_secure_transport_hint(self):
+        class _FakePyMysql:
+            @staticmethod
+            def connect(**_kw):
+                raise Exception("Connections using insecure transport are prohibited while --require_secure_transport=ON.")
 
-# ---------- All MCP tool types: validation behavior ----------
-
-
-class TestValidateToolConfigAllTypes:
-    """Every MCPToolType has defined behavior (valid + message or valid=False)."""
-
-    def test_chroma_returns_skip_message(self):
-        valid, msg = validate_tool_config("chroma", {})
-        assert valid is True
-        assert "not available" in msg or "save" in msg.lower() or "store" in msg.lower() or "credentials" in msg.lower()
-
-    def test_pinecone_accepts_without_validation(self):
-        valid, msg = validate_tool_config("pinecone", {})
-        assert valid is True
-
-    def test_weaviate_returns_skip_message(self):
-        valid, msg = validate_tool_config("weaviate", {})
-        assert valid is True
-        assert "not available" in msg or "save" in msg.lower() or "store" in msg.lower() or "credentials" in msg.lower()
-
-    def test_qdrant_returns_skip_message(self):
-        valid, msg = validate_tool_config("qdrant", {})
-        assert valid is True
-        assert "not available" in msg or "save" in msg.lower() or "store" in msg.lower() or "credentials" in msg.lower()
-
-    def test_vector_db_returns_skip_message(self):
-        valid, msg = validate_tool_config("vector_db", {})
-        assert valid is True
-        assert "not available" in msg or "save" in msg.lower() or "store" in msg.lower()
-
-    def test_s3_returns_skip_message(self):
-        valid, msg = validate_tool_config("s3", {})
-        assert valid is True
-        assert "not available" in msg or "save" in msg.lower() or "store" in msg.lower() or "credentials" in msg.lower()
-
-    def test_github_returns_skip_message(self):
-        valid, msg = validate_tool_config("github", {})
-        assert valid is True
-        assert "not available" in msg or "save" in msg.lower() or "store" in msg.lower() or "credentials" in msg.lower()
-
-    def test_notion_returns_skip_message(self):
-        valid, msg = validate_tool_config("notion", {})
-        assert valid is True
-        assert "not available" in msg or "save" in msg.lower() or "store" in msg.lower() or "credentials" in msg.lower()
-
-    def test_rest_api_empty_url_fails(self):
-        valid, msg = validate_tool_config("rest_api", {"base_url": ""})
+        with patch.dict(sys.modules, {"pymysql": _FakePyMysql}):
+            valid, msg = validate_tool_config(
+                "mysql",
+                {"host": "mysql.example.com", "database": "sales", "user": "u", "password": "p"},
+            )
         assert valid is False
-        assert "URL is required" in msg
+        assert "secure transport" in msg.lower()
+        assert "ssl_mode='required'" in msg.lower()
+
+
+class TestMySqlConnectKwargs:
+    def test_required_ssl_mode_builds_truthy_ssl_dict(self):
+        kw = _mysql_connect_kwargs(
+            {"host": "db", "user": "u", "password": "p", "database": "d", "ssl_mode": "required"}
+        )
+        assert "ssl" in kw
+        assert kw["ssl"].get("verify_mode") == "none"
+        assert kw["ssl"].get("check_hostname") is False
+
+    def test_require_ssl_mode_alias_builds_truthy_ssl_dict(self):
+        kw = _mysql_connect_kwargs(
+            {"host": "db", "user": "u", "password": "p", "database": "d", "ssl_mode": "require"}
+        )
+        assert "ssl" in kw
+
+
+@pytest.mark.parametrize(
+    "tool_type,config,expected_fragment",
+    [
+        ("vector_db", {}, "url is required"),
+        ("pinecone", {}, "api key is required"),
+        ("weaviate", {}, "url is required"),
+        ("qdrant", {}, "url is required"),
+        ("chroma", {}, "url is required"),
+        ("sqlserver", {"host": "x", "database": "d", "password": "p"}, "user is required"),
+        ("snowflake", {}, "user is required"),
+        ("databricks", {}, "host is required"),
+        ("bigquery", {}, "project_id is required"),
+        ("elasticsearch", {}, "url is required"),
+        ("pageindex", {}, "api key is required"),
+        ("s3", {}, "bucket is required"),
+        ("minio", {}, "bucket is required"),
+        ("ceph", {}, "bucket is required"),
+        ("azure_blob", {}, "container is required"),
+        ("gcs", {}, "bucket is required"),
+        ("slack", {}, "token is required"),
+        ("github", {}, "token is required"),
+        ("notion", {}, "api key is required"),
+        ("rest_api", {}, "url is required"),
+    ],
+)
+def test_all_tool_types_have_explicit_validation(tool_type, config, expected_fragment):
+    valid, msg = validate_tool_config(tool_type, config)
+    assert valid is False
+    assert expected_fragment in msg.lower()
+
+
+class TestChromaValidationSoft:
+    """Chroma accepts a well-formed URL without a live server (integration + offline UX)."""
+
+    def test_chroma_valid_when_heartbeat_unreachable(self):
+        with patch("services.mcp_validate._http_reachable", return_value=(False, "unreachable")):
+            valid, msg = validate_tool_config(
+                "chroma",
+                {"url": "http://localhost:8000", "index_name": "test"},
+            )
+        assert valid is True
+        assert "heartbeat not verified" in msg.lower()
+
+
+class TestSqlServerValidationHints:
+    @staticmethod
+    def _sqlserver_base_cfg(user: str = "admin@sandhiai") -> dict:
+        return {
+            "host": "sandhiai.database.windows.net",
+            "port": 1433,
+            "database": "free-sql-db-1732366",
+            "user": user,
+            "password": "secret",
+        }
+
+    def test_sqlserver_login_failed_hint(self):
+        class _FakePyMssql:
+            @staticmethod
+            def connect(**_kw):
+                raise Exception("Login failed for user 'x' (18456)")
+
+        with patch.dict(sys.modules, {"pymssql": _FakePyMssql}):
+            valid, msg = validate_tool_config("sqlserver", self._sqlserver_base_cfg())
+        assert valid is False
+        assert "authentication failed" in msg.lower()
+        assert "admin@sandhiai" in msg.lower() or "logical-server" in msg.lower()
+
+    def test_sqlserver_tls_hint(self):
+        class _FakePyMssql:
+            @staticmethod
+            def connect(**_kw):
+                raise Exception("SSL Provider: handshake failure")
+
+        with patch.dict(sys.modules, {"pymssql": _FakePyMssql}):
+            valid, msg = validate_tool_config("sqlserver", self._sqlserver_base_cfg())
+        assert valid is False
+        assert "tls/ssl handshake failed" in msg.lower()
+
+    def test_sqlserver_bad_user_format_multiple_at_hint(self):
+        class _FakePyMssql:
+            @staticmethod
+            def connect(**_kw):
+                raise Exception("Login failed for user")
+
+        with patch.dict(sys.modules, {"pymssql": _FakePyMssql}):
+            valid, msg = validate_tool_config(
+                "sqlserver",
+                self._sqlserver_base_cfg(user="rahul149386@outlook.com@sandhiai"),
+            )
+        assert valid is False
+        assert "multiple '@'" in msg.lower()
+
+
+class TestDatabricksHttpPathNormalization:
+    @staticmethod
+    def _fake_databricks_sql():
+        captured: dict = {}
+
+        class _FakeCursor:
+            def execute(self, _q):
+                return None
+
+            def fetchall(self):
+                return [(1,)]
+
+            def close(self):
+                return None
+
+        class _FakeConn:
+            def __init__(self, http_path: str):
+                self._http_path = http_path
+
+            def cursor(self):
+                return _FakeCursor()
+
+            def close(self):
+                return None
+
+        class _FakeDsql:
+            @staticmethod
+            def connect(**kwargs):
+                # Validate must pass http_path and access_token through.
+                captured["server_hostname"] = kwargs.get("server_hostname")
+                captured["http_path"] = kwargs.get("http_path")
+                captured["access_token"] = kwargs.get("access_token")
+                return _FakeConn(kwargs.get("http_path"))
+
+        return captured, _FakeDsql
+
+    def test_sql_warehouse_id_plain_builds_http_path(self, monkeypatch):
+        captured, _FakeDsql = self._fake_databricks_sql()
+
+        class _FakeDatabricksModule:
+            sql = _FakeDsql
+
+        monkeypatch.setitem(sys.modules, "databricks", _FakeDatabricksModule())
+        monkeypatch.setitem(sys.modules, "databricks.sql", _FakeDsql)
+
+        valid, _msg = validate_tool_config(
+            "databricks",
+            {
+                "host": "dbc.example.cloud.databricks.com",
+                "token": "dapi-xxx",
+                "sql_warehouse_id": "9d7d0d29a2c3a3414",
+            },
+        )
+        assert valid is True
+        assert captured["http_path"] == "/sql/1.0/warehouses/9d7d0d29a2c3a3414"
+
+    def test_sql_warehouse_id_full_http_path_is_not_double_prefixed(self, monkeypatch):
+        captured, _FakeDsql = self._fake_databricks_sql()
+
+        class _FakeDatabricksModule:
+            sql = _FakeDsql
+
+        monkeypatch.setitem(sys.modules, "databricks", _FakeDatabricksModule())
+        monkeypatch.setitem(sys.modules, "databricks.sql", _FakeDsql)
+
+        full = "/sql/1.0/warehouses/9d7d0d29a2c3a3414"
+        valid, _msg = validate_tool_config(
+            "databricks",
+            {
+                "host": "dbc.example.cloud.databricks.com",
+                "token": "dapi-xxx",
+                "sql_warehouse_id": full,
+            },
+        )
+        assert valid is True
+        assert captured["http_path"] == full

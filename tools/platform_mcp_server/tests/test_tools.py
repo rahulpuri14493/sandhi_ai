@@ -318,6 +318,102 @@ class TestArtifactWriteDatabases:
         out = execution.execute_artifact_write("mysql", {"host": "localhost", "user": "u", "password": "p"}, args)
         assert "database" in out.lower() and "table" in out.lower()
 
+    def test_mysql_artifact_runs_bootstrap_sql_before_insert(self, monkeypatch):
+        import execution_artifact as ea
+
+        mock_cur = MagicMock()
+        mock_conn = MagicMock()
+        mock_conn.cursor.return_value = mock_cur
+        pymysql_mod = types.ModuleType("pymysql")
+        pymysql_mod.connect = MagicMock(return_value=mock_conn)
+        monkeypatch.setitem(sys.modules, "pymysql", pymysql_mod)
+
+        out = ea._artifact_write_mysql(
+            {"host": "localhost", "user": "u", "password": "p", "database": "d"},
+            {
+                "database": "d",
+                "table": "job_metrics",
+                "bootstrap_sql": "CREATE TABLE IF NOT EXISTS d.job_metrics (total_jobs BIGINT)",
+            },
+            [{"total_jobs": 20}],
+            [],
+            "append",
+            "append",
+        )
+        data = json.loads(out)
+        assert data["status"] == "ok"
+        first_sql = mock_cur.execute.call_args_list[0].args[0]
+        assert first_sql.startswith("CREATE TABLE IF NOT EXISTS")
+
+    def test_mysql_artifact_write_uses_tls_aware_connect_kwargs(self, monkeypatch):
+        import execution_artifact as ea
+
+        mock_cur = MagicMock()
+        mock_conn = MagicMock()
+        mock_conn.cursor.return_value = mock_cur
+        pymysql_mod = types.ModuleType("pymysql")
+        connect_spy = MagicMock(return_value=mock_conn)
+        pymysql_mod.connect = connect_spy
+        monkeypatch.setitem(sys.modules, "pymysql", pymysql_mod)
+
+        out = ea._artifact_write_mysql(
+            {
+                "host": "mysql.example.com",
+                "port": 3306,
+                "user": "u",
+                "password": "p",
+                "database": "d",
+                "ssl_mode": "require",
+            },
+            {"database": "d", "table": "job_metrics"},
+            [{"total_jobs": 20}],
+            [],
+            "append",
+            "append",
+        )
+        data = json.loads(out)
+        assert data["status"] == "ok"
+        kw = connect_spy.call_args.kwargs
+        assert kw.get("database") == "d"
+        assert "ssl" in kw
+
+    def test_mysql_bootstrap_sql_in_signed_runtime_target_is_applied_without_schema(self, monkeypatch):
+        import execution_artifact as ea
+
+        monkeypatch.setenv("MCP_INTERNAL_SECRET", "test-secret")
+        monkeypatch.setattr(execution_common, "read_artifact_bytes", lambda ref: b'{"total_jobs":21}\n')
+        mock_cur = MagicMock()
+        mock_conn = MagicMock()
+        mock_conn.cursor.return_value = mock_cur
+        pymysql_mod = types.ModuleType("pymysql")
+        pymysql_mod.connect = MagicMock(return_value=mock_conn)
+        monkeypatch.setitem(sys.modules, "pymysql", pymysql_mod)
+
+        ddl = "CREATE TABLE IF NOT EXISTS `sandhi_app`.`job_metrics` (`total_jobs` BIGINT)"
+        sig = ea._trusted_bootstrap_signature(
+            tool_name="platform_9_mysql",
+            operation_type="insert",
+            schema="",  # mysql target often has no schema key
+            table="job_metrics",
+            bootstrap_sql=ddl,
+            secret="test-secret",
+        )
+        args = _artifact_args()
+        args["tool_name"] = "platform_9_mysql"
+        args["operation_type"] = "insert"
+        args["target"] = {"database": "sandhi_app", "table": "job_metrics", "bootstrap_sql": ddl}
+        args["trusted_bootstrap"] = {"bootstrap_sql": ddl, "sig": sig}
+
+        out = ea.execute_artifact_write(
+            "mysql",
+            {"host": "localhost", "user": "u", "password": "p", "database": "sandhi_app"},
+            args,
+        )
+        data = json.loads(out)
+        assert data["status"] == "ok"
+        first_sql = mock_cur.execute.call_args_list[0].args[0]
+        assert first_sql.startswith("CREATE TABLE IF NOT EXISTS")
+
     def test_bigquery_upsert_without_merge_keys_rejected(self, monkeypatch):
         """Upsert/merge must not fall back to WRITE_TRUNCATE (destructive)."""
         monkeypatch.setattr(execution_common, "read_artifact_bytes", lambda ref: b'{"id":1}\n')
@@ -336,6 +432,75 @@ class TestArtifactWriteDatabases:
         args["operation_type"] = "truncate"
         out = execution.execute_artifact_write("bigquery", {"project_id": "p"}, args)
         assert "unsupported operation_type" in out.lower()
+
+    def test_bigquery_runs_bootstrap_sql_before_load(self, monkeypatch):
+        import execution_artifact as ea
+
+        class _FakeJob:
+            def result(self):
+                return None
+
+        class _FakeClient:
+            def __init__(self):
+                self.queries = []
+                self.loads = []
+
+            def query(self, sql):
+                self.queries.append(sql)
+                return _FakeJob()
+
+            def load_table_from_json(self, records, table_ref, job_config=None):
+                self.loads.append((records, table_ref, job_config))
+                return _FakeJob()
+
+            def delete_table(self, *_a, **_kw):
+                return None
+
+        class _WD:
+            WRITE_TRUNCATE = "WRITE_TRUNCATE"
+            WRITE_APPEND = "WRITE_APPEND"
+
+        class _CD:
+            CREATE_IF_NEEDED = "CREATE_IF_NEEDED"
+
+        class _SU:
+            ALLOW_FIELD_ADDITION = "ALLOW_FIELD_ADDITION"
+
+        class _LJC:
+            def __init__(self, **_kwargs):
+                return None
+
+        fake_client = _FakeClient()
+        bq_mod = types.ModuleType("google.cloud.bigquery")
+        bq_mod.Client = lambda project=None, credentials=None: fake_client
+        bq_mod.LoadJobConfig = _LJC
+        bq_mod.WriteDisposition = _WD
+        bq_mod.CreateDisposition = _CD
+        bq_mod.SchemaUpdateOption = _SU
+        monkeypatch.setitem(sys.modules, "google", types.ModuleType("google"))
+        monkeypatch.setitem(sys.modules, "google.cloud", types.ModuleType("google.cloud"))
+        monkeypatch.setitem(sys.modules, "google.cloud.bigquery", bq_mod)
+        oauth_mod = types.ModuleType("google.oauth2")
+        sa_mod = types.ModuleType("google.oauth2.service_account")
+        sa_mod.Credentials = types.SimpleNamespace(from_service_account_info=lambda info: object())
+        monkeypatch.setitem(sys.modules, "google.oauth2", oauth_mod)
+        monkeypatch.setitem(sys.modules, "google.oauth2.service_account", sa_mod)
+
+        out = ea._artifact_write_bigquery(
+            {"project_id": "p"},
+            {
+                "schema": "ds",
+                "table": "job_metrics",
+                "bootstrap_sql": "CREATE TABLE IF NOT EXISTS ds.job_metrics (total_jobs INT64)",
+            },
+            [{"total_jobs": 20}],
+            [],
+            "append",
+            "append",
+        )
+        data = json.loads(out)
+        assert data["status"] == "ok"
+        assert fake_client.queries and fake_client.queries[0].startswith("CREATE TABLE IF NOT EXISTS")
 
     def test_databricks_artifact_inserts_all_rows_not_capped_at_5000(self, monkeypatch):
         """Regression: writer must not stop at 5000 rows while reporting len(records)."""
@@ -383,6 +548,36 @@ class TestArtifactWriteDatabases:
         )
         assert "invalid catalog/schema/table" in out.lower()
 
+    def test_databricks_artifact_runs_bootstrap_sql_before_insert(self, monkeypatch):
+        import execution_artifact as ea
+
+        mock_cur = MagicMock()
+        mock_conn = MagicMock()
+        mock_conn.cursor.return_value = mock_cur
+        sql_mod = types.ModuleType("databricks.sql")
+        sql_mod.connect = MagicMock(return_value=mock_conn)
+        monkeypatch.setitem(sys.modules, "databricks", types.ModuleType("databricks"))
+        monkeypatch.setitem(sys.modules, "databricks.sql", sql_mod)
+
+        target = {
+            "catalog": "samples",
+            "schema": "bakehouse",
+            "table": "job_metrics",
+            "bootstrap_sql": "CREATE TABLE IF NOT EXISTS samples.bakehouse.job_metrics (total_jobs BIGINT)",
+        }
+        out = ea._artifact_write_databricks(
+            {"host": "https://x.cloud.databricks.com", "token": "t", "http_path": "/sql/1.0/warehouses/w"},
+            target,
+            [{"total_jobs": 20}],
+            [],
+            "append",
+        )
+        data = json.loads(out)
+        assert data["status"] == "ok"
+        assert data["rows"] == 1
+        first_sql = mock_cur.execute.call_args_list[0].args[0]
+        assert first_sql.startswith("CREATE TABLE IF NOT EXISTS")
+
     def test_sqlserver_artifact_rejects_invalid_identifiers(self):
         import execution_artifact as ea
 
@@ -394,6 +589,75 @@ class TestArtifactWriteDatabases:
             "append",
         )
         assert "invalid schema" in out.lower()
+
+    def test_sqlserver_artifact_runs_bootstrap_sql_before_insert(self):
+        import execution_artifact as ea
+
+        mock_cur = MagicMock()
+        mock_conn = MagicMock()
+        mock_conn.cursor.return_value = mock_cur
+        pymssql_mod = types.ModuleType("pymssql")
+        pymssql_mod.connect = MagicMock(return_value=mock_conn)
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setitem(sys.modules, "pymssql", pymssql_mod)
+            out = ea._artifact_write_sqlserver(
+                {"host": "localhost", "user": "u", "password": "p", "database": "d"},
+                {
+                    "database": "d",
+                    "schema": "dbo",
+                    "table": "job_metrics",
+                    "bootstrap_sql": "CREATE TABLE IF NOT EXISTS dbo.job_metrics (total_jobs BIGINT)",
+                },
+                [{"total_jobs": 20}],
+                [],
+                "append",
+            )
+        data = json.loads(out)
+        assert data["status"] == "ok"
+        first_sql = mock_cur.execute.call_args_list[0].args[0]
+        assert first_sql.startswith("CREATE TABLE IF NOT EXISTS")
+
+    def test_snowflake_artifact_runs_bootstrap_sql_before_insert(self, monkeypatch):
+        import execution_artifact as ea
+
+        mock_cur = MagicMock()
+        mock_conn = MagicMock()
+        mock_conn.cursor.return_value = mock_cur
+
+        sf_mod = types.ModuleType("snowflake.connector")
+        sf_mod.connect = MagicMock(return_value=mock_conn)
+        pd_mod = types.ModuleType("pandas")
+        pd_mod.DataFrame = lambda records: types.SimpleNamespace(
+            columns=types.SimpleNamespace(tolist=lambda: list(records[0].keys()))
+        )
+        pt_mod = types.ModuleType("snowflake.connector.pandas_tools")
+        pt_mod.write_pandas = MagicMock(return_value=(True, 1, 1, None))
+
+        snowflake_pkg = types.ModuleType("snowflake")
+        snowflake_pkg.connector = sf_mod
+        monkeypatch.setitem(sys.modules, "pandas", pd_mod)
+        monkeypatch.setitem(sys.modules, "snowflake", snowflake_pkg)
+        monkeypatch.setitem(sys.modules, "snowflake.connector", sf_mod)
+        monkeypatch.setitem(sys.modules, "snowflake.connector.pandas_tools", pt_mod)
+
+        out = ea._artifact_write_snowflake(
+            {"user": "u", "password": "p", "account": "a", "warehouse": "w"},
+            {
+                "database": "SANDHI_AI",
+                "schema": "PUBLIC",
+                "table": "JOB_METRICS",
+                "bootstrap_sql": "CREATE TABLE IF NOT EXISTS SANDHI_AI.PUBLIC.JOB_METRICS (TOTAL_JOBS BIGINT)",
+            },
+            [{"total_jobs": 20}],
+            [],
+            "append",
+            "idem-1",
+        )
+        data = json.loads(out)
+        assert data["status"] == "ok"
+        first_sql = mock_cur.execute.call_args_list[0].args[0]
+        assert first_sql.startswith("CREATE TABLE IF NOT EXISTS")
+        assert pt_mod.write_pandas.call_args.kwargs.get("quote_identifiers") is False
 
     def test_sqlserver_artifact_rejects_invalid_merge_key(self):
         import execution_artifact as ea

@@ -27,12 +27,12 @@ class TestTruncateForLog:
 
 
 class TestSqlQueryFromArgs:
-    def test_reads_top_level_query_from_config_only(self):
+    def test_runtime_query_wins_over_config_query_when_readonly(self):
         q = execution_common._sql_query_from_args(
             {"query": "  SELECT 1  "},
-            {"query": "SELECT should_not_be_used"},
+            {"query": "SELECT should_be_used"},
         )
-        assert q == "SELECT 1"
+        assert q == "SELECT should_be_used"
 
     def test_reads_nested_statement_from_settings(self):
         q = execution_common._sql_query_from_args(
@@ -48,7 +48,7 @@ class TestSqlQueryFromArgs:
         )
         assert q == "SELECT 3"
 
-    def test_arguments_query_is_ignored_when_config_missing(self):
+    def test_reads_runtime_query_when_config_missing(self):
         q = execution_common._sql_query_from_args({}, {"query": "SELECT 1"})
         assert q == "SELECT 1"
 
@@ -56,12 +56,114 @@ class TestSqlQueryFromArgs:
         with pytest.raises(ValueError, match="read-only"):
             execution_common._sql_query_from_args({}, {"query": "DELETE FROM jobs"})
 
-    def test_config_query_wins_over_runtime_query(self):
+    @pytest.mark.parametrize(
+        "q",
+        [
+            "SHOW TABLES",
+            "SHOW TABLES IN samples.bakehouse",
+            "DESCRIBE samples.bakehouse.media_customer_reviews",
+            "DESC samples.bakehouse.media_customer_reviews",
+            "EXPLAIN SELECT 1",
+        ],
+    )
+    def test_runtime_query_allows_readonly_metadata_statements(self, q):
+        # The runtime SQL guard should allow safe metadata introspection statements.
+        out = execution_common._sql_query_from_args({}, {"query": q})
+        assert out == q
+
+
+class TestDatabricksReadDetection:
+    @pytest.mark.parametrize(
+        "q,expect_read",
+        [
+            ("SELECT 1", True),
+            ("WITH x AS (SELECT 1) SELECT * FROM x", True),
+            ("SHOW TABLES IN samples.bakehouse", True),
+            ("DESCRIBE samples.bakehouse.media_customer_reviews", True),
+            ("EXPLAIN SELECT 1", True),
+        ],
+    )
+    def test_databricks_fetches_for_metadata_statements(self, monkeypatch, q, expect_read):
+        # Ensure execute_databricks_sql fetches results for SHOW/DESCRIBE/EXPLAIN (not just SELECT/WITH).
+        import types
+        import sys
+        from execution_sql import execute_databricks_sql
+
+        calls: dict = {"fetchall": 0, "commit": 0}
+
+        class _Cur:
+            description = [("col",)]
+
+            def execute(self, _query):
+                return None
+
+            def fetchall(self):
+                calls["fetchall"] += 1
+                return [(1,)]
+
+            def close(self):
+                return None
+
+        class _Conn:
+            def cursor(self):
+                return _Cur()
+
+            def close(self):
+                return None
+
+            def commit(self):
+                calls["commit"] += 1
+                return None
+
+        sql_mod = types.ModuleType("databricks.sql")
+        sql_mod.connect = lambda **_kw: _Conn()
+        monkeypatch.setitem(sys.modules, "databricks", types.ModuleType("databricks"))
+        monkeypatch.setitem(sys.modules, "databricks.sql", sql_mod)
+
+        out = execute_databricks_sql(
+            {"host": "https://x.cloud.databricks.com", "token": "t", "http_path": "/sql/1.0/warehouses/w"},
+            {"query": q},
+        )
+        if expect_read:
+            assert calls["fetchall"] >= 1
+        assert out
+
+    def test_config_query_used_as_fallback_when_runtime_missing(self):
         q = execution_common._sql_query_from_args(
             {"query": "SELECT from_config"},
-            {"query": "SELECT from_runtime"},
+            {},
         )
         assert q == "SELECT from_config"
+
+
+class TestPyMysqlConnectKwargs:
+    def test_enables_tls_when_ssl_mode_required(self):
+        kw = execution_common._pymysql_connect_kwargs(
+            {"host": "db", "user": "u", "password": "p", "database": "d", "ssl_mode": "required"}
+        )
+        assert "ssl" in kw
+        assert kw["ssl"].get("verify_mode") == "none"
+        assert kw["ssl"].get("check_hostname") is False
+
+    def test_enables_tls_when_ssl_mode_require_alias(self):
+        kw = execution_common._pymysql_connect_kwargs(
+            {"host": "db", "user": "u", "password": "p", "database": "d", "ssl_mode": "require"}
+        )
+        assert "ssl" in kw
+
+    def test_verify_identity_enables_hostname_and_ca_verification(self):
+        kw = execution_common._pymysql_connect_kwargs(
+            {"host": "db", "user": "u", "password": "p", "database": "d", "ssl_mode": "verify_identity"}
+        )
+        assert "ssl" in kw
+        assert kw["ssl"].get("verify_mode") == "required"
+        assert kw["ssl"].get("check_hostname") is True
+
+    def test_does_not_enable_tls_when_disabled(self):
+        kw = execution_common._pymysql_connect_kwargs(
+            {"host": "db", "user": "u", "password": "p", "database": "d", "ssl_mode": "disabled", "ssl": True}
+        )
+        assert "ssl" not in kw
 
 
 class TestRedactObjectStoreKeyForLog:
@@ -126,6 +228,65 @@ class TestParsePlatformToolId:
 
     def test_rejects_invalid(self):
         assert _parse_platform_tool_id("platform_abc_x") is None
+
+
+class TestSqlserverToolErrorResponse:
+    def test_programming_error_includes_schema_and_default_query_hints(self):
+        class ProgrammingError(Exception):
+            pass
+
+        msg = execution_common.sqlserver_tool_error_response(
+            "SQL Server error",
+            ProgrammingError(),
+            {"host": "sandhiai.database.windows.net"},
+        )
+        assert "ProgrammingError" in msg
+        assert "column_name" in msg
+        assert "default query" in msg
+        assert "schema_metadata" in msg
+
+    def test_operational_error_includes_azure_checklist(self):
+        class OperationalError(Exception):
+            pass
+
+        msg = execution_common.sqlserver_tool_error_response(
+            "SQL Server error",
+            OperationalError(),
+            {"host": "sandhiai.database.windows.net"},
+        )
+        assert "OperationalError" in msg
+        assert "Azure SQL checklist" in msg
+        assert "user@logicalServer" in msg
+        assert "egress" in msg.lower()
+
+
+class TestMysqlToolErrorResponse:
+    def test_programming_error_includes_mysql_dialect_hints(self):
+        class ProgrammingError(Exception):
+            pass
+
+        msg = execution_common.mysql_tool_error_response(
+            "MySQL error",
+            ProgrammingError(),
+            {"host": "myserver.mysql.database.azure.com"},
+        )
+        assert "ProgrammingError" in msg
+        assert "LIMIT (not TOP)" in msg
+        assert "avoid SQL Server bracket syntax" in msg
+        assert "schema_metadata" in msg
+
+    def test_operational_error_includes_tls_and_azure_login_hint(self):
+        class OperationalError(Exception):
+            pass
+
+        msg = execution_common.mysql_tool_error_response(
+            "MySQL error",
+            OperationalError(),
+            {"host": "myserver.mysql.database.azure.com"},
+        )
+        assert "OperationalError" in msg
+        assert "ssl_mode='required'" in msg
+        assert "user@server-name" in msg
 
 
 class TestResolveLocalArtifactPath:
