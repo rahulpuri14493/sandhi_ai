@@ -176,14 +176,14 @@ def _ensure_records_for_platform_write(
     """
     if write_mode != "platform" or not isinstance(write_targets, list) or not write_targets:
         return output_data
+    if isinstance(output_data, dict) and isinstance(output_data.get("records"), list):
+        return output_data
     rows = extract_record_rows_from_agent_output(output_data)
     if rows is None:
         raise ValueError(
             "Output contract requires structured tabular output with top-level `records` array; "
             "agent returned non-tabular content."
         )
-    if isinstance(output_data, dict) and isinstance(output_data.get("records"), list):
-        return output_data
     return {"records": rows}
 
 

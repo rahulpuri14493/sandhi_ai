@@ -7,6 +7,8 @@ import json
 from urllib.parse import urlparse
 from typing import Tuple
 
+from services.sql_server_host import sql_server_host_is_azure_sql
+
 logger = logging.getLogger(__name__)
 
 
@@ -154,7 +156,12 @@ def _validate_chroma(config: dict) -> Tuple[bool, str]:
     ok2, _ = _http_reachable(url.rstrip("/") + "/api/v2/heartbeat", headers=headers)
     if ok2:
         return True, "Chroma connection successful"
-    return False, msg
+    # Save/validate UX: a well-formed URL is enough; CI and laptops often have no Chroma listening.
+    return (
+        True,
+        "Chroma URL is valid; live heartbeat not verified (server offline or unreachable). "
+        f"{msg}",
+    )
 
 
 def _validate_postgres(config: dict) -> Tuple[bool, str]:
@@ -297,7 +304,7 @@ def _validate_sqlserver(config: dict) -> Tuple[bool, str]:
 def _sqlserver_validation_error_message(exc: Exception, host: str, user: str) -> str:
     low = str(exc).lower()
     base = "Unable to connect to SQL Server; please check host, port, database, and credentials."
-    is_azure = "database.windows.net" in (host or "").lower()
+    is_azure = sql_server_host_is_azure_sql(host)
     user_at_count = (user or "").count("@")
 
     if "login failed for user" in low or "18456" in low:

@@ -33,7 +33,14 @@ def execute_postgres(config: Dict[str, Any], arguments: Dict[str, Any]) -> str:
         )
     params = arguments.get("params")
     upper = query.lstrip().upper()
-    is_read_query = upper.startswith("SELECT") or upper.startswith("WITH")
+    is_read_query = (
+        upper.startswith("SELECT")
+        or upper.startswith("WITH")
+        or upper.startswith("SHOW")
+        or upper.startswith("DESCRIBE")
+        or upper.startswith("DESC")
+        or upper.startswith("EXPLAIN")
+    )
     interactive_readonly = bool(config.get("interactive_readonly")) or (
         os.environ.get("MCP_POSTGRES_INTERACTIVE_READONLY", "").strip().lower() in ("1", "true", "yes")
     )
@@ -41,7 +48,7 @@ def execute_postgres(config: Dict[str, Any], arguments: Dict[str, Any]) -> str:
         return (
             "Error: interactive Postgres is read-only for this tool "
             "(set interactive_readonly on the MCP tool config or MCP_POSTGRES_INTERACTIVE_READONLY=1). "
-            "Only SELECT (and read-only WITH) queries are allowed. "
+            "Only SELECT/WITH (and metadata statements like SHOW/DESCRIBE/EXPLAIN) are allowed. "
             "Use output_contract platform writes for controlled INSERT/DDL to named tables."
         )
     _log_mcp_sql(
@@ -107,7 +114,14 @@ def execute_mysql(config: Dict[str, Any], arguments: Dict[str, Any]) -> str:
             "query in request arguments. Use output_contract artifact writes for loads/DDL."
         )
     upper = query.lstrip().upper()
-    is_read_query = upper.startswith("SELECT") or upper.startswith("WITH")
+    is_read_query = (
+        upper.startswith("SELECT")
+        or upper.startswith("WITH")
+        or upper.startswith("SHOW")
+        or upper.startswith("DESCRIBE")
+        or upper.startswith("DESC")
+        or upper.startswith("EXPLAIN")
+    )
     interactive_readonly = bool(config.get("interactive_readonly")) or (
         os.environ.get("MCP_MYSQL_INTERACTIVE_READONLY", "").strip().lower() in ("1", "true", "yes")
     )
@@ -115,7 +129,7 @@ def execute_mysql(config: Dict[str, Any], arguments: Dict[str, Any]) -> str:
         return (
             "Error: interactive MySQL is read-only for this tool "
             "(set interactive_readonly on the MCP tool config or MCP_MYSQL_INTERACTIVE_READONLY=1). "
-            "Only SELECT (and read-only WITH) queries are allowed. "
+            "Only SELECT/WITH (and metadata statements like SHOW/DESCRIBE/EXPLAIN) are allowed. "
             "Use output_contract platform writes for controlled INSERT/DDL to named tables."
         )
     params = arguments.get("params")
@@ -174,7 +188,14 @@ def execute_snowflake_sql(config: Dict[str, Any], arguments: Dict[str, Any]) -> 
             "query in request arguments. Use output_contract artifact writes for loads/DDL."
         )
     upper = query.lstrip().upper()
-    is_read_query = upper.startswith("SELECT") or upper.startswith("WITH")
+    is_read_query = (
+        upper.startswith("SELECT")
+        or upper.startswith("WITH")
+        or upper.startswith("SHOW")
+        or upper.startswith("DESCRIBE")
+        or upper.startswith("DESC")
+        or upper.startswith("EXPLAIN")
+    )
     sf_dest = "/".join(
         x for x in [(config.get("database") or "").strip(), (config.get("schema") or "").strip()] if x
     )
@@ -236,7 +257,14 @@ def execute_bigquery_sql(config: Dict[str, Any], arguments: Dict[str, Any]) -> s
     else:
         client = bigquery.Client(project=project or None)
     upper_bq = query.lstrip().upper()
-    is_read_bq = upper_bq.startswith("SELECT") or upper_bq.startswith("WITH")
+    is_read_bq = (
+        upper_bq.startswith("SELECT")
+        or upper_bq.startswith("WITH")
+        or upper_bq.startswith("SHOW")
+        or upper_bq.startswith("DESCRIBE")
+        or upper_bq.startswith("DESC")
+        or upper_bq.startswith("EXPLAIN")
+    )
     _log_mcp_sql("bigquery", query, mode="read" if is_read_bq else "write", dest=project or "(default project)")
     try:
         # codeql[py/sql-injection]: Interactive SQL tool; query from operator args (BigQuery client).
@@ -271,7 +299,14 @@ def execute_sqlserver_sql(config: Dict[str, Any], arguments: Dict[str, Any]) -> 
     except ImportError:
         return "Error: pymssql is not installed"
     upper_ss = query.lstrip().upper()
-    is_read_ss = upper_ss.startswith("SELECT") or upper_ss.startswith("WITH")
+    is_read_ss = (
+        upper_ss.startswith("SELECT")
+        or upper_ss.startswith("WITH")
+        or upper_ss.startswith("SHOW")
+        or upper_ss.startswith("DESCRIBE")
+        or upper_ss.startswith("DESC")
+        or upper_ss.startswith("EXPLAIN")
+    )
     interactive_readonly_ss = bool(config.get("interactive_readonly")) or (
         os.environ.get("MCP_SQLSERVER_INTERACTIVE_READONLY", "").strip().lower() in ("1", "true", "yes")
     )
@@ -279,7 +314,7 @@ def execute_sqlserver_sql(config: Dict[str, Any], arguments: Dict[str, Any]) -> 
         return (
             "Error: interactive SQL Server is read-only for this tool "
             "(set interactive_readonly on the MCP tool config or MCP_SQLSERVER_INTERACTIVE_READONLY=1). "
-            "Only SELECT (and read-only WITH) queries are allowed. "
+            "Only SELECT/WITH (and metadata statements like SHOW/DESCRIBE/EXPLAIN) are allowed. "
             "Use output_contract platform writes for controlled INSERT/DDL to named tables."
         )
     mssql_dest = f"{(config.get('host') or 'localhost').strip()}:{int(config.get('port') or 1433)}/{config.get('database', '')}"

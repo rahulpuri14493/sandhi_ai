@@ -709,7 +709,7 @@ def _sql_query_from_args(config: Dict[str, Any], arguments: Dict[str, Any]) -> s
 
 
 def _is_safe_runtime_read_sql(query: str) -> bool:
-    """Best-effort guard for runtime SQL: single read-only statement (SELECT/WITH plus safe metadata)."""
+    """Best-effort guard for runtime SQL: single read-only SELECT/WITH statement."""
     if not isinstance(query, str):
         return False
     q = query.strip()
@@ -722,15 +722,7 @@ def _is_safe_runtime_read_sql(query: str) -> bool:
         return False
     q = q.rstrip(";").strip()
     upper = q.upper()
-    # Allow read-only metadata statements too (common for introspection).
-    if not (
-        upper.startswith("SELECT")
-        or upper.startswith("WITH")
-        or upper.startswith("SHOW")
-        or upper.startswith("DESCRIBE")
-        or upper.startswith("DESC")
-        or upper.startswith("EXPLAIN")
-    ):
+    if not (upper.startswith("SELECT") or upper.startswith("WITH")):
         return False
     # Disallow common write/DDL/control keywords in runtime SQL.
     if re.search(

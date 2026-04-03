@@ -100,6 +100,19 @@ def test_all_tool_types_have_explicit_validation(tool_type, config, expected_fra
     assert expected_fragment in msg.lower()
 
 
+class TestChromaValidationSoft:
+    """Chroma accepts a well-formed URL without a live server (integration + offline UX)."""
+
+    def test_chroma_valid_when_heartbeat_unreachable(self):
+        with patch("services.mcp_validate._http_reachable", return_value=(False, "unreachable")):
+            valid, msg = validate_tool_config(
+                "chroma",
+                {"url": "http://localhost:8000", "index_name": "test"},
+            )
+        assert valid is True
+        assert "heartbeat not verified" in msg.lower()
+
+
 class TestSqlServerValidationHints:
     @staticmethod
     def _sqlserver_base_cfg(user: str = "admin@sandhiai") -> dict:

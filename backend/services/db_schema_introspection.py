@@ -6,6 +6,8 @@ Used to populate schema_metadata so the agent has database context when writing 
 import json
 from typing import Any, Dict, List, Optional, Tuple
 
+from services.sql_server_host import sql_server_host_is_azure_sql
+
 
 def introspect_postgres(config: dict) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
     """
@@ -211,7 +213,7 @@ def introspect_sqlserver(config: dict) -> Tuple[Optional[Dict[str, Any]], Option
     encryption = (config.get("encryption") or config.get("encrypt") or "").strip().lower()
     if encryption in ("off", "request", "require"):
         kw["encryption"] = encryption
-    elif "database.windows.net" in host.lower():
+    elif sql_server_host_is_azure_sql(host):
         kw["encryption"] = "require"
 
     try:
