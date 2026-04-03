@@ -6,7 +6,6 @@ Unified completion API for admin-configured providers. API keys come from settin
 """
 from __future__ import annotations
 
-import json
 import logging
 import time
 from typing import Any, Dict, List, Optional
@@ -243,14 +242,3 @@ async def _anthropic_messages(
         if isinstance(p, dict) and p.get("type") == "text":
             texts.append(str(p.get("text") or ""))
     return "\n".join(texts).strip()
-
-
-def parse_json_loose(text: str) -> Any:
-    """Parse JSON from model output; strip markdown fences if present."""
-    content = (text or "").strip()
-    if content.startswith("```"):
-        content = content.split("```", 2)[1] if "```" in content else content
-        if content.startswith("json"):
-            content = content[4:].lstrip()
-        content = content.strip()
-    return json.loads(content)

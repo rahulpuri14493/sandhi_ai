@@ -46,14 +46,12 @@ async def post_openai_compatible_raw(
     429 or 5xx, performs one additional request with ``model`` replaced.
     """
     verify = httpx_verify_parameter()
-    last_exc: Optional[BaseException] = None
     resp: Optional[httpx.Response] = None
     for attempt in range(max_retries + 1):
         try:
             resp = await _post_once(url, headers, payload, timeout=timeout, verify=verify)
             break
         except httpx.RequestError as e:
-            last_exc = e
             if attempt < max_retries:
                 delay = 0.5 * (2**attempt)
                 logger.warning(

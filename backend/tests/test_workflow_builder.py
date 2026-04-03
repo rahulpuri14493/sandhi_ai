@@ -3,7 +3,7 @@ import json
 import pytest
 from unittest.mock import MagicMock, patch, AsyncMock
 
-from models.job import Job, WorkflowStep, JobStatus
+from models.job import Job, WorkflowStep
 from models.agent import Agent
 from services.workflow_builder import WorkflowBuilder
 

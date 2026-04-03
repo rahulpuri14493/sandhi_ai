@@ -8,7 +8,7 @@ import uuid
 import pytest
 from fastapi.testclient import TestClient
 
-from core.security import get_password_hash, create_access_token
+from core.security import get_password_hash
 from db.database import get_db
 from main import app
 from models.user import User, UserRole

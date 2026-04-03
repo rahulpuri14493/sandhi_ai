@@ -8,11 +8,8 @@ import json
 import uuid
 from unittest.mock import AsyncMock, patch
 
-import pytest
 from fastapi.testclient import TestClient
 
-from models.job import Job, JobStatus
-from models.user import UserRole
 
 
 # ---------- Auth ----------
@@ -458,7 +455,7 @@ class TestE2EExternalJobs:
         from core.external_token import create_job_token
         from models.job import Job, JobStatus
 
-        token = business_user["token"]
+        business_user["token"]
         business = business_user["user"]
         job = Job(
             business_id=business.id,

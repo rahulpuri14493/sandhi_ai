@@ -1,7 +1,6 @@
 """Tests for middleware error handlers (via app)."""
 from fastapi.testclient import TestClient
 
-from main import app
 
 
 def test_validation_error_returns_422(client: TestClient):

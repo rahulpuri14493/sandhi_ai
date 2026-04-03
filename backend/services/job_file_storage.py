@@ -6,7 +6,7 @@ import re
 import time
 import random
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Optional
 from functools import lru_cache
 
 from core.config import settings

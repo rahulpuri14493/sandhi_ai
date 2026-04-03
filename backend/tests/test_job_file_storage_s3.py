@@ -5,16 +5,13 @@ exercising every S3 branch using a mocked boto3 client -- no real endpoint
 needed.
 """
 
-import io
-import os
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import MagicMock, patch, PropertyMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 
 from services.job_file_storage import (
-    _is_s3_backend,
     _require_s3_settings,
     _extract_error_code,
     _ensure_bucket_ready,
@@ -26,7 +23,6 @@ from services.job_file_storage import (
     download_s3_bytes,
     open_s3_download_stream,
     materialize_to_temp_path,
-    cleanup_temp_path,
     _wait_for_object_visibility,
 )
 

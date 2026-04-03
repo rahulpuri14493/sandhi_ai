@@ -1,5 +1,4 @@
 from sqlalchemy.orm import Session
-from typing import Dict
 from models.job import Job, WorkflowStep
 from models.agent import Agent
 from models.transaction import Transaction, TransactionStatus, Earnings, EarningsStatus

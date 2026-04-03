@@ -16,7 +16,7 @@ from models.job import Job, JobStatus, WorkflowStep, JobSchedule, ScheduleStatus
 from models.agent import Agent
 from models.user import User, UserRole
 from schemas.job import (
-    JobCreate, JobUpdate, JobResponse, WorkflowStepResponse, WorkflowPreview,
+    JobResponse, WorkflowStepResponse, WorkflowPreview,
     AutoSplitBody, AnswerQuestionBody,
     JobScheduleCreate, JobScheduleUpdate, JobScheduleResponse,
     JobScheduleWithJobResponse, ScheduleExecutionHistoryResponse,
@@ -1424,7 +1424,6 @@ async def update_job(
         )
     
     # If new files were added, automatically trigger document analysis (extraction only or via first hired agent)
-    analysis_result = None
     if new_files_added and job.files:
         try:
             files_data = json.loads(job.files)
@@ -1469,7 +1468,7 @@ async def update_job(
             db.commit()
             db.refresh(job)
             
-            analysis_result = {
+            {
                 "analysis": result.get("analysis", ""),
                 "questions": result.get("questions", []),
                 "recommendations": result.get("recommendations", [])

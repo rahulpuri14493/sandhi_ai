@@ -1,16 +1,15 @@
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends
 from sqlalchemy.orm import Session
 from sqlalchemy import func, and_
-from typing import Dict, Any
 from db.database import get_db
-from models.user import User, UserRole
+from models.user import User
 from models.agent import Agent
 from models.job import Job, WorkflowStep
 from models.transaction import Earnings, EarningsStatus, Transaction, TransactionStatus
 from models.communication import AgentCommunication
 from schemas.transaction import EarningsResponse
 from schemas.job import JobResponse
-from core.security import get_current_user, get_current_developer_user, get_current_business_user
+from core.security import get_current_developer_user, get_current_business_user
 
 router = APIRouter(prefix="/api", tags=["dashboards"])
 
@@ -100,7 +99,7 @@ def get_developer_stats(
     
     # Get total communications - need to specify join condition due to multiple foreign keys
     from sqlalchemy import or_
-    developer_agent_subquery = db.query(Agent.id).filter(Agent.developer_id == current_user.id).subquery()
+    db.query(Agent.id).filter(Agent.developer_id == current_user.id).subquery()
     comm_count = db.query(AgentCommunication).filter(
         or_(
             AgentCommunication.from_agent_id.in_(db.query(Agent.id).filter(Agent.developer_id == current_user.id)),

@@ -5,7 +5,7 @@ from pydantic import ValidationError
 
 from schemas.user import UserCreate, UserLogin
 from schemas.agent import AgentCreate, AgentUpdate
-from models.agent import PricingModel, AgentStatus
+from models.agent import PricingModel
 from schemas.job import (
     JobCreate,
     JobUpdate,

@@ -7,7 +7,6 @@ import sys
 from sqlalchemy.orm import Session
 from db.database import SessionLocal
 from models.user import User
-from core.security import get_password_hash
 
 def fix_user_passwords():
     """Rehash all user passwords with bcrypt"""

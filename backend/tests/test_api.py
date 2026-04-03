@@ -1,8 +1,6 @@
 """API endpoint tests."""
-import pytest
 from fastapi.testclient import TestClient
 
-from main import app
 
 
 def test_root(client: TestClient):

@@ -492,7 +492,7 @@ def _validate_pageindex(config: dict) -> Tuple[bool, str]:
         if r.status_code >= 400:
             return False, f"PageIndex API returned {r.status_code}: {r.text[:200]}"
         return True, "PageIndex connection successful"
-    except Exception as e:
+    except Exception:
         logger.exception("PageIndex validation failed")
         return False, "Unable to reach PageIndex API; please verify the base URL and network connectivity."
 

@@ -222,7 +222,7 @@ def _build_agent_task_fallback(
     base = f"You are agent {index + 1} of {total}. "
     if agent.description:
         base += f"Your expertise: {agent.description}. "
-    base += f"Execute ONLY the part of the job that matches your role. "
+    base += "Execute ONLY the part of the job that matches your role. "
     if total > 1 and index > 0:
         base += "You will receive the previous agent's output. Use it as your input. "
     base += f"Do NOT perform work assigned to other agents. Return ONLY your specific output. Job: {job_title}. {job_description or ''}"

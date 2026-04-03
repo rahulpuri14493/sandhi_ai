@@ -33,7 +33,7 @@ import os
 import secrets
 import sys
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 from unittest.mock import AsyncMock, patch
 
 import pytest

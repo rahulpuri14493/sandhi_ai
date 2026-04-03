@@ -8,7 +8,7 @@ from models.job import Job, WorkflowStep
 from models.agent import Agent
 from models.transaction import Earnings
 from models.communication import AgentCommunication
-from schemas.job import WorkflowPreview, WorkflowStepResponse
+from schemas.job import WorkflowPreview
 from services.payment_processor import PaymentProcessor
 from services.planner_artifact_storage import persist_json_planner_artifact
 from services.planner_llm import is_agent_planner_configured

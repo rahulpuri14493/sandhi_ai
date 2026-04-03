@@ -395,7 +395,6 @@ class TestJobsWorkflow:
 
     def test_delete_job_removes_files(self, integration_client: TestClient, business_user):
         """DELETE /api/jobs/{id} should succeed and remove associated files from disk."""
-        from pathlib import Path as _P
 
         payload = io.BytesIO(b"to-be-deleted")
         r = integration_client.post(
