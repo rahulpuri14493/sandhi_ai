@@ -21,12 +21,16 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Install backend dependencies and audit tools
+      - name: Install service dependencies and audit tools
         run: |
           python -m pip install --upgrade pip
-          pip install -r backend/requirements.txt pipdeptree pip-audit
+          pip install \
+            -r backend/requirements.txt \
+            -r tools/platform_mcp_server/requirements.txt \
+            -r tools/a2a_openai_adapter/requirements.txt \
+            pipdeptree pip-audit
 
-      - name: Audit Python dependencies for high/critical vulnerabilities
+      - name: Audit Python dependencies (aggregate all vulnerabilities)
         run: |
           python - <<'PY'
           import json
@@ -34,48 +38,58 @@ jobs:
           import sys
 
           print("Running pip-audit (JSON, local env)...")
-          try:
-            out = subprocess.check_output(
-              ["pip-audit", "--local", "--format", "json", "--desc", "off"],
-              text=True,
-            )
-          except subprocess.CalledProcessError as e:
-            # pip-audit exits non-zero when it finds vulns; we still want its JSON.
-            out = e.output or ""
+          proc = subprocess.run(
+            ["pip-audit", "--local", "--format", "json", "--desc", "off"],
+            text=True,
+            capture_output=True,
+          )
 
-          if not out.strip():
-            print("pip-audit produced no output")
-            sys.exit(0)
+          raw = (proc.stdout or "").strip()
+          if not raw:
+            print("pip-audit produced no stdout; stderr follows:")
+            print((proc.stderr or "").strip())
+            # If pip-audit itself failed without JSON, fail the job so it is visible.
+            sys.exit(proc.returncode if proc.returncode else 1)
+
+          # pip-audit prepends a human line like "Found X known vulnerabilities..."
+          # before JSON. Parse from the first '{'.
+          json_start = raw.find("{")
+          payload = raw[json_start:] if json_start >= 0 else raw
 
           try:
-            data = json.loads(out)
+            data = json.loads(payload)
           except json.JSONDecodeError:
-            print("pip-audit output was not valid JSON; exiting without failing CI.")
+            print("pip-audit stdout was not valid JSON payload:")
+            print(raw)
+            sys.exit(1)
+
+          deps = data.get("dependencies", []) if isinstance(data, dict) else []
+          findings = []
+          for dep in deps:
+            name = dep.get("name")
+            version = dep.get("version")
+            for v in dep.get("vulns", []) or []:
+              findings.append(
+                {
+                  "name": name,
+                  "version": version,
+                  "id": v.get("id"),
+                  "aliases": v.get("aliases") or [],
+                  "fix_versions": v.get("fix_versions") or [],
+                }
+              )
+
+          if not findings:
+            print("pip-audit: no vulnerabilities found across installed service dependencies.")
             sys.exit(0)
 
-          vulns = data.get("vulnerabilities") if isinstance(data, dict) else data
-          if not isinstance(vulns, list):
-            print("pip-audit JSON did not contain a vulnerabilities list; exiting without failing CI.")
-            sys.exit(0)
+          print("pip-audit: vulnerabilities detected (full aggregated list):")
+          for f in findings:
+            alias_text = f" aliases={','.join(f['aliases'])}" if f["aliases"] else ""
+            fix_text = f" fix={','.join(f['fix_versions'])}" if f["fix_versions"] else ""
+            print(f"- {f['name']}=={f['version']} id={f['id']}{alias_text}{fix_text}")
 
-          high_or_critical = []
-          for v in vulns:
-            sev = str(v.get("severity", "")).lower()
-            if sev in ("high", "critical"):
-              high_or_critical.append(v)
-
-          if not high_or_critical:
-            print("pip-audit: no high/critical vulnerabilities found.")
-            sys.exit(0)
-
-          print("pip-audit: high/critical vulnerabilities detected:")
-          for v in high_or_critical:
-            name = v.get("package", {}).get("name")
-            version = v.get("package", {}).get("version")
-            sev = v.get("severity")
-            vid = v.get("id") or v.get("vuln_id")
-            print(f"- {name}=={version} severity={sev} id={vid}")
-
+          # Fail once with the complete list (avoids one-at-a-time discovery loops).
           sys.exit(1)
           PY
 
