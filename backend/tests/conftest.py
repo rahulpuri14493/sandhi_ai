@@ -34,6 +34,10 @@ def _load_repo_dotenv_all() -> None:
         key = key.strip()
         if not key:
             continue
+        # Harness flags (PYTEST_USE_DOTENV_*) must come from the shell/CI only, not repo `.env`,
+        # or a line like PYTEST_USE_DOTENV_STORAGE=1 would skip forced local storage and break tests.
+        if key.startswith("PYTEST_"):
+            continue
         if key in os.environ:
             continue
         val = val.strip()

@@ -13,7 +13,8 @@ from core.config import settings
 
 logger = logging.getLogger(__name__)
 
-_client = None  # lazy singleton when URL set
+# None = not initialized; False = redis extra missing (do not retry import); otherwise Redis client.
+_client = None
 
 
 def _get_client():
@@ -21,15 +22,24 @@ def _get_client():
     url = (getattr(settings, "PLANNER_ARTIFACT_CACHE_REDIS_URL", None) or "").strip()
     if not url:
         return None
-    if _client is None:
+    if _client is False:
+        return None
+    if _client is not None:
+        return _client
+    try:
         import redis
-
-        _client = redis.Redis.from_url(
-            url,
-            decode_responses=False,
-            socket_timeout=2.0,
-            socket_connect_timeout=2.0,
+    except ModuleNotFoundError:
+        logger.warning(
+            "planner_artifact_cache: redis package not installed; ignoring PLANNER_ARTIFACT_CACHE_REDIS_URL",
         )
+        _client = False
+        return None
+    _client = redis.Redis.from_url(
+        url,
+        decode_responses=False,
+        socket_timeout=2.0,
+        socket_connect_timeout=2.0,
+    )
     return _client
 
 
