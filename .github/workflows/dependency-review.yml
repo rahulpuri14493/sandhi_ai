@@ -21,6 +21,8 @@ jobs:
         with:
           comment-summary-in-pr: always
           fail-on-severity: high
+          # python-ecdsa: Minerva timing on P-256; upstream treats side-channels out-of-scope (no fixed version).
+          allow-ghsas: GHSA-wj6h-64fc-37mp
           # Wait for dependency-submission (or other SBOM) jobs so head SHA has a snapshot.
           retry-on-snapshot-warnings: true
           retry-on-snapshot-warnings-timeout: 180
