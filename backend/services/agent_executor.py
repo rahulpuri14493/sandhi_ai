@@ -355,7 +355,7 @@ class AgentExecutor:
             raise ValueError("Job not found")
         
         # Process payment first
-        transaction = self.payment_processor.process_payment(job_id)
+        self.payment_processor.process_payment(job_id)
         
         # Get workflow steps in order
         workflow_steps = self.db.query(WorkflowStep).filter(

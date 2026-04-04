@@ -61,6 +61,11 @@ class Job(Base):
     # One schedule per job (uselist=False enforces singular access).
     # The DB UNIQUE constraint on job_schedules.job_id prevents duplicates.
     schedule = relationship("JobSchedule", back_populates="job", uselist=False, cascade="all, delete-orphan")
+    planner_artifacts = relationship(
+        "JobPlannerArtifact",
+        back_populates="job",
+        cascade="all, delete-orphan",
+    )
 
 
 class WorkflowStep(Base):
@@ -143,3 +148,20 @@ class ScheduleExecutionHistory(Base):
 
     # Relationships
     schedule = relationship("JobSchedule", back_populates="execution_history")
+
+
+class JobPlannerArtifact(Base):
+    """Pointer to full JSON output from Agent Planner / BRD analysis (object storage or local path)."""
+
+    __tablename__ = "job_planner_artifacts"
+
+    id = Column(Integer, primary_key=True, index=True)
+    job_id = Column(Integer, ForeignKey("jobs.id"), nullable=False, index=True)
+    artifact_type = Column(String(64), nullable=False)  # e.g. brd_analysis
+    storage = Column(String(16), nullable=False, default="s3")  # s3 | local
+    bucket = Column(String(255), nullable=True)
+    object_key = Column(Text, nullable=False)
+    byte_size = Column(Integer, nullable=False, default=0)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+
+    job = relationship("Job", back_populates="planner_artifacts")

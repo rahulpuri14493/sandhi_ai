@@ -85,6 +85,10 @@ export interface ConversationItem {
   workflow_collaboration_hint?: WorkflowCollaborationHint | null;
   workflow_collaboration_reason?: string | null;
   timestamp?: string;
+  /** Workflow Q&A: which step's assigned agent asked this */
+  workflow_step_id?: number;
+  agent_id?: number;
+  agent_name?: string | null;
 }
 
 export interface Job {

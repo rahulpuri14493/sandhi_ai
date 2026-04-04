@@ -39,6 +39,24 @@ export default function JobDetailPage() {
   })
   const [isSavingSchedule, setIsSavingSchedule] = useState(false)
   const [countdown, setCountdown] = useState<number | null>(null)
+  const [plannerSectionOpen, setPlannerSectionOpen] = useState(false)
+  const [plannerStatus, setPlannerStatus] = useState<{
+    configured: boolean
+    provider?: string
+    model?: string
+    base_url_configured?: boolean
+  } | null>(null)
+  const [plannerArtifacts, setPlannerArtifacts] = useState<
+    Array<{
+      id: number
+      artifact_type: string
+      storage: string
+      byte_size: number
+      created_at: string
+    }>
+  >([])
+  const [plannerSupportLoading, setPlannerSupportLoading] = useState(false)
+  const [plannerRawModal, setPlannerRawModal] = useState<{ title: string; body: string } | null>(null)
 
   useEffect(() => {
     if (jobId) {
@@ -274,6 +292,34 @@ export default function JobDetailPage() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [job?.status, job?.scheduled_at])
 
+  useEffect(() => {
+    if (!jobId || !plannerSectionOpen) return
+    let cancelled = false
+    setPlannerSupportLoading(true)
+    ;(async () => {
+      try {
+        const [st, listRes] = await Promise.all([
+          jobsAPI.getAgentPlannerStatus(),
+          jobsAPI.listPlannerArtifacts(jobId),
+        ])
+        if (!cancelled) {
+          setPlannerStatus(st)
+          setPlannerArtifacts(Array.isArray(listRes?.items) ? listRes.items : [])
+        }
+      } catch {
+        if (!cancelled) {
+          setPlannerStatus(null)
+          setPlannerArtifacts([])
+        }
+      } finally {
+        if (!cancelled) setPlannerSupportLoading(false)
+      }
+    })()
+    return () => {
+      cancelled = true
+    }
+  }, [jobId, plannerSectionOpen])
+
   if (isLoading) {
     return (
       <div className="container mx-auto px-4 py-8 min-h-screen">
@@ -476,6 +522,121 @@ export default function JobDetailPage() {
             </div>
           )}
         </div>
+
+        <div className="mb-8 bg-dark-100/50 backdrop-blur-xl rounded-2xl shadow-2xl border border-dark-200/50 overflow-hidden">
+          <button
+            type="button"
+            onClick={() => setPlannerSectionOpen((o) => !o)}
+            className="w-full flex items-center justify-between gap-4 px-6 py-4 text-left hover:bg-dark-200/30 transition-colors"
+          >
+            <span className="text-white font-bold text-lg">Agent planner &amp; audit artifacts</span>
+            <span className="text-white/50 text-sm font-semibold">{plannerSectionOpen ? 'Hide' : 'Show'}</span>
+          </button>
+          {plannerSectionOpen && (
+            <div className="px-6 pb-6 pt-0 border-t border-dark-200/50">
+              {plannerSupportLoading ? (
+                <p className="text-white/60 py-4">Loading planner status and artifacts…</p>
+              ) : (
+                <>
+                  <div className="py-4 space-y-2 text-white/80 text-sm">
+                    <p className="font-semibold text-white">Platform planner</p>
+                    {plannerStatus ? (
+                      <ul className="list-disc list-inside space-y-1 text-white/70">
+                        <li>Configured: {plannerStatus.configured ? 'yes' : 'no'}</li>
+                        {plannerStatus.provider != null && <li>Provider: {plannerStatus.provider}</li>}
+                        {plannerStatus.model != null && <li>Model: {plannerStatus.model}</li>}
+                        {plannerStatus.base_url_configured != null && (
+                          <li>Base URL set: {plannerStatus.base_url_configured ? 'yes' : 'no'}</li>
+                        )}
+                      </ul>
+                    ) : (
+                      <p className="text-white/50">Could not load planner status.</p>
+                    )}
+                  </div>
+                  <div>
+                    <p className="font-semibold text-white mb-2 text-sm">Stored artifacts (BRD / task split / tool suggestion)</p>
+                    {plannerArtifacts.length === 0 ? (
+                      <p className="text-white/50 text-sm">No artifacts for this job yet.</p>
+                    ) : (
+                      <div className="overflow-x-auto rounded-xl border border-dark-200/50">
+                        <table className="w-full text-sm text-left">
+                          <thead className="bg-dark-200/40 text-white/70">
+                            <tr>
+                              <th className="px-3 py-2 font-semibold">Type</th>
+                              <th className="px-3 py-2 font-semibold">Storage</th>
+                              <th className="px-3 py-2 font-semibold">Size</th>
+                              <th className="px-3 py-2 font-semibold">Created</th>
+                              <th className="px-3 py-2 font-semibold">Raw JSON</th>
+                            </tr>
+                          </thead>
+                          <tbody className="text-white/85">
+                            {plannerArtifacts.map((row) => (
+                              <tr key={row.id} className="border-t border-dark-200/40">
+                                <td className="px-3 py-2">{row.artifact_type}</td>
+                                <td className="px-3 py-2">{row.storage}</td>
+                                <td className="px-3 py-2">{row.byte_size}</td>
+                                <td className="px-3 py-2 whitespace-nowrap">
+                                  {row.created_at ? new Date(row.created_at).toLocaleString() : '—'}
+                                </td>
+                                <td className="px-3 py-2">
+                                  <button
+                                    type="button"
+                                    className="text-primary-400 hover:text-primary-300 font-semibold underline-offset-2 hover:underline"
+                                    onClick={async () => {
+                                      try {
+                                        const data = await jobsAPI.getPlannerArtifactRaw(jobId, row.id)
+                                        setPlannerRawModal({
+                                          title: `${row.artifact_type} (#${row.id})`,
+                                          body: JSON.stringify(data, null, 2),
+                                        })
+                                      } catch (e) {
+                                        console.error(e)
+                                        alert('Failed to load artifact JSON')
+                                      }
+                                    }}
+                                  >
+                                    View
+                                  </button>
+                                </td>
+                              </tr>
+                            ))}
+                          </tbody>
+                        </table>
+                      </div>
+                    )}
+                  </div>
+                </>
+              )}
+            </div>
+          )}
+        </div>
+
+        {plannerRawModal && (
+          <div
+            className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/70 backdrop-blur-sm"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="planner-raw-title"
+          >
+            <div className="bg-dark-100 border border-dark-200 rounded-2xl shadow-2xl max-w-4xl w-full max-h-[85vh] flex flex-col">
+              <div className="flex items-center justify-between px-5 py-4 border-b border-dark-200/50">
+                <h2 id="planner-raw-title" className="text-lg font-bold text-white">
+                  {plannerRawModal.title}
+                </h2>
+                <button
+                  type="button"
+                  onClick={() => setPlannerRawModal(null)}
+                  className="text-white/70 hover:text-white px-3 py-1 rounded-lg hover:bg-dark-200/50 font-semibold"
+                >
+                  Close
+                </button>
+              </div>
+              <pre className="flex-1 overflow-auto p-4 text-xs text-white/90 font-mono whitespace-pre-wrap break-all">
+                {plannerRawModal.body}
+              </pre>
+            </div>
+          </div>
+        )}
 
         {job.status === 'draft' && (
           <div className="mb-8 bg-dark-100/50 backdrop-blur-xl rounded-2xl shadow-2xl p-6 border border-dark-200/50">

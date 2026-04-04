@@ -1,7 +1,6 @@
 """Unit tests for MCP tool config validation (deterministic, no real network)."""
 
 import sys
-import types
 from unittest.mock import patch
 
 import pytest

@@ -91,6 +91,20 @@ class Settings(BaseSettings):
     HTTPX_CA_BUNDLE_PATH: str = ""  # optional path to CA bundle (corporate proxy / custom roots)
     # When set, task/tool splitters retry once with this model after 429 or 5xx from the LLM endpoint
     LLM_HTTP_FALLBACK_MODEL: str = ""
+    # --- Platform Agent Planner (Issue #62): BRD analysis, workflow split, tool suggestion ---
+    # When AGENT_PLANNER_API_KEY is set, planner handles those flows instead of marketplace agent endpoints.
+    AGENT_PLANNER_ENABLED: bool = True
+    AGENT_PLANNER_PROVIDER: str = "openai_compatible"  # openai_compatible | anthropic
+    AGENT_PLANNER_BASE_URL: str = ""  # e.g. https://api.openai.com/v1 or https://api.mistral.ai/v1
+    AGENT_PLANNER_API_KEY: str = ""
+    AGENT_PLANNER_MODEL: str = "gpt-4o-mini"
+    AGENT_PLANNER_TEMPERATURE: float = 0.3
+    AGENT_PLANNER_MAX_TOKENS: int = 4096
+    AGENT_PLANNER_FALLBACK_MODEL: str = ""  # optional; also uses LLM_HTTP_FALLBACK_MODEL if empty
+    AGENT_PLANNER_HTTP_TIMEOUT_SECONDS: float = 120.0
+    # Optional read-through cache for GET planner artifact raw JSON (empty = disabled).
+    PLANNER_ARTIFACT_CACHE_REDIS_URL: str = ""
+    PLANNER_ARTIFACT_CACHE_TTL_SECONDS: int = 300
     # In-process rate limiting (per client IP + route group). Tune via env for your deployment.
     # Many users behind one NAT share one IP — use higher values in production or Redis-backed limits at scale.
     RATE_LIMIT_ENABLED: bool = True

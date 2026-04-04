@@ -1,8 +1,5 @@
 """Unit tests for services/job_file_storage.py (local backend, no real S3)."""
 
-import os
-import json
-import uuid
 from pathlib import Path
 
 import pytest

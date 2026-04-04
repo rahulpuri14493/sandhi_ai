@@ -1,6 +1,5 @@
 """Coverage-oriented tests for large API modules (jobs/hiring/dashboards)."""
 
-import json
 
 from fastapi.testclient import TestClient
 

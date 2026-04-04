@@ -8,8 +8,10 @@ from models.job import Job, WorkflowStep
 from models.agent import Agent
 from models.transaction import Earnings
 from models.communication import AgentCommunication
-from schemas.job import WorkflowPreview, WorkflowStepResponse
+from schemas.job import WorkflowPreview
 from services.payment_processor import PaymentProcessor
+from services.planner_artifact_storage import persist_json_planner_artifact
+from services.planner_llm import is_agent_planner_configured
 from services.task_splitter import split_job_for_agents
 
 logger = logging.getLogger(__name__)
@@ -109,7 +111,11 @@ class WorkflowBuilder:
     ) -> WorkflowPreview:
         """Automatically split a job across selected agents. workflow_mode: 'independent' | 'sequential' | None.
         step_tools: optional list of {agent_index, allowed_platform_tool_ids, allowed_connection_ids, tool_visibility} per step.
-        tool_visibility: job-level full | names_only | none (restricts what tool info agents see; credentials never shared)."""
+        tool_visibility: job-level full | names_only | none (restricts what tool info agents see; credentials never shared).
+
+        Task splitting uses the platform Agent Planner when it is configured; otherwise the first selected
+        agent's OpenAI-compatible API (if that agent has api_endpoint set). If neither applies, per-step
+        tasks fall back to simple defaults."""
         job = self.db.query(Job).filter(Job.id == job_id).first()
         if not job:
             raise ValueError("Job not found")
@@ -149,10 +155,16 @@ class WorkflowBuilder:
             "output_artifact_format": artifact_format,
         }
         
-        # Split job into subtasks per agent (generalized, uses first agent's API when available)
+        # Task split: platform planner when configured, else first agent's OpenAI-compatible endpoint
         task_assignments = []
+        task_split_audit: Dict[str, Any] = {}
         if agents:
-            splitter = agents[0] if (agents[0].api_endpoint and (agents[0].api_endpoint or "").strip()) else None
+            a0 = agents[0]
+            splitter = (
+                a0
+                if ((a0.api_endpoint or "").strip() or is_agent_planner_configured())
+                else None
+            )
             try:
                 if splitter:
                     task_assignments = await split_job_for_agents(
@@ -162,6 +174,7 @@ class WorkflowBuilder:
                         conversation_data=conversation_data,
                         agents=agents,
                         splitter_agent=splitter,
+                        llm_audit=task_split_audit,
                     )
             except Exception as e:
                 logger.warning("Task split failed: %s, using fallback", e)
@@ -295,7 +308,21 @@ class WorkflowBuilder:
             )
             self.db.add(step)
             steps.append(step)
-        
+
+        if task_split_audit.get("raw_llm_response"):
+            await persist_json_planner_artifact(
+                self.db,
+                job_id,
+                "task_split",
+                {
+                    "job_title": job.title,
+                    "job_description": job.description,
+                    "raw_llm_response": task_split_audit["raw_llm_response"],
+                    "source": task_split_audit.get("source"),
+                    "parsed_assignments": task_assignments,
+                },
+            )
+
         self.db.commit()
         
         # Calculate costs

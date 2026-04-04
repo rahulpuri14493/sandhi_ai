@@ -1,5 +1,5 @@
 """
-Shared httpx usage for OpenAI-compatible chat endpoints (task splitter, tool splitter).
+Shared httpx usage for OpenAI-compatible chat endpoints (task/tool split when not using platform planner).
 
 Retries on transient network errors only; HTTP 4xx/5xx are returned to callers.
 Optional single retry with a fallback model after 429 or 5xx (see LLM_HTTP_FALLBACK_MODEL).
@@ -46,14 +46,12 @@ async def post_openai_compatible_raw(
     429 or 5xx, performs one additional request with ``model`` replaced.
     """
     verify = httpx_verify_parameter()
-    last_exc: Optional[BaseException] = None
     resp: Optional[httpx.Response] = None
     for attempt in range(max_retries + 1):
         try:
             resp = await _post_once(url, headers, payload, timeout=timeout, verify=verify)
             break
         except httpx.RequestError as e:
-            last_exc = e
             if attempt < max_retries:
                 delay = 0.5 * (2**attempt)
                 logger.warning(

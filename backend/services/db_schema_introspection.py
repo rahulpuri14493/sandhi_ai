@@ -3,7 +3,6 @@ Introspect SQL database schemas for MCP tools.
 Returns tables, columns (name, type, nullable), primary keys, and foreign keys.
 Used to populate schema_metadata so the agent has database context when writing SQL.
 """
-import json
 from typing import Any, Dict, List, Optional, Tuple
 
 from services.sql_server_host import sql_server_host_is_azure_sql

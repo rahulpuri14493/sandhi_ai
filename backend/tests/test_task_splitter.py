@@ -2,7 +2,7 @@
 import asyncio
 import json
 import pytest
-from unittest.mock import MagicMock, AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 from models.agent import Agent
 from services.task_splitter import (
@@ -91,6 +91,115 @@ def test_split_fallback_when_api_returns_error(multi_agents):
     assert len(result) == 3
     for i, r in enumerate(result):
         assert r["agent_index"] == i
+
+
+@pytest.mark.asyncio
+async def test_split_populates_llm_audit_when_planner_used(multi_agents):
+    """With platform planner configured, audit gets raw text and source=planner."""
+    splitter = multi_agents[0]
+    splitter.api_endpoint = ""
+    api_response = [
+        {"agent_index": 0, "task": "P0", "assigned_document_ids": ["BRD1"]},
+        {"agent_index": 1, "task": "P1", "assigned_document_ids": ["BRD2"]},
+        {"agent_index": 2, "task": "P2", "assigned_document_ids": ["BRD3"]},
+    ]
+    raw_json = json.dumps(api_response)
+    audit: dict = {}
+    with patch("services.task_splitter.is_agent_planner_configured", return_value=True):
+        with patch(
+            "services.task_splitter.planner_chat_completion",
+            new=AsyncMock(return_value=raw_json),
+        ):
+            out = await split_job_for_agents(
+                job_title="P",
+                job_description="d",
+                documents_content=[
+                    {"id": "BRD1", "name": "a", "content": "a"},
+                    {"id": "BRD2", "name": "b", "content": "b"},
+                    {"id": "BRD3", "name": "c", "content": "c"},
+                ],
+                conversation_data=None,
+                agents=multi_agents,
+                splitter_agent=splitter,
+                llm_audit=audit,
+            )
+    assert audit.get("raw_llm_response") == raw_json
+    assert audit.get("source") == "planner"
+    assert len(out) == 3
+    assert out[0]["task"] == "P0"
+
+
+@pytest.mark.asyncio
+async def test_split_planner_uses_agent_planner_temperature_not_splitter_agent(
+    monkeypatch, multi_agents
+):
+    """Codex: planner path must use AGENT_PLANNER_TEMPERATURE, not first agent temperature."""
+    from core.config import settings
+
+    splitter = multi_agents[0]
+    splitter.api_endpoint = ""
+    splitter.temperature = 0.99
+    monkeypatch.setattr(settings, "AGENT_PLANNER_TEMPERATURE", 0.11, raising=False)
+    raw_json = json.dumps(
+        [
+            {"agent_index": 0, "task": "P0", "assigned_document_ids": ["BRD1"]},
+            {"agent_index": 1, "task": "P1", "assigned_document_ids": ["BRD2"]},
+            {"agent_index": 2, "task": "P2", "assigned_document_ids": ["BRD3"]},
+        ]
+    )
+    mock_planner = AsyncMock(return_value=raw_json)
+    with patch("services.task_splitter.is_agent_planner_configured", return_value=True):
+        with patch("services.task_splitter.planner_chat_completion", mock_planner):
+            await split_job_for_agents(
+                job_title="P",
+                job_description="d",
+                documents_content=[
+                    {"id": "BRD1", "name": "a", "content": "a"},
+                    {"id": "BRD2", "name": "b", "content": "b"},
+                    {"id": "BRD3", "name": "c", "content": "c"},
+                ],
+                conversation_data=None,
+                agents=multi_agents,
+                splitter_agent=splitter,
+            )
+    mock_planner.assert_called_once()
+    _args, kwargs = mock_planner.call_args
+    assert kwargs.get("temperature") == 0.11
+
+
+def test_split_populates_llm_audit_when_api_succeeds(multi_agents):
+    """Optional llm_audit dict receives raw model text and source."""
+    splitter = multi_agents[0]
+    splitter.api_endpoint = "https://api.example.com/chat"
+    splitter.api_key = "sk-xxx"
+    api_response = [
+        {"agent_index": 0, "task": "Task A", "assigned_document_ids": ["BRD1"]},
+        {"agent_index": 1, "task": "Task B", "assigned_document_ids": ["BRD2"]},
+        {"agent_index": 2, "task": "Task C", "assigned_document_ids": ["BRD3"]},
+    ]
+    raw_json = json.dumps(api_response)
+    mock_resp = MagicMock()
+    mock_resp.status_code = 200
+    mock_resp.json.return_value = {"choices": [{"message": {"content": raw_json}}]}
+    audit: dict = {}
+    with patch("services.task_splitter.post_openai_compatible_raw", new=AsyncMock(return_value=mock_resp)):
+        asyncio.run(
+            split_job_for_agents(
+                job_title="API Job",
+                job_description="Use API",
+                documents_content=[
+                    {"id": "BRD1", "name": "a.docx", "content": "a"},
+                    {"id": "BRD2", "name": "b.docx", "content": "b"},
+                    {"id": "BRD3", "name": "c.docx", "content": "c"},
+                ],
+                conversation_data=None,
+                agents=multi_agents,
+                splitter_agent=splitter,
+                llm_audit=audit,
+            )
+        )
+    assert audit.get("raw_llm_response") == raw_json
+    assert audit.get("source") == "agent_endpoint"
 
 
 def test_split_success_parses_json_from_api(multi_agents):

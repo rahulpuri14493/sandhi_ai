@@ -9,14 +9,71 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
-# Use in-memory SQLite for tests to avoid DB setup
-os.environ.setdefault("DATABASE_URL", "sqlite:///:memory:")
-# Default tests to local file storage unless a specific suite enables S3.
-# This prevents CI failures when OBJECT_STORAGE_BACKEND defaults to "s3"
-# but S3_* credentials are intentionally not configured for unit/integration tests.
-os.environ.setdefault("OBJECT_STORAGE_BACKEND", "local")
-# Disable the APScheduler background scheduler during tests
-os.environ.setdefault("DISABLE_SCHEDULER", "true")
+
+def _load_repo_dotenv_all() -> None:
+    """
+    Merge the repository root `.env` into `os.environ` before `Settings` and `db.database`
+    are imported.
+
+    Does not override variables already set in the shell or CI (same rule as python-dotenv).
+    Supports optional `export KEY=...` and single/double-quoted values.
+    """
+    repo_root = Path(__file__).resolve().parents[2]
+    env_path = repo_root / ".env"
+    if not env_path.is_file():
+        return
+    for raw in env_path.read_text(encoding="utf-8", errors="ignore").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("export "):
+            line = line[7:].strip()
+        if "=" not in line:
+            continue
+        key, _, val = line.partition("=")
+        key = key.strip()
+        if not key:
+            continue
+        # Harness flags (PYTEST_USE_DOTENV_*) must come from the shell/CI only, not repo `.env`,
+        # or a line like PYTEST_USE_DOTENV_STORAGE=1 would skip forced local storage and break tests.
+        if key.startswith("PYTEST_"):
+            continue
+        if key in os.environ:
+            continue
+        val = val.strip()
+        if len(val) >= 2 and val[0] == val[-1] and val[0] in "\"'":
+            val = val[1:-1]
+        os.environ[key] = val
+
+
+def _env_truthy(name: str) -> bool:
+    return os.environ.get(name, "").strip().lower() in ("1", "true", "yes", "on")
+
+
+_load_repo_dotenv_all()
+
+# Isolate harness from typical dev `.env`: `db.database` and storage clients initialize at import.
+# Opt out of overrides (use merged shell + `.env` values) with PYTEST_USE_DOTENV_DATABASE=1 and/or
+# PYTEST_USE_DOTENV_STORAGE=1. The default `client` fixture still uses in-memory SQLite sessions.
+if not _env_truthy("PYTEST_USE_DOTENV_DATABASE"):
+    os.environ["DATABASE_URL"] = "sqlite:///:memory:"
+else:
+    os.environ.setdefault("DATABASE_URL", "sqlite:///:memory:")
+
+if not _env_truthy("PYTEST_USE_DOTENV_STORAGE"):
+    os.environ["OBJECT_STORAGE_BACKEND"] = "local"
+else:
+    os.environ.setdefault("OBJECT_STORAGE_BACKEND", "local")
+
+os.environ["DISABLE_SCHEDULER"] = "true"
+
+# Avoid real planner LLM calls and planner-heavy code paths when `.env` enables the agent planner.
+if not _env_truthy("PYTEST_USE_DOTENV_PLANNER"):
+    os.environ["AGENT_PLANNER_ENABLED"] = "false"
+else:
+    os.environ.setdefault("AGENT_PLANNER_ENABLED", "false")
+
+# Other keys (Redis cache URL, API keys for non-planner paths, Celery URLs, etc.) still apply.
 
 from db.database import Base, get_db
 from main import app

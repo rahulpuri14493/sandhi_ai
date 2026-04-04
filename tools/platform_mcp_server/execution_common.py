@@ -15,7 +15,7 @@ import re
 import secrets
 import sys
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 from urllib.parse import urlparse, unquote, urlunparse
 
 # Local dev: .../repo/tools/platform_mcp_server/execution_common.py -> parents[2] is repo root.

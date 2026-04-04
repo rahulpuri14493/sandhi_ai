@@ -6,7 +6,7 @@ Protected by MCP_INTERNAL_SECRET header.
 import json
 from fastapi import APIRouter, Depends, HTTPException, Header
 from sqlalchemy.orm import Session
-from typing import List, Optional
+from typing import Optional
 from pydantic import BaseModel
 
 from db.database import get_db

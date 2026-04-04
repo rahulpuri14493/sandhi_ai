@@ -15,7 +15,6 @@ import uuid
 from datetime import datetime, timedelta
 from unittest.mock import patch, MagicMock
 
-import pytest
 from sqlalchemy.orm import Session
 
 from core.security import get_password_hash

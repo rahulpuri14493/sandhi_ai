@@ -6,7 +6,7 @@ Classify platform MCP tool types for UX and BRD-aligned tool splitting.
 """
 from __future__ import annotations
 
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List
 
 # Primarily retrieval / search during a step (still may have side effects in some providers).
 _READ_BIAS_TYPES = frozenset(

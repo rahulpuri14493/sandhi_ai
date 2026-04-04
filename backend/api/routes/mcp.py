@@ -315,7 +315,7 @@ async def validate_connection(
             timeout=15.0,
         )
         return {"valid": True, "message": "MCP server connection successful"}
-    except Exception as e:
+    except Exception:
         logging.exception("MCP server connection validation failed for base_url=%s, endpoint_path=%s", base_url, endpoint_path)
         return {
             "valid": False,

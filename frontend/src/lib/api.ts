@@ -188,6 +188,15 @@ export const jobsAPI = {
   generateWorkflowQuestions(jobId: number) {
     return api.post('/jobs/' + jobId + '/generate-workflow-questions').then((res) => res.data)
   },
+  getAgentPlannerStatus() {
+    return api.get('/jobs/planner/status').then((res) => res.data)
+  },
+  listPlannerArtifacts(jobId: number) {
+    return api.get(`/jobs/${jobId}/planner-artifacts`).then((res) => res.data)
+  },
+  getPlannerArtifactRaw(jobId: number, artifactId: number) {
+    return api.get(`/jobs/${jobId}/planner-artifacts/${artifactId}/raw`, { responseType: 'json' }).then((res) => res.data)
+  },
   suggestWorkflowTools(jobId: number, agentIds: number[]) {
     return api
       .post<{

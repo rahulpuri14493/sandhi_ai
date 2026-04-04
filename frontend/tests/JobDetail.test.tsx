@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest'
-import { render, screen, waitFor } from '@testing-library/react'
+import { render, screen, waitFor, fireEvent } from '@testing-library/react'
 import { MemoryRouter, Route, Routes } from 'react-router-dom'
 import JobDetailPage from '../src/pages/JobDetail'
 
@@ -33,6 +33,9 @@ vi.mock('../src/lib/api', () => ({
     cancel: vi.fn(),
     answerQuestion: vi.fn(),
     generateWorkflowQuestions: vi.fn(),
+    getAgentPlannerStatus: vi.fn(),
+    listPlannerArtifacts: vi.fn(),
+    getPlannerArtifactRaw: vi.fn(),
   },
   mcpAPI: {
     listTools: vi.fn().mockResolvedValue([]),
@@ -86,5 +89,50 @@ describe('JobDetail page', () => {
     await waitFor(() => {
       expect(screen.getByText(/Job not found/i)).toBeInTheDocument()
     })
+  })
+
+  it('loads planner status and artifacts when audit section opened', async () => {
+    vi.mocked(jobsAPI.getAgentPlannerStatus).mockResolvedValue({
+      configured: true,
+      provider: 'openai_compatible',
+      model: 'gpt-4o-mini',
+      base_url_configured: true,
+    })
+    vi.mocked(jobsAPI.listPlannerArtifacts).mockResolvedValue({
+      items: [
+        {
+          id: 9,
+          artifact_type: 'task_split',
+          storage: 'local',
+          byte_size: 120,
+          created_at: '2024-06-01T12:00:00Z',
+        },
+      ],
+    })
+    vi.mocked(jobsAPI.getPlannerArtifactRaw).mockResolvedValue({ raw: true })
+
+    render(wrap(<JobDetailPage />))
+    await waitFor(() => {
+      expect(screen.getByRole('heading', { name: /Job detail smoke/i })).toBeInTheDocument()
+    })
+
+    const toggle = screen.getByRole('button', { name: /Agent planner/i })
+    fireEvent.click(toggle)
+
+    await waitFor(() => {
+      expect(jobsAPI.getAgentPlannerStatus).toHaveBeenCalled()
+      expect(jobsAPI.listPlannerArtifacts).toHaveBeenCalledWith(42)
+    })
+
+    expect(await screen.findByText(/task_split/i)).toBeInTheDocument()
+
+    const viewBtn = screen.getByRole('button', { name: /^View$/i })
+    fireEvent.click(viewBtn)
+
+    await waitFor(() => {
+      expect(jobsAPI.getPlannerArtifactRaw).toHaveBeenCalledWith(42, 9)
+    })
+    expect(screen.getByRole('dialog')).toBeInTheDocument()
+    expect(screen.getByText(/"raw"/)).toBeInTheDocument()
   })
 })

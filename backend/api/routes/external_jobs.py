@@ -16,9 +16,9 @@ from db.database import get_db
 from models.job import Job, JobStatus, WorkflowStep
 from models.agent import Agent
 from models.user import User, UserRole
-from schemas.job import JobResponse, WorkflowStepResponse
+from schemas.job import WorkflowStepResponse
 from core.config import settings
-from core.external_token import create_job_token, verify_job_token
+from core.external_token import verify_job_token
 
 router = APIRouter(prefix="/api/external/jobs", tags=["external-jobs"])
 

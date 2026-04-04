@@ -326,6 +326,26 @@ class WorkflowPreview(BaseModel):
     breakdown: Dict[str, float]  # task_costs, communication_costs, commission
 
 
+class PlannerArtifactResponse(BaseModel):
+    """Postgres pointer to planner JSON in MinIO/S3 (or local dev path). object_key is not redacted — job owner only."""
+
+    id: int
+    job_id: int
+    artifact_type: str
+    storage: str
+    bucket: Optional[str] = None
+    object_key: str
+    byte_size: int
+    created_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+class PlannerArtifactListResponse(BaseModel):
+    items: List[PlannerArtifactResponse]
+
+
 # Update forward references
 JobResponse.model_rebuild()
 WorkflowStepResponse.model_rebuild()

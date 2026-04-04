@@ -32,7 +32,10 @@ async def test_read_document_txt_csv_json_and_unsupported(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_analyze_documents_extraction_only_when_no_agent(tmp_path):
+async def test_analyze_documents_extraction_only_when_no_agent(tmp_path, monkeypatch):
+    import services.document_analyzer as mod
+
+    monkeypatch.setattr(mod, "is_agent_planner_configured", lambda: False)
     da = DocumentAnalyzer()
     p_txt = tmp_path / "req.txt"
     p_txt.write_text("Reqs here", encoding="utf-8")
@@ -51,6 +54,9 @@ async def test_analyze_documents_extraction_only_when_no_agent(tmp_path):
 
 @pytest.mark.asyncio
 async def test_analyze_documents_a2a_json_parse(monkeypatch, tmp_path):
+    import services.document_analyzer as mod
+
+    monkeypatch.setattr(mod, "is_agent_planner_configured", lambda: False)
     da = DocumentAnalyzer()
     p_txt = tmp_path / "req.txt"
     p_txt.write_text("Reqs here", encoding="utf-8")
@@ -163,6 +169,9 @@ def test_filter_critical_questions_empty_input():
 
 @pytest.mark.asyncio
 async def test_generate_workflow_clarification_questions_parses_fenced_json(monkeypatch):
+    import services.document_analyzer as mod
+
+    monkeypatch.setattr(mod, "is_agent_planner_configured", lambda: False)
     da = DocumentAnalyzer()
 
     async def fake_execute_via_a2a(url, input_data, **kwargs):
