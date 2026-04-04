@@ -1,0 +1,17 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://sandhi.ai/schemas/planner_artifact_envelope.v1.json",
+  "title": "Planner artifact planner_meta (embedded in stored JSON)",
+  "type": "object",
+  "properties": {
+    "schema_version": { "const": "planner_artifact.v1" },
+    "artifact_type": {
+      "type": "string",
+      "enum": ["brd_analysis", "task_split", "tool_suggestion"]
+    },
+    "planner_model": { "type": "string" },
+    "created_at": { "type": "string", "format": "date-time" }
+  },
+  "required": ["schema_version", "artifact_type", "planner_model", "created_at"],
+  "additionalProperties": false
+}

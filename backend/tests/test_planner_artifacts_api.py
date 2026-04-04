@@ -80,6 +80,195 @@ def test_list_planner_artifacts_happy_path(client: TestClient, db_session, tmp_p
     assert data["items"][0]["id"] == art.id
 
 
+def test_planner_pipeline_composes_latest_per_type(client: TestClient, db_session, tmp_path):
+    """GET planner-pipeline returns latest row per artifact type (id tie-break when created_at ties)."""
+    biz, headers = _biz_headers(db_session, "pipe")
+    job = Job(business_id=biz.id, title="J", status=JobStatus.DRAFT, conversation=json.dumps([]))
+    db_session.add(job)
+    db_session.commit()
+    db_session.refresh(job)
+
+    f_old = tmp_path / "ts_old.json"
+    f_old.write_text('{"task_split": "old"}', encoding="utf-8")
+    f_new = tmp_path / "ts_new.json"
+    f_new.write_text('{"task_split": "new"}', encoding="utf-8")
+    f_brd = tmp_path / "brd.json"
+    f_brd.write_text('{"analysis": "x"}', encoding="utf-8")
+
+    db_session.add_all(
+        [
+            JobPlannerArtifact(
+                job_id=job.id,
+                artifact_type="task_split",
+                storage="local",
+                bucket=None,
+                object_key=str(f_old),
+                byte_size=1,
+            ),
+            JobPlannerArtifact(
+                job_id=job.id,
+                artifact_type="task_split",
+                storage="local",
+                bucket=None,
+                object_key=str(f_new),
+                byte_size=1,
+            ),
+            JobPlannerArtifact(
+                job_id=job.id,
+                artifact_type="brd_analysis",
+                storage="local",
+                bucket=None,
+                object_key=str(f_brd),
+                byte_size=1,
+            ),
+        ]
+    )
+    db_session.commit()
+
+    r = client.get(f"/api/jobs/{job.id}/planner-pipeline", headers=headers)
+    assert r.status_code == 200, r.text
+    data = r.json()
+    assert data["schema_version"] == "planner_pipeline.v1"
+    assert data["job_id"] == job.id
+    assert data["task_split"] == {"task_split": "new"}
+    assert data["brd_analysis"] == {"analysis": "x"}
+    assert data["tool_suggestion"] is None
+    assert data["artifact_ids"]["brd_analysis"] is not None
+    assert data["artifact_ids"]["task_split"] is not None
+    assert data["artifact_ids"]["tool_suggestion"] is None
+
+
+def test_planner_pipeline_requires_auth(client: TestClient):
+    r = client.get("/api/jobs/1/planner-pipeline")
+    assert r.status_code in (401, 403)
+
+
+def test_planner_pipeline_job_not_found(client: TestClient, db_session):
+    _, headers = _biz_headers(db_session)
+    r = client.get("/api/jobs/999999/planner-pipeline", headers=headers)
+    assert r.status_code == 404
+
+
+def test_planner_pipeline_forbidden_other_business(client: TestClient, db_session):
+    owner, _ = _biz_headers(db_session, "pipe_owner")
+    other, other_headers = _biz_headers(db_session, "pipe_other")
+    job = Job(business_id=owner.id, title="J", status=JobStatus.DRAFT, conversation=json.dumps([]))
+    db_session.add(job)
+    db_session.commit()
+    db_session.refresh(job)
+
+    r = client.get(f"/api/jobs/{job.id}/planner-pipeline", headers=other_headers)
+    assert r.status_code == 403
+
+
+def test_planner_pipeline_empty_job_returns_null_payloads(client: TestClient, db_session):
+    biz, headers = _biz_headers(db_session, "pipe_empty")
+    job = Job(business_id=biz.id, title="J", status=JobStatus.DRAFT, conversation=json.dumps([]))
+    db_session.add(job)
+    db_session.commit()
+    db_session.refresh(job)
+
+    r = client.get(f"/api/jobs/{job.id}/planner-pipeline", headers=headers)
+    assert r.status_code == 200, r.text
+    data = r.json()
+    assert data["schema_version"] == "planner_pipeline.v1"
+    assert data["job_id"] == job.id
+    assert data["brd_analysis"] is None
+    assert data["task_split"] is None
+    assert data["tool_suggestion"] is None
+    assert data["artifact_ids"]["brd_analysis"] is None
+    assert data["artifact_ids"]["task_split"] is None
+    assert data["artifact_ids"]["tool_suggestion"] is None
+
+
+def test_planner_pipeline_invalid_json_returns_null_payload_with_artifact_id(
+    client: TestClient, db_session, tmp_path
+):
+    biz, headers = _biz_headers(db_session, "pipe_badjson")
+    job = Job(business_id=biz.id, title="J", status=JobStatus.DRAFT, conversation=json.dumps([]))
+    db_session.add(job)
+    db_session.commit()
+    db_session.refresh(job)
+
+    f = tmp_path / "corrupt.json"
+    f.write_text("{broken", encoding="utf-8")
+    art = JobPlannerArtifact(
+        job_id=job.id,
+        artifact_type="brd_analysis",
+        storage="local",
+        bucket=None,
+        object_key=str(f),
+        byte_size=8,
+    )
+    db_session.add(art)
+    db_session.commit()
+
+    r = client.get(f"/api/jobs/{job.id}/planner-pipeline", headers=headers)
+    assert r.status_code == 200, r.text
+    data = r.json()
+    assert data["brd_analysis"] is None
+    assert data["artifact_ids"]["brd_analysis"] == art.id
+
+
+def test_planner_pipeline_developer_on_workflow_can_read(client: TestClient, db_session, tmp_path):
+    biz, _ = _biz_headers(db_session, "pipe_devbiz")
+    dev = User(
+        email=f"dev_pipe_{uuid.uuid4().hex[:8]}@example.com",
+        password_hash=get_password_hash("pw123456"),
+        role=UserRole.DEVELOPER,
+    )
+    db_session.add(dev)
+    db_session.commit()
+    db_session.refresh(dev)
+    dev_headers = {"Authorization": f"Bearer {create_access_token({'sub': dev.id})}"}
+
+    job = Job(business_id=biz.id, title="J", status=JobStatus.DRAFT, conversation=json.dumps([]))
+    db_session.add(job)
+    db_session.commit()
+    db_session.refresh(job)
+
+    agent = Agent(
+        developer_id=dev.id,
+        name="Agent",
+        description="d",
+        status=AgentStatus.ACTIVE,
+        price_per_task=1.0,
+        price_per_communication=0.1,
+        api_endpoint="https://example.com/v1/chat",
+    )
+    db_session.add(agent)
+    db_session.commit()
+    db_session.refresh(agent)
+
+    step = WorkflowStep(
+        job_id=job.id,
+        agent_id=agent.id,
+        step_order=1,
+        input_data="{}",
+        status="pending",
+    )
+    db_session.add(step)
+    db_session.commit()
+
+    f = tmp_path / "pipe_dev.json"
+    f.write_text('{"tasks": [1]}', encoding="utf-8")
+    db_session.add(
+        JobPlannerArtifact(
+            job_id=job.id,
+            artifact_type="task_split",
+            storage="local",
+            bucket=None,
+            object_key=str(f),
+            byte_size=1,
+        )
+    )
+    db_session.commit()
+
+    r = client.get(f"/api/jobs/{job.id}/planner-pipeline", headers=dev_headers)
+    assert r.status_code == 200, r.text
+    assert r.json()["task_split"] == {"tasks": [1]}
+
+
 def test_download_planner_artifact_raw_requires_auth(client: TestClient):
     r = client.get("/api/jobs/1/planner-artifacts/1/raw")
     assert r.status_code in (401, 403)

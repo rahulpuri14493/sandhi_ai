@@ -36,6 +36,7 @@ vi.mock('../src/lib/api', () => ({
     getAgentPlannerStatus: vi.fn(),
     listPlannerArtifacts: vi.fn(),
     getPlannerArtifactRaw: vi.fn(),
+    getPlannerPipeline: vi.fn(),
   },
   mcpAPI: {
     listTools: vi.fn().mockResolvedValue([]),
@@ -109,6 +110,14 @@ describe('JobDetail page', () => {
         },
       ],
     })
+    vi.mocked(jobsAPI.getPlannerPipeline).mockResolvedValue({
+      schema_version: 'planner_pipeline.v1',
+      job_id: 42,
+      brd_analysis: null,
+      task_split: null,
+      tool_suggestion: null,
+      artifact_ids: {},
+    })
     vi.mocked(jobsAPI.getPlannerArtifactRaw).mockResolvedValue({ raw: true })
 
     render(wrap(<JobDetailPage />))
@@ -122,9 +131,10 @@ describe('JobDetail page', () => {
     await waitFor(() => {
       expect(jobsAPI.getAgentPlannerStatus).toHaveBeenCalled()
       expect(jobsAPI.listPlannerArtifacts).toHaveBeenCalledWith(42)
+      expect(jobsAPI.getPlannerPipeline).toHaveBeenCalledWith(42)
     })
 
-    expect(await screen.findByText(/task_split/i)).toBeInTheDocument()
+    expect(await screen.findByText('task_split')).toBeInTheDocument()
 
     const viewBtn = screen.getByRole('button', { name: /^View$/i })
     fireEvent.click(viewBtn)

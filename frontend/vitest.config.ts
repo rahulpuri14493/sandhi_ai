@@ -22,8 +22,11 @@ export default defineConfig({
       ],
       excludeAfterRemap: true,
       exclude: [
-        'tests/**',
+        // Never count test code toward coverage (only production sources in `include`).
+        '**/tests/**',
+        '**/__tests__/**',
         '**/*.test.{ts,tsx}',
+        '**/*.spec.{ts,tsx}',
         '**/*.d.ts',
         '**/main.tsx',
         '**/vite-env.d.ts',
