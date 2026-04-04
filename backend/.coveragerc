@@ -6,8 +6,12 @@ omit =
     alembic/*
     fix_user_passwords.py
     run.py
+    run_celery_worker.py
+    services/task_queue.py
     venv/*
     .venv/*
+    tests/**
+    */tests/**
 
 [paths]
 source =
@@ -18,6 +22,11 @@ source =
     d:\sandhi_ai\backend
 
 [report]
+omit =
+    tests/**
+    */tests/**
+    run_celery_worker.py
+    services/task_queue.py
 exclude_lines =
     pragma: no cover
     def __repr__

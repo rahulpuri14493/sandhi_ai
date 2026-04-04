@@ -1305,7 +1305,7 @@ async def update_job(
     job_id: int,
     title: Optional[str] = Form(None),
     description: Optional[str] = Form(None),
-    status: Optional[str] = Form(None),
+    new_status: Optional[str] = Form(None, alias="status"),
     files: Optional[List[UploadFile]] = File(None),
     allowed_platform_tool_ids: Optional[str] = Form(None),
     allowed_connection_ids: Optional[str] = Form(None),
@@ -1331,7 +1331,7 @@ async def update_job(
         )
 
     # Only allow updates to draft jobs or status changes
-    if job.status != JobStatus.DRAFT and status is None:
+    if job.status != JobStatus.DRAFT and new_status is None:
         if title is not None or description is not None:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
@@ -1364,13 +1364,13 @@ async def update_job(
         job.title = title
     if description is not None:
         job.description = description
-    if status is not None:
+    if new_status is not None:
         try:
-            job.status = JobStatus(status)
+            job.status = JobStatus(new_status)
         except ValueError:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
-                detail=f"Invalid status: {status}"
+                detail=f"Invalid status: {new_status}"
             )
     
     # Handle file uploads (overwrite existing documents with the new upload set)

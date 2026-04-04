@@ -386,6 +386,44 @@ class TestE2EJobs:
         assert body["tool_suggestion"] is None
         assert body["artifact_ids"]["brd_analysis"] is not None
 
+    def test_job_filter_options_shape(self, integration_client: TestClient, business_user):
+        """E2E: authenticated job list filter metadata for the UI."""
+        token = business_user["token"]
+        r = integration_client.get(
+            "/api/jobs/filter-options",
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert r.status_code == 200
+        data = r.json()
+        assert "statuses" in data and "sort_options" in data
+        assert any(s.get("value") == "draft" for s in data["statuses"])
+        assert any(s.get("value") == "oldest" for s in data["sort_options"])
+
+    def test_cancel_in_progress_job_via_api(
+        self, integration_client: TestClient, business_user, integration_db_session
+    ):
+        """E2E: business can cancel a job that is marked in progress."""
+        from models.job import Job, JobStatus
+
+        token = business_user["token"]
+        headers = {"Authorization": f"Bearer {token}"}
+        r = integration_client.post(
+            "/api/jobs",
+            data={"title": "Cancel me", "description": "e2e"},
+            headers=headers,
+        )
+        assert r.status_code == 201
+        job_id = r.json()["id"]
+        job = integration_db_session.query(Job).filter(Job.id == job_id).first()
+        assert job is not None
+        job.status = JobStatus.IN_PROGRESS
+        integration_db_session.commit()
+
+        r2 = integration_client.post(f"/api/jobs/{job_id}/cancel", headers=headers)
+        assert r2.status_code == 200, r2.text
+        body = r2.json()
+        assert body.get("status") == "cancelled"
+
 
 # ---------- Dashboards ----------
 class TestE2EDashboards:
