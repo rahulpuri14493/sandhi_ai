@@ -1,4 +1,4 @@
-from pydantic import BaseModel, field_validator
+from pydantic import BaseModel, Field, field_validator
 from typing import Optional, List, Dict, Any
 from datetime import datetime, timezone as tz
 import json
@@ -344,6 +344,20 @@ class PlannerArtifactResponse(BaseModel):
 
 class PlannerArtifactListResponse(BaseModel):
     items: List[PlannerArtifactResponse]
+
+
+class PlannerPipelineBundleResponse(BaseModel):
+    """
+    Read model: latest persisted brd_analysis, task_split, and tool_suggestion JSON per job.
+    Does not change how artifacts are written; composes existing storage pointers.
+    """
+
+    schema_version: str = "planner_pipeline.v1"
+    job_id: int
+    brd_analysis: Optional[Dict[str, Any]] = None
+    task_split: Optional[Dict[str, Any]] = None
+    tool_suggestion: Optional[Dict[str, Any]] = None
+    artifact_ids: Dict[str, Optional[int]] = Field(default_factory=dict)
 
 
 # Update forward references

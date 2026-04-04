@@ -112,4 +112,21 @@ describe('jobsAPI', () => {
       })
     })
   })
+
+  describe('getPlannerPipeline', () => {
+    it('GETs composed planner bundle', async () => {
+      const bundle = {
+        schema_version: 'planner_pipeline.v1',
+        job_id: 9,
+        brd_analysis: null,
+        task_split: null,
+        tool_suggestion: null,
+        artifact_ids: {},
+      }
+      mockGet.mockResolvedValueOnce({ data: bundle })
+      const out = await jobsAPI.getPlannerPipeline(9)
+      expect(mockGet).toHaveBeenCalledWith('/jobs/9/planner-pipeline')
+      expect(out).toEqual(bundle)
+    })
+  })
 })

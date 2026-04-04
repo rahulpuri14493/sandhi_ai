@@ -1,0 +1,24 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://sandhi.ai/schemas/planner_pipeline.v1.json",
+  "title": "GET /api/jobs/{id}/planner-pipeline response",
+  "type": "object",
+  "properties": {
+    "schema_version": { "const": "planner_pipeline.v1" },
+    "job_id": { "type": "integer" },
+    "brd_analysis": { "type": ["object", "null"] },
+    "task_split": { "type": ["object", "null"] },
+    "tool_suggestion": { "type": ["object", "null"] },
+    "artifact_ids": {
+      "type": "object",
+      "properties": {
+        "brd_analysis": { "type": ["integer", "null"] },
+        "task_split": { "type": ["integer", "null"] },
+        "tool_suggestion": { "type": ["integer", "null"] }
+      },
+      "additionalProperties": false
+    }
+  },
+  "required": ["schema_version", "job_id", "artifact_ids"],
+  "additionalProperties": false
+}

@@ -23,6 +23,7 @@ from schemas.job import (
     ScheduleListResponse, ScheduleActionResponse, RerunResponse,
     JobFilterOptions, ScheduleFilterOptions, EnumOption,
     PlannerArtifactListResponse, PlannerArtifactResponse,
+    PlannerPipelineBundleResponse,
 )
 from core.security import get_current_user, get_current_business_user
 from core.config import settings
@@ -34,6 +35,7 @@ from services.payment_processor import PaymentProcessor
 from services.document_analyzer import DocumentAnalyzer
 from services.planner_artifact_cache import get_cached_planner_raw, set_cached_planner_raw
 from services.planner_artifact_storage import (
+    load_latest_planner_pipeline_payloads,
     persist_brd_analysis_artifact,
     persist_json_planner_artifact,
     read_planner_artifact_bytes,
@@ -1047,6 +1049,35 @@ async def download_job_planner_artifact_raw(
         )
     await asyncio.to_thread(set_cached_planner_raw, job_id, artifact_id, data)
     return Response(content=data, media_type="application/json")
+
+
+@router.get("/{job_id}/planner-pipeline", response_model=PlannerPipelineBundleResponse)
+def get_job_planner_pipeline(
+    job_id: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """
+    Read-only composed view: latest brd_analysis, task_split, and tool_suggestion JSON per job.
+    Same auth as planner-artifacts; does not change storage or execution.
+    """
+    job = db.query(Job).filter(Job.id == job_id).first()
+    if not job:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Job not found")
+    if not _user_can_access_job(job, current_user, db):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Not authorized")
+    payloads, row_ids = load_latest_planner_pipeline_payloads(db, job_id)
+    return PlannerPipelineBundleResponse(
+        job_id=job_id,
+        brd_analysis=payloads.get("brd_analysis"),
+        task_split=payloads.get("task_split"),
+        tool_suggestion=payloads.get("tool_suggestion"),
+        artifact_ids={
+            "brd_analysis": row_ids.get("brd_analysis"),
+            "task_split": row_ids.get("task_split"),
+            "tool_suggestion": row_ids.get("tool_suggestion"),
+        },
+    )
 
 
 @router.get("/filter-options", response_model=JobFilterOptions)

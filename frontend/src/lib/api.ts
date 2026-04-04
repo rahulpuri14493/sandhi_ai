@@ -1,5 +1,5 @@
 import axios from 'axios'
-import type { User } from './types'
+import type { PlannerPipelineBundle, User } from './types'
 
 const API_BASE = '/api'
 
@@ -196,6 +196,9 @@ export const jobsAPI = {
   },
   getPlannerArtifactRaw(jobId: number, artifactId: number) {
     return api.get(`/jobs/${jobId}/planner-artifacts/${artifactId}/raw`, { responseType: 'json' }).then((res) => res.data)
+  },
+  getPlannerPipeline(jobId: number) {
+    return api.get<PlannerPipelineBundle>(`/jobs/${jobId}/planner-pipeline`).then((res) => res.data)
   },
   suggestWorkflowTools(jobId: number, agentIds: number[]) {
     return api

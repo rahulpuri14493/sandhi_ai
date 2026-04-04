@@ -1,12 +1,24 @@
-import { useEffect, useState } from 'react'
+import { useCallback, useEffect, useState } from 'react'
 import { useParams, useSearchParams, useNavigate, useLocation } from 'react-router-dom'
 import { jobsAPI, mcpAPI } from '../lib/api'
-import type { Job, WorkflowPreview, WorkflowStep, JobSchedule } from '../lib/types'
+import type { Job, WorkflowPreview, WorkflowStep, JobSchedule, PlannerPipelineBundle } from '../lib/types'
 import SchedulePicker, { humanReadableSchedule } from '../components/SchedulePicker'
 import { WorkflowBuilder } from '../components/WorkflowBuilder'
 import { CostCalculator } from '../components/CostCalculator'
 import { JobStatusTracker } from '../components/JobStatusTracker'
 import { DocumentConversation } from '../components/DocumentConversation'
+
+function ppStr(v: unknown): string {
+  if (v == null) return ''
+  if (typeof v === 'string') return v
+  if (typeof v === 'number' || typeof v === 'boolean') return String(v)
+  return ''
+}
+
+function ppStrList(v: unknown): string[] {
+  if (!Array.isArray(v)) return []
+  return v.map(ppStr).filter((s) => s.length > 0)
+}
 
 export default function JobDetailPage() {
   const { id } = useParams<{ id: string }>()
@@ -57,6 +69,8 @@ export default function JobDetailPage() {
   >([])
   const [plannerSupportLoading, setPlannerSupportLoading] = useState(false)
   const [plannerRawModal, setPlannerRawModal] = useState<{ title: string; body: string } | null>(null)
+  const [plannerPipeline, setPlannerPipeline] = useState<PlannerPipelineBundle | null>(null)
+  const [plannerPipelineError, setPlannerPipelineError] = useState<string | null>(null)
 
   useEffect(() => {
     if (jobId) {
@@ -296,20 +310,29 @@ export default function JobDetailPage() {
     if (!jobId || !plannerSectionOpen) return
     let cancelled = false
     setPlannerSupportLoading(true)
+    setPlannerPipeline(null)
+    setPlannerPipelineError(null)
     ;(async () => {
       try {
-        const [st, listRes] = await Promise.all([
+        const [stRes, listRes, pipeRes] = await Promise.allSettled([
           jobsAPI.getAgentPlannerStatus(),
           jobsAPI.listPlannerArtifacts(jobId),
+          jobsAPI.getPlannerPipeline(jobId),
         ])
-        if (!cancelled) {
-          setPlannerStatus(st)
-          setPlannerArtifacts(Array.isArray(listRes?.items) ? listRes.items : [])
-        }
-      } catch {
-        if (!cancelled) {
-          setPlannerStatus(null)
+        if (cancelled) return
+        if (stRes.status === 'fulfilled') setPlannerStatus(stRes.value)
+        else setPlannerStatus(null)
+        if (listRes.status === 'fulfilled') {
+          setPlannerArtifacts(Array.isArray(listRes.value?.items) ? listRes.value.items : [])
+        } else {
           setPlannerArtifacts([])
+        }
+        if (pipeRes.status === 'fulfilled') {
+          setPlannerPipeline(pipeRes.value)
+          setPlannerPipelineError(null)
+        } else {
+          setPlannerPipeline(null)
+          setPlannerPipelineError('Could not load combined planning view.')
         }
       } finally {
         if (!cancelled) setPlannerSupportLoading(false)
@@ -317,6 +340,18 @@ export default function JobDetailPage() {
     })()
     return () => {
       cancelled = true
+    }
+  }, [jobId, plannerSectionOpen])
+
+  const refreshPlannerPipelineIfOpen = useCallback(async () => {
+    if (!jobId || !plannerSectionOpen) return
+    try {
+      const pipe = await jobsAPI.getPlannerPipeline(jobId)
+      setPlannerPipeline(pipe)
+      setPlannerPipelineError(null)
+    } catch {
+      setPlannerPipeline(null)
+      setPlannerPipelineError('Could not load combined planning view.')
     }
   }, [jobId, plannerSectionOpen])
 
@@ -553,6 +588,197 @@ export default function JobDetailPage() {
                       <p className="text-white/50">Could not load planner status.</p>
                     )}
                   </div>
+
+                  <div className="mt-6 pt-6 border-t border-dark-200/50">
+                    <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3 mb-4">
+                      <div>
+                        <p className="font-semibold text-white text-sm">Planning overview</p>
+                        <p className="text-white/50 text-xs mt-0.5">
+                          Latest BRD analysis, auto-split tasks, and tool suggestions in one place. Export downloads the same JSON as the API.
+                        </p>
+                      </div>
+                      <button
+                        type="button"
+                        disabled={!plannerPipeline}
+                        onClick={() => {
+                          if (!plannerPipeline) return
+                          const blob = new Blob([JSON.stringify(plannerPipeline, null, 2)], {
+                            type: 'application/json',
+                          })
+                          const url = window.URL.createObjectURL(blob)
+                          const a = document.createElement('a')
+                          a.href = url
+                          a.download = `job-${jobId}-planner-pipeline.json`
+                          document.body.appendChild(a)
+                          a.click()
+                          window.URL.revokeObjectURL(url)
+                          document.body.removeChild(a)
+                        }}
+                        className="shrink-0 px-4 py-2 rounded-xl text-sm font-bold bg-dark-200/70 text-white border border-dark-300 hover:bg-dark-200 disabled:opacity-40 disabled:pointer-events-none"
+                      >
+                        Export combined JSON
+                      </button>
+                    </div>
+                    {plannerPipelineError && (
+                      <p className="text-amber-400/90 text-sm mb-3">{plannerPipelineError}</p>
+                    )}
+                    {plannerPipeline && (
+                      <div className="space-y-5">
+                        <section className="rounded-xl border border-dark-200/50 bg-dark-200/20 p-4">
+                          <h4 className="text-white font-bold text-sm mb-2">BRD analysis</h4>
+                          {plannerPipeline.artifact_ids?.brd_analysis != null &&
+                          plannerPipeline.brd_analysis == null ? (
+                            <p className="text-amber-400/90 text-xs">
+                              Latest artifact is stored but JSON could not be read. Open raw from the table below.
+                            </p>
+                          ) : plannerPipeline.brd_analysis ? (
+                            <div className="space-y-3 text-sm text-white/85">
+                              {ppStr(plannerPipeline.brd_analysis.analysis) ? (
+                                <div>
+                                  <p className="text-white/50 text-xs font-semibold uppercase tracking-wide mb-1">
+                                    Analysis
+                                  </p>
+                                  <div className="max-h-48 overflow-y-auto rounded-lg bg-dark-100/50 p-3 text-white/90 whitespace-pre-wrap">
+                                    {ppStr(plannerPipeline.brd_analysis.analysis)}
+                                  </div>
+                                </div>
+                              ) : null}
+                              {ppStrList(plannerPipeline.brd_analysis.questions).length > 0 ? (
+                                <div>
+                                  <p className="text-white/50 text-xs font-semibold uppercase tracking-wide mb-1">
+                                    Questions
+                                  </p>
+                                  <ul className="list-disc list-inside space-y-1 text-white/80">
+                                    {ppStrList(plannerPipeline.brd_analysis.questions).map((q, i) => (
+                                      <li key={i}>{q}</li>
+                                    ))}
+                                  </ul>
+                                </div>
+                              ) : null}
+                              {ppStrList(plannerPipeline.brd_analysis.recommendations).length > 0 ? (
+                                <div>
+                                  <p className="text-white/50 text-xs font-semibold uppercase tracking-wide mb-1">
+                                    Recommendations
+                                  </p>
+                                  <ul className="list-disc list-inside space-y-1 text-white/80">
+                                    {ppStrList(plannerPipeline.brd_analysis.recommendations).map((r, i) => (
+                                      <li key={i}>{r}</li>
+                                    ))}
+                                  </ul>
+                                </div>
+                              ) : null}
+                              {!ppStr(plannerPipeline.brd_analysis.analysis) &&
+                                ppStrList(plannerPipeline.brd_analysis.questions).length === 0 &&
+                                ppStrList(plannerPipeline.brd_analysis.recommendations).length === 0 && (
+                                  <p className="text-white/50 text-xs">No summary fields in this artifact.</p>
+                                )}
+                            </div>
+                          ) : (
+                            <p className="text-white/50 text-xs">No BRD analysis artifact for this job yet.</p>
+                          )}
+                        </section>
+
+                        <section className="rounded-xl border border-dark-200/50 bg-dark-200/20 p-4">
+                          <h4 className="text-white font-bold text-sm mb-2">Task split (auto-split)</h4>
+                          {plannerPipeline.artifact_ids?.task_split != null &&
+                          plannerPipeline.task_split == null ? (
+                            <p className="text-amber-400/90 text-xs">
+                              Latest artifact is stored but JSON could not be read. Open raw from the table below.
+                            </p>
+                          ) : plannerPipeline.task_split &&
+                            Array.isArray(plannerPipeline.task_split.parsed_assignments) ? (
+                            <ol className="space-y-3 list-decimal list-inside text-sm text-white/85">
+                              {(plannerPipeline.task_split.parsed_assignments as Record<string, unknown>[]).map(
+                                (row, idx) => {
+                                  const reason = ppStr(row.assignment_reason)
+                                  const docs = Array.isArray(row.assigned_document_ids)
+                                    ? (row.assigned_document_ids as unknown[]).map(ppStr).filter(Boolean)
+                                    : []
+                                  return (
+                                    <li key={idx} className="pl-1">
+                                      <span className="font-semibold text-white">
+                                        Agent index {ppStr(row.agent_index) || String(idx)}
+                                      </span>
+                                      {ppStr(row.task) ? (
+                                        <p className="mt-1 text-white/80 whitespace-pre-wrap">{ppStr(row.task)}</p>
+                                      ) : null}
+                                      {docs.length > 0 ? (
+                                        <p className="mt-1 text-xs text-white/55">
+                                          Documents: {docs.join(', ')}
+                                        </p>
+                                      ) : null}
+                                      {reason ? (
+                                        <p className="mt-2 text-xs text-primary-300/90 border-l-2 border-primary-500/40 pl-2">
+                                          <span className="text-white/50 font-semibold">Why this agent: </span>
+                                          {reason}
+                                        </p>
+                                      ) : null}
+                                    </li>
+                                  )
+                                },
+                              )}
+                            </ol>
+                          ) : plannerPipeline.task_split ? (
+                            <p className="text-white/50 text-xs">
+                              No parsed_assignments in the latest task split. Use View on the artifact row for full JSON.
+                            </p>
+                          ) : (
+                            <p className="text-white/50 text-xs">No task split artifact for this job yet.</p>
+                          )}
+                        </section>
+
+                        <section className="rounded-xl border border-dark-200/50 bg-dark-200/20 p-4">
+                          <h4 className="text-white font-bold text-sm mb-2">Tool suggestions</h4>
+                          {plannerPipeline.artifact_ids?.tool_suggestion != null &&
+                          plannerPipeline.tool_suggestion == null ? (
+                            <p className="text-amber-400/90 text-xs">
+                              Latest artifact is stored but JSON could not be read. Open raw from the table below.
+                            </p>
+                          ) : plannerPipeline.tool_suggestion &&
+                            Array.isArray(plannerPipeline.tool_suggestion.step_suggestions) ? (
+                            <ul className="space-y-3 text-sm text-white/85">
+                              {(plannerPipeline.tool_suggestion.step_suggestions as Record<string, unknown>[]).map(
+                                (s, idx) => (
+                                  <li
+                                    key={idx}
+                                    className="rounded-lg bg-dark-100/40 border border-dark-200/30 p-3"
+                                  >
+                                    <p className="font-semibold text-white">
+                                      Step {idx + 1}
+                                      {' · '}
+                                      agent index{' '}
+                                      {typeof s.agent_index === 'number' ||
+                                      (typeof s.agent_index === 'string' && s.agent_index !== '')
+                                        ? ppStr(s.agent_index)
+                                        : '—'}
+                                    </p>
+                                    {ppStr(s.rationale) ? (
+                                      <p className="mt-1 text-white/75 text-xs whitespace-pre-wrap">
+                                        {ppStr(s.rationale)}
+                                      </p>
+                                    ) : null}
+                                    {Array.isArray(s.platform_tool_ids) && s.platform_tool_ids.length > 0 ? (
+                                      <p className="mt-1 text-xs text-white/50">
+                                        Platform tool IDs:{' '}
+                                        {(s.platform_tool_ids as unknown[]).map(ppStr).join(', ')}
+                                      </p>
+                                    ) : null}
+                                  </li>
+                                ),
+                              )}
+                            </ul>
+                          ) : plannerPipeline.tool_suggestion ? (
+                            <p className="text-white/50 text-xs">
+                              No step_suggestions in this artifact. Use View for full JSON.
+                            </p>
+                          ) : (
+                            <p className="text-white/50 text-xs">No tool suggestion artifact for this job yet.</p>
+                          )}
+                        </section>
+                      </div>
+                    )}
+                  </div>
+
                   <div>
                     <p className="font-semibold text-white mb-2 text-sm">Stored artifacts (BRD / task split / tool suggestion)</p>
                     {plannerArtifacts.length === 0 ? (
@@ -740,7 +966,11 @@ export default function JobDetailPage() {
               key={jobId}
               jobId={jobId}
               job={job}
-              onWorkflowCreated={() => { loadJob(); loadWorkflowPreview(); }}
+              onWorkflowCreated={() => {
+                loadJob()
+                loadWorkflowPreview()
+                void refreshPlannerPipelineIfOpen()
+              }}
               initialSelectedAgentIds={selectedAgentsFromCreate}
             />
             {job.workflow_steps && job.workflow_steps.length > 0 && (

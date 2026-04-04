@@ -11,6 +11,16 @@ from models.agent import Agent
 logger = logging.getLogger(__name__)
 
 
+def _optional_assignment_reason(entry: Dict[str, Any]) -> Optional[str]:
+    r = entry.get("assignment_reason")
+    if not isinstance(r, str):
+        return None
+    s = r.strip()
+    if not s:
+        return None
+    return s[:2000]
+
+
 async def split_job_for_agents(
     job_title: str,
     job_description: str,
@@ -73,7 +83,8 @@ WORK DIVISION MUST BE DRIVEN BY:
 
 RULES:
 - Return ONLY valid JSON. No markdown, no explanation.
-- Format: [{"agent_index": 0, "task": "...", "assigned_document_ids": ["BRD1"]}, {"agent_index": 1, "task": "...", "assigned_document_ids": ["BRD2"]}, ...]
+- Format: [{"agent_index": 0, "task": "...", "assigned_document_ids": ["BRD1"], "assignment_reason": "optional short why this agent fits"}, ...]
+- assignment_reason is optional; include it when you can justify the mapping in one or two sentences.
 - agent_index must be 0-based (0, 1, 2, ...) for each of the N agents.
 - Derive each subtask directly from the BRD and the job prompt. Each task must reference the specific requirement or scope it fulfils.
 - Each task must be SELF-CONTAINED and SCOPE-BOUND: each agent does ONLY its part, nothing else.
@@ -103,7 +114,7 @@ AGENTS (each will perform one subtask):
 """
 
     user_content += f"""Using the BRD, job prompt, and Q&A above, split this job into {len(agents)} subtasks.
-Return JSON array with agent_index, task, and assigned_document_ids for each agent.
+Return JSON array with agent_index, task, and assigned_document_ids for each agent (optional assignment_reason per row).
 If user text explicitly says mappings like "BRD1 handled by Agent1", enforce them strictly in assigned_document_ids."""
 
     model = (getattr(splitter_agent, "llm_model", None) or "").strip() or "gpt-4o-mini"
@@ -176,11 +187,15 @@ If user text explicitly says mappings like "BRD1 handled by Agent1", enforce the
             for i in range(len(agents)):
                 entry = next((e for e in parsed if e.get("agent_index") == i), None)
                 if entry and isinstance(entry.get("task"), str):
-                    result.append({
+                    row: Dict[str, Any] = {
                         "agent_index": i,
                         "task": entry["task"],
                         "assigned_document_ids": normalized_scope.get(i),
-                    })
+                    }
+                    ar = _optional_assignment_reason(entry)
+                    if ar:
+                        row["assignment_reason"] = ar
+                    result.append(row)
                 else:
                     result.append({
                         "agent_index": i,

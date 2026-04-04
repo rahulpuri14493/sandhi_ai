@@ -337,6 +337,55 @@ class TestE2EJobs:
         assert r2.status_code == 200
         assert r2.json().get("items") == []
 
+        r3 = integration_client.get(f"/api/jobs/{job_id}/planner-pipeline", headers=headers)
+        assert r3.status_code == 200
+        pipe = r3.json()
+        assert pipe["schema_version"] == "planner_pipeline.v1"
+        assert pipe["job_id"] == job_id
+        assert pipe["brd_analysis"] is None
+        assert pipe["task_split"] is None
+        assert pipe["tool_suggestion"] is None
+
+    def test_planner_pipeline_with_stored_artifact(
+        self, integration_client: TestClient, business_user, integration_db_session, tmp_path
+    ):
+        """E2E: create job via API, attach local planner file row, read composed planner-pipeline."""
+        from models.job import JobPlannerArtifact
+
+        token = business_user["token"]
+        headers = {"Authorization": f"Bearer {token}"}
+        r = integration_client.post(
+            "/api/jobs",
+            data={"title": "Planner pipeline e2e", "description": "with artifact"},
+            headers=headers,
+        )
+        assert r.status_code == 201
+        job_id = r.json()["id"]
+
+        jf = tmp_path / "e2e_planner_pipeline.json"
+        jf.write_text('{"e2e": true, "stage": "brd"}', encoding="utf-8")
+        integration_db_session.add(
+            JobPlannerArtifact(
+                job_id=job_id,
+                artifact_type="brd_analysis",
+                storage="local",
+                bucket=None,
+                object_key=str(jf),
+                byte_size=int(jf.stat().st_size),
+            )
+        )
+        integration_db_session.commit()
+
+        rp = integration_client.get(f"/api/jobs/{job_id}/planner-pipeline", headers=headers)
+        assert rp.status_code == 200, rp.text
+        body = rp.json()
+        assert body["schema_version"] == "planner_pipeline.v1"
+        assert body["job_id"] == job_id
+        assert body["brd_analysis"] == {"e2e": True, "stage": "brd"}
+        assert body["task_split"] is None
+        assert body["tool_suggestion"] is None
+        assert body["artifact_ids"]["brd_analysis"] is not None
+
 
 # ---------- Dashboards ----------
 class TestE2EDashboards:

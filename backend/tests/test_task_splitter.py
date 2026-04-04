@@ -130,6 +130,42 @@ async def test_split_populates_llm_audit_when_planner_used(multi_agents):
 
 
 @pytest.mark.asyncio
+async def test_split_includes_optional_assignment_reason(multi_agents):
+    splitter = multi_agents[0]
+    splitter.api_endpoint = ""
+    api_response = [
+        {
+            "agent_index": 0,
+            "task": "P0",
+            "assigned_document_ids": ["BRD1"],
+            "assignment_reason": "Best for data extraction.",
+        },
+        {"agent_index": 1, "task": "P1", "assigned_document_ids": ["BRD2"]},
+        {"agent_index": 2, "task": "P2", "assigned_document_ids": ["BRD3"]},
+    ]
+    raw_json = json.dumps(api_response)
+    with patch("services.task_splitter.is_agent_planner_configured", return_value=True):
+        with patch(
+            "services.task_splitter.planner_chat_completion",
+            new=AsyncMock(return_value=raw_json),
+        ):
+            out = await split_job_for_agents(
+                job_title="P",
+                job_description="d",
+                documents_content=[
+                    {"id": "BRD1", "name": "a", "content": "a"},
+                    {"id": "BRD2", "name": "b", "content": "b"},
+                    {"id": "BRD3", "name": "c", "content": "c"},
+                ],
+                conversation_data=None,
+                agents=multi_agents,
+                splitter_agent=splitter,
+            )
+    assert out[0].get("assignment_reason") == "Best for data extraction."
+    assert "assignment_reason" not in out[1]
+
+
+@pytest.mark.asyncio
 async def test_split_planner_uses_agent_planner_temperature_not_splitter_agent(
     monkeypatch, multi_agents
 ):

@@ -225,3 +225,17 @@ export interface JobScheduleWithJob extends JobSchedule {
   job_title: string
   job_status: string
 }
+
+/** GET /jobs/:id/planner-pipeline — latest BRD, task split, and tool suggestion payloads */
+export interface PlannerPipelineBundle {
+  schema_version: string
+  job_id: number
+  brd_analysis: Record<string, unknown> | null
+  task_split: Record<string, unknown> | null
+  tool_suggestion: Record<string, unknown> | null
+  artifact_ids: {
+    brd_analysis?: number | null
+    task_split?: number | null
+    tool_suggestion?: number | null
+  }
+}

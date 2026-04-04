@@ -9,16 +9,79 @@ from __future__ import annotations
 import json
 import logging
 import uuid
-from typing import Any, Dict, Optional
+from datetime import datetime, timezone
+from typing import Any, Dict, Optional, Tuple
 
 from sqlalchemy.orm import Session
 
+from core.config import settings
 from models.job import JobPlannerArtifact
 from services.job_file_storage import download_s3_bytes, persist_file
 
 logger = logging.getLogger(__name__)
 
+
+def _agent_planner_enabled_for_meta() -> bool:
+    """Mirror planner_llm.is_agent_planner_configured without importing planner_llm (import-cycle safe)."""
+    if not getattr(settings, "AGENT_PLANNER_ENABLED", True):
+        return False
+    return bool((getattr(settings, "AGENT_PLANNER_API_KEY", None) or "").strip())
+
 GENERIC_PLANNER_ARTIFACT_TYPES = frozenset({"task_split", "tool_suggestion"})
+
+# Latest-one-of-each for composed API (read model).
+PLANNER_PIPELINE_ARTIFACT_TYPES: Tuple[str, ...] = ("brd_analysis", "task_split", "tool_suggestion")
+
+
+def attach_planner_meta(payload: Dict[str, Any], artifact_type: str) -> Dict[str, Any]:
+    """
+    Add provenance envelope under planner_meta without removing existing keys (backward compatible).
+    """
+    model = (getattr(settings, "AGENT_PLANNER_MODEL", None) or "").strip() or "unspecified"
+    if not _agent_planner_enabled_for_meta():
+        model = "planner_disabled"
+    out = dict(payload)
+    out["planner_meta"] = {
+        "schema_version": "planner_artifact.v1",
+        "artifact_type": artifact_type,
+        "planner_model": model,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    }
+    return out
+
+
+def load_latest_planner_pipeline_payloads(
+    db: Session, job_id: int
+) -> Tuple[Dict[str, Optional[Dict[str, Any]]], Dict[str, Optional[int]]]:
+    """
+    Sync: for each pipeline artifact type, load the newest row by created_at and parse JSON.
+    Returns (payloads_by_type, artifact_row_ids_by_type).
+    """
+    payloads: Dict[str, Optional[Dict[str, Any]]] = {k: None for k in PLANNER_PIPELINE_ARTIFACT_TYPES}
+    row_ids: Dict[str, Optional[int]] = {k: None for k in PLANNER_PIPELINE_ARTIFACT_TYPES}
+    for at in PLANNER_PIPELINE_ARTIFACT_TYPES:
+        row = (
+            db.query(JobPlannerArtifact)
+            .filter(JobPlannerArtifact.job_id == job_id, JobPlannerArtifact.artifact_type == at)
+            .order_by(JobPlannerArtifact.created_at.desc(), JobPlannerArtifact.id.desc())
+            .first()
+        )
+        if not row:
+            continue
+        row_ids[at] = int(row.id)
+        try:
+            raw = read_planner_artifact_bytes(row)
+            payloads[at] = json.loads(raw.decode("utf-8"))
+        except Exception as exc:
+            logger.warning(
+                "planner_pipeline_read_fail job_id=%s artifact_type=%s id=%s error=%s",
+                job_id,
+                at,
+                row.id,
+                type(exc).__name__,
+            )
+            payloads[at] = None
+    return payloads, row_ids
 
 
 def _should_persist_brd_payload(result: Dict[str, Any]) -> bool:
@@ -106,7 +169,8 @@ async def persist_json_planner_artifact(
         logger.warning("persist_json_planner_artifact: unsupported artifact_type=%s", artifact_type)
         return None
     try:
-        payload_bytes = json.dumps(payload, default=str).encode("utf-8")
+        wrapped = attach_planner_meta(payload, artifact_type)
+        payload_bytes = json.dumps(wrapped, default=str).encode("utf-8")
     except (TypeError, ValueError) as exc:
         logger.warning(
             "artifact_write_fail job_id=%s artifact_type=%s reason=json_encode error=%s",
@@ -126,7 +190,8 @@ async def persist_brd_analysis_artifact(db: Session, job_id: int, result: Dict[s
     if not _should_persist_brd_payload(result):
         return None
     try:
-        payload_bytes = json.dumps(result, default=str).encode("utf-8")
+        wrapped = attach_planner_meta(result, "brd_analysis")
+        payload_bytes = json.dumps(wrapped, default=str).encode("utf-8")
     except (TypeError, ValueError) as exc:
         logger.warning(
             "artifact_write_fail job_id=%s artifact_type=brd_analysis reason=json_encode error=%s",
