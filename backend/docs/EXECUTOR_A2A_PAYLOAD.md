@@ -15,13 +15,13 @@ The job executor builds a single JSON object per workflow step and sends it to a
 
 - **Registry**: JSON file, default `backend/resources/config/tool_assignment_registry.default.json`. Override with `TOOL_ASSIGNMENT_REGISTRY_PATH` (absolute path). Maps `task_type` (from step `input_data.task_type` or inferred from `assigned_task`) to preferred MCP `tool_type` values and `max_tools`.
 - **Compatibility**: Optional `Agent.capabilities` entries `mcp:allow_types:postgres,mysql` or `mcp:deny_types:s3` filter tools before assignment.
-- **Assignment**: Rule-based ordering and truncation; set `TOOL_ASSIGNMENT_USE_LLM=true` to prefer tools listed in `input_data.llm_suggested_tool_names` when the planner provides them.
+- **Assignment**: Rule-based ordering and truncation; `TOOL_ASSIGNMENT_USE_LLM=true` (default) prefers tools listed in `input_data.llm_suggested_tool_names` when present. `TOOL_ASSIGNMENT_LLM_PICK_TOOLS=true` (default) allows the platform planner to populate that list at execution when `AGENT_PLANNER_API_KEY` is set.
 
 ## Validation
 
 When `EXECUTOR_PAYLOAD_VALIDATE=true` (default), Pydantic checks **known** fields for sensible types. **Extra keys are allowed** so workflows can add fields without a backend deploy.
 
-Before any agent HTTP/A2A call, `A2A_OUTBOUND_VALIDATE=true` (default) ensures the payload is JSON-serializable, under `A2A_OUTBOUND_MAX_BYTES`, and that `sandhi_a2a_task` parses when present. Set `A2A_TASK_ENVELOPE_STRICT=true` to require the envelope on every outbound call.
+Before any agent HTTP/A2A call, `A2A_OUTBOUND_VALIDATE=true` (default) ensures the payload is JSON-serializable, under `A2A_OUTBOUND_MAX_BYTES`, and that `sandhi_a2a_task` parses when present. `A2A_TASK_ENVELOPE_STRICT=true` (default) requires the envelope on every outbound call; set `A2A_TASK_ENVELOPE_STRICT=false` only for legacy agents that do not receive `sandhi_a2a_task`.
 
 ### Type rules (fail fast before any HTTP call)
 

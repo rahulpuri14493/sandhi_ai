@@ -19,8 +19,13 @@ export type WorkflowCollaborationMode = 'from_brd' | 'independent' | 'sequential
 
 export type ToolVisibility = 'full' | 'names_only' | 'none'
 
-/** Per-step tool assignment: agent_index -> { platformIds, connectionIds, toolVisibility? } */
-type StepToolSelection = Record<number, { platformIds: number[]; connectionIds: number[]; toolVisibility?: ToolVisibility }>
+/** Per-step tool assignment: agent_index -> { platformIds, connectionIds, toolVisibility?, taskType? } */
+type StepToolSelection = Record<
+  number,
+  { platformIds: number[]; connectionIds: number[]; toolVisibility?: ToolVisibility; taskType?: string }
+>
+
+type StepToolsUpdateOpts = { taskType?: string }
 
 const DEFAULT_OUTPUT_CONTRACT = {
   version: '1.0',
@@ -240,9 +245,29 @@ export function WorkflowBuilder({ jobId, onWorkflowCreated, initialSelectedAgent
     }
   }
 
-  const setStepTools = (agentIndex: number, platformIds: number[], connectionIds: number[], toolVisibility?: ToolVisibility) => {
+  const setStepTools = (
+    agentIndex: number,
+    platformIds: number[],
+    connectionIds: number[],
+    toolVisibility?: ToolVisibility,
+    opts?: StepToolsUpdateOpts
+  ) => {
     setStepToolSelections((prev) => {
-      const next = { ...prev, [agentIndex]: { platformIds, connectionIds, toolVisibility } }
+      const prevSel = prev[agentIndex]
+      let taskType = prevSel?.taskType
+      if (opts && 'taskType' in opts) {
+        const t = opts.taskType?.trim()
+        taskType = t || undefined
+      }
+      const next = {
+        ...prev,
+        [agentIndex]: {
+          platformIds,
+          connectionIds,
+          toolVisibility,
+          ...(taskType ? { taskType } : {}),
+        },
+      }
       stepToolSelectionsRef.current = next
       return next
     })
@@ -344,6 +369,7 @@ export function WorkflowBuilder({ jobId, onWorkflowCreated, initialSelectedAgent
           platformIds: s.platform_tool_ids ?? [],
           connectionIds: prev.connectionIds,
           toolVisibility: prev.toolVisibility,
+          ...(prev.taskType ? { taskType: prev.taskType } : {}),
         }
       }
       setStepToolSelections(next)
@@ -395,11 +421,14 @@ export function WorkflowBuilder({ jobId, onWorkflowCreated, initialSelectedAgent
         // When only connections are selected, send empty platform list so backend does not inherit job-level platform tools
         const platformIds = hasPlatform ? sel!.platformIds : (hasConn ? [] : undefined)
         const connectionIds = hasConn ? sel!.connectionIds : (hasPlatform ? [] : undefined)
+        const slug = (sel?.taskType ?? '').trim().toLowerCase()
+        const task_type = /^[a-z][a-z0-9_]{0,63}$/i.test(slug) ? slug : undefined
         return {
           agent_index: idx,
           allowed_platform_tool_ids: platformIds,
           allowed_connection_ids: connectionIds,
           tool_visibility: sel?.toolVisibility ?? jobToolVisibility,
+          ...(task_type ? { task_type } : {}),
         }
       })
       // Always send step_tools when building a workflow so each step stores effective tool_visibility
@@ -691,6 +720,23 @@ export function WorkflowBuilder({ jobId, onWorkflowCreated, initialSelectedAgent
                           <option value="names_only">Names only (no schema)</option>
                           <option value="none">None (no tools)</option>
                         </select>
+                      </div>
+                      <div className="mb-3">
+                        <label className="block text-xs text-white/70 mb-1">
+                          Task type slug (optional — tool assignment registry)
+                        </label>
+                        <input
+                          type="text"
+                          value={sel.taskType ?? ''}
+                          onChange={(e) =>
+                            setStepTools(idx, sel.platformIds, sel.connectionIds, sel.toolVisibility, {
+                              taskType: e.target.value,
+                            })
+                          }
+                          placeholder="e.g. search, persist"
+                          className="w-full max-w-md px-3 py-2 bg-dark-200/80 border border-dark-300 rounded-lg text-white text-sm placeholder:text-white/35 focus:ring-2 focus:ring-primary-500 focus:border-primary-500"
+                          title="Letter, then letters, digits, or underscores (max 64 chars). Invalid values are omitted when creating the workflow."
+                        />
                       </div>
                       <div className="space-y-2">
                         <div className="text-sm font-semibold text-white/90">Selected for this step:</div>

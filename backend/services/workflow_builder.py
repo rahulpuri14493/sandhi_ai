@@ -110,7 +110,7 @@ class WorkflowBuilder:
         tool_visibility: Optional[str] = None,
     ) -> WorkflowPreview:
         """Automatically split a job across selected agents. workflow_mode: 'independent' | 'sequential' | None.
-        step_tools: optional list of {agent_index, allowed_platform_tool_ids, allowed_connection_ids, tool_visibility} per step.
+        step_tools: optional list of {agent_index, allowed_platform_tool_ids, allowed_connection_ids, tool_visibility, task_type} per step.
         tool_visibility: job-level full | names_only | none (restricts what tool info agents see; credentials never shared).
 
         Task splitting uses the platform Agent Planner when it is configured; otherwise the first selected
@@ -271,13 +271,13 @@ class WorkflowBuilder:
                 "document_scope_restricted": document_scope_restricted,
                 "previous_agents_outputs": []  # Filled by executor when passing previous outputs
             }
-            
+
             # Validate step input data includes documents and conversation
             step_docs = step_input_data.get('documents', [])
             step_conv = step_input_data.get('conversation', [])
             logger.debug("Step %s for agent '%s': depends_on_previous=%s documents=%s conversation_items=%s", idx + 1, agent.name, depends_on_previous, len(step_docs), len(step_conv))
-            
-            step_platform = step_conn = step_tool_visibility = None
+
+            step_platform = step_conn = step_tool_visibility = step_task_type = None
             if step_tools:
                 for st in step_tools:
                     if st.get("agent_index") == idx:
@@ -287,6 +287,9 @@ class WorkflowBuilder:
                         if st.get("allowed_connection_ids") is not None:
                             step_conn = st.get("allowed_connection_ids")
                         step_tool_visibility = st.get("tool_visibility")
+                        tt = st.get("task_type")
+                        if tt is not None and str(tt).strip():
+                            step_task_type = str(tt).strip().lower()
                         break
                 if step_platform is None and job_platform_ids is not None:
                     step_platform = job_platform_ids
@@ -298,6 +301,8 @@ class WorkflowBuilder:
                 if job_conn_ids is not None:
                     step_conn = job_conn_ids
             step_visibility = step_tool_visibility if step_tool_visibility is not None else (tool_visibility or getattr(job, "tool_visibility", None))
+            if step_task_type:
+                step_input_data["task_type"] = step_task_type
             step = WorkflowStep(
                 job_id=job_id,
                 agent_id=agent.id,

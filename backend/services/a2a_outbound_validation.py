@@ -40,7 +40,7 @@ def validate_outbound_a2a_payload(input_data: Dict[str, Any]) -> None:
         )
 
     task = input_data.get("sandhi_a2a_task")
-    strict = bool(getattr(settings, "A2A_TASK_ENVELOPE_STRICT", False))
+    strict = bool(getattr(settings, "A2A_TASK_ENVELOPE_STRICT", True))
     if strict and task is None:
         raise ValueError("A2A_TASK_ENVELOPE_STRICT=true but sandhi_a2a_task is missing")
 

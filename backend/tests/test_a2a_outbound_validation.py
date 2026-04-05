@@ -18,8 +18,9 @@ def _minimal_task(agent_id: int = 5) -> dict:
 
 
 class TestValidateOutboundA2APayload:
-    def test_accepts_serializable_payload_without_envelope(self):
-        validate_outbound_a2a_payload({"documents": [], "conversation": []})
+    def test_accepts_serializable_payload_without_envelope_when_strict_off(self):
+        with patch.object(settings, "A2A_TASK_ENVELOPE_STRICT", False):
+            validate_outbound_a2a_payload({"documents": [], "conversation": []})
 
     def test_skips_all_checks_when_disabled(self):
         with patch.object(settings, "A2A_OUTBOUND_VALIDATE", False):
@@ -37,10 +38,9 @@ class TestValidateOutboundA2APayload:
             with pytest.raises(ValueError, match="exceeds A2A_OUTBOUND_MAX_BYTES"):
                 validate_outbound_a2a_payload(payload)
 
-    def test_strict_requires_envelope(self):
-        with patch.object(settings, "A2A_TASK_ENVELOPE_STRICT", True):
-            with pytest.raises(ValueError, match="sandhi_a2a_task is missing"):
-                validate_outbound_a2a_payload({"sandhi_trace": {"agent_id": 1}})
+    def test_strict_requires_envelope_by_default(self):
+        with pytest.raises(ValueError, match="sandhi_a2a_task is missing"):
+            validate_outbound_a2a_payload({"sandhi_trace": {"agent_id": 1}})
 
     def test_parses_envelope_when_present(self):
         validate_outbound_a2a_payload(

@@ -2,11 +2,13 @@ from pydantic import BaseModel, Field, field_validator
 from typing import Optional, List, Dict, Any
 from datetime import datetime, timezone as tz
 import json
+import re
 from zoneinfo import available_timezones
 from models.job import JobStatus, ScheduleStatus
 
 
 _VALID_TIMEZONES = available_timezones()
+_STEP_TASK_TYPE_RE = re.compile(r"^[a-z][a-z0-9_]{0,63}$", re.IGNORECASE)
 
 
 def _validate_timezone(v: str) -> str:
@@ -204,6 +206,20 @@ class StepToolsAssignment(BaseModel):
     allowed_platform_tool_ids: Optional[List[int]] = None
     allowed_connection_ids: Optional[List[int]] = None
     tool_visibility: Optional[str] = None  # full | names_only | none (step override)
+    # Registry / envelope task_type slug (letter + alphanumeric/underscore, max 64 chars).
+    task_type: Optional[str] = None
+
+    @field_validator("task_type")
+    @classmethod
+    def validate_task_type_slug(cls, v: Optional[str]) -> Optional[str]:
+        if v is None or not str(v).strip():
+            return None
+        t = str(v).strip().lower()
+        if not _STEP_TASK_TYPE_RE.match(t):
+            raise ValueError(
+                "task_type must be a slug: start with a letter, then up to 63 letters, digits, or underscores"
+            )
+        return t
 
 
 class AutoSplitBody(BaseModel):

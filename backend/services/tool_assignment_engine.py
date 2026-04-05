@@ -114,7 +114,7 @@ def assign_tools_for_step(
     assigned_meta = [_tool_meta_from_descriptor(t) for t in ordered]
 
     # Optional LLM path: reserved — merge planner-suggested names when present
-    if getattr(settings, "TOOL_ASSIGNMENT_USE_LLM", False):
+    if getattr(settings, "TOOL_ASSIGNMENT_USE_LLM", True):
         suggested = input_data.get("llm_suggested_tool_names")
         if isinstance(suggested, list) and suggested:
             name_order = [str(x).strip() for x in suggested if str(x).strip()]

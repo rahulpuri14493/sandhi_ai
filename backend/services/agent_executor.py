@@ -554,11 +554,39 @@ class AgentExecutor:
             available_mcp_tools = filter_tools_for_agent(agent, raw_mcp_tools)
             tool_visibility = getattr(step, "tool_visibility", None) or getattr(job, "tool_visibility", None) or "full"
             visible_mcp_tools = _apply_tool_visibility(available_mcp_tools or [], tool_visibility)
+            inp_for_assign = dict(input_data)
+            if (
+                getattr(settings, "TOOL_ASSIGNMENT_LLM_PICK_TOOLS", True)
+                and getattr(settings, "TOOL_ASSIGNMENT_USE_LLM", True)
+                and not inp_for_assign.get("llm_suggested_tool_names")
+                and visible_mcp_tools
+            ):
+                try:
+                    from services.planner_llm import is_agent_planner_configured
+                    from services.tool_assignment_llm import suggest_tool_names_with_llm
+
+                    if is_agent_planner_configured():
+                        max_n = int(getattr(settings, "TOOL_ASSIGNMENT_LLM_MAX_TOOLS", 12) or 12)
+                        max_n = max(1, min(max_n, len(visible_mcp_tools)))
+                        picked = await suggest_tool_names_with_llm(
+                            job_title=str(inp_for_assign.get("job_title") or ""),
+                            assigned_task=str(inp_for_assign.get("assigned_task") or ""),
+                            task_type=infer_task_type(inp_for_assign),
+                            tools=visible_mcp_tools,
+                            max_names=max_n,
+                        )
+                        if picked:
+                            inp_for_assign["llm_suggested_tool_names"] = picked
+                except Exception as e:
+                    logger.warning("tool_assignment_llm_pick_failed: %s", e)
             ordered_tools, assigned_meta, assign_src, assign_flagged = assign_tools_for_step(
-                input_data=input_data,
+                input_data=inp_for_assign,
                 agent=agent,
                 available_mcp_tools=visible_mcp_tools,
             )
+            picked_names = inp_for_assign.get("llm_suggested_tool_names")
+            if picked_names is not None:
+                input_data["llm_suggested_tool_names"] = picked_names
             input_data["assigned_tools"] = [
                 m.model_dump(mode="python", exclude_none=True) for m in assigned_meta
             ]

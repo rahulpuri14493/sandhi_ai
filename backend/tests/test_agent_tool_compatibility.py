@@ -47,6 +47,25 @@ class TestFilterToolsForAgent:
         assert len(out) == 1
         assert out[0]["name"] == "p"
 
+    def test_allow_connection_ids_keeps_only_those_connections(self):
+        agent = _agent(capabilities=["mcp:allow_connection_ids:2,3"])
+        tools = [
+            {"name": "a", "tool_type": "postgres", "connection_id": 2},
+            {"name": "b", "tool_type": "postgres", "connection_id": 9},
+            {"name": "c", "tool_type": "postgres"},
+        ]
+        out = filter_tools_for_agent(agent, tools)
+        assert [t["name"] for t in out] == ["a"]
+
+    def test_deny_connection_ids_drops_listed(self):
+        agent = _agent(capabilities=["mcp:deny_connection_ids:5"])
+        tools = [
+            {"name": "a", "tool_type": "s3", "connection_id": 5},
+            {"name": "b", "tool_type": "s3", "connection_id": 6},
+        ]
+        out = filter_tools_for_agent(agent, tools)
+        assert [t["name"] for t in out] == ["b"]
+
     def test_skips_non_dict_entries(self):
         agent = _agent()
         tools = [None, {"name": "ok", "tool_type": "s3"}]

@@ -10,7 +10,7 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.responses import Response
 from db.run_alembic_upgrade import run_alembic_upgrade
-from api.routes import auth, agents, jobs, payments, dashboards, hiring, external_jobs, mcp, mcp_internal
+from api.routes import auth, agents, jobs, payments, dashboards, hiring, external_jobs, external_platform, mcp, mcp_internal
 from middleware.error_handler import (
     validation_exception_handler,
     http_exception_handler,
@@ -161,6 +161,7 @@ app.include_router(payments.router)
 app.include_router(dashboards.router)
 app.include_router(hiring.router)
 app.include_router(external_jobs.router)
+app.include_router(external_platform.router)
 app.include_router(mcp.router)
 app.include_router(mcp_internal.router)
 

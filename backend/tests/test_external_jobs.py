@@ -205,6 +205,31 @@ def test_share_link_requires_auth(client_with_data):
     assert response.status_code == 401
 
 
+@patch("api.routes.external_jobs._get_external_api_key")
+def test_external_reload_tool_assignment_registry(mock_get_key, client_with_data):
+    """POST /api/external/platform/tool-assignment-registry/reload with X-API-Key returns registry meta."""
+    mock_get_key.return_value = "secret-key"
+    client = client_with_data[0]
+    response = client.post(
+        "/api/external/platform/tool-assignment-registry/reload",
+        headers={"X-API-Key": "secret-key"},
+    )
+    assert response.status_code == 200
+    data = response.json()
+    assert data.get("ok") is True
+    assert "version" in data
+    assert "rules" in data
+    assert "source_path" in data
+
+
+@patch("api.routes.external_jobs._get_external_api_key")
+def test_external_reload_tool_assignment_registry_requires_api_key(mock_get_key, client_with_data):
+    mock_get_key.return_value = "secret-key"
+    client = client_with_data[0]
+    response = client.post("/api/external/platform/tool-assignment-registry/reload")
+    assert response.status_code == 401
+
+
 def test_share_link_returns_url_when_authenticated(client_with_data):
     """GET /api/jobs/{id}/share-link returns share_url when business user authenticated."""
     client, business, job, _ = client_with_data

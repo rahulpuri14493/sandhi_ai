@@ -225,7 +225,14 @@ export const jobsAPI = {
     jobId: number,
     agentIds: number[],
     workflowMode?: 'independent' | 'sequential',
-    stepTools?: Array<{ agent_index: number; allowed_platform_tool_ids?: number[]; allowed_connection_ids?: number[]; tool_visibility?: 'full' | 'names_only' | 'none' }>,
+    stepTools?: Array<{
+      agent_index: number
+      allowed_platform_tool_ids?: number[]
+      allowed_connection_ids?: number[]
+      tool_visibility?: 'full' | 'names_only' | 'none'
+      /** Registry / envelope task slug (optional); must match backend pattern. */
+      task_type?: string
+    }>,
     toolVisibility?: 'full' | 'names_only' | 'none',
     outputSettings?: {
       write_execution_mode?: 'platform' | 'agent' | 'ui_only'
@@ -236,7 +243,13 @@ export const jobsAPI = {
     const body: {
       agent_ids: number[]
       workflow_mode?: string
-      step_tools?: Array<{ agent_index: number; allowed_platform_tool_ids?: number[]; allowed_connection_ids?: number[]; tool_visibility?: string }>
+      step_tools?: Array<{
+        agent_index: number
+        allowed_platform_tool_ids?: number[]
+        allowed_connection_ids?: number[]
+        tool_visibility?: string
+        task_type?: string
+      }>
       tool_visibility?: string
       write_execution_mode?: string
       output_artifact_format?: string

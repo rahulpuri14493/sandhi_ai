@@ -128,11 +128,15 @@ class Settings(BaseSettings):
     TOOL_ASSIGNMENT_REGISTRY_PATH: str = ""
     TOOL_ASSIGNMENT_ENABLED: bool = True
     # When true, merge llm_suggested_tool_names from step input_data (planner) into assignment order.
-    TOOL_ASSIGNMENT_USE_LLM: bool = False
+    TOOL_ASSIGNMENT_USE_LLM: bool = True
+    # When true with USE_LLM, executor asks the platform planner to pick tool names from the allowlist (no planner pre-fill).
+    TOOL_ASSIGNMENT_LLM_PICK_TOOLS: bool = True
+    # Max tool names the planner may return for TOOL_ASSIGNMENT_LLM_PICK_TOOLS (capped by visible tool count).
+    TOOL_ASSIGNMENT_LLM_MAX_TOOLS: int = 12
     # Validate JSON size + sandhi_a2a_task before every A2A HTTP call.
     A2A_OUTBOUND_VALIDATE: bool = True
     A2A_OUTBOUND_MAX_BYTES: int = 4194304
     # When true, sandhi_a2a_task must be present and parseable (in addition to outbound checks).
-    A2A_TASK_ENVELOPE_STRICT: bool = False
+    A2A_TASK_ENVELOPE_STRICT: bool = True
 
 settings = Settings()

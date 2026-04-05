@@ -1656,6 +1656,7 @@ async def auto_split_workflow(
                 "allowed_platform_tool_ids": st.allowed_platform_tool_ids,
                 "allowed_connection_ids": st.allowed_connection_ids,
                 "tool_visibility": getattr(st, "tool_visibility", None),
+                "task_type": getattr(st, "task_type", None),
             }
             for st in body.step_tools
         ]
