@@ -1656,12 +1656,15 @@ async def auto_split_workflow(
                 "allowed_platform_tool_ids": st.allowed_platform_tool_ids,
                 "allowed_connection_ids": st.allowed_connection_ids,
                 "tool_visibility": getattr(st, "tool_visibility", None),
+                "task_type": getattr(st, "task_type", None),
             }
             for st in body.step_tools
         ]
     tv = body.tool_visibility
     if tv is not None and tv not in ("full", "names_only", "none"):
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="tool_visibility must be 'full', 'names_only', or 'none'")
+    if tv is not None:
+        job.tool_visibility = _validate_tool_visibility(tv)
     if body.write_execution_mode is not None:
         job.write_execution_mode = _validate_write_execution_mode(body.write_execution_mode)
     if body.output_artifact_format is not None:

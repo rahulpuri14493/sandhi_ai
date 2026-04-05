@@ -7,6 +7,8 @@ import { WorkflowBuilder } from '../components/WorkflowBuilder'
 import { CostCalculator } from '../components/CostCalculator'
 import { JobStatusTracker } from '../components/JobStatusTracker'
 import { DocumentConversation } from '../components/DocumentConversation'
+import { buildJobDetailSharedToolWarning } from '../lib/independentWorkflowSharedTools'
+import { filterByJobAllowedIds, jobHasExplicitMcpScope } from '../lib/jobMcpScope'
 
 function ppStr(v: unknown): string {
   if (v == null) return ''
@@ -18,6 +20,15 @@ function ppStr(v: unknown): string {
 function ppStrList(v: unknown): string[] {
   if (!Array.isArray(v)) return []
   return v.map(ppStr).filter((s) => s.length > 0)
+}
+
+type StepToolVisibilityUi = 'full' | 'names_only' | 'none'
+
+/** Step override, else job default, else full (legacy rows with no stored visibility). */
+function effectiveStepToolVisibility(step: WorkflowStep, job: Job | null | undefined): StepToolVisibilityUi {
+  const v = step.tool_visibility ?? job?.tool_visibility
+  if (v === 'full' || v === 'names_only' || v === 'none') return v
+  return 'full'
 }
 
 export default function JobDetailPage() {
@@ -186,17 +197,26 @@ export default function JobDetailPage() {
   }
 
   const openStepToolsModal = async (step: WorkflowStep) => {
-    setEditingStepTools(step)
+    let latestJob: Job | null = job
+    try {
+      latestJob = await jobsAPI.get(jobId)
+      setJob(latestJob)
+    } catch {
+      // keep cached job
+    }
+    const stepFromServer = latestJob?.workflow_steps?.find((s) => s.id === step.id) ?? step
+    setEditingStepTools(stepFromServer)
     setStepToolsSelection({
-      platformIds: step.allowed_platform_tool_ids ?? [],
-      connectionIds: step.allowed_connection_ids ?? [],
+      platformIds: stepFromServer.allowed_platform_tool_ids ?? [],
+      connectionIds: stepFromServer.allowed_connection_ids ?? [],
+      toolVisibility: effectiveStepToolVisibility(stepFromServer, latestJob),
     })
     try {
       const [tools, conns] = await Promise.all([mcpAPI.listTools(), mcpAPI.listConnections()])
-      const allowedPlatform = job?.allowed_platform_tool_ids
-      const allowedConn = job?.allowed_connection_ids
-      setStepToolsModalPlatform(allowedPlatform?.length ? tools.filter((t: { id: number }) => allowedPlatform.includes(t.id)) : tools)
-      setStepToolsModalConnections(allowedConn?.length ? conns.filter((c: { id: number }) => allowedConn.includes(c.id)) : conns)
+      const allowedPlatform = latestJob?.allowed_platform_tool_ids
+      const allowedConn = latestJob?.allowed_connection_ids
+      setStepToolsModalPlatform(filterByJobAllowedIds(tools, allowedPlatform))
+      setStepToolsModalConnections(filterByJobAllowedIds(conns, allowedConn))
     } catch (e) {
       console.error(e)
     }
@@ -209,6 +229,7 @@ export default function JobDetailPage() {
       await jobsAPI.updateStepTools(jobId, editingStepTools.id, {
         allowed_platform_tool_ids: stepToolsSelection.platformIds,
         allowed_connection_ids: stepToolsSelection.connectionIds,
+        tool_visibility: stepToolsSelection.toolVisibility,
       })
       await loadJob()
       await loadWorkflowPreview()
@@ -976,7 +997,35 @@ export default function JobDetailPage() {
             {job.workflow_steps && job.workflow_steps.length > 0 && (
               <div className="mt-6 p-6 bg-dark-100/50 rounded-2xl border border-dark-200/50">
                 <h3 className="font-bold text-white mb-3">Tools per step</h3>
-                <p className="text-sm text-white/60 mb-4">Choose which tools each agent can use. You can limit an agent to specific tools (e.g. only Postgres) or leave it to use all job tools.</p>
+                {(() => {
+                  const w = buildJobDetailSharedToolWarning(job)
+                  if (!w) return null
+                  return (
+                    <div
+                      className={`mb-4 p-4 rounded-xl border-2 text-sm ${
+                        w.variant === 'strong'
+                          ? 'bg-amber-500/15 border-amber-500/50 text-amber-100'
+                          : 'bg-slate-600/20 border-slate-400/40 text-white/90'
+                      }`}
+                      role="status"
+                    >
+                      <p className="font-bold text-white mb-2">{w.title}</p>
+                      <ul className="list-disc list-inside space-y-1.5 text-white/85">
+                        {w.lines.map((line, i) => (
+                          <li key={i}>{line}</li>
+                        ))}
+                      </ul>
+                      <p className="mt-2 text-xs text-white/50">
+                        See <code className="text-primary-300">backend/docs/INDEPENDENT_WORKFLOW_SHARED_TOOLS.md</code> for headers and behavior.
+                      </p>
+                    </div>
+                  )
+                })()}
+                <p className="text-sm text-white/60 mb-4">
+                  {jobHasExplicitMcpScope(job)
+                    ? 'Choose which tools each agent can use. You can limit an agent to specific tools (e.g. only Postgres) or leave a step empty to use the job\u2019s tool list.'
+                    : 'Choose which tools each agent can use. With no job-level tool list, a step left empty shows no tools assigned here.'}
+                </p>
                 <div className="space-y-2">
                   {job.workflow_steps.map((step) => (
                     <div key={step.id} className="flex items-center justify-between py-2 px-4 bg-dark-200/30 rounded-xl border border-dark-300">
@@ -985,7 +1034,9 @@ export default function JobDetailPage() {
                         <span className="text-sm text-white/50">
                           {(step.allowed_platform_tool_ids?.length ?? 0) + (step.allowed_connection_ids?.length ?? 0) > 0
                             ? `${step.allowed_platform_tool_ids?.length ?? 0} platform, ${step.allowed_connection_ids?.length ?? 0} connection(s)`
-                            : 'All job tools'}
+                            : jobHasExplicitMcpScope(job)
+                              ? 'Uses job-scoped tools'
+                              : '—'}
                         </span>
                         <button
                           type="button"
@@ -1013,8 +1064,16 @@ export default function JobDetailPage() {
                 <div className="mb-4">
                   <h4 className="text-white font-semibold mb-2">Tool visibility (what this step sees)</h4>
                   <select
-                    value={stepToolsSelection.toolVisibility ?? 'full'}
-                    onChange={(e) => setStepToolsSelection((prev) => ({ ...prev, toolVisibility: e.target.value as 'full' | 'names_only' | 'none' }))}
+                    value={
+                      stepToolsSelection.toolVisibility ??
+                      (editingStepTools ? effectiveStepToolVisibility(editingStepTools, job) : 'full')
+                    }
+                    onChange={(e) =>
+                      setStepToolsSelection((prev) => ({
+                        ...prev,
+                        toolVisibility: e.target.value as StepToolVisibilityUi,
+                      }))
+                    }
                     className="w-full px-3 py-2 bg-dark-200 border border-dark-300 rounded-lg text-white focus:ring-2 focus:ring-primary-500"
                   >
                     <option value="full">Full — Names, descriptions, schema & business context</option>
@@ -1147,7 +1206,9 @@ export default function JobDetailPage() {
                     <span className="text-sm text-white/70">
                       {names || (platformIds.length > 0 || connCount > 0
                         ? `${platformIds.length} platform, ${connCount} connection(s)`
-                        : 'All job tools')}
+                        : jobHasExplicitMcpScope(job)
+                          ? 'Uses job-scoped tools'
+                          : '—')}
                       {visibilityLabel && <span className="text-white/50 ml-1">(visibility: {visibilityLabel})</span>}
                     </span>
                   </div>

@@ -87,6 +87,18 @@ def test_step_tools_assignment_with_tool_visibility():
     assert data.tool_visibility == "none"
 
 
+def test_step_tools_assignment_task_type_slug():
+    """StepToolsAssignment normalizes task_type to a lowercase slug."""
+    data = StepToolsAssignment(agent_index=0, task_type="Search")
+    assert data.task_type == "search"
+
+
+def test_step_tools_assignment_task_type_invalid():
+    """StepToolsAssignment rejects invalid task_type slugs."""
+    with pytest.raises(ValidationError):
+        StepToolsAssignment(agent_index=0, task_type="123bad")
+
+
 def test_auto_split_body_tool_visibility():
     """AutoSplitBody accepts tool_visibility."""
     data = AutoSplitBody(agent_ids=[1, 2], tool_visibility="names_only")

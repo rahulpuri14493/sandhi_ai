@@ -82,6 +82,8 @@ describe('NewJob page', () => {
       expect.objectContaining({
         title: 'Integration job',
         tool_visibility: 'none',
+        allowed_platform_tool_ids: [],
+        allowed_connection_ids: [],
       })
     )
     expect(mockNavigate).toHaveBeenCalledWith('/jobs/99', {

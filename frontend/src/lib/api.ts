@@ -123,9 +123,20 @@ export const jobsAPI = {
   },
   update(jobId: number, data: Record<string, unknown>, files?: File[]) {
     const form = new FormData()
-    Object.entries(data).forEach(([k, v]) => {
+    const platformAllow = data.allowed_platform_tool_ids
+    const connectionAllow = data.allowed_connection_ids
+    const rest = { ...data } as Record<string, unknown>
+    delete rest.allowed_platform_tool_ids
+    delete rest.allowed_connection_ids
+    Object.entries(rest).forEach(([k, v]) => {
       if (v !== undefined && v !== null) form.append(k, typeof v === 'string' ? v : JSON.stringify(v))
     })
+    if (Array.isArray(platformAllow)) {
+      form.append('allowed_platform_tool_ids', JSON.stringify(platformAllow))
+    }
+    if (Array.isArray(connectionAllow)) {
+      form.append('allowed_connection_ids', JSON.stringify(connectionAllow))
+    }
     if (files?.length) files.forEach((f) => form.append('files', f))
     return api.put('/jobs/' + jobId, form, { headers: { 'Content-Type': 'multipart/form-data' } }).then((res) => res.data)
   },
@@ -214,7 +225,14 @@ export const jobsAPI = {
     jobId: number,
     agentIds: number[],
     workflowMode?: 'independent' | 'sequential',
-    stepTools?: Array<{ agent_index: number; allowed_platform_tool_ids?: number[]; allowed_connection_ids?: number[]; tool_visibility?: 'full' | 'names_only' | 'none' }>,
+    stepTools?: Array<{
+      agent_index: number
+      allowed_platform_tool_ids?: number[]
+      allowed_connection_ids?: number[]
+      tool_visibility?: 'full' | 'names_only' | 'none'
+      /** Registry / envelope task slug (optional); must match backend pattern. */
+      task_type?: string
+    }>,
     toolVisibility?: 'full' | 'names_only' | 'none',
     outputSettings?: {
       write_execution_mode?: 'platform' | 'agent' | 'ui_only'
@@ -225,7 +243,13 @@ export const jobsAPI = {
     const body: {
       agent_ids: number[]
       workflow_mode?: string
-      step_tools?: Array<{ agent_index: number; allowed_platform_tool_ids?: number[]; allowed_connection_ids?: number[]; tool_visibility?: string }>
+      step_tools?: Array<{
+        agent_index: number
+        allowed_platform_tool_ids?: number[]
+        allowed_connection_ids?: number[]
+        tool_visibility?: string
+        task_type?: string
+      }>
       tool_visibility?: string
       write_execution_mode?: string
       output_artifact_format?: string
@@ -233,7 +257,8 @@ export const jobsAPI = {
     } = { agent_ids: agentIds }
     if (workflowMode) body.workflow_mode = workflowMode
     if (stepTools?.length) body.step_tools = stepTools
-    if (toolVisibility) body.tool_visibility = toolVisibility
+    // Omit when undefined so the server uses the job default; all union values are non-empty strings.
+    if (toolVisibility !== undefined) body.tool_visibility = toolVisibility
     if (outputSettings) {
       if (outputSettings.write_execution_mode !== undefined) {
         body.write_execution_mode = outputSettings.write_execution_mode

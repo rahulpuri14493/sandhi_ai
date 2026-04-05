@@ -1,0 +1,49 @@
+{
+  "version": 1,
+  "rules": [
+    {
+      "id": "research",
+      "task_types": ["research", "retrieval", "rag", "analyze_documents"],
+      "preferred_tool_types": [
+        "vector_db",
+        "pinecone",
+        "weaviate",
+        "qdrant",
+        "chroma",
+        "elasticsearch",
+        "pageindex"
+      ],
+      "max_tools": 12
+    },
+    {
+      "id": "sql_analytics",
+      "task_types": ["sql", "analytics", "warehouse", "reporting"],
+      "preferred_tool_types": [
+        "postgres",
+        "mysql",
+        "sqlserver",
+        "snowflake",
+        "databricks",
+        "bigquery"
+      ],
+      "max_tools": 12
+    },
+    {
+      "id": "storage",
+      "task_types": ["storage", "files", "etl_files"],
+      "preferred_tool_types": [
+        "s3",
+        "minio",
+        "ceph",
+        "azure_blob",
+        "gcs",
+        "filesystem"
+      ],
+      "max_tools": 10
+    }
+  ],
+  "fallback": {
+    "max_tools": 24,
+    "flag_unmatched": true
+  }
+}

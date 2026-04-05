@@ -1,6 +1,8 @@
-import { useState, useEffect, useRef } from 'react'
+import { useState, useEffect, useRef, useMemo } from 'react'
 import { jobsAPI, agentsAPI, mcpAPI } from '../lib/api'
 import { getToolAccessBadge } from '../lib/mcpToolAccess'
+import { buildIndependentSharedToolWarning } from '../lib/independentWorkflowSharedTools'
+import { filterByJobAllowedIds, jobHasExplicitMcpScope } from '../lib/jobMcpScope'
 import type { Agent } from '../lib/types'
 import type { Job } from '../lib/types'
 import type { MCPToolConfigRes, MCPServerConnectionRes } from '../lib/api'
@@ -17,8 +19,13 @@ export type WorkflowCollaborationMode = 'from_brd' | 'independent' | 'sequential
 
 export type ToolVisibility = 'full' | 'names_only' | 'none'
 
-/** Per-step tool assignment: agent_index -> { platformIds, connectionIds, toolVisibility? } */
-type StepToolSelection = Record<number, { platformIds: number[]; connectionIds: number[]; toolVisibility?: ToolVisibility }>
+/** Per-step tool assignment: agent_index -> { platformIds, connectionIds, toolVisibility?, taskType? } */
+type StepToolSelection = Record<
+  number,
+  { platformIds: number[]; connectionIds: number[]; toolVisibility?: ToolVisibility; taskType?: string }
+>
+
+type StepToolsUpdateOpts = { taskType?: string }
 
 const DEFAULT_OUTPUT_CONTRACT = {
   version: '1.0',
@@ -150,11 +157,21 @@ export function WorkflowBuilder({ jobId, onWorkflowCreated, initialSelectedAgent
     }
   }, [job?.id, job?.write_execution_mode, job?.output_artifact_format, job?.output_contract])
 
+  // Sync job-level tool visibility from API (including 'none'; do not use truthy check on the string).
+  useEffect(() => {
+    if (!job?.id) return
+    const tv = job.tool_visibility
+    if (tv === 'full' || tv === 'names_only' || tv === 'none') {
+      setJobToolVisibility(tv)
+    } else {
+      setJobToolVisibility('full')
+    }
+  }, [job?.id, job?.tool_visibility])
+
   // When job has workflow steps, pre-fill step tool selections from saved state (by step order)
   useEffect(() => {
     const jobData = job ?? null
     const steps = jobData?.workflow_steps
-    if (jobData?.tool_visibility) setJobToolVisibility(jobData.tool_visibility as ToolVisibility)
     if (!steps?.length || selectedAgents.length === 0) return
     // Steps are ordered by step_order; index i = step_order - 1
     const next: StepToolSelection = {}
@@ -170,7 +187,7 @@ export function WorkflowBuilder({ jobId, onWorkflowCreated, initialSelectedAgent
       return prev
     })
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [job?.id, job?.tool_visibility, job?.workflow_steps, selectedAgents.length])
+  }, [job?.id, job?.workflow_steps, selectedAgents.length])
 
   /** After a job has run, keep agent list aligned with saved workflow steps when opening this screen. */
   useEffect(() => {
@@ -180,6 +197,27 @@ export function WorkflowBuilder({ jobId, onWorkflowCreated, initialSelectedAgent
   }, [job?.id, job?.status, job?.workflow_steps])
 
   const workflowLocked = !!(job?.status && job.status !== 'draft')
+
+  const independentSharedToolWarning = useMemo(
+    () =>
+      buildIndependentSharedToolWarning({
+        collaborationMode: workflowCollaboration,
+        selectedAgentCount: selectedAgents.length,
+        stepToolSelections: selectedAgents.map((_, idx) => {
+          const s = stepToolSelections[idx] ?? { platformIds: [], connectionIds: [] }
+          return { platformIds: s.platformIds, connectionIds: s.connectionIds }
+        }),
+        jobAllowedPlatformIds: job?.allowed_platform_tool_ids,
+        jobAllowedConnectionIds: job?.allowed_connection_ids,
+      }),
+    [
+      workflowCollaboration,
+      selectedAgents,
+      stepToolSelections,
+      job?.allowed_platform_tool_ids,
+      job?.allowed_connection_ids,
+    ]
+  )
 
   const loadAgents = async () => {
     try {
@@ -200,24 +238,36 @@ export function WorkflowBuilder({ jobId, onWorkflowCreated, initialSelectedAgent
       const jobData = job ?? (jobId ? await jobsAPI.get(jobId).catch(() => null) : null)
       const allowedPlatform = jobData?.allowed_platform_tool_ids
       const allowedConn = jobData?.allowed_connection_ids
-      setPlatformTools(
-        allowedPlatform?.length
-          ? tools.filter((t: MCPToolConfigRes) => allowedPlatform.includes(t.id))
-          : tools
-      )
-      setConnections(
-        allowedConn?.length
-          ? conns.filter((c: MCPServerConnectionRes) => allowedConn.includes(c.id))
-          : conns
-      )
+      setPlatformTools(filterByJobAllowedIds(tools, allowedPlatform))
+      setConnections(filterByJobAllowedIds(conns, allowedConn))
     } catch (error) {
       console.error('Failed to load tools:', error)
     }
   }
 
-  const setStepTools = (agentIndex: number, platformIds: number[], connectionIds: number[], toolVisibility?: ToolVisibility) => {
+  const setStepTools = (
+    agentIndex: number,
+    platformIds: number[],
+    connectionIds: number[],
+    toolVisibility?: ToolVisibility,
+    opts?: StepToolsUpdateOpts
+  ) => {
     setStepToolSelections((prev) => {
-      const next = { ...prev, [agentIndex]: { platformIds, connectionIds, toolVisibility } }
+      const prevSel = prev[agentIndex]
+      let taskType = prevSel?.taskType
+      if (opts && 'taskType' in opts) {
+        const t = opts.taskType?.trim()
+        taskType = t || undefined
+      }
+      const next = {
+        ...prev,
+        [agentIndex]: {
+          platformIds,
+          connectionIds,
+          toolVisibility,
+          ...(taskType ? { taskType } : {}),
+        },
+      }
       stepToolSelectionsRef.current = next
       return next
     })
@@ -319,6 +369,7 @@ export function WorkflowBuilder({ jobId, onWorkflowCreated, initialSelectedAgent
           platformIds: s.platform_tool_ids ?? [],
           connectionIds: prev.connectionIds,
           toolVisibility: prev.toolVisibility,
+          ...(prev.taskType ? { taskType: prev.taskType } : {}),
         }
       }
       setStepToolSelections(next)
@@ -370,20 +421,25 @@ export function WorkflowBuilder({ jobId, onWorkflowCreated, initialSelectedAgent
         // When only connections are selected, send empty platform list so backend does not inherit job-level platform tools
         const platformIds = hasPlatform ? sel!.platformIds : (hasConn ? [] : undefined)
         const connectionIds = hasConn ? sel!.connectionIds : (hasPlatform ? [] : undefined)
+        const slug = (sel?.taskType ?? '').trim().toLowerCase()
+        const task_type = /^[a-z][a-z0-9_]{0,63}$/i.test(slug) ? slug : undefined
         return {
           agent_index: idx,
           allowed_platform_tool_ids: platformIds,
           allowed_connection_ids: connectionIds,
-          tool_visibility: sel?.toolVisibility,
+          tool_visibility: sel?.toolVisibility ?? jobToolVisibility,
+          ...(task_type ? { task_type } : {}),
         }
       })
-      const hasStepTools = stepTools.some((s) => (s.allowed_platform_tool_ids?.length ?? 0) > 0 || (s.allowed_connection_ids?.length ?? 0) > 0 || s.tool_visibility)
+      // Always send step_tools when building a workflow so each step stores effective tool_visibility
+      // (matches job dropdown). Backend merges omitted allowlists with job-level scope.
+      const hasStepTools = selectedAgents.length > 0
       await jobsAPI.autoSplitWorkflow(
         jobId,
         selectedAgents,
         workflowMode,
         hasStepTools ? stepTools : undefined,
-        jobToolVisibility !== 'full' ? jobToolVisibility : undefined,
+        jobToolVisibility,
         showOutputContractBlock
           ? {
               write_execution_mode: writeExecutionMode,
@@ -524,6 +580,28 @@ export function WorkflowBuilder({ jobId, onWorkflowCreated, initialSelectedAgent
               {workflowCollaboration === 'sequential' && 'Best when agent 2 needs agent 1’s result (pipeline).'}
               {workflowCollaboration === 'from_brd' && 'Uses analyze-documents hint from your BRD when available.'}
             </p>
+            {independentSharedToolWarning && (
+              <div
+                className={`mt-4 p-4 rounded-xl border-2 text-sm ${
+                  independentSharedToolWarning.variant === 'strong'
+                    ? 'bg-amber-500/15 border-amber-500/50 text-amber-100'
+                    : 'bg-slate-600/20 border-slate-400/40 text-white/90'
+                }`}
+                role="status"
+              >
+                <p className="font-bold text-white mb-2">{independentSharedToolWarning.title}</p>
+                <ul className="list-disc list-inside space-y-1.5 text-white/85 leading-relaxed">
+                  {independentSharedToolWarning.lines.map((line, i) => (
+                    <li key={i}>{line}</li>
+                  ))}
+                </ul>
+                <p className="mt-3 text-xs text-white/55">
+                  Operations guide: repository file{' '}
+                  <code className="text-primary-300 bg-dark-200/80 px-1 rounded">backend/docs/INDEPENDENT_WORKFLOW_SHARED_TOOLS.md</code>
+                  — parallel execution, logging headers (<code className="text-primary-300">X-Sandhi-Trace-Id</code>, etc.).
+                </p>
+              </div>
+            )}
             {workflowCollaboration === 'from_brd' && job?.allowed_platform_tool_ids && job.allowed_platform_tool_ids.length > 0 && (
               <p className="text-xs text-emerald-400/90 mt-1.5 font-medium">
                 Job tools will be assigned to all agents automatically. You can optionally restrict tools per agent below.
@@ -591,7 +669,17 @@ export function WorkflowBuilder({ jobId, onWorkflowCreated, initialSelectedAgent
                 </button>
               </div>
               <p className="text-sm text-white/70 mb-4">
-                Add only the tools each agent can use. If none are added, that agent will have access to all job tools.
+                {jobHasExplicitMcpScope(job) ? (
+                  <>
+                    Add only the tools each agent can use. If you leave a step empty, it uses the{' '}
+                    <strong className="text-white/90">job&rsquo;s selected tools</strong> only.
+                  </>
+                ) : (
+                  <>
+                    Add only the tools each agent can use. With no job-level tool selection yet, a step you leave empty shows{' '}
+                    <strong className="text-white/90">no tools</strong> here — pick tools per step or restrict tools when creating the job.
+                  </>
+                )}{' '}
                 Suggestions use the same BRD excerpts and Q&amp;A as task splitting (first selected agent = splitter API).
               </p>
               <div className="mb-4 p-4 rounded-xl bg-dark-100/80 border border-dark-300 text-sm text-white/85 space-y-2">
@@ -633,10 +721,35 @@ export function WorkflowBuilder({ jobId, onWorkflowCreated, initialSelectedAgent
                           <option value="none">None (no tools)</option>
                         </select>
                       </div>
+                      <div className="mb-3">
+                        <label className="block text-xs text-white/70 mb-1">
+                          Task type slug (optional — tool assignment registry)
+                        </label>
+                        <input
+                          type="text"
+                          value={sel.taskType ?? ''}
+                          onChange={(e) =>
+                            setStepTools(idx, sel.platformIds, sel.connectionIds, sel.toolVisibility, {
+                              taskType: e.target.value,
+                            })
+                          }
+                          placeholder="e.g. search, persist"
+                          className="w-full max-w-md px-3 py-2 bg-dark-200/80 border border-dark-300 rounded-lg text-white text-sm placeholder:text-white/35 focus:ring-2 focus:ring-primary-500 focus:border-primary-500"
+                          title="Letter, then letters, digits, or underscores (max 64 chars). Invalid values are omitted when creating the workflow."
+                        />
+                      </div>
                       <div className="space-y-2">
                         <div className="text-sm font-semibold text-white/90">Selected for this step:</div>
                         {!hasAnySelected ? (
-                          <p className="text-xs text-white/50 italic">No tools selected — this step will use all job tools.</p>
+                          jobHasExplicitMcpScope(job) ? (
+                            <p className="text-xs text-white/50 italic">
+                              No tools selected for this step — uses the job&rsquo;s tool list.
+                            </p>
+                          ) : (
+                            <p className="text-xs text-white/45 tabular-nums" aria-label="No tools selected">
+                              —
+                            </p>
+                          )
                         ) : (
                           <div className="flex flex-wrap gap-3">
                             {selectedPlatformTools.map((t) => {

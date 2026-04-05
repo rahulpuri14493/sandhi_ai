@@ -1,6 +1,7 @@
 import { describe, it, expect } from 'vitest'
 import { cn } from '@/lib/utils'
 import { getToolAccessBadge } from '@/lib/mcpToolAccess'
+import { filterByJobAllowedIds, jobHasExplicitMcpScope } from '@/lib/jobMcpScope'
 
 describe('cn', () => {
   it('merges class names', () => {
@@ -46,5 +47,36 @@ describe('getToolAccessBadge', () => {
 
   it('trims and lowercases type', () => {
     expect(getToolAccessBadge('  POSTGRES  ').short).toBe('sql')
+  })
+})
+
+describe('jobHasExplicitMcpScope', () => {
+  it('is false when job is null or lists are empty', () => {
+    expect(jobHasExplicitMcpScope(null)).toBe(false)
+    expect(jobHasExplicitMcpScope(undefined)).toBe(false)
+    expect(jobHasExplicitMcpScope({})).toBe(false)
+    expect(jobHasExplicitMcpScope({ allowed_platform_tool_ids: [], allowed_connection_ids: [] })).toBe(false)
+  })
+
+  it('is true when either allowlist is non-empty', () => {
+    expect(jobHasExplicitMcpScope({ allowed_platform_tool_ids: [1] })).toBe(true)
+    expect(jobHasExplicitMcpScope({ allowed_connection_ids: [2] })).toBe(true)
+  })
+})
+
+describe('filterByJobAllowedIds', () => {
+  const items = [{ id: 1 }, { id: 2 }, { id: 3 }]
+
+  it('returns all items when allowlist is null or undefined', () => {
+    expect(filterByJobAllowedIds(items, null)).toEqual(items)
+    expect(filterByJobAllowedIds(items, undefined)).toEqual(items)
+  })
+
+  it('returns empty when allowlist is an empty array', () => {
+    expect(filterByJobAllowedIds(items, [])).toEqual([])
+  })
+
+  it('returns only matching ids', () => {
+    expect(filterByJobAllowedIds(items, [2])).toEqual([{ id: 2 }])
   })
 })

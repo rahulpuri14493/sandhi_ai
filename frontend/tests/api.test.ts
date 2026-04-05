@@ -42,6 +42,7 @@ let agentsAPI: any
 let jobsAPI: any
 let dashboardsAPI: any
 let mcpAPI: any
+let hiringAPI: any
 
 describe('lib/api', () => {
   beforeAll(async () => {
@@ -52,6 +53,7 @@ describe('lib/api', () => {
     jobsAPI = mod.jobsAPI
     dashboardsAPI = mod.dashboardsAPI
     mcpAPI = mod.mcpAPI
+    hiringAPI = mod.hiringAPI
   })
 
   beforeEach(() => {
@@ -68,6 +70,13 @@ describe('lib/api', () => {
     expect(out.headers.Authorization).toBe('Bearer t1')
   })
 
+  it('request interceptor leaves config unchanged without token', () => {
+    const config = { headers: {} as Record<string, string> }
+    const out = requestInterceptor!(config)
+    expect(out).toBe(config)
+    expect(out.headers.Authorization).toBeUndefined()
+  })
+
   it('clears token on 401 responses', async () => {
     localStorage.setItem('access_token', 't1')
     expect(responseErrorInterceptor).toBeTypeOf('function')
@@ -77,6 +86,13 @@ describe('lib/api', () => {
     ).rejects.toBeTruthy()
 
     expect(localStorage.getItem('access_token')).toBeNull()
+  })
+
+  it('response error interceptor passes through non-401 errors', async () => {
+    localStorage.setItem('access_token', 't1')
+    const err = { response: { status: 500 } }
+    await expect(responseErrorInterceptor!(err)).rejects.toBe(err)
+    expect(localStorage.getItem('access_token')).toBe('t1')
   })
 
   it('authAPI.login stores access token', async () => {
@@ -244,6 +260,89 @@ describe('lib/api', () => {
     await mcpAPI.refreshToolSchema(1)
     await mcpAPI.deleteTool(1)
     await mcpAPI.getTool(1)
+  })
+
+  it('jobsAPI queue, schedules, planner, suggest, cancel, and auto-split output settings', async () => {
+    get.mockResolvedValue({ data: {} })
+    post.mockResolvedValue({ data: {} })
+    put.mockResolvedValue({ data: {} })
+
+    await jobsAPI.getQueueStats()
+    expect(get).toHaveBeenCalledWith('/jobs/queue/stats')
+
+    await jobsAPI.listAllSchedules()
+    await jobsAPI.getSchedule(3)
+    await jobsAPI.createSchedule(3, { scheduled_at: '2026-01-01T00:00:00Z', timezone: 'UTC' })
+    await jobsAPI.updateSchedule(3, { status: 'inactive' })
+    await jobsAPI.cancel(8)
+
+    await jobsAPI.getAgentPlannerStatus()
+    await jobsAPI.listPlannerArtifacts(4)
+    await jobsAPI.getPlannerArtifactRaw(4, 12)
+    await jobsAPI.getPlannerPipeline(4)
+    await jobsAPI.suggestWorkflowTools(4, [1, 2])
+
+    await jobsAPI.autoSplitWorkflow(1, [1], 'sequential', undefined, undefined, {
+      write_execution_mode: 'platform',
+      output_artifact_format: 'jsonl',
+      output_contract: { a: 1 },
+    })
+    expect(post).toHaveBeenCalledWith(
+      '/jobs/1/workflow/auto-split',
+      expect.objectContaining({
+        agent_ids: [1],
+        workflow_mode: 'sequential',
+        write_execution_mode: 'platform',
+        output_artifact_format: 'jsonl',
+        output_contract: { a: 1 },
+      })
+    )
+  })
+
+  it('jobsAPI.create optional schedule and execution output fields', async () => {
+    const appendSpy = vi.spyOn(FormData.prototype, 'append')
+    post.mockResolvedValueOnce({ data: { id: 1 } })
+    await jobsAPI.create({
+      title: 't',
+      schedule_scheduled_at: '2026-06-01T12:00:00Z',
+      schedule_timezone: 'America/New_York',
+      write_execution_mode: 'agent',
+      output_artifact_format: 'json',
+      output_contract: { k: 'v' },
+    })
+    expect(appendSpy).toHaveBeenCalledWith('schedule_scheduled_at', '2026-06-01T12:00:00Z')
+    expect(appendSpy).toHaveBeenCalledWith('schedule_timezone', 'America/New_York')
+    expect(appendSpy).toHaveBeenCalledWith('write_execution_mode', 'agent')
+    expect(appendSpy).toHaveBeenCalledWith('output_artifact_format', 'json')
+    expect(appendSpy).toHaveBeenCalledWith('output_contract', JSON.stringify({ k: 'v' }))
+    appendSpy.mockRestore()
+  })
+
+  it('mcpAPI certifyConnection, async write, and operation status', async () => {
+    post.mockResolvedValueOnce({
+      data: { certified: true, checks: [], recommended_policy: 'default' },
+    })
+    await mcpAPI.certifyConnection(9)
+    expect(post).toHaveBeenCalledWith('/mcp/connections/9/certify')
+
+    post.mockResolvedValueOnce({ data: { ok: 1 } })
+    await mcpAPI.callPlatformWriteAsync({
+      tool_name: 't',
+      artifact_ref: { storage: 'local', path: 'p', format: 'jsonl' },
+      target: { target_type: 'sql', name: 'n' },
+      idempotency_key: 'ik',
+    })
+    expect(post).toHaveBeenCalledWith('/mcp/call-platform-write-async', expect.any(Object))
+
+    get.mockResolvedValueOnce({ data: { status: 'done' } })
+    await mcpAPI.getWriteOperation('op-1')
+    expect(get).toHaveBeenCalledWith('/mcp/operations/op-1')
+  })
+
+  it('hiringAPI.listPositions without status uses bare path', async () => {
+    get.mockResolvedValueOnce({ data: [] })
+    await hiringAPI.listPositions()
+    expect(get).toHaveBeenCalledWith('/hiring/positions')
   })
 
   it('exports the configured axios instance', () => {

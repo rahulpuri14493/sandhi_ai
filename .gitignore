@@ -214,9 +214,7 @@ __marimo__/
 
 # Node
 node_modules/
-# Keep frontend app source tracked; root lib/ above is for Python
-!frontend/lib/
-!frontend/lib/**
+# App code lives under frontend/src (root lib/ is for Python / other tooling)
 !frontend/src/lib/
 !frontend/src/lib/**
 .next/

@@ -34,7 +34,10 @@ def _message_parts_from_input(input_data: Dict[str, Any]) -> List[Dict[str, Any]
     """
     Convert our executor input_data into A2A Message parts.
     We send a single text part containing JSON so the agent receives full context.
-    Agents that expect natural language can parse or we could add a human-readable part.
+
+    Payloads are normalized by the job executor (see ``schemas.executor_platform_payload``):
+    ``platform_a2a_schema`` (e.g. sandhi.executor_context.v1) and ``sandhi_trace`` (job_id,
+    workflow_step_id, step_order, agent_id) appear in that JSON for debugging and external agents.
     """
     return [_text_part(json.dumps(input_data, default=str))]
 

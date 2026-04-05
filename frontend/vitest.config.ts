@@ -32,6 +32,8 @@ export default defineConfig({
         '**/vite-env.d.ts',
         // Types-only module (TS erased at runtime).
         '**/types.ts',
+        // Spec mirror for A2A envelope (interfaces + single const); coverage is via backend + integration.
+        '**/sandhiA2aTask.ts',
       ],
       reporter: ['text', 'text-summary'],
       thresholds: {
