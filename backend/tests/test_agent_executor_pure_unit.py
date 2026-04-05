@@ -170,6 +170,43 @@ def test_partition_workflow_waves_third_independent_joins_prior_wave():
     assert waves == [[s1], [s2, s3]]
 
 
+def test_next_workflow_step_returns_lowest_following_step_order():
+    s1 = SimpleNamespace(id=1, step_order=1)
+    s2 = SimpleNamespace(id=2, step_order=3)
+    s3 = SimpleNamespace(id=3, step_order=2)
+    nxt = ae._next_workflow_step([s1, s2, s3], s1)
+    assert nxt is not None and nxt.id == s3.id
+
+
+def test_next_workflow_step_returns_none_for_terminal_step():
+    s1 = SimpleNamespace(id=1, step_order=2)
+    assert ae._next_workflow_step([s1], s1) is None
+
+
+def test_parallel_context_for_step_single_wave():
+    s1 = SimpleNamespace(id=10, step_order=1, depends_on_previous=True)
+    ctx = ae._parallel_context_for_step([s1], s1)
+    assert ctx is not None
+    assert ctx["wave_index"] == 0
+    assert ctx["parallel_group_id"] == "job-wave-0"
+    assert ctx["concurrent_workflow_step_ids"] == [10]
+    assert ctx["depends_on_previous_wave"] is False
+
+
+def test_parallel_context_for_step_second_wave_depends_on_previous():
+    s1 = SimpleNamespace(id=1, step_order=1, depends_on_previous=True)
+    s2 = SimpleNamespace(id=2, step_order=2, depends_on_previous=True)
+    ctx = ae._parallel_context_for_step([s1, s2], s2)
+    assert ctx["wave_index"] == 1
+    assert ctx["depends_on_previous_wave"] is True
+
+
+def test_parallel_context_for_step_returns_none_when_step_not_in_waves():
+    s1 = SimpleNamespace(id=1, step_order=1, depends_on_previous=True)
+    orphan = SimpleNamespace(id=99, step_order=5, depends_on_previous=True)
+    assert ae._parallel_context_for_step([s1], orphan) is None
+
+
 def test_parse_write_policy():
     c = {"write_policy": {"on_write_error": "continue", "min_successful_targets": 2}}
     p = ae._parse_write_policy(c, write_targets_count=5)

@@ -123,5 +123,16 @@ class Settings(BaseSettings):
     WORKFLOW_PARALLEL_INDEPENDENT_STEPS: bool = True
     # Cap concurrent step executions per job (semaphore inside each parallel wave).
     WORKFLOW_MAX_PARALLEL_STEPS: int = 8
+    # --- Tool assignment registry + A2A task envelope ---
+    # Absolute path to JSON registry; empty = packaged backend/resources/config/tool_assignment_registry.default.json
+    TOOL_ASSIGNMENT_REGISTRY_PATH: str = ""
+    TOOL_ASSIGNMENT_ENABLED: bool = True
+    # When true, merge llm_suggested_tool_names from step input_data (planner) into assignment order.
+    TOOL_ASSIGNMENT_USE_LLM: bool = False
+    # Validate JSON size + sandhi_a2a_task before every A2A HTTP call.
+    A2A_OUTBOUND_VALIDATE: bool = True
+    A2A_OUTBOUND_MAX_BYTES: int = 4194304
+    # When true, sandhi_a2a_task must be present and parseable (in addition to outbound checks).
+    A2A_TASK_ENVELOPE_STRICT: bool = False
 
 settings = Settings()

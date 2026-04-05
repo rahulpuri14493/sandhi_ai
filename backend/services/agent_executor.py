@@ -31,6 +31,15 @@ from schemas.executor_platform_payload import (
     enrich_executor_payload_trace_only,
     validate_and_enrich_executor_payload,
 )
+from schemas.sandhi_a2a_task import (
+    NextAgentRef,
+    ParallelExecutionContext,
+    SandhiA2ATaskV1,
+    task_envelope_to_dict,
+)
+from services.agent_tool_compatibility import filter_tools_for_agent, validate_tools_for_agent
+from services.a2a_outbound_validation import validate_outbound_a2a_payload
+from services.tool_assignment_engine import assign_tools_for_step, infer_task_type
 
 logger = logging.getLogger(__name__)
 
@@ -81,6 +90,32 @@ def _partition_workflow_waves(workflow_steps: List[WorkflowStep]) -> List[List[W
         waves.append(wave)
         i = j + 1
     return waves
+
+
+def _next_workflow_step(
+    workflow_steps: List[WorkflowStep], current: WorkflowStep
+) -> Optional[WorkflowStep]:
+    """Next step by ``step_order`` (linear successor in the workflow DAG we execute)."""
+    successors = [s for s in workflow_steps if s.step_order > current.step_order]
+    if not successors:
+        return None
+    return min(successors, key=lambda s: s.step_order)
+
+
+def _parallel_context_for_step(
+    workflow_steps: List[WorkflowStep], step: WorkflowStep
+) -> Optional[Dict[str, Any]]:
+    waves = _partition_workflow_waves(workflow_steps)
+    for wi, wave in enumerate(waves):
+        ids = [s.id for s in wave]
+        if step.id in ids:
+            return {
+                "wave_index": wi,
+                "parallel_group_id": f"job-wave-{wi}",
+                "concurrent_workflow_step_ids": ids,
+                "depends_on_previous_wave": wi > 0,
+            }
+    return None
 
 
 # Tool types that fetch text from an external corpus (vector DB, PageIndex, etc.)
@@ -512,16 +547,63 @@ class AgentExecutor:
                 platform_tool_ids=effective_platform if effective_platform is not None else None,
                 connection_ids=effective_conn if effective_conn is not None else None,
             )
+            raw_mcp_tools = available_mcp_tools or []
+            compat_errors = validate_tools_for_agent(agent, raw_mcp_tools)
+            if compat_errors:
+                raise ValueError(compat_errors[0])
+            available_mcp_tools = filter_tools_for_agent(agent, raw_mcp_tools)
             tool_visibility = getattr(step, "tool_visibility", None) or getattr(job, "tool_visibility", None) or "full"
-            available_mcp_tools = _apply_tool_visibility(available_mcp_tools or [], tool_visibility)
-            if available_mcp_tools:
-                input_data["available_mcp_tools"] = available_mcp_tools
+            visible_mcp_tools = _apply_tool_visibility(available_mcp_tools or [], tool_visibility)
+            ordered_tools, assigned_meta, assign_src, assign_flagged = assign_tools_for_step(
+                input_data=input_data,
+                agent=agent,
+                available_mcp_tools=visible_mcp_tools,
+            )
+            input_data["assigned_tools"] = [
+                m.model_dump(mode="python", exclude_none=True) for m in assigned_meta
+            ]
+            nxt_step = _next_workflow_step(workflow_steps, step)
+            next_ref: Optional[NextAgentRef] = None
+            if nxt_step:
+                next_agent_row = self.db.query(Agent).filter(Agent.id == nxt_step.agent_id).first()
+                endpoint: Optional[str] = None
+                if next_agent_row and getattr(next_agent_row, "a2a_enabled", False):
+                    endpoint = (next_agent_row.api_endpoint or "").strip() or None
+                next_ref = NextAgentRef(
+                    agent_id=nxt_step.agent_id,
+                    workflow_step_id=nxt_step.id,
+                    name=(next_agent_row.name if next_agent_row else None),
+                    a2a_endpoint=endpoint,
+                    step_order=nxt_step.step_order,
+                )
+            par_raw = _parallel_context_for_step(workflow_steps, step)
+            par_ctx = ParallelExecutionContext(**par_raw) if par_raw else None
+            sandhi_task = SandhiA2ATaskV1(
+                agent_id=agent.id,
+                task_id=f"{job_id}-{step.id}-{self._mcp_correlation_trace_id}",
+                payload={
+                    "assigned_task": input_data.get("assigned_task"),
+                    "job_title": input_data.get("job_title"),
+                    "job_id": job_id,
+                    "workflow_step_id": step.id,
+                    "step_order": step.step_order,
+                },
+                next_agent=next_ref,
+                assigned_tools=assigned_meta,
+                parallel=par_ctx,
+                task_type=infer_task_type(input_data),
+                assignment_source=assign_src,
+                assignment_flagged=assign_flagged,
+            )
+            input_data["sandhi_a2a_task"] = task_envelope_to_dict(sandhi_task)
+            if ordered_tools:
+                input_data["available_mcp_tools"] = ordered_tools
                 input_data["business_id"] = job.business_id
                 if step.step_order == 1:
                     self._log_action("job", job_id, "mcp_tool_discovery", {
                         "business_id": job.business_id,
-                        "tool_count": len(available_mcp_tools),
-                        "tool_names": [t.get("name") for t in available_mcp_tools[:20]],
+                        "tool_count": len(ordered_tools),
+                        "tool_names": [t.get("name") for t in ordered_tools[:20]],
                     })
 
             collaboration_hint = _get_workflow_collaboration_hint_from_job(job)
@@ -807,6 +889,7 @@ class AgentExecutor:
         """Execute agent via plugin, A2A protocol, or OpenAI-compatible (via platform adapter). Architecture runs A2A everywhere: native A2A agents or OpenAI endpoints via the adapter."""
         if agent.plugin_config:
             return await self._execute_plugin_agent(agent, input_data)
+        validate_outbound_a2a_payload(input_data)
         if getattr(agent, "a2a_enabled", False):
             return await self._execute_a2a_agent(agent, input_data)
         # OpenAI-compatible endpoint: route through platform A2A adapter so architecture is A2A everywhere

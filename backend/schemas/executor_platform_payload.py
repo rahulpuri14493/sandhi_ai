@@ -51,6 +51,30 @@ class ExecutorAgentPayload(BaseModel):
     document_scope_restricted: Optional[bool] = None
     allowed_document_ids: Optional[List[Any]] = None
     assigned_document_names: Optional[List[Any]] = None
+    # Structured tool assignment + versioned A2A task envelope (optional for legacy jobs)
+    assigned_tools: Optional[List[Any]] = None
+    sandhi_a2a_task: Optional[Dict[str, Any]] = None
+
+    @field_validator("assigned_tools", mode="before")
+    @classmethod
+    def _assigned_tools_list_of_objects(cls, v: Any) -> Any:
+        if v is None:
+            return None
+        if not isinstance(v, list):
+            raise ValueError(f"assigned_tools must be a list or null, got {type(v).__name__}")
+        for i, item in enumerate(v):
+            if not isinstance(item, dict):
+                raise ValueError(f"assigned_tools[{i}] must be an object")
+        return v
+
+    @field_validator("sandhi_a2a_task", mode="before")
+    @classmethod
+    def _sandhi_a2a_task_object(cls, v: Any) -> Any:
+        if v is None:
+            return None
+        if not isinstance(v, dict):
+            raise ValueError(f"sandhi_a2a_task must be an object or null, got {type(v).__name__}")
+        return v
 
     @field_validator("documents", mode="before")
     @classmethod
@@ -68,7 +92,7 @@ class ExecutorAgentPayload(BaseModel):
             return None
         if isinstance(v, list):
             return v
-        raise TypeError(f"conversation must be a list or null, got {type(v).__name__}")
+        raise ValueError(f"conversation must be a list or null, got {type(v).__name__}")
 
     @field_validator("available_mcp_tools", mode="before")
     @classmethod

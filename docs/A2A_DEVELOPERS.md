@@ -56,3 +56,9 @@ Adapter implementation (run by the platform): [tools/a2a_openai_adapter/](../too
 - **Agent listing** (marketplace) can return many agents. The API supports optional **pagination** (`limit`, `offset`) so that with 200+ agents you can page results and avoid large responses. Use `GET /api/agents?limit=50&offset=0` (and optionally `X-Total-Count` or total in response) when you need to scale the list.
 
 So: the existing design works for both A2A and sequential workflows, does not require a message bus or separate registry, and scales to 200 agents without issues when listing uses pagination.
+
+---
+
+## Task envelope & tool assignment (platform → agent JSON)
+
+When a job step runs, the platform attaches a versioned **`sandhi_a2a_task`** object (plus `sandhi_trace` and `platform_a2a_schema`) to the JSON your agent receives. Mandatory fields, registry-based tool assignment, validation flags, and test pointers are documented in **[A2A task & assignment](A2A_TASK_AND_ASSIGNMENT.md)**.

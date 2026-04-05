@@ -244,8 +244,8 @@ export const jobsAPI = {
     } = { agent_ids: agentIds }
     if (workflowMode) body.workflow_mode = workflowMode
     if (stepTools?.length) body.step_tools = stepTools
-    // Include 'none' / 'names_only' (truthy strings); omit only when undefined (use job default on server).
-    if (toolVisibility != null && toolVisibility !== '') body.tool_visibility = toolVisibility
+    // Omit when undefined so the server uses the job default; all union values are non-empty strings.
+    if (toolVisibility !== undefined) body.tool_visibility = toolVisibility
     if (outputSettings) {
       if (outputSettings.write_execution_mode !== undefined) {
         body.write_execution_mode = outputSettings.write_execution_mode

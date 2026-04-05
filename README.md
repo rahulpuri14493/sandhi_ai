@@ -45,6 +45,21 @@ Sandhi AI is built so the **platform owns orchestration** and **agents focus on 
 
 For implementation details on A2A behavior, see [A2A for developers](docs/A2A_DEVELOPERS.md).
 
+### How each agent run is prepared (plain language)
+
+If you are new to the codebase, these terms describe **what the platform puts in the JSON** when it calls an agent for one step of a job:
+
+| Term | What it means for you |
+|------|------------------------|
+| **Task envelope** | A **standard block of fields** inside that JSON—like a shipping label on a package. It says which agent is running, a stable **task id** for logs, a short **payload** summary (job/step hints), **which tools** the platform attached for this step, and **who runs next** in the workflow (or `null` if this is the last step). Same shape every time so agents and integrators can rely on it. |
+| **Tool registry** | A **configurable rules file** (not Python code) that maps **kinds of work** (e.g. “research”, “SQL”) to **preferred tool types** and limits how many tools to pass through. You can tune it per deployment—**no code change**—to steer which integrations agents see first. |
+| **Assignment** | The step where the platform **chooses and orders** the actual MCP tools from your allowlists for that job/step, using the registry (and optional planner hints). **Assignment** is the decision; the **task envelope** is where that decision is written for the agent to read. |
+| **Validation** | **Automatic checks** before the platform sends the request: types and required fields, size limits, and that the task envelope matches the published contract. Bad payloads **fail fast** with a clear error instead of reaching the agent. |
+
+Full field names, JSON Schema, environment variables, and tests: **[A2A task & assignment](docs/A2A_TASK_AND_ASSIGNMENT.md)**.
+
+For where features live in the tree (backend vs frontend folders and naming), see [Codebase layout](docs/CODEBASE_LAYOUT.md).
+
 ## Product Vision
 
 Sandhi AI is the **AI agentic execution layer** for multi-agent work.
