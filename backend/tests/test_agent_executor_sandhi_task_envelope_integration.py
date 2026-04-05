@@ -1,10 +1,11 @@
 """Integration tests: executor attaches ``sandhi_a2a_task`` + ``assigned_tools`` before agent call."""
 
 import json
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 import pytest
 
+from core.config import settings
 from models.agent import Agent, AgentStatus, PricingModel
 from models.job import Job, JobStatus, WorkflowStep
 from models.user import User, UserRole
@@ -167,3 +168,79 @@ async def test_two_step_job_first_step_envelope_points_to_next_agent(db_session)
         patch.object(ex, "_execute_agent", side_effect=_capture),
     ):
         await ex._execute_one_step_core(job.id, s1.id, None)
+
+
+@pytest.mark.asyncio
+async def test_llm_tool_pick_skipped_when_tool_assignment_disabled(db_session):
+    """Planner tool-pick must not run when assignment engine is disabled (Codex P2)."""
+    biz = User(email="env-pick-gate-biz@test.com", password_hash="x", role=UserRole.BUSINESS)
+    dev = User(email="env-pick-gate-dev@test.com", password_hash="x", role=UserRole.DEVELOPER)
+    db_session.add_all([biz, dev])
+    db_session.commit()
+    db_session.refresh(biz)
+    db_session.refresh(dev)
+    agent = Agent(
+        developer_id=dev.id,
+        name="PickGateAgent",
+        price_per_task=1.0,
+        status=AgentStatus.ACTIVE,
+        pricing_model=PricingModel.PAY_PER_USE,
+        api_endpoint="http://example.invalid/pick",
+        a2a_enabled=True,
+    )
+    db_session.add(agent)
+    db_session.commit()
+    db_session.refresh(agent)
+    job = Job(
+        business_id=biz.id,
+        title="PickGateJob",
+        status=JobStatus.IN_PROGRESS,
+        description="d",
+        files=json.dumps([]),
+        conversation=json.dumps([]),
+        total_cost=1.0,
+        write_execution_mode="ui_only",
+    )
+    db_session.add(job)
+    db_session.commit()
+    db_session.refresh(job)
+    step = WorkflowStep(
+        job_id=job.id,
+        agent_id=agent.id,
+        step_order=1,
+        status="pending",
+        input_data=json.dumps(
+            {
+                "job_title": job.title,
+                "job_description": "",
+                "documents": [],
+                "conversation": [],
+                "assigned_task": "Hello",
+            }
+        ),
+    )
+    db_session.add(step)
+    db_session.commit()
+    db_session.refresh(step)
+
+    ex = AgentExecutor(db_session)
+    pick = AsyncMock(return_value=["t1"])
+
+    async def _capture(_agent, _inp):
+        return {"content": "ok"}
+
+    with (
+        patch.object(settings, "TOOL_ASSIGNMENT_ENABLED", False),
+        patch.object(settings, "TOOL_ASSIGNMENT_LLM_PICK_TOOLS", True),
+        patch.object(settings, "TOOL_ASSIGNMENT_USE_LLM", True),
+        patch("services.tool_assignment_llm.suggest_tool_names_with_llm", pick),
+        patch.object(
+            ex,
+            "_get_available_mcp_tools_async",
+            return_value=[{"name": "t1", "tool_type": "s3"}],
+        ),
+        patch.object(ex, "_execute_agent", side_effect=_capture),
+    ):
+        await ex._execute_one_step_core(job.id, step.id, None)
+
+    pick.assert_not_called()

@@ -137,7 +137,8 @@ def assign_tools_for_step(
             must = {str(x).strip() for x in must_names if str(x).strip()}
             must_tools = [t for t in tools if str(t.get("name") or "").strip() in must]
             rest = [t for t in ordered if t not in must_tools]
-            ordered = (must_tools + rest)[:max_tools]
+            target_len = max(max_tools, len(must_tools))
+            ordered = must_tools + rest[: max(0, target_len - len(must_tools))]
             assigned_meta = [_tool_meta_from_descriptor(t) for t in ordered]
 
     logger.debug(

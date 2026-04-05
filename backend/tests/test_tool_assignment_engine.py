@@ -155,6 +155,34 @@ class TestAssignToolsForStep:
         assert "must" in names
         assert len(meta) == len(ordered)
 
+    def test_must_include_two_tools_when_max_tools_two_keeps_both(self, tmp_path):
+        """max_tools=2 with two required tools in a 3+ tool pool: both required tools stay in ordered."""
+        reg_path = tmp_path / "reg.json"
+        reg_path.write_text(
+            '{"version":1,"rules":[{"id":"r","task_types":["t"],"preferred_tool_types":["s3"],'
+            '"max_tools":2}],"fallback":{"max_tools":2,"flag_unmatched":false}}',
+            encoding="utf-8",
+        )
+        reg = load_tool_assignment_registry_from_path(reg_path)
+        tools = [
+            {"name": "m1", "tool_type": "postgres"},
+            {"name": "m2", "tool_type": "mysql"},
+            {"name": "extra", "tool_type": "s3"},
+        ]
+        ordered, meta, _source, _flagged = assign_tools_for_step(
+            input_data={
+                "task_type": "t",
+                "assignment_requirements": {"must_include_tool_names": ["m1", "m2"]},
+            },
+            agent=_agent(),
+            available_mcp_tools=tools,
+            registry=reg,
+        )
+        names = [t["name"] for t in ordered]
+        assert set(names) >= {"m1", "m2"}
+        assert len(ordered) >= 2
+        assert len(meta) == len(ordered)
+
     def test_non_dict_assignment_requirements_ignored(self, tmp_path):
         reg_path = tmp_path / "reg.json"
         reg_path.write_text(

@@ -556,7 +556,8 @@ class AgentExecutor:
             visible_mcp_tools = _apply_tool_visibility(available_mcp_tools or [], tool_visibility)
             inp_for_assign = dict(input_data)
             if (
-                getattr(settings, "TOOL_ASSIGNMENT_LLM_PICK_TOOLS", True)
+                getattr(settings, "TOOL_ASSIGNMENT_ENABLED", True)
+                and getattr(settings, "TOOL_ASSIGNMENT_LLM_PICK_TOOLS", True)
                 and getattr(settings, "TOOL_ASSIGNMENT_USE_LLM", True)
                 and not inp_for_assign.get("llm_suggested_tool_names")
                 and visible_mcp_tools
