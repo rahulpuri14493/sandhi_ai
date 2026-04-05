@@ -108,6 +108,17 @@ JSONRPC_VERSION = "2.0"
 BUSINESS_ID_HEADER = "x-mcp-business-id"
 
 
+def _sandhi_correlation_log_suffix(request: Request) -> str:
+    """Optional executor correlation headers for production log filtering."""
+    parts = []
+    for hdr in ("X-Sandhi-Job-Id", "X-Sandhi-Workflow-Step-Id", "X-Sandhi-Trace-Id"):
+        v = request.headers.get(hdr) or request.headers.get(hdr.lower())
+        if v:
+            key = hdr.replace("X-Sandhi-", "").lower().replace("-", "_")
+            parts.append(f"{key}={v}")
+    return (" " + " ".join(parts)) if parts else ""
+
+
 def _get_business_id(request: Request) -> int:
     """Extract business_id from header (set by backend when calling this server)."""
     raw = request.headers.get(BUSINESS_ID_HEADER) or request.headers.get("X-MCP-Business-Id")
@@ -1389,13 +1400,14 @@ async def jsonrpc(request: Request, x_mcp_business_id: Optional[str] = Header(No
             result_text = execute_platform_tool(tool_type, config, arguments)
             is_err = result_text.startswith("Error:")
             logger.info(
-                "MCP tools/call business_id=%s tool=%s tool_type=%s is_error=%s result_chars=%s result_output=%s",
+                "MCP tools/call business_id=%s tool=%s tool_type=%s is_error=%s result_chars=%s result_output=%s%s",
                 business_id,
                 name,
                 tool_type,
                 is_err,
                 len(result_text),
                 _tool_result_for_log(result_text),
+                _sandhi_correlation_log_suffix(request),
             )
             return JSONResponse({
                 "jsonrpc": JSONRPC_VERSION,
@@ -1419,7 +1431,13 @@ async def jsonrpc(request: Request, x_mcp_business_id: Optional[str] = Header(No
                 "error": {"code": -32000, "message": "Failed to fetch tool configuration from backend"},
             })
         except Exception as e:
-            logger.error("tools/call error business_id=%s tool=%s (%s)", business_id, name, type(e).__name__)
+            logger.error(
+                "tools/call error business_id=%s tool=%s (%s)%s",
+                business_id,
+                name,
+                type(e).__name__,
+                _sandhi_correlation_log_suffix(request),
+            )
             return JSONResponse({
                 "jsonrpc": JSONRPC_VERSION,
                 "id": req_id,

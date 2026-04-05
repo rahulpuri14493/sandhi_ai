@@ -1,3 +1,4 @@
+import asyncio
 import logging
 import json
 import hashlib
@@ -7,6 +8,7 @@ from datetime import datetime
 from typing import Any, Dict, List, Optional
 import httpx
 from sqlalchemy.orm import Session
+from db.database import SessionLocal
 from models.job import Job, JobStatus, WorkflowStep
 from models.agent import Agent
 from models.communication import AgentCommunication
@@ -25,8 +27,61 @@ from core.artifact_contract import (
     extract_record_rows_from_agent_output,
     normalize_agent_output_for_artifact,
 )
+from schemas.executor_platform_payload import (
+    enrich_executor_payload_trace_only,
+    validate_and_enrich_executor_payload,
+)
 
 logger = logging.getLogger(__name__)
+
+
+def _load_step_input_json(
+    raw: Optional[str],
+    *,
+    job_id: int,
+    step_id: int,
+    step_order: int,
+) -> Dict[str, Any]:
+    """Parse WorkflowStep.input_data; raise ValueError with correlation context on failure."""
+    if not raw or not str(raw).strip():
+        return {}
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError as e:
+        raise ValueError(
+            f"WorkflowStep input_data is not valid JSON "
+            f"(job_id={job_id} workflow_step_id={step_id} step_order={step_order}): {e}"
+        ) from e
+    if not isinstance(data, dict):
+        raise ValueError(
+            f"WorkflowStep input_data must be a JSON object, got {type(data).__name__} "
+            f"(job_id={job_id} workflow_step_id={step_id} step_order={step_order})"
+        )
+    return data
+
+
+def _partition_workflow_waves(workflow_steps: List[WorkflowStep]) -> List[List[WorkflowStep]]:
+    """
+    Partition ordered workflow steps into execution waves.
+    Each wave is a maximal consecutive group where every step after the first has
+    depends_on_previous=False, so those steps may run concurrently without sharing
+    previous_step_output. The first step in a wave may still depend on the prior wave.
+    """
+    if not workflow_steps:
+        return []
+    waves: List[List[WorkflowStep]] = []
+    i = 0
+    n = len(workflow_steps)
+    while i < n:
+        wave = [workflow_steps[i]]
+        j = i
+        while j + 1 < n and not getattr(workflow_steps[j + 1], "depends_on_previous", True):
+            j += 1
+            wave.append(workflow_steps[j])
+        waves.append(wave)
+        i = j + 1
+    return waves
+
 
 # Tool types that fetch text from an external corpus (vector DB, PageIndex, etc.)
 _RETRIEVAL_MCP_TOOL_TYPES = frozenset(
@@ -268,6 +323,23 @@ class AgentExecutor:
     def __init__(self, db: Session):
         self.db = db
         self.payment_processor = PaymentProcessor(db)
+        self._mcp_correlation_job_id: Optional[int] = None
+        self._mcp_correlation_step_id: Optional[int] = None
+        self._mcp_correlation_trace_id: Optional[str] = None
+
+    def _sandhi_mcp_correlation_headers(self) -> Dict[str, str]:
+        """HTTP headers for platform/BYO MCP calls — observability in platform-mcp-server logs."""
+        h: Dict[str, str] = {}
+        jid = getattr(self, "_mcp_correlation_job_id", None)
+        sid = getattr(self, "_mcp_correlation_step_id", None)
+        tid = getattr(self, "_mcp_correlation_trace_id", None)
+        if jid is not None:
+            h["X-Sandhi-Job-Id"] = str(jid)
+        if sid is not None:
+            h["X-Sandhi-Workflow-Step-Id"] = str(sid)
+        if tid:
+            h["X-Sandhi-Trace-Id"] = str(tid)
+        return h
 
     async def _persist_output_artifact(self, job: Job, step: WorkflowStep, output_data: Dict[str, Any]) -> Dict[str, Any]:
         output_format = (getattr(job, "output_artifact_format", None) or "jsonl").strip().lower()
@@ -339,15 +411,299 @@ class AgentExecutor:
                     "sig": sig,
                 }
         timeout = float(write_spec.get("timeout_seconds") or getattr(settings, "MCP_TOOL_DEFAULT_TIMEOUT_SECONDS", 60.0))
+        extra_headers = {"X-MCP-Business-Id": str(business_id)}
+        extra_headers.update(self._sandhi_mcp_correlation_headers())
         return await mcp_call_tool(
             base_url=settings.PLATFORM_MCP_SERVER_URL.rstrip("/"),
             tool_name=tool_name,
             arguments=arguments,
             endpoint_path="/mcp",
-            extra_headers={"X-MCP-Business-Id": str(business_id)},
+            extra_headers=extra_headers,
             timeout=timeout,
         )
-    
+
+    async def _execute_one_step_core(
+        self,
+        job_id: int,
+        step_id: int,
+        previous_chain_output: Optional[Any],
+    ) -> Any:
+        """Execute a single workflow step using this executor's DB session."""
+        job = self.db.query(Job).filter(Job.id == job_id).first()
+        if not job:
+            raise ValueError("Job not found")
+        workflow_steps = (
+            self.db.query(WorkflowStep)
+            .filter(WorkflowStep.job_id == job_id)
+            .order_by(WorkflowStep.step_order)
+            .all()
+        )
+        step = self.db.query(WorkflowStep).filter(
+            WorkflowStep.id == step_id, WorkflowStep.job_id == job_id
+        ).first()
+        if not step:
+            raise ValueError(f"Workflow step {step_id} not found for job {job_id}")
+
+        self._mcp_correlation_job_id = job_id
+        self._mcp_correlation_step_id = step.id
+        self._mcp_correlation_trace_id = str(uuid.uuid4())
+        logger.info(
+            "workflow_step_mcp_context job_id=%s workflow_step_id=%s trace_id=%s",
+            job_id,
+            step.id,
+            self._mcp_correlation_trace_id,
+        )
+
+        async def _run_step_body() -> Any:
+
+            step.status = "in_progress"
+            step.started_at = datetime.utcnow()
+            self.db.commit()
+
+            self._log_action("workflow_step", step.id, "execution_started", {
+                "job_id": job_id,
+                "agent_id": step.agent_id
+            })
+
+            agent = self.db.query(Agent).filter(Agent.id == step.agent_id).first()
+            if not agent:
+                raise ValueError(f"Agent {step.agent_id} not found")
+
+            depends_on_previous = getattr(step, "depends_on_previous", True)
+            if previous_chain_output and depends_on_previous:
+                base_input = _load_step_input_json(
+                    step.input_data, job_id=job_id, step_id=step.id, step_order=step.step_order
+                )
+                input_data = {
+                    **base_input,
+                    "previous_step_output": previous_chain_output
+                }
+            else:
+                input_data = _load_step_input_json(
+                    step.input_data, job_id=job_id, step_id=step.id, step_order=step.step_order
+                )
+
+            if input_data.get("document_scope_restricted"):
+                allowed_ids_raw = input_data.get("allowed_document_ids") or []
+                allowed_ids = {str(x) for x in allowed_ids_raw if str(x).strip()}
+                docs_in_payload = input_data.get("documents") or []
+                payload_doc_ids = {str((d or {}).get("id")) for d in docs_in_payload if isinstance(d, dict) and (d or {}).get("id")}
+                if not allowed_ids:
+                    raise ValueError("Document scope restricted but allowed_document_ids is empty")
+                if payload_doc_ids and not payload_doc_ids.issubset(allowed_ids):
+                    raise ValueError(
+                        f"Policy violation: step {step.step_order} received out-of-scope BRDs. "
+                        f"allowed={sorted(allowed_ids)} payload={sorted(payload_doc_ids)}"
+                    )
+
+            job_platform_ids = _parse_allowed_ids(getattr(job, "allowed_platform_tool_ids", None))
+            job_conn_ids = _parse_allowed_ids(getattr(job, "allowed_connection_ids", None))
+            step_platform_ids = _parse_allowed_ids(getattr(step, "allowed_platform_tool_ids", None))
+            step_conn_ids = _parse_allowed_ids(getattr(step, "allowed_connection_ids", None))
+            effective_platform = step_platform_ids if step_platform_ids is not None else job_platform_ids
+            effective_conn = step_conn_ids if step_conn_ids is not None else job_conn_ids
+            if job_platform_ids is not None and effective_platform is not None:
+                effective_platform = [x for x in effective_platform if x in job_platform_ids]
+            if job_conn_ids is not None and effective_conn is not None:
+                effective_conn = [x for x in effective_conn if x in job_conn_ids]
+
+            available_mcp_tools = await self._get_available_mcp_tools_async(
+                job.business_id,
+                platform_tool_ids=effective_platform if effective_platform is not None else None,
+                connection_ids=effective_conn if effective_conn is not None else None,
+            )
+            tool_visibility = getattr(step, "tool_visibility", None) or getattr(job, "tool_visibility", None) or "full"
+            available_mcp_tools = _apply_tool_visibility(available_mcp_tools or [], tool_visibility)
+            if available_mcp_tools:
+                input_data["available_mcp_tools"] = available_mcp_tools
+                input_data["business_id"] = job.business_id
+                if step.step_order == 1:
+                    self._log_action("job", job_id, "mcp_tool_discovery", {
+                        "business_id": job.business_id,
+                        "tool_count": len(available_mcp_tools),
+                        "tool_names": [t.get("name") for t in available_mcp_tools[:20]],
+                    })
+
+            collaboration_hint = _get_workflow_collaboration_hint_from_job(job)
+            if collaboration_hint == "async_a2a":
+                peer_agents = self._get_peer_agents_for_step(workflow_steps, step, agent)
+                if peer_agents:
+                    input_data["peer_agents"] = peer_agents
+                    if step.step_order == 1:
+                        self._log_action("job", job_id, "peer_a2a_context", {
+                            "peer_count": len(peer_agents),
+                            "peer_ids": [p["agent_id"] for p in peer_agents],
+                        })
+
+            documents = input_data.get('documents', [])
+            conversation = input_data.get('conversation', [])
+
+            if not (agent.api_endpoint and (agent.api_endpoint or "").strip()):
+                raise ValueError(
+                    f"Only hired agents with an API endpoint are supported. "
+                    f"Agent '{agent.name}' (id={agent.id}) has no api_endpoint configured."
+                )
+            logger.debug("========== Executing Step %s ==========", step.step_order)
+            logger.debug("Agent: %s (hired endpoint)", agent.name)
+            logger.debug("Agent endpoint: %s", agent.api_endpoint)
+            logger.debug("Job Title: %s", input_data.get('job_title', 'N/A'))
+            logger.debug("Job Description: %s...", (input_data.get('job_description') or 'N/A')[:100])
+
+            if documents:
+                logger.debug("Found %s document(s) to send to agent", len(documents))
+                for i, doc in enumerate(documents):
+                    content_length = len(doc.get('content', '')) if doc.get('content') else 0
+                    content_preview = doc.get('content', '')[:150] if doc.get('content') else 'EMPTY'
+                    logger.debug("Document %s: %s type=%s content_length=%s preview=%s...", i + 1, doc.get('name', 'Unknown'), doc.get('type', 'unknown'), content_length, content_preview)
+            else:
+                logger.warning("No documents found in input_data")
+
+            if conversation:
+                questions = [item for item in conversation if item.get('type') == 'question']
+                answers = [item for item in conversation if item.get('type') == 'question' and item.get('answer')]
+                completions = [item for item in conversation if item.get('type') == 'completion']
+                logger.debug("Found %s conversation item(s) questions=%s answered=%s completions=%s", len(conversation), len(questions), len(answers), len(completions))
+                if completions:
+                    logger.debug("Latest completion: %s...", (completions[-1].get('message') or 'N/A')[:100])
+            else:
+                logger.warning("No conversation found in input_data")
+
+            logger.debug("=================================================")
+
+            output_data = None
+            artifact_ref = None
+            contract = _parse_output_contract(getattr(job, "output_contract", None))
+            write_mode = (getattr(job, "write_execution_mode", None) or "platform").strip().lower()
+            write_targets: List[Dict[str, Any]] = contract.get("write_targets") if isinstance(contract, dict) else []
+            write_policy = _parse_write_policy(contract, len(write_targets) if isinstance(write_targets, list) else 0)
+            write_results: List[Dict[str, Any]] = []
+            input_data["output_contract"] = contract
+            input_data["write_execution_mode"] = write_mode
+            input_data["write_targets"] = write_targets
+            if getattr(settings, "EXECUTOR_PAYLOAD_VALIDATE", True):
+                input_data = validate_and_enrich_executor_payload(
+                    input_data,
+                    job_id=job_id,
+                    workflow_step_id=step.id,
+                    step_order=step.step_order,
+                    agent_id=agent.id,
+                    total_steps=len(workflow_steps),
+                )
+            else:
+                input_data = enrich_executor_payload_trace_only(
+                    input_data,
+                    job_id=job_id,
+                    workflow_step_id=step.id,
+                    step_order=step.step_order,
+                    agent_id=agent.id,
+                    total_steps=len(workflow_steps),
+                )
+            try:
+                output_data = await self._execute_agent(agent, input_data)
+                output_data = normalize_agent_output_for_artifact(output_data)
+                output_data = _normalize_placeholder_error_values(output_data)
+                output_data = _ensure_records_for_platform_write(
+                    output_data,
+                    write_mode=write_mode,
+                    write_targets=write_targets,
+                )
+                if write_mode == "ui_only":
+                    output_format = (getattr(job, "output_artifact_format", None) or "jsonl").strip().lower()
+                    if output_format not in ("jsonl", "json"):
+                        output_format = "jsonl"
+                    artifact_ref = {
+                        "artifact_id": str(uuid.uuid4()),
+                        "storage": "inline",
+                        "inline_only": True,
+                        "format": output_format,
+                        "created_at": datetime.utcnow().isoformat(),
+                    }
+                else:
+                    artifact_ref = await self._persist_output_artifact(job, step, output_data)
+                if write_mode == "platform" and isinstance(write_targets, list) and write_targets:
+                    successful_writes = 0
+                    for target in write_targets:
+                        if not isinstance(target, dict):
+                            continue
+                        tool_name = str(target.get("tool_name", "")).strip() or None
+                        try:
+                            write_result = await self._trigger_platform_write(
+                                business_id=job.business_id,
+                                write_spec=target,
+                                artifact_ref=artifact_ref,
+                                step=step,
+                            )
+                            write_results.append({
+                                "tool_name": tool_name,
+                                "status": "success",
+                                "result": write_result,
+                            })
+                            successful_writes += 1
+                        except Exception as target_error:
+                            write_results.append({
+                                "tool_name": tool_name,
+                                "status": "failed",
+                                "error": str(target_error),
+                            })
+                            if write_policy.get("on_write_error") == "fail_job":
+                                raise
+                    if successful_writes < int(write_policy.get("min_successful_targets", 0)):
+                        raise ValueError(
+                            "Write policy violation: "
+                            f"successful_targets={successful_writes} < "
+                            f"min_successful_targets={write_policy.get('min_successful_targets')}"
+                        )
+
+                step.output_data = json.dumps({
+                    "agent_output": output_data,
+                    "artifact_ref": artifact_ref,
+                    "write_execution_mode": write_mode,
+                    "write_policy": write_policy,
+                    "write_results": write_results,
+                })
+                step.status = "completed"
+                step.completed_at = datetime.utcnow()
+                step.cost = agent.price_per_task
+            except Exception as step_error:
+                step.status = "failed"
+                step.completed_at = datetime.utcnow()
+                error_msg = str(step_error)
+                if len(error_msg) > 500:
+                    error_msg = error_msg[:500] + "..."
+                step.output_data = json.dumps({
+                    "error": error_msg,
+                    "agent_output": output_data,
+                    "artifact_ref": artifact_ref,
+                    "write_execution_mode": write_mode,
+                    "write_policy": write_policy,
+                    "write_results": write_results,
+                })
+                self.db.commit()
+
+                raise Exception(f"Workflow step {step.step_order} failed: {error_msg}") from step_error
+
+            if previous_chain_output is not None and getattr(step, "depends_on_previous", True):
+                idx = next((i for i, w in enumerate(workflow_steps) if w.id == step.id), -1)
+                if idx > 0:
+                    previous_step = workflow_steps[idx - 1]
+                    self._log_communication(previous_step, step, previous_chain_output)
+
+            self.db.commit()
+
+            self._log_action("workflow_step", step.id, "execution_completed", {
+                "job_id": job_id,
+                "agent_id": step.agent_id,
+                "output_size": len(str(output_data))
+            })
+            return output_data
+
+        try:
+            return await _run_step_body()
+        finally:
+            self._mcp_correlation_job_id = None
+            self._mcp_correlation_step_id = None
+            self._mcp_correlation_trace_id = None
+
     async def execute_job(self, job_id: int):
         """Execute a job by running all workflow steps"""
         job = self.db.query(Job).filter(Job.id == job_id).first()
@@ -369,257 +725,46 @@ class AgentExecutor:
             self.db.commit()
             return
         
-        previous_output = None
-        
+        if getattr(settings, "WORKFLOW_PARALLEL_INDEPENDENT_STEPS", True):
+            waves = _partition_workflow_waves(workflow_steps)
+        else:
+            waves = [[s] for s in workflow_steps]
+
         try:
-            # Strict sequential execution: steps run in step_order; each step gets previous_output only when depends_on_previous is True
-            for step in workflow_steps:
-                # Update step status
-                step.status = "in_progress"
-                step.started_at = datetime.utcnow()
-                self.db.commit()
-                
-                # Log execution start
-                self._log_action("workflow_step", step.id, "execution_started", {
-                    "job_id": job_id,
-                    "agent_id": step.agent_id
-                })
-                
-                # Execute agent
-                agent = self.db.query(Agent).filter(Agent.id == step.agent_id).first()
-                if not agent:
-                    raise ValueError(f"Agent {step.agent_id} not found")
-                
-                # Prepare input data
-                # Independent steps (depends_on_previous=False) do not receive previous agent output.
-                # Sequential steps receive previous_step_output for handoff.
-                depends_on_previous = getattr(step, "depends_on_previous", True)
-                if previous_output and depends_on_previous:
-                    # Merge previous output with base input data from step
-                    base_input = json.loads(step.input_data) if step.input_data else {}
-                    input_data = {
-                        **base_input,  # Job context, conversation, documents, etc.
-                        "previous_step_output": previous_output  # Output from previous agent
-                    }
-                else:
-                    # First step or independent step - use step's input data only (no previous output)
-                    input_data = json.loads(step.input_data) if step.input_data else {}
+            max_parallel = getattr(settings, "WORKFLOW_MAX_PARALLEL_STEPS", 8) or 8
+            try:
+                max_parallel = max(1, int(max_parallel))
+            except (TypeError, ValueError):
+                max_parallel = 8
+            sem = asyncio.Semaphore(max_parallel)
+            previous_chain_output: Optional[Any] = None
 
-                # Strict BRD scope guard: if step is document-restricted, ensure only allowed docs are present.
-                if input_data.get("document_scope_restricted"):
-                    allowed_ids_raw = input_data.get("allowed_document_ids") or []
-                    allowed_ids = {str(x) for x in allowed_ids_raw if str(x).strip()}
-                    docs_in_payload = input_data.get("documents") or []
-                    payload_doc_ids = {str((d or {}).get("id")) for d in docs_in_payload if isinstance(d, dict) and (d or {}).get("id")}
-                    if not allowed_ids:
-                        raise ValueError("Document scope restricted but allowed_document_ids is empty")
-                    if payload_doc_ids and not payload_doc_ids.issubset(allowed_ids):
-                        raise ValueError(
-                            f"Policy violation: step {step.step_order} received out-of-scope BRDs. "
-                            f"allowed={sorted(allowed_ids)} payload={sorted(payload_doc_ids)}"
-                        )
+            async def _run_step_isolated(st: WorkflowStep, prev: Optional[Any]) -> Any:
+                async with sem:
+                    child_db = SessionLocal()
+                    try:
+                        child_ex = AgentExecutor(child_db)
+                        return await child_ex._execute_one_step_core(job_id, st.id, prev)
+                    finally:
+                        child_db.close()
 
-                # Resolve which tools this step (agent) can use: step-level overrides; else job-level; else all business tools
-                job_platform_ids = _parse_allowed_ids(getattr(job, "allowed_platform_tool_ids", None))
-                job_conn_ids = _parse_allowed_ids(getattr(job, "allowed_connection_ids", None))
-                step_platform_ids = _parse_allowed_ids(getattr(step, "allowed_platform_tool_ids", None))
-                step_conn_ids = _parse_allowed_ids(getattr(step, "allowed_connection_ids", None))
-                # Step explicit list (including []) overrides job; else use job list; else None = all business tools
-                effective_platform = step_platform_ids if step_platform_ids is not None else job_platform_ids
-                effective_conn = step_conn_ids if step_conn_ids is not None else job_conn_ids
-                # Step can only use tools that are in job scope
-                if job_platform_ids is not None and effective_platform is not None:
-                    effective_platform = [x for x in effective_platform if x in job_platform_ids]
-                if job_conn_ids is not None and effective_conn is not None:
-                    effective_conn = [x for x in effective_conn if x in job_conn_ids]
-
-                available_mcp_tools = await self._get_available_mcp_tools_async(
-                    job.business_id,
-                    platform_tool_ids=effective_platform if effective_platform is not None else None,
-                    connection_ids=effective_conn if effective_conn is not None else None,
-                )
-                # Hybrid A2A: restrict what tool info agents see (credentials never shared)
-                tool_visibility = getattr(step, "tool_visibility", None) or getattr(job, "tool_visibility", None) or "full"
-                available_mcp_tools = _apply_tool_visibility(available_mcp_tools or [], tool_visibility)
-                if available_mcp_tools:
-                    input_data["available_mcp_tools"] = available_mcp_tools
-                    input_data["business_id"] = job.business_id
-                    if step.step_order == 1:
-                        self._log_action("job", job_id, "mcp_tool_discovery", {
-                            "business_id": job.business_id,
-                            "tool_count": len(available_mcp_tools),
-                            "tool_names": [t.get("name") for t in available_mcp_tools[:20]],
-                        })
-
-                # Hybrid A2A: peer context for async_a2a — agents can call each other; no tools/credentials shared
-                collaboration_hint = _get_workflow_collaboration_hint_from_job(job)
-                if collaboration_hint == "async_a2a":
-                    peer_agents = self._get_peer_agents_for_step(workflow_steps, step, agent)
-                    if peer_agents:
-                        input_data["peer_agents"] = peer_agents
-                        if step.step_order == 1:
-                            self._log_action("job", job_id, "peer_a2a_context", {
-                                "peer_count": len(peer_agents),
-                                "peer_ids": [p["agent_id"] for p in peer_agents],
-                            })
-                
-                # Uploaded documents are requirement documents: agent must understand them, ask questions if any, else execute and answer.
-                documents = input_data.get('documents', [])
-                conversation = input_data.get('conversation', [])
-                
-                # Execution flow: 1) Get step's input_data (job context, requirement docs, conversation).
-                # 2) Only hired agents (with api_endpoint) are supported – call agent's endpoint with api_key.
-                # 3) If agent has plugin_config → run plugin. 4) Response is stored as step output.
-                if not (agent.api_endpoint and (agent.api_endpoint or "").strip()):
-                    raise ValueError(
-                        f"Only hired agents with an API endpoint are supported. "
-                        f"Agent '{agent.name}' (id={agent.id}) has no api_endpoint configured."
+            for wave in waves:
+                wave_sorted = sorted(wave, key=lambda s: s.step_order)
+                if len(wave_sorted) == 1:
+                    st = wave_sorted[0]
+                    previous_chain_output = await self._execute_one_step_core(
+                        job_id, st.id, previous_chain_output
                     )
-                logger.debug("========== Executing Step %s ==========", step.step_order)
-                logger.debug("Agent: %s (hired endpoint)", agent.name)
-                logger.debug("Agent endpoint: %s", agent.api_endpoint)
-                logger.debug("Job Title: %s", input_data.get('job_title', 'N/A'))
-                logger.debug("Job Description: %s...", (input_data.get('job_description') or 'N/A')[:100])
-                
-                # Log documents
-                if documents:
-                    logger.debug("Found %s document(s) to send to agent", len(documents))
-                    for i, doc in enumerate(documents):
-                        content_length = len(doc.get('content', '')) if doc.get('content') else 0
-                        content_preview = doc.get('content', '')[:150] if doc.get('content') else 'EMPTY'
-                        logger.debug("Document %s: %s type=%s content_length=%s preview=%s...", i + 1, doc.get('name', 'Unknown'), doc.get('type', 'unknown'), content_length, content_preview)
                 else:
-                    logger.warning("No documents found in input_data")
-                
-                # Log conversation
-                if conversation:
-                    questions = [item for item in conversation if item.get('type') == 'question']
-                    answers = [item for item in conversation if item.get('type') == 'question' and item.get('answer')]
-                    completions = [item for item in conversation if item.get('type') == 'completion']
-                    logger.debug("Found %s conversation item(s) questions=%s answered=%s completions=%s", len(conversation), len(questions), len(answers), len(completions))
-                    if completions:
-                        logger.debug("Latest completion: %s...", (completions[-1].get('message') or 'N/A')[:100])
-                else:
-                    logger.warning("No conversation found in input_data")
-                
-                logger.debug("=================================================")
-                
-                # Execute agent (API or plugin)
-                output_data = None
-                artifact_ref = None
-                contract = _parse_output_contract(getattr(job, "output_contract", None))
-                write_mode = (getattr(job, "write_execution_mode", None) or "platform").strip().lower()
-                write_targets: List[Dict[str, Any]] = contract.get("write_targets") if isinstance(contract, dict) else []
-                write_policy = _parse_write_policy(contract, len(write_targets) if isinstance(write_targets, list) else 0)
-                write_results: List[Dict[str, Any]] = []
-                input_data["output_contract"] = contract
-                input_data["write_execution_mode"] = write_mode
-                input_data["write_targets"] = write_targets
-                try:
-                    output_data = await self._execute_agent(agent, input_data)
-                    output_data = normalize_agent_output_for_artifact(output_data)
-                    output_data = _normalize_placeholder_error_values(output_data)
-                    output_data = _ensure_records_for_platform_write(
-                        output_data,
-                        write_mode=write_mode,
-                        write_targets=write_targets,
-                    )
-                    # ui_only: keep results in step.output_data (DB) for the UI only — no S3/local artifact file, no contract writes.
-                    if write_mode == "ui_only":
-                        output_format = (getattr(job, "output_artifact_format", None) or "jsonl").strip().lower()
-                        if output_format not in ("jsonl", "json"):
-                            output_format = "jsonl"
-                        artifact_ref = {
-                            "artifact_id": str(uuid.uuid4()),
-                            "storage": "inline",
-                            "inline_only": True,
-                            "format": output_format,
-                            "created_at": datetime.utcnow().isoformat(),
-                        }
-                    else:
-                        artifact_ref = await self._persist_output_artifact(job, step, output_data)
-                    if write_mode == "platform" and isinstance(write_targets, list) and write_targets:
-                        successful_writes = 0
-                        for target in write_targets:
-                            if not isinstance(target, dict):
-                                continue
-                            tool_name = str(target.get("tool_name", "")).strip() or None
-                            try:
-                                write_result = await self._trigger_platform_write(
-                                    business_id=job.business_id,
-                                    write_spec=target,
-                                    artifact_ref=artifact_ref,
-                                    step=step,
-                                )
-                                write_results.append({
-                                    "tool_name": tool_name,
-                                    "status": "success",
-                                    "result": write_result,
-                                })
-                                successful_writes += 1
-                            except Exception as target_error:
-                                write_results.append({
-                                    "tool_name": tool_name,
-                                    "status": "failed",
-                                    "error": str(target_error),
-                                })
-                                # Policy-controlled behavior: fail immediately or continue collecting target outcomes.
-                                if write_policy.get("on_write_error") == "fail_job":
-                                    raise
-                        if successful_writes < int(write_policy.get("min_successful_targets", 0)):
-                            raise ValueError(
-                                "Write policy violation: "
-                                f"successful_targets={successful_writes} < "
-                                f"min_successful_targets={write_policy.get('min_successful_targets')}"
-                            )
+                    async with asyncio.TaskGroup() as tg:
+                        task_objs = [
+                            tg.create_task(_run_step_isolated(st, previous_chain_output))
+                            for st in wave_sorted
+                        ]
+                    results = [t.result() for t in task_objs]
+                    previous_chain_output = results[-1]
+                self.db.expire_all()
 
-                    # Update step with output + persisted artifact reference contract
-                    step.output_data = json.dumps({
-                        "agent_output": output_data,
-                        "artifact_ref": artifact_ref,
-                        "write_execution_mode": write_mode,
-                        "write_policy": write_policy,
-                        "write_results": write_results,
-                    })
-                    step.status = "completed"
-                    step.completed_at = datetime.utcnow()
-                    step.cost = agent.price_per_task
-                except Exception as step_error:
-                    # Mark step as failed
-                    step.status = "failed"
-                    step.completed_at = datetime.utcnow()
-                    error_msg = str(step_error)
-                    if len(error_msg) > 500:
-                        error_msg = error_msg[:500] + "..."
-                    # Persist error with best-effort context for postmortem debugging.
-                    step.output_data = json.dumps({
-                        "error": error_msg,
-                        "agent_output": output_data,
-                        "artifact_ref": artifact_ref,
-                        "write_execution_mode": write_mode,
-                        "write_policy": write_policy,
-                        "write_results": write_results,
-                    })
-                    self.db.commit()
-                    
-                    # Re-raise to mark job as failed
-                    raise Exception(f"Workflow step {step.step_order} failed: {error_msg}")
-                
-                # Log communication if there's a previous step
-                if previous_output is not None:
-                    previous_step = workflow_steps[workflow_steps.index(step) - 1]
-                    self._log_communication(previous_step, step, previous_output)
-                
-                previous_output = output_data
-                self.db.commit()
-                
-                # Log execution completion
-                self._log_action("workflow_step", step.id, "execution_completed", {
-                    "job_id": job_id,
-                    "agent_id": step.agent_id,
-                    "output_size": len(str(output_data))
-                })
-            
             # Mark job as completed
             job.status = JobStatus.COMPLETED
             job.execution_token = None
@@ -634,20 +779,29 @@ class AgentExecutor:
                 "total_cost": job.total_cost
             })
         
-        except Exception as e:
+        except (Exception, BaseExceptionGroup) as caught:
+            # TaskGroup raises ExceptionGroup (not a subclass of Exception); unwrap to one Exception for logging.
+            err: BaseException = caught
+            if isinstance(err, BaseExceptionGroup):
+                while isinstance(err, BaseExceptionGroup) and err.exceptions:
+                    err = err.exceptions[0]
+            if not isinstance(err, Exception):
+                raise caught
+            e = err
             # Mark job as failed with reason
             logger.exception("Job execution failed job_id=%s", job_id)
             job.status = JobStatus.FAILED
             job.execution_token = None
-            error_message = type(e).__name__
-            job.failure_reason = error_message
+            detail = str(e).strip()
+            error_message = f"{type(e).__name__}: {detail}" if detail else type(e).__name__
+            job.failure_reason = error_message[:2000]
             self.db.commit()
-            
+
             # Log error
             self._log_action("job", job_id, "failed", {
                 "error": error_message
             })
-            raise
+            raise e
     
     async def _execute_agent(self, agent: Agent, input_data: Dict[str, Any]) -> Dict[str, Any]:
         """Execute agent via plugin, A2A protocol, or OpenAI-compatible (via platform adapter). Architecture runs A2A everywhere: native A2A agents or OpenAI endpoints via the adapter."""
@@ -1342,12 +1496,14 @@ END DOCUMENT {i+1}: {doc_name}
                 endpoint_path = "/" + endpoint_path
             remote_tools: list = []
             try:
+                xh = self._sandhi_mcp_correlation_headers()
                 res = await mcp_list_tools(
                     base_url=base_url,
                     endpoint_path=endpoint_path,
                     auth_type=c.auth_type or "none",
                     credentials=creds,
                     timeout=20.0,
+                    extra_headers=xh if xh else None,
                 )
                 remote_tools = res.get("tools") or []
             except Exception as e:
@@ -1428,7 +1584,16 @@ END DOCUMENT {i+1}: {doc_name}
                 return json.dumps({"error": "External MCP tool name missing in registry."})
             creds = decrypt_json(conn.encrypted_credentials) if conn.encrypted_credentials else None
             timeout = float(getattr(settings, "MCP_TOOL_DEFAULT_TIMEOUT_SECONDS", 60.0))
+            xh = self._sandhi_mcp_correlation_headers()
             try:
+                logger.info(
+                    "byo_mcp_tools_call connection_id=%s tool=%s job_id=%s workflow_step_id=%s trace_id=%s",
+                    meta.get("connection_id"),
+                    ext_name,
+                    xh.get("X-Sandhi-Job-Id", "-"),
+                    xh.get("X-Sandhi-Workflow-Step-Id", "-"),
+                    xh.get("X-Sandhi-Trace-Id", "-"),
+                )
                 result = await mcp_call_tool(
                     base_url=conn.base_url.rstrip("/"),
                     tool_name=ext_name,
@@ -1437,9 +1602,16 @@ END DOCUMENT {i+1}: {doc_name}
                     auth_type=conn.auth_type or "none",
                     credentials=creds,
                     timeout=timeout,
+                    extra_headers=xh if xh else None,
                 )
             except Exception as e:
-                logger.exception("BYO MCP tools/call failed connection_id=%s tool=%s", meta.get("connection_id"), ext_name)
+                logger.exception(
+                    "BYO MCP tools/call failed connection_id=%s tool=%s job_id=%s workflow_step_id=%s",
+                    meta.get("connection_id"),
+                    ext_name,
+                    xh.get("X-Sandhi-Job-Id"),
+                    xh.get("X-Sandhi-Workflow-Step-Id"),
+                )
                 return json.dumps({"error": type(e).__name__})
             return self._mcp_tool_result_to_text(result)
         args = arguments if isinstance(arguments, dict) else {}
@@ -1502,7 +1674,17 @@ END DOCUMENT {i+1}: {doc_name}
         if not base:
             return json.dumps({"error": "Platform MCP server not configured"})
         extra_headers = {"X-MCP-Business-Id": str(business_id)}
+        extra_headers.update(self._sandhi_mcp_correlation_headers())
+        corr = self._sandhi_mcp_correlation_headers()
         try:
+            logger.info(
+                "platform_mcp_tools_call tool_name=%s business_id=%s job_id=%s workflow_step_id=%s trace_id=%s",
+                tool_name,
+                business_id,
+                corr.get("X-Sandhi-Job-Id", "-"),
+                corr.get("X-Sandhi-Workflow-Step-Id", "-"),
+                corr.get("X-Sandhi-Trace-Id", "-"),
+            )
             result = await mcp_call_tool(
                 base_url=base,
                 tool_name=tool_name,
@@ -1512,7 +1694,13 @@ END DOCUMENT {i+1}: {doc_name}
                 extra_headers=extra_headers,
             )
         except Exception as e:
-            logger.exception("Platform MCP tools/call failed tool_name=%s", tool_name)
+            logger.exception(
+                "Platform MCP tools/call failed tool_name=%s business_id=%s job_id=%s workflow_step_id=%s",
+                tool_name,
+                business_id,
+                corr.get("X-Sandhi-Job-Id"),
+                corr.get("X-Sandhi-Workflow-Step-Id"),
+            )
             return json.dumps({"error": type(e).__name__})
         return self._mcp_tool_result_to_text(result)
 

@@ -212,25 +212,22 @@ class WorkflowBuilder:
                 self.db.query(AgentCommunication).filter(comm_filter).delete(synchronize_session=False)
         self.db.query(WorkflowStep).filter(WorkflowStep.job_id == job_id).delete(synchronize_session=False)
         
-        # When no step_tools provided (e.g. "From BRD/document"): assign job-level tools to every step so selection is saved and visible when job is opened
-        job_platform_ids = None
-        job_conn_ids = None
-        if not step_tools:
-            if getattr(job, "allowed_platform_tool_ids", None):
-                try:
-                    parsed = json.loads(job.allowed_platform_tool_ids)
-                    if isinstance(parsed, list) and len(parsed) > 0:
-                        job_platform_ids = [int(x) for x in parsed if x is not None]
-                except (TypeError, ValueError, json.JSONDecodeError):
-                    pass
-            if getattr(job, "allowed_connection_ids", None):
-                try:
-                    parsed = json.loads(job.allowed_connection_ids)
-                    if isinstance(parsed, list) and len(parsed) > 0:
-                        job_conn_ids = [int(x) for x in parsed if x is not None]
-                except (TypeError, ValueError, json.JSONDecodeError):
-                    pass
-        
+        def _parse_job_tool_allowlist(raw) -> Optional[list]:
+            if not raw:
+                return None
+            try:
+                parsed = json.loads(raw)
+                if isinstance(parsed, list):
+                    return [int(x) for x in parsed if x is not None]
+            except (TypeError, ValueError, json.JSONDecodeError):
+                pass
+            return None
+
+        # Job-level allowlists: used when step_tools is absent, or to fill per-step defaults when
+        # the client sends step_tools with tool_visibility but omits IDs (inherit job scope).
+        job_platform_ids = _parse_job_tool_allowlist(getattr(job, "allowed_platform_tool_ids", None))
+        job_conn_ids = _parse_job_tool_allowlist(getattr(job, "allowed_connection_ids", None))
+
         # Create workflow steps - each agent gets assigned task + base context
         steps = []
         for idx, agent in enumerate(agents):
@@ -284,12 +281,18 @@ class WorkflowBuilder:
             if step_tools:
                 for st in step_tools:
                     if st.get("agent_index") == idx:
-                        step_platform = st.get("allowed_platform_tool_ids")
-                        step_conn = st.get("allowed_connection_ids")
+                        # Only override when the client sent an explicit list (including []); None = inherit job allowlist.
+                        if st.get("allowed_platform_tool_ids") is not None:
+                            step_platform = st.get("allowed_platform_tool_ids")
+                        if st.get("allowed_connection_ids") is not None:
+                            step_conn = st.get("allowed_connection_ids")
                         step_tool_visibility = st.get("tool_visibility")
                         break
+                if step_platform is None and job_platform_ids is not None:
+                    step_platform = job_platform_ids
+                if step_conn is None and job_conn_ids is not None:
+                    step_conn = job_conn_ids
             else:
-                # Auto-assign job-level tools to this step (From BRD/document: tools selection by system, saved for completed job view)
                 if job_platform_ids is not None:
                     step_platform = job_platform_ids
                 if job_conn_ids is not None:
@@ -302,8 +305,8 @@ class WorkflowBuilder:
                 input_data=json.dumps(step_input_data),
                 status="pending",
                 depends_on_previous=depends_on_previous,
-                allowed_platform_tool_ids=json.dumps(step_platform) if step_platform else None,
-                allowed_connection_ids=json.dumps(step_conn) if step_conn else None,
+                allowed_platform_tool_ids=json.dumps(step_platform) if step_platform is not None else None,
+                allowed_connection_ids=json.dumps(step_conn) if step_conn is not None else None,
                 tool_visibility=step_visibility,
             )
             self.db.add(step)

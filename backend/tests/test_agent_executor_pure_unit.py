@@ -9,6 +9,32 @@ import pytest
 import services.agent_executor as ae
 
 
+def test_load_step_input_json_empty():
+    assert ae._load_step_input_json(None, job_id=1, step_id=2, step_order=1) == {}
+    assert ae._load_step_input_json("", job_id=1, step_id=2, step_order=1) == {}
+    assert ae._load_step_input_json("   ", job_id=1, step_id=2, step_order=1) == {}
+
+
+def test_load_step_input_json_valid():
+    d = ae._load_step_input_json(
+        '{"job_title":"x","documents":[]}',
+        job_id=7,
+        step_id=8,
+        step_order=1,
+    )
+    assert d["job_title"] == "x"
+
+
+def test_load_step_input_json_invalid():
+    with pytest.raises(ValueError, match="not valid JSON"):
+        ae._load_step_input_json("{", job_id=1, step_id=2, step_order=1)
+
+
+def test_load_step_input_json_not_object():
+    with pytest.raises(ValueError, match="must be a JSON object"):
+        ae._load_step_input_json("[1]", job_id=1, step_id=2, step_order=1)
+
+
 def test_sign_trusted_bootstrap_payload_no_secret(monkeypatch):
     monkeypatch.setattr(ae.settings, "MCP_INTERNAL_SECRET", "")
     assert ae._sign_trusted_bootstrap_payload(
@@ -77,6 +103,71 @@ def test_parse_output_contract():
     assert ae._parse_output_contract("bad") == {}
     assert ae._parse_output_contract(json.dumps({"a": 1})) == {"a": 1}
     assert ae._parse_output_contract(json.dumps([1])) == {}
+
+
+def test_partition_workflow_waves_empty():
+    assert ae._partition_workflow_waves([]) == []
+
+
+def test_partition_workflow_waves_all_sequential():
+    s1 = SimpleNamespace(id=1, step_order=1, depends_on_previous=True)
+    s2 = SimpleNamespace(id=2, step_order=2, depends_on_previous=True)
+    s3 = SimpleNamespace(id=3, step_order=3, depends_on_previous=True)
+    steps = [s1, s2, s3]
+    waves = ae._partition_workflow_waves(steps)
+    assert waves == [[s1], [s2], [s3]]
+
+
+def test_partition_workflow_waves_independent_run_together():
+    s1 = SimpleNamespace(id=1, step_order=1, depends_on_previous=True)
+    s2 = SimpleNamespace(id=2, step_order=2, depends_on_previous=False)
+    s3 = SimpleNamespace(id=3, step_order=3, depends_on_previous=False)
+    s4 = SimpleNamespace(id=4, step_order=4, depends_on_previous=True)
+    steps = [s1, s2, s3, s4]
+    waves = ae._partition_workflow_waves(steps)
+    assert waves == [[s1, s2, s3], [s4]]
+
+
+def test_partition_workflow_waves_single_step():
+    s1 = SimpleNamespace(id=1, step_order=1, depends_on_previous=True)
+    assert ae._partition_workflow_waves([s1]) == [[s1]]
+
+
+def test_partition_workflow_waves_first_independent_then_two_parallel():
+    """First step alone (no prior); second and third independent of each other → one wave of three."""
+    s1 = SimpleNamespace(id=1, step_order=1, depends_on_previous=False)
+    s2 = SimpleNamespace(id=2, step_order=2, depends_on_previous=False)
+    s3 = SimpleNamespace(id=3, step_order=3, depends_on_previous=False)
+    waves = ae._partition_workflow_waves([s1, s2, s3])
+    assert waves == [[s1, s2, s3]]
+
+
+def test_partition_workflow_waves_alternating_dependent_independent():
+    """T, F, T, F → [s1,s2], [s3,s4] — each dependent step starts a new wave."""
+    s1 = SimpleNamespace(id=1, step_order=1, depends_on_previous=True)
+    s2 = SimpleNamespace(id=2, step_order=2, depends_on_previous=False)
+    s3 = SimpleNamespace(id=3, step_order=3, depends_on_previous=True)
+    s4 = SimpleNamespace(id=4, step_order=4, depends_on_previous=False)
+    waves = ae._partition_workflow_waves([s1, s2, s3, s4])
+    assert waves == [[s1, s2], [s3, s4]]
+
+
+def test_partition_workflow_waves_missing_depends_attr_defaults_sequential():
+    """getattr(..., True) when depends_on_previous is absent → no parallel merge."""
+    s1 = SimpleNamespace(id=1, step_order=1)
+    s2 = SimpleNamespace(id=2, step_order=2)
+    s3 = SimpleNamespace(id=3, step_order=3)
+    waves = ae._partition_workflow_waves([s1, s2, s3])
+    assert waves == [[s1], [s2], [s3]]
+
+
+def test_partition_workflow_waves_third_independent_joins_prior_wave():
+    """T, T, F — step 3 has depends_on_previous=False so it merges into the same wave as step 2."""
+    s1 = SimpleNamespace(id=1, step_order=1, depends_on_previous=True)
+    s2 = SimpleNamespace(id=2, step_order=2, depends_on_previous=True)
+    s3 = SimpleNamespace(id=3, step_order=3, depends_on_previous=False)
+    waves = ae._partition_workflow_waves([s1, s2, s3])
+    assert waves == [[s1], [s2, s3]]
 
 
 def test_parse_write_policy():

@@ -26,6 +26,8 @@ class Settings(BaseSettings):
     EXTERNAL_API_BASE_URL: str = "http://localhost:8000"
     # A2A adapter: when set, OpenAI-compatible agents are called via this A2A endpoint (platform runs A2A everywhere)
     A2A_ADAPTER_URL: str = "http://a2a-openai-adapter:8080"
+    # Validate executor→agent JSON payloads (types + sandhi_trace). Set false only as a temporary escape hatch.
+    EXECUTOR_PAYLOAD_VALIDATE: bool = True
     # Platform MCP server: URL for the platform-hosted MCP server (tool discovery + invocation for agents)
     PLATFORM_MCP_SERVER_URL: str = "http://platform-mcp-server:8081"
     # Internal secret for platform MCP server and backend-to-MCP-server calls (same secret in both)
@@ -117,5 +119,9 @@ class Settings(BaseSettings):
     # When True, use leftmost X-Forwarded-For for the client IP (trusted reverse proxy only).
     # Default False: ignore X-Forwarded-For so clients cannot spoof IPs and bypass limits.
     RATE_LIMIT_TRUST_PROXY_HEADERS: bool = False
+    # When True, consecutive steps with depends_on_previous=False run in parallel (separate DB sessions).
+    WORKFLOW_PARALLEL_INDEPENDENT_STEPS: bool = True
+    # Cap concurrent step executions per job (semaphore inside each parallel wave).
+    WORKFLOW_MAX_PARALLEL_STEPS: int = 8
 
 settings = Settings()

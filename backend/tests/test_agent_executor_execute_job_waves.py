@@ -1,0 +1,516 @@
+"""Corner cases and coverage for AgentExecutor.execute_job wave scheduling and _execute_one_step_core."""
+import asyncio
+import json
+import time
+import uuid
+from unittest.mock import AsyncMock, patch
+
+import pytest
+
+from models.agent import Agent
+from models.job import Job, JobStatus, WorkflowStep
+from models.user import User, UserRole
+from services import agent_executor as ae
+from services.agent_executor import AgentExecutor
+
+
+def _create_job_with_steps(
+    db_session,
+    *,
+    depends_on_previous_list: list,
+    total_cost: float | None = None,
+    write_execution_mode: str = "ui_only",
+):
+    """
+    Build a job with len(depends_on_previous_list) steps, one agent per step.
+    depends_on_previous_list[i] is stored on WorkflowStep at step_order i+1.
+    """
+    n = len(depends_on_previous_list)
+    assert n >= 1
+    unique = uuid.uuid4().hex[:8]
+    business = User(
+        email=f"biz-{unique}@t.com",
+        password_hash="h",
+        role=UserRole.BUSINESS,
+    )
+    dev = User(
+        email=f"dev-{unique}@t.com",
+        password_hash="h",
+        role=UserRole.DEVELOPER,
+    )
+    db_session.add_all([business, dev])
+    db_session.commit()
+    db_session.refresh(business)
+    db_session.refresh(dev)
+
+    agents = []
+    for i in range(n):
+        a = Agent(
+            developer_id=dev.id,
+            name=f"Agent-{i}-{unique}",
+            price_per_task=1.0,
+            price_per_communication=0.1,
+            api_endpoint=f"http://example.invalid/a{i}",
+            a2a_enabled=True,
+        )
+        db_session.add(a)
+        agents.append(a)
+    db_session.commit()
+    for a in agents:
+        db_session.refresh(a)
+
+    if total_cost is None:
+        total_cost = float(n)
+
+    job = Job(
+        business_id=business.id,
+        title=f"job-{unique}",
+        status=JobStatus.IN_PROGRESS,
+        files=json.dumps([]),
+        conversation=json.dumps([]),
+        total_cost=total_cost,
+        write_execution_mode=write_execution_mode,
+    )
+    db_session.add(job)
+    db_session.commit()
+    db_session.refresh(job)
+
+    base = {"job_title": job.title, "job_description": "", "documents": [], "conversation": []}
+    steps = []
+    for i in range(n):
+        dep = depends_on_previous_list[i]
+        st = WorkflowStep(
+            job_id=job.id,
+            agent_id=agents[i].id,
+            step_order=i + 1,
+            status="pending",
+            input_data=json.dumps(base),
+            depends_on_previous=dep,
+        )
+        db_session.add(st)
+        steps.append(st)
+    db_session.commit()
+    for st in steps:
+        db_session.refresh(st)
+    return job, steps, agents
+
+
+@pytest.mark.asyncio
+async def test_execute_job_raises_when_job_missing(db_session):
+    executor = AgentExecutor(db_session)
+    with pytest.raises(ValueError, match="Job not found"):
+        await executor.execute_job(9_999_001)
+
+
+@pytest.mark.asyncio
+async def test_execute_job_no_workflow_steps_marks_failed(db_session):
+    unique = uuid.uuid4().hex[:8]
+    business = User(
+        email=f"biz-{unique}@t.com",
+        password_hash="h",
+        role=UserRole.BUSINESS,
+    )
+    db_session.add(business)
+    db_session.commit()
+    db_session.refresh(business)
+    job = Job(
+        business_id=business.id,
+        title="empty",
+        status=JobStatus.IN_PROGRESS,
+        files=json.dumps([]),
+        conversation=json.dumps([]),
+        total_cost=0.0,
+    )
+    db_session.add(job)
+    db_session.commit()
+    db_session.refresh(job)
+
+    executor = AgentExecutor(db_session)
+    await executor.execute_job(job.id)
+
+    db_session.refresh(job)
+    assert job.status == JobStatus.FAILED
+    assert "No workflow steps" in (job.failure_reason or "")
+
+
+@pytest.mark.asyncio
+async def test_execute_one_step_core_job_not_found(db_session):
+    ex = AgentExecutor(db_session)
+    with pytest.raises(ValueError, match="Job not found"):
+        await ex._execute_one_step_core(9_999_002, 1, None)
+
+
+@pytest.mark.asyncio
+async def test_execute_one_step_core_step_not_found(db_session):
+    unique = uuid.uuid4().hex[:8]
+    business = User(email=f"b2-{unique}@t.com", password_hash="h", role=UserRole.BUSINESS)
+    dev = User(email=f"d2-{unique}@t.com", password_hash="h", role=UserRole.DEVELOPER)
+    db_session.add_all([business, dev])
+    db_session.commit()
+    db_session.refresh(business)
+    db_session.refresh(dev)
+    agent = Agent(
+        developer_id=dev.id,
+        name="A",
+        price_per_task=1.0,
+        price_per_communication=0.1,
+        api_endpoint="http://example.invalid/a",
+        a2a_enabled=True,
+    )
+    db_session.add(agent)
+    db_session.commit()
+    db_session.refresh(agent)
+    job = Job(
+        business_id=business.id,
+        title="j",
+        status=JobStatus.IN_PROGRESS,
+        files=json.dumps([]),
+        conversation=json.dumps([]),
+        total_cost=1.0,
+        write_execution_mode="ui_only",
+    )
+    db_session.add(job)
+    db_session.commit()
+    db_session.refresh(job)
+
+    ex = AgentExecutor(db_session)
+    with pytest.raises(ValueError, match="Workflow step .* not found"):
+        await ex._execute_one_step_core(job.id, 9_999_003, None)
+
+
+def _minimal_job_with_two_independent_steps(db_session):
+    job, steps, _agents = _create_job_with_steps(db_session, depends_on_previous_list=[True, False])
+    return job, steps[0], steps[1]
+
+
+@pytest.mark.asyncio
+async def test_single_step_job_completes(db_session):
+    job, steps, _ = _create_job_with_steps(db_session, depends_on_previous_list=[True])
+
+    async def fake_core(self, job_id, step_id, prev):
+        assert prev is None
+        return {"done": True}
+
+    with patch.object(AgentExecutor, "_execute_one_step_core", new=fake_core):
+        executor = AgentExecutor(db_session)
+        await executor.execute_job(job.id)
+
+    db_session.refresh(job)
+    assert job.status == JobStatus.COMPLETED
+
+
+@pytest.mark.asyncio
+async def test_parallel_wave_invokes_core_concurrently(db_session):
+    """Two independent steps in one wave should start both cores before either long sleep ends."""
+    job, s1, s2 = _minimal_job_with_two_independent_steps(db_session)
+    starts = {}
+
+    async def fake_core(self, job_id, step_id, prev):
+        starts[step_id] = time.monotonic()
+        await asyncio.sleep(0.15)
+        return {"step_id": step_id}
+
+    with patch.object(AgentExecutor, "_execute_one_step_core", new=fake_core):
+        executor = AgentExecutor(db_session)
+        await executor.execute_job(job.id)
+
+    t1, t2 = starts[s1.id], starts[s2.id]
+    assert abs(t1 - t2) < 0.08, "both steps should start close together when parallel"
+
+
+@pytest.mark.asyncio
+async def test_three_step_parallel_wave_all_receive_none_previous(db_session):
+    job, steps, _ = _create_job_with_steps(
+        db_session,
+        depends_on_previous_list=[True, False, False],
+    )
+    received = {}
+
+    async def fake_core(self, job_id, step_id, prev):
+        received[step_id] = prev
+        return {"id": step_id}
+
+    with patch.object(AgentExecutor, "_execute_one_step_core", new=fake_core):
+        await AgentExecutor(db_session).execute_job(job.id)
+
+    for st in steps:
+        assert received[st.id] is None
+
+
+@pytest.mark.asyncio
+async def test_after_parallel_wave_next_step_gets_last_step_order_output(db_session):
+    """
+    Wave [1,2] parallel → previous_chain_output = results[-1] = highest step_order in wave.
+    Step 3 (depends) must receive step 2's return value, not step 1's.
+    """
+    job, steps, _ = _create_job_with_steps(
+        db_session,
+        depends_on_previous_list=[True, False, True],
+    )
+    s1, s2, s3 = steps
+
+    async def fake_core(self, job_id, step_id, prev):
+        if step_id == s1.id:
+            assert prev is None
+            return {"wave": 1, "step_order": 1}
+        if step_id == s2.id:
+            assert prev is None
+            return {"wave": 1, "step_order": 2}
+        if step_id == s3.id:
+            assert prev == {"wave": 1, "step_order": 2}
+            return {"wave": 2}
+        raise AssertionError("unknown step")
+
+    with patch.object(AgentExecutor, "_execute_one_step_core", new=fake_core):
+        await AgentExecutor(db_session).execute_job(job.id)
+
+    db_session.refresh(job)
+    assert job.status == JobStatus.COMPLETED
+
+
+@pytest.mark.asyncio
+async def test_parallel_disabled_runs_sequential_single_step_waves(db_session):
+    job, s1, s2 = _minimal_job_with_two_independent_steps(db_session)
+    order = []
+
+    async def fake_core(self, job_id, step_id, prev):
+        order.append(step_id)
+        await asyncio.sleep(0.02)
+        return {"step_id": step_id}
+
+    with patch.object(ae.settings, "WORKFLOW_PARALLEL_INDEPENDENT_STEPS", False):
+        with patch.object(AgentExecutor, "_execute_one_step_core", new=fake_core):
+            executor = AgentExecutor(db_session)
+            await executor.execute_job(job.id)
+
+    assert order == [s1.id, s2.id]
+
+
+@pytest.mark.asyncio
+async def test_invalid_max_parallel_falls_back_to_eight(db_session):
+    job, _s1, _s2 = _minimal_job_with_two_independent_steps(db_session)
+
+    async def fake_core(self, job_id, step_id, prev):
+        return {"step_id": step_id}
+
+    with patch.object(ae.settings, "WORKFLOW_MAX_PARALLEL_STEPS", "not-an-int"):
+        with patch.object(AgentExecutor, "_execute_one_step_core", new=fake_core):
+            executor = AgentExecutor(db_session)
+            await executor.execute_job(job.id)
+
+    db_session.refresh(job)
+    assert job.status == JobStatus.COMPLETED
+
+
+@pytest.mark.asyncio
+async def test_max_parallel_zero_coerces_to_eight_via_or_branch(db_session):
+    """`getattr(...) or 8` treats 0 as falsy, so concurrency cap becomes 8."""
+    job, _s1, _s2 = _minimal_job_with_two_independent_steps(db_session)
+
+    async def fake_core(self, job_id, step_id, prev):
+        return {"ok": True}
+
+    with patch.object(ae.settings, "WORKFLOW_MAX_PARALLEL_STEPS", 0):
+        with patch.object(AgentExecutor, "_execute_one_step_core", new=fake_core):
+            await AgentExecutor(db_session).execute_job(job.id)
+
+    db_session.refresh(job)
+    assert job.status == JobStatus.COMPLETED
+
+
+@pytest.mark.asyncio
+async def test_max_parallel_negative_int_becomes_one(db_session):
+    job, _s1, _s2 = _minimal_job_with_two_independent_steps(db_session)
+
+    async def fake_core(self, job_id, step_id, prev):
+        return {"ok": True}
+
+    with patch.object(ae.settings, "WORKFLOW_MAX_PARALLEL_STEPS", -5):
+        with patch.object(AgentExecutor, "_execute_one_step_core", new=fake_core):
+            await AgentExecutor(db_session).execute_job(job.id)
+
+    db_session.refresh(job)
+    assert job.status == JobStatus.COMPLETED
+
+
+@pytest.mark.asyncio
+async def test_max_parallel_float_truncates_to_int(db_session):
+    job, _s1, _s2 = _minimal_job_with_two_independent_steps(db_session)
+
+    async def fake_core(self, job_id, step_id, prev):
+        return {"ok": True}
+
+    with patch.object(ae.settings, "WORKFLOW_MAX_PARALLEL_STEPS", 3.7):
+        with patch.object(AgentExecutor, "_execute_one_step_core", new=fake_core):
+            await AgentExecutor(db_session).execute_job(job.id)
+
+    db_session.refresh(job)
+    assert job.status == JobStatus.COMPLETED
+
+
+@pytest.mark.asyncio
+async def test_parallel_wave_failure_marks_job_failed(db_session):
+    job, s1, s2 = _minimal_job_with_two_independent_steps(db_session)
+
+    async def fake_core(self, job_id, step_id, prev):
+        if step_id == s2.id:
+            raise RuntimeError("step2 failed")
+        await asyncio.sleep(0.05)
+        return {"ok": True}
+
+    with patch.object(AgentExecutor, "_execute_one_step_core", new=fake_core):
+        executor = AgentExecutor(db_session)
+        with pytest.raises(RuntimeError, match="step2 failed"):
+            await executor.execute_job(job.id)
+
+    db_session.refresh(job)
+    assert job.status == JobStatus.FAILED
+    assert "step2 failed" in (job.failure_reason or "")
+
+
+@pytest.mark.asyncio
+async def test_sequential_first_step_failure_marks_job_failed(db_session):
+    """First wave is a single step (both steps depend) → no TaskGroup; failure is plain Exception."""
+    job, steps, _ = _create_job_with_steps(db_session, depends_on_previous_list=[True, True])
+    s1, _s2 = steps
+
+    async def fake_core(self, job_id, step_id, prev):
+        if step_id == s1.id:
+            raise RuntimeError("wave1 failed")
+        return {"ok": True}
+
+    with patch.object(AgentExecutor, "_execute_one_step_core", new=fake_core):
+        with pytest.raises(RuntimeError, match="wave1 failed"):
+            await AgentExecutor(db_session).execute_job(job.id)
+
+    db_session.refresh(job)
+    assert job.status == JobStatus.FAILED
+    assert "wave1 failed" in (job.failure_reason or "")
+
+
+@pytest.mark.asyncio
+async def test_core_logs_communication_when_step_depends_on_previous(db_session):
+    job, steps, _ = _create_job_with_steps(db_session, depends_on_previous_list=[True, True])
+    s1, s2 = steps
+    ex = AgentExecutor(db_session)
+
+    with (
+        patch.object(ex, "_get_available_mcp_tools_async", new_callable=AsyncMock, return_value=[]),
+        patch.object(ex, "_execute_agent", new_callable=AsyncMock, return_value={"content": "ok"}),
+    ):
+        with patch.object(AgentExecutor, "_log_communication") as log_c:
+            await ex._execute_one_step_core(job.id, s1.id, None)
+        log_c.assert_not_called()
+
+        chain = {"from_step": 1}
+        with patch.object(AgentExecutor, "_log_communication") as log_c:
+            await ex._execute_one_step_core(job.id, s2.id, chain)
+        log_c.assert_called_once()
+        args = log_c.call_args[0]
+        assert args[0].id == s1.id and args[1].id == s2.id
+        assert args[2] == chain
+
+
+@pytest.mark.asyncio
+async def test_core_skips_communication_when_step_independent_even_with_chain(db_session):
+    """Parallel semantics: previous_chain may be set but independent steps must not log handoff."""
+    job, steps, _ = _create_job_with_steps(db_session, depends_on_previous_list=[True, False])
+    _s1, s2 = steps
+    ex = AgentExecutor(db_session)
+
+    with (
+        patch.object(ex, "_get_available_mcp_tools_async", new_callable=AsyncMock, return_value=[]),
+        patch.object(ex, "_execute_agent", new_callable=AsyncMock, return_value={"content": "ok"}),
+    ):
+        with patch.object(AgentExecutor, "_log_communication") as log_c:
+            await ex._execute_one_step_core(job.id, s2.id, {"stale": True})
+        log_c.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_alternating_waves_sequential_then_parallel_then_sequential(db_session):
+    """
+    Partition T,F,T,F → waves [[s1,s2],[s3,s4]]. Step 3 and 4 both get chain from step 2 output.
+    """
+    job, steps, _ = _create_job_with_steps(
+        db_session,
+        depends_on_previous_list=[True, False, True, False],
+    )
+    s1, s2, s3, s4 = steps
+
+    async def fake_core(self, job_id, step_id, prev):
+        if step_id == s1.id:
+            assert prev is None
+            return {"order": 1}
+        if step_id == s2.id:
+            assert prev is None
+            return {"order": 2}
+        if step_id == s3.id:
+            assert prev == {"order": 2}
+            return {"order": 3}
+        if step_id == s4.id:
+            assert prev == {"order": 2}
+            return {"order": 4}
+        raise AssertionError(step_id)
+
+    with patch.object(AgentExecutor, "_execute_one_step_core", new=fake_core):
+        await AgentExecutor(db_session).execute_job(job.id)
+
+    db_session.refresh(job)
+    assert job.status == JobStatus.COMPLETED
+
+
+@pytest.mark.asyncio
+async def test_semaphore_limits_parallel_starts_when_max_parallel_one(db_session):
+    """With cap 1, parallel wave runs cores one-at-a-time (second start after first sleep)."""
+    job, steps, _ = _create_job_with_steps(
+        db_session,
+        depends_on_previous_list=[True, False, False],
+    )
+    events = []
+
+    async def fake_core(self, job_id, step_id, prev):
+        t0 = time.monotonic()
+        events.append(("start", step_id, t0))
+        await asyncio.sleep(0.07)
+        events.append(("end", step_id, time.monotonic()))
+        return {"id": step_id}
+
+    with patch.object(ae.settings, "WORKFLOW_MAX_PARALLEL_STEPS", 1):
+        with patch.object(AgentExecutor, "_execute_one_step_core", new=fake_core):
+            await AgentExecutor(db_session).execute_job(job.id)
+
+    starts = [e for e in events if e[0] == "start"]
+    assert len(starts) == 3
+    # Second start should not happen until ~one sleep after first start (serialized by semaphore)
+    assert starts[1][2] >= starts[0][2] + 0.055
+    assert starts[2][2] >= starts[1][2] + 0.055
+
+
+@pytest.mark.asyncio
+async def test_nested_exceptiongroup_unwraps_to_inner_exception(db_session):
+    """execute_job handler walks BaseExceptionGroup to the first leaf for failure_reason."""
+
+    class _FakeTaskGroup:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            raise BaseExceptionGroup(
+                "multi",
+                [ValueError("inner leaf")],
+            )
+
+    job, _s1, _s2 = _minimal_job_with_two_independent_steps(db_session)
+
+    async def fake_core(self, job_id, step_id, prev):
+        return {"ok": True}
+
+    with patch.object(asyncio, "TaskGroup", _FakeTaskGroup):
+        with patch.object(AgentExecutor, "_execute_one_step_core", new=fake_core):
+            with pytest.raises(ValueError, match="inner leaf"):
+                await AgentExecutor(db_session).execute_job(job.id)
+
+    db_session.refresh(job)
+    assert job.status == JobStatus.FAILED
+    assert "inner leaf" in (job.failure_reason or "")

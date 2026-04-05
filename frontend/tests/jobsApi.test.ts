@@ -65,6 +65,44 @@ describe('jobsAPI', () => {
       const form = mockPost.mock.calls[0][1] as FormData
       expect(form.has('tool_visibility')).toBe(false)
     })
+
+    it('appends empty allowlists as JSON arrays when explicitly provided', async () => {
+      await jobsAPI.create({
+        title: 'Empty scope',
+        allowed_platform_tool_ids: [],
+        allowed_connection_ids: [],
+      })
+      const form = mockPost.mock.calls[0][1] as FormData
+      expect(form.get('allowed_platform_tool_ids')).toBe(JSON.stringify([]))
+      expect(form.get('allowed_connection_ids')).toBe(JSON.stringify([]))
+    })
+  })
+
+  describe('update', () => {
+    it('appends empty allowlists when arrays are provided', async () => {
+      const appendSpy = vi.spyOn(FormData.prototype, 'append')
+      await jobsAPI.update(5, {
+        title: 'T',
+        allowed_platform_tool_ids: [],
+        allowed_connection_ids: [],
+        tool_visibility: 'none',
+      })
+      expect(mockPut).toHaveBeenCalled()
+      expect(appendSpy).toHaveBeenCalledWith('allowed_platform_tool_ids', JSON.stringify([]))
+      expect(appendSpy).toHaveBeenCalledWith('allowed_connection_ids', JSON.stringify([]))
+      expect(appendSpy).toHaveBeenCalledWith('tool_visibility', 'none')
+      appendSpy.mockRestore()
+    })
+
+    it('does not append allowlists when omitted', async () => {
+      const appendSpy = vi.spyOn(FormData.prototype, 'append')
+      await jobsAPI.update(5, { title: 'Only title' })
+      const allowPlatformCalls = appendSpy.mock.calls.filter((c) => c[0] === 'allowed_platform_tool_ids')
+      const allowConnCalls = appendSpy.mock.calls.filter((c) => c[0] === 'allowed_connection_ids')
+      expect(allowPlatformCalls).toHaveLength(0)
+      expect(allowConnCalls).toHaveLength(0)
+      appendSpy.mockRestore()
+    })
   })
 
   describe('autoSplitWorkflow', () => {
