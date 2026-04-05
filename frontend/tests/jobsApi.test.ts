@@ -129,6 +129,24 @@ describe('jobsAPI', () => {
       await jobsAPI.autoSplitWorkflow(1, [2])
       expect(mockPost).toHaveBeenCalledWith('/jobs/1/workflow/auto-split', { agent_ids: [2] })
     })
+
+    it('passes task_type through step_tools when provided', async () => {
+      await jobsAPI.autoSplitWorkflow(1, [2, 3], 'independent', [
+        { agent_index: 0, task_type: 'research', tool_visibility: 'full' },
+        { agent_index: 1, allowed_platform_tool_ids: [9], task_type: 'sql' },
+      ])
+      expect(mockPost).toHaveBeenCalledWith(
+        '/jobs/1/workflow/auto-split',
+        expect.objectContaining({
+          agent_ids: [2, 3],
+          workflow_mode: 'independent',
+          step_tools: [
+            { agent_index: 0, task_type: 'research', tool_visibility: 'full' },
+            { agent_index: 1, allowed_platform_tool_ids: [9], task_type: 'sql' },
+          ],
+        })
+      )
+    })
   })
 
   describe('updateStepTools', () => {
