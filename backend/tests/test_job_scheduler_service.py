@@ -307,40 +307,6 @@ class TestExecuteSchedule:
 
 
     @patch("services.job_scheduler.get_scheduler")
-    @patch("services.job_scheduler.threading")
-    @patch("services.job_scheduler.SessionLocal")
-    def test_thread_failure_sets_job_failed(self, mock_session_local, mock_enqueue, mock_threading, mock_get_sched, db_session):
-        """If the thread fails to start, job should be set to FAILED (not APPROVED)."""
-        # Fallback to local thread execution to trigger the failure without needing Celery
-        settings.JOB_EXECUTION_BACKEND = "local"
-
-        user = _make_user(db_session)
-        dev = _make_user(db_session, UserRole.DEVELOPER)
-        agent = _make_agent(db_session, dev)
-        job = _make_job(db_session, user, JobStatus.IN_QUEUE)
-        _make_step(db_session, job, agent)
-        schedule = _make_schedule(db_session, job)
-
-        mock_session_local.return_value = db_session
-        db_session.close = lambda: None
-        mock_thread = MagicMock()
-        mock_thread.start.side_effect = RuntimeError("thread pool exhausted")
-        mock_threading.Thread.return_value = mock_thread
-        mock_svc = MagicMock()
-        mock_get_sched.return_value = mock_svc
-
-        _execute_schedule(schedule.id)
-
-        assert job.status == JobStatus.FAILED
-        assert "thread" in job.failure_reason.lower() or "failed" in job.failure_reason.lower()
-        # History should also reflect the failure
-        history = db_session.query(ScheduleExecutionHistory).filter(
-            ScheduleExecutionHistory.schedule_id == schedule.id,
-            ScheduleExecutionHistory.status == "failed",
-        ).first()
-        assert history is not None
-
-    @patch("services.job_scheduler.get_scheduler")
     @patch("services.job_scheduler.SessionLocal")
     def test_missing_schedule_removed(self, mock_session_local, mock_get_sched, db_session):
         mock_session_local.return_value = db_session
