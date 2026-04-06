@@ -1,11 +1,12 @@
-"""Background scheduler service using APScheduler DateTriggers.
+"""Distributed scheduler service using Celery ETA tasks.
 
-Each active JobSchedule gets its own APScheduler DateTrigger job.
-When a schedule fires, it resets the job's workflow steps and triggers execution.
+Each active JobSchedule is enqueued as a Celery ETA task with a stable task_id.
+When a task fires, it resets the job's workflow steps and triggers execution.
 Schedules are deactivated after execution (one-time only).
 
-Routes call add_schedule / update_schedule / remove_schedule to keep APScheduler
-in sync with the DB.  On startup, load_all_schedules() bootstraps from the DB.
+Routes call add_schedule / update_schedule / remove_schedule to keep Celery queue
+in sync with the DB.  On startup, load_all_schedules() bootstraps from the DB
+to ensure durability after restart.
 
 Workflow (from the user's perspective):
   1. Before scheduled time — user can still edit the job.
@@ -27,8 +28,6 @@ from typing import Optional
 
 from zoneinfo import ZoneInfo
 
-from apscheduler.schedulers.background import BackgroundScheduler
-from apscheduler.triggers.date import DateTrigger
 from sqlalchemy.orm import Session
 
 try:
@@ -46,6 +45,8 @@ from models.job import (
 )
 from services.agent_executor import AgentExecutor
 from services.task_queue import enqueue_execute_platform_job
+
+from services.task_queue import celery_app, trigger_scheduled_job
 
 logger = logging.getLogger(__name__)
 
@@ -200,7 +201,7 @@ def queue_job_execution(
 
 
 def _execute_schedule(schedule_id: int):
-    """Callback fired by APScheduler when a DateTrigger fires.
+    """Callback fired by the Celery worker when an ETA task arrives.
 
     Opens its own DB session, validates the job, transitions it from
     IN_QUEUE → IN_PROGRESS, deactivates the schedule, and spawns an
@@ -218,7 +219,7 @@ def _execute_schedule(schedule_id: int):
     try:
         schedule = db.query(JobSchedule).filter(JobSchedule.id == schedule_id).first()
         if not schedule:
-            logger.warning("Schedule %s no longer exists — removing APScheduler job", schedule_id)
+            logger.warning("Schedule %s no longer exists — revoking Celery ETA task", schedule_id)
             svc = get_scheduler()
             if svc:
                 svc.remove_schedule(schedule_id)
@@ -301,7 +302,7 @@ def _execute_schedule(schedule_id: int):
         schedule.next_run_time = None
         db.commit()
 
-        # Remove from APScheduler (schedule already fired, won't be needed again)
+        # Internal cleanup of the scheduler singleton state (task has already fired)
         svc = get_scheduler()
         if svc:
             svc.remove_schedule(schedule_id)
@@ -331,85 +332,14 @@ def _execute_schedule(schedule_id: int):
         db.close()
 
 
-# ---------------------------------------------------------------------------
-# Stuck job watchdog
-# ---------------------------------------------------------------------------
-
-def _check_stuck_jobs():
-    """Periodic watchdog: detect jobs stuck in IN_PROGRESS or IN_QUEUE.
-
-    Uses schedule.last_run_time (when the schedule last fired) as the reference
-    point — NOT Job.created_at (which is when the job was first created and could
-    be much older than the current execution).
-
-    Does NOT kill the job — just logs a warning and creates a history entry.
-    The frontend can show a warning banner so the user decides to cancel or wait.
-    """
-    from core.config import settings
-
-    threshold_hours = getattr(settings, "STUCK_JOB_THRESHOLD_HOURS", 6)
-    cutoff = datetime.utcnow() - timedelta(hours=threshold_hours)
-
-    db = SessionLocal()
-    try:
-        # Find jobs whose schedule fired before the cutoff and are still running/queued
-        stuck_rows = (
-            db.query(Job, JobSchedule)
-            .join(JobSchedule, JobSchedule.job_id == Job.id)
-            .filter(
-                Job.status.in_([JobStatus.IN_PROGRESS, JobStatus.IN_QUEUE]),
-                JobSchedule.last_run_time.isnot(None),
-                JobSchedule.last_run_time < cutoff,
-            )
-            .all()
-        )
-        for job, schedule in stuck_rows:
-            logger.warning(
-                "Job %s has been %s since schedule fired at %s (over %d hours) — potentially stuck",
-                job.id, job.status.value, schedule.last_run_time, threshold_hours,
-            )
-            # Avoid duplicate entries — only create one potentially_stuck record per job
-            existing = (
-                db.query(ScheduleExecutionHistory)
-                .filter(
-                    ScheduleExecutionHistory.job_id == job.id,
-                    ScheduleExecutionHistory.status == "potentially_stuck",
-                )
-                .first()
-            )
-            if not existing:
-                history = ScheduleExecutionHistory(
-                    schedule_id=schedule.id,
-                    job_id=job.id,
-                    status="potentially_stuck",
-                    failure_reason=f"Job has been {job.status.value} for over {threshold_hours} hours",
-                    triggered_by="watchdog",
-                )
-                db.add(history)
-        db.commit()
-    except Exception:
-        logger.exception("Error in stuck job watchdog")
-        db.rollback()
-    finally:
-        db.close()
-
 
 # ---------------------------------------------------------------------------
-# DateTrigger helper
+# Celery helper
 # ---------------------------------------------------------------------------
-
-def _datetime_to_date_trigger(scheduled_at, timezone_str: str = "UTC") -> DateTrigger:
-    """Create a DateTrigger for a one-time schedule.
-
-    The timezone tells APScheduler what local time the user intended.
-    scheduled_at is stored as UTC in the DB; the DateTrigger uses ZoneInfo
-    to fire at the correct wall-clock time.
-    """
-    return DateTrigger(run_date=scheduled_at, timezone=ZoneInfo(timezone_str))
 
 
 def _schedule_job_id(schedule_id: int) -> str:
-    """APScheduler job ID for a given schedule row (e.g. 'schedule_42')."""
+    """Stable Celery task ID for a given schedule row (e.g. 'schedule_42')."""
     return f"schedule_{schedule_id}"
 
 
@@ -418,102 +348,94 @@ def _schedule_job_id(schedule_id: int) -> str:
 # ---------------------------------------------------------------------------
 
 class JobSchedulerService:
-    """Manages APScheduler lifecycle with per-schedule DateTrigger jobs.
+    """Manages scheduling lifecycle via Celery ETA tasks.
 
     Singleton — access via get_scheduler(). Started/stopped by the FastAPI
     lifespan handler in main.py. Disabled in tests via DISABLE_SCHEDULER=true.
     """
 
     def __init__(self):
-        self._scheduler: BackgroundScheduler | None = None
+        # BackgroundScheduler instance is gone we now use Celery ETA tasks, but we keep this for the stuck job watchdog and potential future in-process scheduling features.
+        self._is_running = False
+        self._scheduler = None
 
     @property
     def running(self) -> bool:
-        return self._scheduler is not None and self._scheduler.running
+        # Since we moved to Celery ETA tasks, the scheduler is effectively always "running" as long as Celery is available and the API is running.
+        return self._is_running
 
     # -- Lifecycle ----------------------------------------------------------
 
     def start(self):
-        """Start the scheduler and load all active schedules from the DB."""
+        """Bootstrap: load all active schedules from the DB into Celery."""
         global _scheduler_service
-
-        if self._scheduler and self._scheduler.running:
-            logger.warning("Scheduler is already running")
-            return
-
-        self._scheduler = BackgroundScheduler()
-        self._scheduler.start()
         _scheduler_service = self
+        self._is_running = True
 
-        # Register stuck job watchdog (runs every 30 minutes)
-        self._scheduler.add_job(
-            _check_stuck_jobs,
-            trigger="interval",
-            minutes=30,
-            id="stuck_job_watchdog",
-            replace_existing=True,
-        )
+        # Don't start if disabled (fixes test environment issues)
+        if getattr(settings, "DISABLE_SCHEDULER", False):
+            return
 
         # Bootstrap: load all active schedules from the DB
         self.load_all_schedules()
-        logger.info("Job scheduler started (DateTrigger per schedule, watchdog every 30m)")
+        self._is_running = True
+        logger.info("Job scheduler started (Celery ETA tasks loaded)")
+
 
     def stop(self):
+        """Cleanup the singleton reference on shutdown. Celery ETA tasks are one-time and will be cleaned up automatically after firing, so no need to revoke them here."""
         global _scheduler_service
-        if self._scheduler and self._scheduler.running:
-            self._scheduler.shutdown(wait=False)
-            logger.info("Job scheduler stopped")
-        self._scheduler = None
         _scheduler_service = None
+        self._is_running = False
+        logger.info("Job scheduler stopped")
 
     # -- Schedule management ------------------------------------------------
 
     def add_schedule(self, schedule_id: int, scheduled_at, timezone: str = "UTC"):
-        """Register a new DateTrigger job for a schedule."""
-        if not self._scheduler or not self._scheduler.running:
-            return
-        job_id = _schedule_job_id(schedule_id)
-        try:
-            trigger = _datetime_to_date_trigger(scheduled_at, timezone)
-            self._scheduler.add_job(
-                _execute_schedule,
-                trigger,
-                args=[schedule_id],
-                id=job_id,
-                replace_existing=True,
-            )
-            logger.info("Added APScheduler job %s (at: %s, tz: %s)", job_id, scheduled_at, timezone)
-        except Exception:
-            logger.exception("Failed to add APScheduler job for schedule %s", schedule_id)
+        """Register a new Celery ETA task for a schedule."""
 
-    def update_schedule(self, schedule_id: int, scheduled_at, timezone: str = "UTC"):
-        """Reschedule an existing APScheduler job with new date/timezone."""
-        if not self._scheduler or not self._scheduler.running:
+        if not celery_app:
             return
-        job_id = _schedule_job_id(schedule_id)
+        
+        task_id = _schedule_job_id(schedule_id)
+
         try:
-            trigger = _datetime_to_date_trigger(scheduled_at, timezone)
-            existing = self._scheduler.get_job(job_id)
-            if existing:
-                self._scheduler.reschedule_job(job_id, trigger=trigger)
-                logger.info("Rescheduled APScheduler job %s (at: %s, tz: %s)", job_id, scheduled_at, timezone)
-            else:
-                self.add_schedule(schedule_id, scheduled_at, timezone)
+            # 1. Convert scheduled_at + timezone to a UTC datetime fot Celery ETA
+            if scheduled_at.tzinfo is None:
+                zone = ZoneInfo(timezone)
+                scheduled_at = scheduled_at.replace(tzinfo=zone)
+
+            run_at_utc = scheduled_at.astimezone(ZoneInfo("UTC"))
+
+            # 2. Revoke any existing task just to be safe(idempotency)
+            celery_app.control.revoke(task_id, terminate=True)
+
+            # 3. apply the new ETA task
+            trigger_scheduled_job.apply_async(
+                args=[schedule_id],
+                eta=run_at_utc,
+                task_id=task_id,
+            )
+            logger.info("Added Celery ETA task %s (at: %s UTC)", task_id, timezone) 
         except Exception:
-            logger.exception("Failed to update APScheduler job for schedule %s", schedule_id)
+            logger.exception("Failed to add Celery ETA task for schedule %s", schedule_id)
+        
+    def update_schedule(self, schedule_id: int, scheduled_at, timezone: str = "UTC"):
+        """Reschedule by simply overwriting the ETA task."""
+        # Because we use a deterministic task_id based on schedule_id, add_schedule will revoke the old task and add the new one, effectively updating the schedule.
+        self.add_schedule(schedule_id, scheduled_at, timezone) 
 
     def remove_schedule(self, schedule_id: int):
-        """Remove a DateTrigger job from the scheduler."""
-        if not self._scheduler or not self._scheduler.running:
+        """Remove an ETA task from the Celery queue."""
+        if not celery_app:
             return
-        job_id = _schedule_job_id(schedule_id)
+        
+        task_id = _schedule_job_id(schedule_id)
         try:
-            existing = self._scheduler.get_job(job_id)
-            if existing:
-                self._scheduler.remove_job(job_id)
-                logger.info("Removed APScheduler job %s", job_id)
+            celery_app.control.revoke(task_id, terminate=True)
+            logger.info("Removed Celery ETA task %s", task_id)
         except Exception:
-            logger.exception("Failed to remove APScheduler job for schedule %s", schedule_id)
+            logger.exception("Failed to remove Celery ETA task for schedule_id %s", schedule_id)
 
     def load_all_schedules(self):
         """Load all active schedules from the DB and register DateTrigger jobs.

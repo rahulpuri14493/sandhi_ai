@@ -1,10 +1,10 @@
-"""Unit tests for the JobSchedulerService (DateTrigger-based, one-time only).
+"""Unit tests for the JobSchedulerService (Celery ETA-based, one-time only).
 
 Tests cover:
 - Schedule execution callback triggers job correctly (IN_QUEUE → IN_PROGRESS)
 - Only IN_QUEUE jobs are picked up; all other statuses are skipped
 - Skips jobs without workflow steps, missing jobs/schedules
-- Schedules deactivate and remove their APScheduler job after execution
+- Schedules deactivate and clean up their task state after job execution
 - Execution history entries are created
 - Thread failure sets job to FAILED (not APPROVED)
 - Scheduler lifecycle (start/stop)
@@ -30,6 +30,7 @@ from services.job_scheduler import (
     reset_job_for_execution,
 )
 
+from core.config import settings
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -153,6 +154,10 @@ class TestExecuteSchedule:
     @patch("services.job_scheduler.SessionLocal")
     def test_triggers_execution_sets_in_progress(self, mock_session_local, mock_threading, db_session):
         """Schedule fires → IN_QUEUE job set to IN_PROGRESS, thread started."""
+
+        # Force fallback to local thread execution to test the core logic without Celery involved
+        settings.JOB_EXECUTION_BACKEND = "local"
+
         user = _make_user(db_session)
         dev = _make_user(db_session, UserRole.DEVELOPER)
         agent = _make_agent(db_session, dev)
@@ -278,7 +283,7 @@ class TestExecuteSchedule:
     @patch("services.job_scheduler.threading")
     @patch("services.job_scheduler.SessionLocal")
     def test_deactivates_and_removes(self, mock_session_local, mock_threading, mock_get_sched, db_session):
-        """Schedule deactivates before thread starts, APScheduler job removed."""
+        """Schedule deactivates before thread starts, task ID cleaned from service state."""
         user = _make_user(db_session)
         dev = _make_user(db_session, UserRole.DEVELOPER)
         agent = _make_agent(db_session, dev)
@@ -300,11 +305,15 @@ class TestExecuteSchedule:
         assert schedule.last_run_time is not None
         mock_svc.remove_schedule.assert_called_once_with(schedule.id)
 
+
     @patch("services.job_scheduler.get_scheduler")
     @patch("services.job_scheduler.threading")
     @patch("services.job_scheduler.SessionLocal")
-    def test_thread_failure_sets_job_failed(self, mock_session_local, mock_threading, mock_get_sched, db_session):
+    def test_thread_failure_sets_job_failed(self, mock_session_local, mock_enqueue, mock_threading, mock_get_sched, db_session):
         """If the thread fails to start, job should be set to FAILED (not APPROVED)."""
+        # Fallback to local thread execution to trigger the failure without needing Celery
+        settings.JOB_EXECUTION_BACKEND = "local"
+
         user = _make_user(db_session)
         dev = _make_user(db_session, UserRole.DEVELOPER)
         agent = _make_agent(db_session, dev)
@@ -412,12 +421,14 @@ class TestJobSchedulerServiceLifecycle:
 
 
 # ---------------------------------------------------------------------------
-# add / update / remove schedule (DateTrigger-based)
+# add / update / remove schedule (Celery ETA-based)
 # ---------------------------------------------------------------------------
 
 class TestScheduleManagement:
+    @patch("services.job_scheduler.trigger_scheduled_job")
+    @patch("services.job_scheduler.celery_app")
     @patch("services.job_scheduler.SessionLocal")
-    def test_add_schedule_registers_job(self, mock_session_local):
+    def test_add_schedule_registers_job(self, mock_session_local, mock_celery_app, mock_trigger):
         mock_db = MagicMock()
         mock_db.query.return_value.filter.return_value.all.return_value = []
         mock_session_local.return_value = mock_db
@@ -428,12 +439,16 @@ class TestScheduleManagement:
         future = datetime.utcnow() + timedelta(hours=1)
         service.add_schedule(1, scheduled_at=future, timezone="UTC")
 
-        job = service._scheduler.get_job("schedule_1")
-        assert job is not None
+        # Verify Celery ETA task was queued
+        mock_trigger.apply_async.assert_called_once()
+        # Verify old task was revoked safely (idempotency check)
+        mock_celery_app.control.revoke.assert_called_once_with("schedule_1", terminate=True)
         service.stop()
 
+    @patch("services.job_scheduler.trigger_scheduled_job")
+    @patch("services.job_scheduler.celery_app")
     @patch("services.job_scheduler.SessionLocal")
-    def test_update_schedule_reschedules(self, mock_session_local):
+    def test_update_schedule_reschedules(self, mock_session_local, mock_celery_app, mock_trigger):
         mock_db = MagicMock()
         mock_db.query.return_value.filter.return_value.all.return_value = []
         mock_session_local.return_value = mock_db
@@ -447,12 +462,14 @@ class TestScheduleManagement:
         future2 = datetime.utcnow() + timedelta(hours=2)
         service.update_schedule(1, scheduled_at=future2, timezone="UTC")
 
-        job = service._scheduler.get_job("schedule_1")
-        assert job is not None
+        # Added once, updated once = 2 calls
+        assert mock_trigger.apply_async.call_count == 2
+        assert mock_celery_app.control.revoke.call_count == 2
         service.stop()
 
+    @patch("services.job_scheduler.celery_app")
     @patch("services.job_scheduler.SessionLocal")
-    def test_remove_schedule_removes_job(self, mock_session_local):
+    def test_remove_schedule_removes_job(self, mock_session_local, mock_celery_app):
         mock_db = MagicMock()
         mock_db.query.return_value.filter.return_value.all.return_value = []
         mock_session_local.return_value = mock_db
@@ -464,14 +481,15 @@ class TestScheduleManagement:
         service.add_schedule(1, scheduled_at=future, timezone="UTC")
         service.remove_schedule(1)
 
-        job = service._scheduler.get_job("schedule_1")
-        assert job is None
+        # 1 revoke from add_schedule safety check, 1 revoke from remove_schedule
+        assert mock_celery_app.control.revoke.call_count == 2
         service.stop()
 
+    @patch("services.job_scheduler.celery_app", new=None)
     def test_operations_when_not_running_are_safe(self):
         service = JobSchedulerService()
         future = datetime.utcnow() + timedelta(hours=1)
-        # Should not raise even when scheduler is not running
+        # Should not raise even when celery_app is missing
         service.add_schedule(1, scheduled_at=future, timezone="UTC")
         service.update_schedule(1, scheduled_at=future, timezone="UTC")
         service.remove_schedule(1)

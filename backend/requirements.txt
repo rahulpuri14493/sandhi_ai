@@ -37,7 +37,6 @@ pytest==7.4.4
 pytest-asyncio==0.23.3
 pytest-cov==4.1.0
 cryptography==46.0.6
-APScheduler==3.10.4
 celery==5.4.0
 redis==5.1.1
 starlette==0.49.1
