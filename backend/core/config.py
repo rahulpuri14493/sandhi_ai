@@ -104,6 +104,35 @@ class Settings(BaseSettings):
     AGENT_PLANNER_MAX_TOKENS: int = 4096
     AGENT_PLANNER_FALLBACK_MODEL: str = ""  # optional; also uses LLM_HTTP_FALLBACK_MODEL if empty
     AGENT_PLANNER_HTTP_TIMEOUT_SECONDS: float = 120.0
+    # Planner transport is chosen at runtime per job/agent mix.
+    # Native A2A planner endpoint (used when runtime policy picks native_a2a).
+    AGENT_PLANNER_A2A_URL: str = ""
+    # Optional Bearer for platform → native A2A planner (model keys may live only on the agent service).
+    AGENT_PLANNER_A2A_API_KEY: str = ""
+    # Dedicated planner A2A adapter URL (used when runtime policy picks a2a_adapter). Do not reuse A2A_ADAPTER_URL.
+    AGENT_PLANNER_ADAPTER_URL: str = ""
+    # Secondary planner profile (automatic failover target after primary planner failure).
+    AGENT_PLANNER_SECONDARY_ENABLED: bool = False
+    AGENT_PLANNER_SECONDARY_PROVIDER: str = ""  # empty -> inherit primary provider
+    AGENT_PLANNER_SECONDARY_BASE_URL: str = ""
+    AGENT_PLANNER_SECONDARY_API_KEY: str = ""
+    AGENT_PLANNER_SECONDARY_MODEL: str = ""
+    AGENT_PLANNER_SECONDARY_FALLBACK_MODEL: str = ""
+    AGENT_PLANNER_SECONDARY_HTTP_TIMEOUT_SECONDS: float = 120.0
+    AGENT_PLANNER_SECONDARY_A2A_URL: str = ""
+    AGENT_PLANNER_SECONDARY_A2A_API_KEY: str = ""
+    AGENT_PLANNER_SECONDARY_ADAPTER_URL: str = ""
+    # Multi-agent task split: retries when platform planner is configured (no hired-agent split fallback).
+    AGENT_PLANNER_SPLIT_MAX_ATTEMPTS: int = 4
+    AGENT_PLANNER_SPLIT_RETRY_BACKOFF_SECONDS: float = 2.0
+    # After a failed parse, one extra planner call tries to repair output into valid JSON.
+    AGENT_PLANNER_SPLIT_JSON_REPAIR: bool = True
+    # Before each retry after the first, re-fetch job documents (S3/MinIO/local) for fresh BRD text.
+    AGENT_PLANNER_SPLIT_RELOAD_DOCS_BETWEEN_ATTEMPTS: bool = True
+    # At job execution start, re-run planner split and replace workflow steps (same agents/order/tools).
+    AGENT_PLANNER_EXECUTE_REPLAN: bool = True
+    # When execute-time replan fails: fail (default) or continue with the workflow built in the UI.
+    AGENT_PLANNER_EXECUTE_REPLAN_ON_FAILURE: str = "fail"  # fail | continue
     # Optional read-through cache for GET planner artifact raw JSON (empty = disabled).
     PLANNER_ARTIFACT_CACHE_REDIS_URL: str = ""
     PLANNER_ARTIFACT_CACHE_TTL_SECONDS: int = 300

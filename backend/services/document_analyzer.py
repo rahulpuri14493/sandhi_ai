@@ -1,11 +1,8 @@
 from typing import List, Dict, Any, Optional
-import httpx
 import logging
 from pathlib import Path
 import json
 from core.config import settings
-from services.a2a_client import execute_via_a2a
-from services.httpx_tls import httpx_verify_parameter
 from services.job_file_storage import materialize_to_temp_path, cleanup_temp_path
 from services.planner_llm import is_agent_planner_configured, planner_chat_completion
 
@@ -13,7 +10,7 @@ logger = logging.getLogger(__name__)
 
 
 class DocumentAnalyzer:
-    """Extract document text and run Q&A via hired agent."""
+    """Extract document text; BRD reasoning and workflow clarification use the platform Agent Planner only."""
 
     def __init__(self):
         pass
@@ -168,71 +165,6 @@ class DocumentAnalyzer:
         finally:
             cleanup_temp_path(file_info, local_path)
     
-    async def _analyze_documents_via_a2a(
-        self,
-        all_content: str,
-        job_title: str,
-        job_description: Optional[str],
-        conversation_history: List[Dict[str, str]],
-        agent_api_url: str,
-        agent_api_key: Optional[str],
-        *,
-        adapter_url: Optional[str] = None,
-        adapter_metadata: Optional[Dict[str, Any]] = None,
-    ) -> Dict[str, Any]:
-        """Call hired agent via A2A for BRD analysis (direct or via platform adapter); return same shape as OpenAI path."""
-        input_data = {
-            "job_title": job_title,
-            "job_description": job_description or "",
-            "documents_content": all_content,
-            "conversation_history": conversation_history,
-            "task": "Analyze the documents and requirements. Ask ONLY important clarifying questions (critical gaps, real ambiguities, risks). Do NOT ask minor or obvious questions (e.g. for simple math like 'add 2+5' do not ask output format—integer/float; use a reasonable default). Return valid JSON: {\"analysis\": \"...\", \"questions\": [] (only if truly needed), \"recommendations\": [], \"solutions\": [], \"next_steps\": []}. Works for both sequential and A2A workflows.",
-        }
-        if adapter_url and adapter_metadata is not None:
-            result = await execute_via_a2a(
-                adapter_url,
-                input_data,
-                api_key=None,
-                blocking=True,
-                timeout=120.0,
-                adapter_metadata=adapter_metadata,
-            )
-        else:
-            result = await execute_via_a2a(
-                agent_api_url,
-                input_data,
-                api_key=agent_api_key,
-                blocking=True,
-                timeout=120.0,
-            )
-        content = (result.get("content") or "").strip()
-        try:
-            parsed = json.loads(content)
-            hint = parsed.get("workflow_collaboration_hint")
-            if hint not in ("sequential", "async_a2a"):
-                hint = None
-            return {
-                "analysis": parsed.get("analysis", ""),
-                "questions": parsed.get("questions", []),
-                "recommendations": parsed.get("recommendations", []),
-                "solutions": parsed.get("solutions", []),
-                "next_steps": parsed.get("next_steps", []),
-                "workflow_collaboration_hint": hint,
-                "workflow_collaboration_reason": (parsed.get("workflow_collaboration_reason") or "").strip() or None if hint else None,
-                "raw_response": content,
-            }
-        except json.JSONDecodeError:
-            return {
-                "analysis": content,
-                "questions": self._extract_questions(content),
-                "recommendations": self._extract_recommendations(content),
-                "solutions": [],
-                "next_steps": [],
-                "workflow_collaboration_hint": None,
-                "workflow_collaboration_reason": None,
-                "raw_response": content,
-            }
-
     async def _analyze_with_platform_planner(
         self,
         *,
@@ -396,9 +328,8 @@ Be thorough and solution-oriented. Prefer sensible defaults over asking trivial 
         use_a2a: bool = False,
     ) -> Dict[str, Any]:
         """
-        Extract document text and optionally analyze via hired agent.
-        - When agent_api_url is provided: use hired agent for analysis and Q&A.
-        - When not provided: only extract text; return extracted data and empty questions.
+        Extract document text; when the platform Agent Planner is configured, run BRD analysis via planner.
+        Optional agent_api_url / use_a2a kwargs are ignored (kept for call-site compatibility).
         """
         conversation_history = conversation_history or []
         job_title = str(job_title).strip() if job_title is not None else ""
@@ -438,221 +369,20 @@ Be thorough and solution-oriented. Prefer sensible defaults over asking trivial 
                 conversation_history=conversation_history,
             )
         
-        # No hired agent endpoint → extraction only
-        if not (agent_api_url and (agent_api_url or "").strip()):
-            return {
-                "analysis": f"Document text extracted for job '{job_title}'. Select and assign agents to this job to enable AI-powered analysis and Q&A.",
-                "questions": [],
-                "recommendations": [],
-                "solutions": [],
-                "next_steps": [],
-                "raw_response": "",
-            }
-        
-        # A2A path: call hired agent via A2A protocol (same semantics, different transport)
-        if use_a2a:
-            return await self._analyze_documents_via_a2a(
-                all_content=all_content,
-                job_title=job_title,
-                job_description=job_description,
-                conversation_history=conversation_history,
-                agent_api_url=agent_api_url.strip(),
-                agent_api_key=agent_api_key,
-            )
-        
-        # OpenAI-compatible via platform adapter: route through A2A so architecture is A2A everywhere
-        adapter_url = (getattr(settings, "A2A_ADAPTER_URL", None) or "").strip()
-        if adapter_url:
-            model = (agent_llm_model or "").strip() or "gpt-4o-mini"
-            return await self._analyze_documents_via_a2a(
-                all_content=all_content,
-                job_title=job_title,
-                job_description=job_description,
-                conversation_history=conversation_history,
-                agent_api_url=agent_api_url.strip(),
-                agent_api_key=agent_api_key,
-                adapter_url=adapter_url,
-                adapter_metadata={
-                    "openai_url": agent_api_url.strip(),
-                    "openai_api_key": (agent_api_key or "").strip() or "",
-                    "openai_model": model,
-                },
-            )
-        
-        # Hired agent: build the prompt and call agent endpoint (OpenAI-compatible, no adapter)
-        system_prompt = """You are an expert AI assistant specialized in deeply understanding business requirements from documents and providing intelligent solutions.
+        # BRD reasoning is platform-owned; no hired-agent LLM fallback.
+        return {
+            "analysis": (
+                f"Document text extracted for job '{job_title}'. "
+                "Configure the platform Agent Planner (AGENT_PLANNER_API_KEY and related settings) "
+                "for AI-powered BRD analysis and Q&A."
+            ),
+            "questions": [],
+            "recommendations": [],
+            "solutions": [],
+            "next_steps": [],
+            "raw_response": "",
+        }
 
-Your primary tasks:
-1. DEEP ANALYSIS: Thoroughly analyze all uploaded documents to extract:
-   - Business objectives and goals
-   - Technical requirements and specifications
-   - Data structures, formats, and sources
-   - Workflow processes and dependencies
-   - Constraints, limitations, and edge cases
-   - Success criteria and expected outcomes
-
-2. INTELLIGENT QUESTIONING: Ask ONLY important, high-impact questions that:
-   - Fill critical gaps in understanding (missing scope, constraints, or success criteria)
-   - Clarify genuinely ambiguous requirements that affect the outcome
-   - Identify real risks or blockers
-   Do NOT ask minor or obvious questions. Examples of what NOT to ask:
-   - For simple tasks (e.g. "add 2+5", "calculate X"): do not ask output format (integer/float), precision, or trivial preferences; use a reasonable default.
-   - Do not ask about details that can be inferred from context or that do not change the deliverable.
-   - Prefer assuming sensible defaults over asking the user to confirm every small detail.
-   Works for both sequential (pipeline) and A2A (peer collaboration) workflows.
-
-3. PROBLEM SOLVING: After receiving answers:
-   - Synthesize all information (documents + answers)
-   - Identify the core problem or need
-   - Provide actionable solutions and recommendations
-   - Suggest optimal approaches or workflows
-   - Highlight potential challenges and mitigation strategies
-
-4. SOLUTION-ORIENTED: Once you understand the problem:
-   - Provide clear, actionable recommendations
-   - Suggest specific AI agents or workflows that could solve the problem
-   - Outline implementation steps
-   - Identify key success factors
-
-5. WORKFLOW MODE HINT: When you understand the workflow needed, suggest how agents should collaborate:
-   - "sequential": Use when the job is a pipeline — Agent 1's output is the input to Agent 2 (step-by-step handoff). Standard agents (A2A off) are fine.
-   - "async_a2a": Use when the job needs agents to work asynchronously and communicate with each other as peers (not just one output feeding the next). Recommend A2A-enabled agents.
-
-IMPORTANT: You must respond with valid JSON only. Format your response as JSON with this exact structure:
-{
-    "analysis": "Comprehensive analysis of requirements, extracted data, and understanding of the problem",
-    "questions": ["Question 1", "Question 2", "Question 3"] (empty array if no questions needed),
-    "recommendations": ["Actionable recommendation 1", "Recommendation 2"],
-    "solutions": ["Proposed solution 1", "Solution 2"] (optional, provide when problem is understood),
-    "next_steps": ["Step 1", "Step 2"] (optional, provide when ready to proceed),
-    "workflow_collaboration_hint": "sequential" or "async_a2a" (optional; suggest based on whether work is pipeline vs peer collaboration),
-    "workflow_collaboration_reason": "One sentence explaining why." (optional; only when workflow_collaboration_hint is set)
-}
-
-When you have enough information to understand the problem, provide solutions and recommendations instead of asking more questions."""
-        
-        # Build user prompt
-        job_desc_part = f'Job Description: {job_description}\n\n' if job_description else ''
-        conv_part = ''
-        if conversation_history:
-            formatted_conv = self._format_conversation(conversation_history)
-            conv_part = f'\n\nPrevious Conversation History:\n{formatted_conv}\n\n'
-        
-        user_prompt = f"""Job Title: {job_title}
-{job_desc_part}=== UPLOADED DOCUMENTS WITH REQUIREMENTS ===
-{all_content}
-{conv_part}
-TASK: 
-1. Perform a DEEP and COMPREHENSIVE analysis of all documents above
-2. Extract ALL requirements, data structures, workflows, and business objectives
-3. Identify what the user needs to accomplish
-4. Ask ONLY critical questions—missing information that would change scope or outcome. Do NOT ask minor questions (e.g. for "add 2+5" do not ask integer vs float; assume a reasonable default).
-5. Once you understand the problem, provide SOLUTIONS and RECOMMENDATIONS
-
-Be thorough and solution-oriented. Prefer sensible defaults over asking trivial questions."""
-        
-        messages = [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt}
-        ]
-        
-        # Add conversation history if provided - only include Q&A pairs with both question and answer
-        def _str_strip(val: Any) -> str:
-            if val is None:
-                return ""
-            if isinstance(val, str):
-                return val.strip()
-            return str(val).strip()
-
-        if conversation_history:
-            for item in conversation_history:
-                if item.get("type") == "question":
-                    question = _str_strip(item.get("question"))
-                    answer = _str_strip(item.get("answer"))
-                    if question and answer:
-                        messages.append({"role": "user", "content": question})
-                        messages.append({"role": "assistant", "content": answer})
-                elif item.get("type") == "analysis":
-                    content = _str_strip(item.get("content"))
-                    if content:
-                        messages.append({"role": "assistant", "content": f"Analysis: {content}"})
-        
-        try:
-            max_content_length = 50000
-            for msg in messages:
-                if len(msg.get("content", "")) > max_content_length:
-                    msg["content"] = msg["content"][:max_content_length] + "\n\n[Content truncated due to length...]"
-            
-            model = (agent_llm_model or "").strip() or "gpt-4o-mini"
-            temperature = agent_temperature if agent_temperature is not None else 0.7
-            payload = {
-                "model": model,
-                "messages": messages,
-                "temperature": temperature,
-                "max_tokens": 2000,
-            }
-            headers = {"Content-Type": "application/json"}
-            if agent_api_key and (agent_api_key or "").strip():
-                headers["Authorization"] = f"Bearer {(agent_api_key or '').strip()}"
-            
-            async with httpx.AsyncClient(timeout=120.0, verify=False) as client:
-                response = await client.post(
-                    agent_api_url.strip(),
-                    json=payload,
-                    headers=headers,
-                )
-                response.raise_for_status()
-                result = response.json()
-                raw_content = result["choices"][0]["message"].get("content")
-                # OpenAI can return content as string or list of parts (e.g. multimodal)
-                if isinstance(raw_content, list):
-                    assistant_message = " ".join(
-                        p.get("text", p.get("content", "")) if isinstance(p, dict) else str(p)
-                        for p in raw_content
-                    )
-                elif isinstance(raw_content, str):
-                    assistant_message = raw_content
-                else:
-                    assistant_message = str(raw_content or "")
-                
-                try:
-                    parsed = json.loads(assistant_message)
-                    hint = parsed.get("workflow_collaboration_hint")
-                    if hint not in ("sequential", "async_a2a"):
-                        hint = None
-                    return {
-                        "analysis": parsed.get("analysis", ""),
-                        "questions": parsed.get("questions", []),
-                        "recommendations": parsed.get("recommendations", []),
-                        "solutions": parsed.get("solutions", []),
-                        "next_steps": parsed.get("next_steps", []),
-                        "workflow_collaboration_hint": hint,
-                        "workflow_collaboration_reason": (parsed.get("workflow_collaboration_reason") or "").strip() or None if hint else None,
-                        "raw_response": assistant_message,
-                    }
-                except json.JSONDecodeError:
-                    return {
-                        "analysis": assistant_message,
-                        "questions": self._extract_questions(assistant_message),
-                        "recommendations": self._extract_recommendations(assistant_message),
-                        "solutions": [],
-                        "next_steps": [],
-                        "workflow_collaboration_hint": None,
-                        "workflow_collaboration_reason": None,
-                        "raw_response": assistant_message,
-                    }
-        except httpx.HTTPStatusError as e:
-            error_detail = f"Hired agent API error: {e.response.status_code}"
-            try:
-                error_detail += f" - {e.response.text[:500]}"
-            except Exception:
-                pass
-            raise Exception(error_detail)
-        except httpx.RequestError as e:
-            raise Exception(f"Hired agent API request error: {str(e)}")
-        except Exception as e:
-            raise Exception(f"Error analyzing documents: {str(e)}")
-    
     async def process_user_response(
         self,
         user_answer: str,
@@ -723,8 +453,8 @@ Be thorough and solution-oriented. Prefer sensible defaults over asking trivial 
         Generate clarifying questions for the end user based on the workflow (assigned tasks),
         BRD documents, and job prompt. Used in the Q&A step after Build Workflow so agents
         can get requirements clarified before execution.
-        When only_step is set, scope is that workflow step only (assigned agent's endpoint).
-        Returns {"questions": ["...", ...]}.
+        When only_step is set, scope is that workflow step only in the prompt.
+        Uses platform Agent Planner only; returns {"questions": [...]}.
         """
         max_q = 2 if only_step is not None else 3
         if only_step is not None:
@@ -808,64 +538,34 @@ or
 {{"questions": []}}
 No markdown. No extra keys. No explanation text."""
 
-        if not (agent_api_url and (agent_api_url or "").strip()):
+        if not is_agent_planner_configured():
             return {"questions": []}
 
-        adapter_url = (getattr(settings, "A2A_ADAPTER_URL", None) or "").strip()
-        if use_a2a and not adapter_url:
-            # Direct A2A to agent
-            input_data = {"job_title": job_title, "job_description": job_description, "prompt": user_prompt}
-            result = await execute_via_a2a(
-                agent_api_url.strip(),
-                input_data,
-                api_key=(agent_api_key or "").strip() or None,
-                blocking=True,
-                timeout=120.0,
-            )
-            content = (result.get("content") or "").strip()
-        elif adapter_url:
-            model = (agent_llm_model or "").strip() or "gpt-4o-mini"
-            input_data = {"job_title": job_title, "job_description": job_description, "prompt": user_prompt}
-            result = await execute_via_a2a(
-                adapter_url,
-                input_data,
-                api_key=None,
-                blocking=True,
-                timeout=120.0,
-                adapter_metadata={
-                    "openai_url": agent_api_url.strip(),
-                    "openai_api_key": (agent_api_key or "").strip() or "",
-                    "openai_model": model,
-                },
-            )
-            content = (result.get("content") or "").strip()
-        else:
-            # Direct OpenAI
-            model = (agent_llm_model or "").strip() or "gpt-4o-mini"
-            payload = {
-                "model": model,
-                "messages": [
-                    {"role": "system", "content": "You are in CLARIFICATION mode for workflow execution. Generate ONLY execution-critical questions mapped to workflow steps/agents. NEVER provide answers, calculations, solutions, recommendations, summaries, or next steps. Ask only when a required input/constraint/ambiguity blocks correct execution for a step. Enforce strict quality gate: each question must materially change implementation/scope and be currently blocking and not already answered. MAX 3 questions. Reject trivial questions (format preference, method preference, generic context). If all steps are executable, return empty array. Return only valid JSON: {\"questions\": [\"[Step N - Agent Name] ...?\"]} or {\"questions\": []}. No markdown. No extra keys."},
+        system_content = (
+            "You are in CLARIFICATION mode for workflow execution. Generate ONLY execution-critical "
+            "questions mapped to workflow steps/agents. NEVER provide answers, calculations, solutions, "
+            "recommendations, summaries, or next steps. Ask only when a required input/constraint/"
+            "ambiguity blocks correct execution for a step. Enforce strict quality gate: each question "
+            "must materially change implementation/scope and be currently blocking and not already answered. "
+            f"MAX {max_q} questions. Reject trivial questions (format preference, method preference, "
+            "generic context). If all steps are executable, return empty array. Return only valid JSON: "
+            '{"questions": ["[Step N - Agent Name] ...?"]} or {"questions": []}. No markdown. No extra keys.'
+        )
+        try:
+            planner_temp = float(getattr(settings, "AGENT_PLANNER_TEMPERATURE", 0.5) or 0.5)
+            content = await planner_chat_completion(
+                [
+                    {"role": "system", "content": system_content},
                     {"role": "user", "content": user_prompt[:50000]},
                 ],
-                "temperature": agent_temperature if agent_temperature is not None else 0.5,
-                "max_tokens": 1500,
-            }
-            headers = {"Content-Type": "application/json"}
-            if agent_api_key and (agent_api_key or "").strip():
-                headers["Authorization"] = f"Bearer {(agent_api_key or '').strip()}"
-            async with httpx.AsyncClient(timeout=120.0, verify=httpx_verify_parameter()) as client:
-                resp = await client.post(agent_api_url.strip(), json=payload, headers=headers)
-                resp.raise_for_status()
-                data = resp.json()
-                raw = (data.get("choices") or [{}])[0].get("message") or {}
-                content = (raw.get("content") or "").strip()
-                if isinstance(content, list):
-                    content = " ".join(
-                        p.get("text", p.get("content", "")) if isinstance(p, dict) else str(p)
-                        for p in content
-                    )
+                temperature=min(0.5, planner_temp),
+                max_tokens=1500,
+            )
+        except Exception as e:
+            logger.warning("Workflow clarification via platform planner failed: %s", e)
+            return {"questions": []}
 
+        content = (content or "").strip()
         if not content:
             return {"questions": []}
         if content.startswith("```"):

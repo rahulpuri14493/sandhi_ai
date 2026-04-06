@@ -29,8 +29,10 @@ from core.security import get_current_user, get_current_business_user
 from core.config import settings
 from services.job_scheduler import get_scheduler, reset_job_for_execution, queue_job_execution
 from services.task_queue import get_queue_stats
+from services.task_splitter import PlannerSplitError
 from services.workflow_builder import WorkflowBuilder
 from services.tool_splitter import suggest_tool_assignments_for_agents
+from services.planner_llm import planner_runtime_transport_scope, resolve_runtime_planner_transport
 from services.payment_processor import PaymentProcessor
 from services.document_analyzer import DocumentAnalyzer
 from services.planner_artifact_cache import get_cached_planner_raw, set_cached_planner_raw
@@ -101,26 +103,91 @@ def _user_can_access_job(job: Job, current_user: User, db: Session) -> bool:
     )
 
 
-def _get_first_hired_agent_for_job(db: Session, job_id: int) -> Optional[tuple]:
-    """Return (api_url, api_key, llm_model, temperature, a2a_enabled) for the first hired agent, or None."""
-    first_step = (
-        db.query(WorkflowStep)
-        .filter(WorkflowStep.job_id == job_id)
-        .order_by(WorkflowStep.step_order)
-        .first()
+def _platform_tool_name_map_for_business(db: Session, business_id: int) -> Dict[int, str]:
+    rows = (
+        db.query(MCPToolConfig.id, MCPToolConfig.name)
+        .filter(MCPToolConfig.user_id == business_id, MCPToolConfig.is_active == True)
+        .all()
     )
-    if not first_step:
-        return None
-    agent = db.query(Agent).filter(Agent.id == first_step.agent_id).first()
-    if not agent or not (agent.api_endpoint and (agent.api_endpoint or "").strip()):
-        return None
-    return (
-        agent.api_endpoint.strip(),
-        (agent.api_key or "").strip() or None,
-        (getattr(agent, "llm_model", None) or None),
-        (getattr(agent, "temperature", None)),
-        getattr(agent, "a2a_enabled", False),
-    )
+    out: Dict[int, str] = {}
+    for tid, name in rows:
+        try:
+            key = int(tid)
+        except (TypeError, ValueError):
+            continue
+        nm = (str(name or "") or "").strip()
+        if nm:
+            out[key] = nm
+    return out
+
+
+def _attach_tool_names_to_step_suggestions(
+    tool_suggestion: Optional[Dict[str, Any]], tool_name_by_id: Dict[int, str]
+) -> Optional[Dict[str, Any]]:
+    if not isinstance(tool_suggestion, dict):
+        return tool_suggestion
+
+    # Normalize into one stable shape for UI/export:
+    # - keep `step_suggestions` at top level
+    # - enrich each row with `platform_tool_names`
+    # - hide `platform_tool_ids` once names are present
+    if not isinstance(tool_suggestion.get("step_suggestions"), list):
+        parsed_result = tool_suggestion.get("parsed_result")
+        if isinstance(parsed_result, dict) and isinstance(parsed_result.get("step_suggestions"), list):
+            tool_suggestion["step_suggestions"] = list(parsed_result.get("step_suggestions") or [])
+
+    def _enrich_rows(rows: Any) -> None:
+        if not isinstance(rows, list):
+            return
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            existing = row.get("platform_tool_names")
+            if isinstance(existing, list) and len(existing) > 0:
+                # Hide numeric IDs from end-user JSON when readable names are already present.
+                row.pop("platform_tool_ids", None)
+                continue
+            raw_ids = row.get("platform_tool_ids")
+            if not isinstance(raw_ids, list):
+                continue
+            names: List[str] = []
+            for rid in raw_ids:
+                try:
+                    key = int(rid)
+                except (TypeError, ValueError):
+                    continue
+                nm = tool_name_by_id.get(key)
+                if nm:
+                    names.append(nm)
+            if names:
+                row["platform_tool_names"] = names
+                row.pop("platform_tool_ids", None)
+
+    _enrich_rows(tool_suggestion.get("step_suggestions"))
+    parsed_result = tool_suggestion.get("parsed_result")
+    if isinstance(parsed_result, dict):
+        _enrich_rows(parsed_result.get("step_suggestions"))
+    return tool_suggestion
+
+
+def _enrich_tool_suggestion_json_bytes(
+    data: bytes, *, db: Session, business_id: int
+) -> bytes:
+    """Best-effort enrich tool_suggestion JSON with platform_tool_names for display/export."""
+    try:
+        payload = json.loads(data.decode("utf-8"))
+    except Exception:
+        return data
+    if not isinstance(payload, dict):
+        return data
+    tool_name_by_id = _platform_tool_name_map_for_business(db, business_id)
+    enriched = _attach_tool_names_to_step_suggestions(payload, tool_name_by_id)
+    if not isinstance(enriched, dict):
+        return data
+    try:
+        return json.dumps(enriched, ensure_ascii=False).encode("utf-8")
+    except Exception:
+        return data
 
 
 # Allowed file extensions (including .zip; zip contents are extracted and only allowed types kept)
@@ -131,6 +198,13 @@ ALLOWED_EXTENSIONS = {
 
 # Extensions for files we can extract text from (used when unpacking zip; no nested .zip)
 EXTRACTABLE_EXTENSIONS = ALLOWED_EXTENSIONS - {'.zip'}
+
+
+def _workflow_origin_for_response(job) -> str:
+    v = getattr(job, "workflow_origin", None)
+    if isinstance(v, str) and v.strip().lower() in ("manual", "auto_split"):
+        return v.strip().lower()
+    return "auto_split"
 
 
 def _zip_extract_backoff(attempt_idx: int) -> float:
@@ -537,6 +611,7 @@ async def create_job(
         "write_execution_mode": new_job.write_execution_mode,
         "output_artifact_format": new_job.output_artifact_format,
         "output_contract": output_contract_obj,
+        "workflow_origin": _workflow_origin_for_response(new_job),
     }
     return JobResponse(**response_data)
 
@@ -547,7 +622,7 @@ async def analyze_documents(
     current_user: User = Depends(get_current_business_user),
     db: Session = Depends(get_db)
 ):
-    """Analyze uploaded documents and generate questions. Uses platform planner when configured; else hired agent."""
+    """Analyze uploaded documents and generate questions via platform Agent Planner when configured."""
     job = db.query(Job).filter(Job.id == job_id).first()
     if not job:
         raise HTTPException(
@@ -586,13 +661,6 @@ async def analyze_documents(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="No valid document sources found in job files"
         )
-    hired = _get_first_hired_agent_for_job(db, job.id)
-    if hired:
-        agent_url, agent_key, agent_model, agent_temp, use_a2a = hired
-    else:
-        agent_url = agent_key = agent_model = agent_temp = None
-        use_a2a = False
-    
     try:
         analyzer = DocumentAnalyzer()
         result = await analyzer.analyze_documents_and_generate_questions(
@@ -600,11 +668,6 @@ async def analyze_documents(
             job_title=job.title,
             job_description=job.description,
             conversation_history=conversation_history,
-            agent_api_url=agent_url,
-            agent_api_key=agent_key,
-            agent_llm_model=agent_model,
-            agent_temperature=agent_temp,
-            use_a2a=use_a2a,
         )
         
         # Add the new questions to conversation
@@ -731,12 +794,6 @@ async def answer_question(
     
     files_data = json.loads(job.files)
     documents = [f for f in files_data if has_readable_source(f)]
-    hired = _get_first_hired_agent_for_job(db, job.id)
-    if hired:
-        agent_url, agent_key, agent_model, agent_temp, use_a2a = hired
-    else:
-        agent_url = agent_key = agent_model = agent_temp = None
-        use_a2a = False
 
     try:
         analyzer = DocumentAnalyzer()
@@ -746,11 +803,6 @@ async def answer_question(
             job_title=job.title,
             job_description=job.description,
             conversation_history=conversation_history,
-            agent_api_url=agent_url,
-            agent_api_key=agent_key,
-            agent_llm_model=agent_model,
-            agent_temperature=agent_temp,
-            use_a2a=use_a2a,
         )
         
         # Add new questions if any (dedupe: skip if already in conversation or already in this batch)
@@ -823,9 +875,8 @@ async def generate_workflow_questions(
     db: Session = Depends(get_db)
 ):
     """
-    Generate clarifying questions from each workflow step's assigned agent (their API/A2A),
-    using BRD documents and job context. Questions are tagged with workflow_step_id and agent_id.
-    Requires each assigned agent to have an api_endpoint. Platform Agent Planner is not used here.
+    Generate clarifying questions using BRD documents, job context, and the full workflow.
+    Uses the platform Agent Planner only (no per-agent LLM calls). Questions are not tied to a single step id.
     """
     job = db.query(Job).filter(Job.id == job_id).first()
     if not job:
@@ -870,17 +921,28 @@ async def generate_workflow_questions(
         except (json.JSONDecodeError, TypeError):
             pass
 
-    had_endpoint = False
-    for step in steps:
-        ag = db.query(Agent).filter(Agent.id == step.agent_id).first()
-        if ag and (ag.api_endpoint or "").strip():
-            had_endpoint = True
-            break
-    if not had_endpoint:
+    from services.planner_llm import is_agent_planner_configured
+
+    if not is_agent_planner_configured():
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="No assigned agents have an API endpoint. Configure each agent's endpoint so they can ask clarification questions for their task.",
+            detail="Workflow clarification requires the platform Agent Planner. Configure AGENT_PLANNER_API_KEY.",
         )
+
+    workflow_tasks = []
+    for step in steps:
+        agent = db.query(Agent).filter(Agent.id == step.agent_id).first()
+        input_data = {}
+        if step.input_data:
+            try:
+                input_data = json.loads(step.input_data)
+            except (json.JSONDecodeError, TypeError):
+                pass
+        workflow_tasks.append({
+            "step_order": step.step_order,
+            "agent_name": agent.name if agent else "Agent",
+            "assigned_task": input_data.get("assigned_task", ""),
+        })
 
     new_conversation = conversation_history.copy()
     existing_questions = {
@@ -892,67 +954,32 @@ async def generate_workflow_questions(
     added_questions = []
     analyzer = DocumentAnalyzer()
 
-    for step in steps:
-        agent = db.query(Agent).filter(Agent.id == step.agent_id).first()
-        if not agent or not (agent.api_endpoint or "").strip():
-            logger.info(
-                "Skipping workflow step %s: agent %s has no API endpoint for Q&A",
-                step.id,
-                step.agent_id,
-            )
+    try:
+        result = await analyzer.generate_workflow_clarification_questions(
+            job_title=job.title or "",
+            job_description=job.description,
+            documents_content=documents_content,
+            workflow_tasks=workflow_tasks,
+            conversation_history=new_conversation,
+            only_step=None,
+        )
+    except Exception as e:
+        logger.warning("Workflow clarification questions failed for job_id=%s: %s", job_id, e)
+        result = {"questions": []}
+
+    for q in result.get("questions") or []:
+        qs = str(q).strip() if q else ""
+        if not qs or qs in existing_questions or qs in seen_in_batch:
             continue
-
-        input_data = {}
-        if step.input_data:
-            try:
-                input_data = json.loads(step.input_data)
-            except (json.JSONDecodeError, TypeError):
-                pass
-        only_step = {
-            "step_order": step.step_order,
-            "agent_name": agent.name if agent else "Agent",
-            "assigned_task": input_data.get("assigned_task", ""),
-        }
-
-        try:
-            result = await analyzer.generate_workflow_clarification_questions(
-                job_title=job.title or "",
-                job_description=job.description,
-                documents_content=documents_content,
-                workflow_tasks=[only_step],
-                conversation_history=new_conversation,
-                agent_api_url=(agent.api_endpoint or "").strip(),
-                agent_api_key=(agent.api_key or "").strip() or None,
-                agent_llm_model=getattr(agent, "llm_model", None),
-                agent_temperature=getattr(agent, "temperature", None),
-                use_a2a=bool(getattr(agent, "a2a_enabled", False)),
-                only_step=only_step,
-            )
-        except Exception as e:
-            logger.warning(
-                "Workflow clarification questions failed for step %s (agent %s): %s",
-                step.id,
-                step.agent_id,
-                e,
-            )
-            continue
-
-        for q in result.get("questions") or []:
-            qs = str(q).strip() if q else ""
-            if not qs or qs in existing_questions or qs in seen_in_batch:
-                continue
-            seen_in_batch.add(qs)
-            existing_questions.add(qs)
-            added_questions.append(qs)
-            new_conversation.append({
-                "type": "question",
-                "question": qs,
-                "answer": None,
-                "timestamp": str(datetime.utcnow()),
-                "workflow_step_id": step.id,
-                "agent_id": agent.id,
-                "agent_name": agent.name if agent else None,
-            })
+        seen_in_batch.add(qs)
+        existing_questions.add(qs)
+        added_questions.append(qs)
+        new_conversation.append({
+            "type": "question",
+            "question": qs,
+            "answer": None,
+            "timestamp": str(datetime.utcnow()),
+        })
 
     questions = added_questions
 
@@ -1038,6 +1065,12 @@ async def download_job_planner_artifact_raw(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Artifact not found")
     cached = await asyncio.to_thread(get_cached_planner_raw, job_id, artifact_id)
     if cached is not None:
+        if (row.artifact_type or "").strip().lower() == "tool_suggestion":
+            cached = _enrich_tool_suggestion_json_bytes(
+                cached,
+                db=db,
+                business_id=int(job.business_id),
+            )
         return Response(content=cached, media_type="application/json")
     try:
         data = await asyncio.to_thread(read_planner_artifact_bytes, row)
@@ -1046,6 +1079,12 @@ async def download_job_planner_artifact_raw(
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="Could not read artifact from storage",
+        )
+    if (row.artifact_type or "").strip().lower() == "tool_suggestion":
+        data = _enrich_tool_suggestion_json_bytes(
+            data,
+            db=db,
+            business_id=int(job.business_id),
         )
     await asyncio.to_thread(set_cached_planner_raw, job_id, artifact_id, data)
     return Response(content=data, media_type="application/json")
@@ -1067,11 +1106,15 @@ def get_job_planner_pipeline(
     if not _user_can_access_job(job, current_user, db):
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Not authorized")
     payloads, row_ids = load_latest_planner_pipeline_payloads(db, job_id)
+    tool_suggestion = payloads.get("tool_suggestion")
+    if isinstance(tool_suggestion, dict):
+        tool_name_by_id = _platform_tool_name_map_for_business(db, int(job.business_id))
+        tool_suggestion = _attach_tool_names_to_step_suggestions(tool_suggestion, tool_name_by_id)
     return PlannerPipelineBundleResponse(
         job_id=job_id,
         brd_analysis=payloads.get("brd_analysis"),
         task_split=payloads.get("task_split"),
-        tool_suggestion=payloads.get("tool_suggestion"),
+        tool_suggestion=tool_suggestion,
         artifact_ids={
             "brd_analysis": row_ids.get("brd_analysis"),
             "task_split": row_ids.get("task_split"),
@@ -1186,6 +1229,7 @@ def list_jobs(
             "write_execution_mode": getattr(job, "write_execution_mode", "platform"),
             "output_artifact_format": getattr(job, "output_artifact_format", "jsonl"),
             "output_contract": _parse_contract_json(getattr(job, "output_contract", None)),
+            "workflow_origin": _workflow_origin_for_response(job),
         }
         result.append(JobResponse(**job_dict))
     return result
@@ -1296,6 +1340,7 @@ def get_job(
         "write_execution_mode": getattr(job, "write_execution_mode", "platform"),
         "output_artifact_format": getattr(job, "output_artifact_format", "jsonl"),
         "output_contract": _parse_contract_json(getattr(job, "output_contract", None)),
+        "workflow_origin": _workflow_origin_for_response(job),
     }
     return JobResponse(**job_dict)
 
@@ -1454,18 +1499,11 @@ async def update_job(
             len(old_files_to_cleanup),
         )
     
-    # If new files were added, automatically trigger document analysis (extraction only or via first hired agent)
+    # If new files were added, automatically trigger document analysis (planner when configured)
     if new_files_added and job.files:
         try:
             files_data = json.loads(job.files)
             documents = [f for f in files_data if has_readable_source(f)]
-            hired = _get_first_hired_agent_for_job(db, job.id)
-            if hired:
-                agent_url, agent_key = hired[0], hired[1]
-                use_a2a = hired[4] if len(hired) > 4 else False
-            else:
-                agent_url = agent_key = None
-                use_a2a = False
 
             analyzer = DocumentAnalyzer()
             result = await analyzer.analyze_documents_and_generate_questions(
@@ -1473,9 +1511,6 @@ async def update_job(
                 job_title=job.title,
                 job_description=job.description,
                 conversation_history=[],
-                agent_api_url=agent_url,
-                agent_api_key=agent_key,
-                use_a2a=use_a2a,
             )
             
             # Add analysis and questions to conversation
@@ -1555,6 +1590,7 @@ async def update_job(
         "write_execution_mode": getattr(job, "write_execution_mode", "platform"),
         "output_artifact_format": getattr(job, "output_artifact_format", "jsonl"),
         "output_contract": _parse_contract_json(getattr(job, "output_contract", None)),
+        "workflow_origin": _workflow_origin_for_response(job),
     }
 
     return JobResponse(**job_dict)
@@ -1674,14 +1710,23 @@ async def auto_split_workflow(
         job.output_contract = json.dumps(contract_obj) if contract_obj is not None else None
     db.commit()
     workflow_builder = WorkflowBuilder(db)
-    preview = await workflow_builder.auto_split_workflow_async(
-        job_id, body.agent_ids, workflow_mode=workflow_mode, step_tools=step_tools, tool_visibility=tv
-    )
+    try:
+        preview = await workflow_builder.auto_split_workflow_async(
+            job_id, body.agent_ids, workflow_mode=workflow_mode, step_tools=step_tools, tool_visibility=tv
+        )
+    except PlannerSplitError as e:
+        detail = str(e) or "Platform task planner could not build the workflow split."
+        if getattr(e, "last_detail", None):
+            detail = f"{detail} Detail: {e.last_detail}"
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=detail[:2000],
+        ) from e
     return preview
 
 
 class SuggestWorkflowToolsBody(BaseModel):
-    """Agents in workflow order (same as auto-split). LLM: platform planner if configured, else first agent's endpoint."""
+    """Agents in workflow order (same as auto-split). Tool suggestions use platform planner or a deterministic fallback."""
     agent_ids: List[int]
 
 
@@ -1761,19 +1806,22 @@ async def suggest_workflow_tools(
 
     wb = WorkflowBuilder(db)
     documents_content = await wb.load_job_documents_content_async(job)
-    splitter_agent = agents_ordered[0]
 
     llm_audit: Dict[str, Any] = {}
-    result = await suggest_tool_assignments_for_agents(
-        job_title=job.title or "",
-        job_description=job.description or "",
-        documents_content=documents_content,
-        conversation_data=conversation_data,
-        agents=agents_ordered,
-        platform_tools=platform_tools,
-        splitter_agent=splitter_agent,
-        llm_audit=llm_audit,
+    decision = resolve_runtime_planner_transport(
+        db,
+        agent_ids=[int(a.id) for a in agents_ordered if getattr(a, "id", None) is not None],
     )
+    with planner_runtime_transport_scope(decision):
+        result = await suggest_tool_assignments_for_agents(
+            job_title=job.title or "",
+            job_description=job.description or "",
+            documents_content=documents_content,
+            conversation_data=conversation_data,
+            agents=agents_ordered,
+            platform_tools=platform_tools,
+            llm_audit=llm_audit,
+        )
     if llm_audit.get("raw_llm_response"):
         aid = await persist_json_planner_artifact(
             db,
@@ -1958,6 +2006,7 @@ def approve_job(
         "write_execution_mode": getattr(job, "write_execution_mode", "platform"),
         "output_artifact_format": getattr(job, "output_artifact_format", "jsonl"),
         "output_contract": _parse_contract_json(getattr(job, "output_contract", None)),
+        "workflow_origin": _workflow_origin_for_response(job),
     }
     return JobResponse(**job_dict)
 
@@ -2054,6 +2103,7 @@ def execute_job(
         "write_execution_mode": getattr(job, "write_execution_mode", "platform"),
         "output_artifact_format": getattr(job, "output_artifact_format", "jsonl"),
         "output_contract": _parse_contract_json(getattr(job, "output_contract", None)),
+        "workflow_origin": _workflow_origin_for_response(job),
     }
     return JobResponse(**job_dict)
 
@@ -2175,6 +2225,7 @@ def get_job_status(
         "write_execution_mode": getattr(job, "write_execution_mode", "platform"),
         "output_artifact_format": getattr(job, "output_artifact_format", "jsonl"),
         "output_contract": _parse_contract_json(getattr(job, "output_contract", None)),
+        "workflow_origin": _workflow_origin_for_response(job),
     }
 
     # Compute schedule-aware fields for frontend UX

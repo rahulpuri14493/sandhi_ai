@@ -65,7 +65,6 @@ async def test_suggest_tools_empty_platform_tools_returns_fallback():
         conversation_data=None,
         agents=[agent],
         platform_tools=[],
-        splitter_agent=agent,
     )
     assert out["fallback_used"] is True
     assert out["step_suggestions"] == []
@@ -82,14 +81,6 @@ async def test_suggest_tools_no_splitter_url_uses_fallback_partition():
         SimpleNamespace(name="A0", description="x"),
         SimpleNamespace(name="A1", description="y"),
     ]
-    splitter = SimpleNamespace(
-        name="S",
-        description="d",
-        api_endpoint="",
-        api_key=None,
-        llm_model=None,
-        temperature=None,
-    )
     out = await suggest_tool_assignments_for_agents(
         job_title="job",
         job_description="desc",
@@ -97,7 +88,6 @@ async def test_suggest_tools_no_splitter_url_uses_fallback_partition():
         conversation_data=None,
         agents=agents,
         platform_tools=tools,
-        splitter_agent=splitter,
     )
     assert out["fallback_used"] is True
     assert len(out["step_suggestions"]) == 2
@@ -105,44 +95,25 @@ async def test_suggest_tools_no_splitter_url_uses_fallback_partition():
 
 
 @pytest.mark.asyncio
-async def test_suggest_tools_llm_success_parses_json_array():
+async def test_suggest_tools_planner_success_parses_json_array():
     tools = [
         SimpleNamespace(id=7, name="W", tool_type="weaviate"),
     ]
     agents = [SimpleNamespace(name="Only", description="d")]
-    splitter = SimpleNamespace(
-        name="Split",
-        description="d",
-        api_endpoint="https://llm.example/v1/chat/completions",
-        api_key="k",
-        llm_model="gpt-4o-mini",
-        temperature=0.2,
-    )
-    mock_resp = MagicMock()
-    mock_resp.status_code = 200
-    mock_resp.json.return_value = {
-        "choices": [
-            {
-                "message": {
-                    "content": '[{"agent_index": 0, "platform_tool_ids": [7], "rationale": "needs search"}]'
-                }
-            }
-        ]
-    }
-    with patch(
-        "services.tool_splitter.post_openai_compatible_raw",
-        new_callable=AsyncMock,
-        return_value=mock_resp,
-    ):
-        out = await suggest_tool_assignments_for_agents(
-            job_title="t",
-            job_description="d",
-            documents_content=[{"id": "1", "name": "BRD", "content": "short"}],
-            conversation_data=None,
-            agents=agents,
-            platform_tools=tools,
-            splitter_agent=splitter,
-        )
+    raw = '[{"agent_index": 0, "platform_tool_ids": [7], "rationale": "needs search"}]'
+    with patch("services.tool_splitter.is_agent_planner_configured", return_value=True):
+        with patch(
+            "services.tool_splitter.planner_chat_completion",
+            new=AsyncMock(return_value=raw),
+        ):
+            out = await suggest_tool_assignments_for_agents(
+                job_title="t",
+                job_description="d",
+                documents_content=[{"id": "1", "name": "BRD", "content": "short"}],
+                conversation_data=None,
+                agents=agents,
+                platform_tools=tools,
+            )
     assert out["fallback_used"] is False
     assert out["step_suggestions"][0]["platform_tool_ids"] == [7]
     assert "rationale" in out["step_suggestions"][0]
@@ -150,39 +121,27 @@ async def test_suggest_tools_llm_success_parses_json_array():
 
 
 @pytest.mark.asyncio
-async def test_suggest_tools_fills_llm_audit_on_agent_endpoint():
+async def test_suggest_tools_fills_llm_audit_on_planner():
     tools = [SimpleNamespace(id=7, name="W", tool_type="weaviate")]
     agents = [SimpleNamespace(name="Only", description="d")]
-    splitter = SimpleNamespace(
-        name="Split",
-        description="d",
-        api_endpoint="https://llm.example/v1/chat/completions",
-        api_key="k",
-        llm_model="gpt-4o-mini",
-        temperature=0.2,
-    )
     raw = '[{"agent_index": 0, "platform_tool_ids": [7], "rationale": "x"}]'
-    mock_resp = MagicMock()
-    mock_resp.status_code = 200
-    mock_resp.json.return_value = {"choices": [{"message": {"content": raw}}]}
     audit: dict = {}
-    with patch(
-        "services.tool_splitter.post_openai_compatible_raw",
-        new_callable=AsyncMock,
-        return_value=mock_resp,
-    ):
-        await suggest_tool_assignments_for_agents(
-            job_title="t",
-            job_description="d",
-            documents_content=None,
-            conversation_data=None,
-            agents=agents,
-            platform_tools=tools,
-            splitter_agent=splitter,
-            llm_audit=audit,
-        )
+    with patch("services.tool_splitter.is_agent_planner_configured", return_value=True):
+        with patch(
+            "services.tool_splitter.planner_chat_completion",
+            new=AsyncMock(return_value=raw),
+        ):
+            await suggest_tool_assignments_for_agents(
+                job_title="t",
+                job_description="d",
+                documents_content=None,
+                conversation_data=None,
+                agents=agents,
+                platform_tools=tools,
+                llm_audit=audit,
+            )
     assert audit.get("raw_llm_response") == raw
-    assert audit.get("source") == "agent_endpoint"
+    assert audit.get("source") == "planner"
 
 
 @pytest.mark.asyncio
@@ -192,14 +151,6 @@ async def test_suggest_tools_planner_uses_agent_planner_temperature(monkeypatch)
 
     tools = [SimpleNamespace(id=7, name="W", tool_type="weaviate")]
     agents = [SimpleNamespace(name="Only", description="d")]
-    splitter = SimpleNamespace(
-        name="Split",
-        description="d",
-        api_endpoint="",
-        api_key=None,
-        llm_model="gpt-4o-mini",
-        temperature=0.99,
-    )
     monkeypatch.setattr(settings, "AGENT_PLANNER_TEMPERATURE", 0.22, raising=False)
     raw = json.dumps(
         [{"agent_index": 0, "platform_tool_ids": [7], "rationale": "search"}]
@@ -214,7 +165,6 @@ async def test_suggest_tools_planner_uses_agent_planner_temperature(monkeypatch)
                 conversation_data=None,
                 agents=agents,
                 platform_tools=tools,
-                splitter_agent=splitter,
             )
     mock_planner.assert_called_once()
     _args, kwargs = mock_planner.call_args

@@ -239,7 +239,15 @@ async def send_message(
 
     normalized_url = (url or "").strip()
     adapter = (settings.A2A_ADAPTER_URL or "").strip()
-    allow_private = bool(adapter and _a2a_urls_equivalent(normalized_url, adapter))
+    planner_adapter = (getattr(settings, "AGENT_PLANNER_ADAPTER_URL", None) or "").strip()
+    planner_native = (getattr(settings, "AGENT_PLANNER_A2A_URL", None) or "").strip()
+    allow_private = bool(
+        adapter and _a2a_urls_equivalent(normalized_url, adapter)
+    ) or bool(
+        planner_adapter and _a2a_urls_equivalent(normalized_url, planner_adapter)
+    ) or bool(
+        planner_native and _a2a_urls_equivalent(normalized_url, planner_native)
+    )
     safe_url = _validate_public_http_url(
         normalized_url, allow_private_resolve=allow_private
     )

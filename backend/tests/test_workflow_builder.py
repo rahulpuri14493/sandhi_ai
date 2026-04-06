@@ -280,9 +280,10 @@ def test_auto_split_persists_task_split_artifact_when_split_returns_raw_audit(mo
                     with patch.object(builder.payment_processor, "calculate_job_cost", return_value=MagicMock()):
                         builder.auto_split_workflow(1, [1, 2], workflow_mode="sequential")
     p_artifact.assert_awaited()
-    aa = p_artifact.await_args
+    task_split_calls = [c for c in p_artifact.await_args_list if len(c.args) >= 4 and c.args[2] == "task_split"]
+    assert task_split_calls, "Expected at least one task_split artifact write"
+    aa = task_split_calls[0]
     assert aa.args[1] == 1
-    assert aa.args[2] == "task_split"
     payload = aa.args[3]
     assert payload.get("raw_llm_response") == "[]"
     assert payload.get("source") == "planner"

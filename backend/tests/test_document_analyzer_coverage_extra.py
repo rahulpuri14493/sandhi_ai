@@ -243,196 +243,21 @@ async def test_platform_planner_failure_propagates(monkeypatch, tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_analyze_documents_hired_agent_openai_json(monkeypatch, tmp_path):
+async def test_analyze_documents_no_planner_ignores_hired_agent_url(monkeypatch, tmp_path):
     import services.document_analyzer as mod
-    from core.config import settings
 
     monkeypatch.setattr(mod, "is_agent_planner_configured", lambda: False)
-    monkeypatch.setattr(settings, "A2A_ADAPTER_URL", "", raising=False)
-
-    class FakeResponse:
-        def raise_for_status(self):
-            pass
-
-        def json(self):
-            return {
-                "choices": [
-                    {
-                        "message": {
-                            "content": json.dumps(
-                                {
-                                    "analysis": "HTTP agent",
-                                    "questions": ["Q?"],
-                                    "workflow_collaboration_hint": "invalid_hint",
-                                }
-                            )
-                        }
-                    }
-                ]
-            }
-
-    class FakeClient:
-        def __init__(self, *a, **kw):
-            pass
-
-        async def __aenter__(self):
-            return self
-
-        async def __aexit__(self, *a):
-            return None
-
-        async def post(self, *a, **kw):
-            return FakeResponse()
-
-    monkeypatch.setattr(mod.httpx, "AsyncClient", lambda *a, **kw: FakeClient())
     da = DocumentAnalyzer()
     p = tmp_path / "r.txt"
     p.write_text("body", encoding="utf-8")
     out = await da.analyze_documents_and_generate_questions(
         documents=[{"path": str(p), "name": "r.txt"}],
         job_title="J",
-        job_description="D",
-        conversation_history=[
-            {"type": "question", "question": "A?", "answer": "B"},
-            {"type": "analysis", "content": "Note"},
-        ],
-        agent_api_url="https://agent.example/v1/chat",
+        agent_api_url="https://would-be-agent.example/v1",
         agent_api_key="k",
     )
-    assert out["analysis"] == "HTTP agent"
-    assert out["workflow_collaboration_hint"] is None
-
-
-@pytest.mark.asyncio
-async def test_analyze_documents_hired_agent_list_content_and_bad_json(monkeypatch, tmp_path):
-    import services.document_analyzer as mod
-    from core.config import settings
-
-    monkeypatch.setattr(mod, "is_agent_planner_configured", lambda: False)
-    monkeypatch.setattr(settings, "A2A_ADAPTER_URL", "", raising=False)
-
-    class FakeResponse:
-        def raise_for_status(self):
-            pass
-
-        def json(self):
-            return {
-                "choices": [
-                    {"message": {"content": [{"text": "Part1"}, {"content": "Part2"}]}}
-                ]
-            }
-
-    class FakeClient:
-        async def __aenter__(self):
-            return self
-
-        async def __aexit__(self, *a):
-            return None
-
-        async def post(self, *a, **kw):
-            return FakeResponse()
-
-    monkeypatch.setattr(mod.httpx, "AsyncClient", lambda *a, **kw: FakeClient())
-    da = DocumentAnalyzer()
-    p = tmp_path / "r.txt"
-    p.write_text("x", encoding="utf-8")
-    out = await da.analyze_documents_and_generate_questions(
-        documents=[{"path": str(p), "name": "r.txt"}],
-        job_title="J",
-        agent_api_url="https://agent.example/v1",
-        agent_api_key="k",
-    )
-    assert "Part1" in out["analysis"] and "Part2" in out["analysis"]
-
-    class FakeResponse2:
-        def raise_for_status(self):
-            pass
-
-        def json(self):
-            return {"choices": [{"message": {"content": "not json at all"}}]}
-
-    class FakeClient2:
-        async def __aenter__(self):
-            return self
-
-        async def __aexit__(self, *a):
-            return None
-
-        async def post(self, *a, **kw):
-            return FakeResponse2()
-
-    monkeypatch.setattr(mod.httpx, "AsyncClient", lambda *a, **kw: FakeClient2())
-    out2 = await da.analyze_documents_and_generate_questions(
-        documents=[{"path": str(p), "name": "r.txt"}],
-        job_title="J",
-        agent_api_url="https://agent.example/v1",
-    )
-    assert "not json" in out2["analysis"]
-
-
-@pytest.mark.asyncio
-async def test_analyze_documents_hired_agent_http_error(monkeypatch, tmp_path):
-    import httpx
-
-    import services.document_analyzer as mod
-    from core.config import settings
-
-    monkeypatch.setattr(mod, "is_agent_planner_configured", lambda: False)
-    monkeypatch.setattr(settings, "A2A_ADAPTER_URL", "", raising=False)
-
-    req = httpx.Request("POST", "https://agent.example/v1")
-    resp = httpx.Response(502, request=req, text="bad")
-    err = httpx.HTTPStatusError("err", request=req, response=resp)
-
-    class FakeClient:
-        async def __aenter__(self):
-            return self
-
-        async def __aexit__(self, *a):
-            return None
-
-        async def post(self, *a, **kw):
-            raise err
-
-    monkeypatch.setattr(mod.httpx, "AsyncClient", lambda *a, **kw: FakeClient())
-    da = DocumentAnalyzer()
-    p = tmp_path / "r.txt"
-    p.write_text("x", encoding="utf-8")
-    with pytest.raises(Exception, match="502"):
-        await da.analyze_documents_and_generate_questions(
-            documents=[{"path": str(p), "name": "r.txt"}],
-            job_title="J",
-            agent_api_url="https://agent.example/v1",
-        )
-
-
-@pytest.mark.asyncio
-async def test_analyze_documents_adapter_a2a_branch(monkeypatch, tmp_path):
-    import services.document_analyzer as mod
-    from core.config import settings
-
-    monkeypatch.setattr(mod, "is_agent_planner_configured", lambda: False)
-    monkeypatch.setattr(settings, "A2A_ADAPTER_URL", "http://adapter.local", raising=False)
-
-    async def fake_a2a(adapter_url, input_data, **kwargs):
-        assert adapter_url == "http://adapter.local"
-        assert kwargs.get("adapter_metadata", {}).get("openai_model")
-        return {"content": json.dumps({"analysis": "via adapter", "questions": []})}
-
-    monkeypatch.setattr(mod, "execute_via_a2a", fake_a2a)
-    da = DocumentAnalyzer()
-    p = tmp_path / "r.txt"
-    p.write_text("x", encoding="utf-8")
-    out = await da.analyze_documents_and_generate_questions(
-        documents=[{"path": str(p), "name": "r.txt"}],
-        job_title="J",
-        conversation_history=[],
-        agent_api_url="https://api.openai.com/v1",
-        agent_api_key="sk-test",
-        agent_llm_model="gpt-4o-mini",
-        use_a2a=False,
-    )
-    assert out["analysis"] == "via adapter"
+    assert "Configure the platform Agent Planner" in out["analysis"]
+    assert out["questions"] == []
 
 
 @pytest.mark.asyncio

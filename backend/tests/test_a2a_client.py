@@ -240,6 +240,59 @@ async def test_send_message_calls_httpx():
 
 
 @pytest.mark.asyncio
+async def test_send_message_allows_private_resolve_when_target_is_planner_adapter(monkeypatch):
+    """Dedicated planner adapter URL (private IP) must match SSRF allowlist like hired-agent adapter."""
+    from core import config
+
+    monkeypatch.setattr(config.settings, "AGENT_PLANNER_ADAPTER_URL", "http://a2a-planner-adapter:8080")
+    monkeypatch.setattr(config.settings, "ALLOW_PRIVATE_AGENT_ENDPOINTS", False)
+    monkeypatch.setattr(
+        "services.a2a_client.socket.getaddrinfo",
+        lambda *a, **k: [(socket.AF_INET, None, None, None, ("172.19.0.3", 0))],
+    )
+    with patch("services.a2a_client.httpx.AsyncClient") as mock_client:
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.json.return_value = {
+            "result": {"message": {"parts": [{"text": "planner-adapter-ok"}]}}
+        }
+        mock_client.return_value.__aenter__.return_value.post = AsyncMock(
+            return_value=mock_response
+        )
+        result = await send_message(
+            "http://a2a-planner-adapter:8080",
+            [{"text": "ping"}],
+        )
+    assert result["content"] == "planner-adapter-ok"
+
+
+@pytest.mark.asyncio
+async def test_send_message_allows_private_resolve_when_target_is_native_planner_a2a(monkeypatch):
+    from core import config
+
+    monkeypatch.setattr(config.settings, "AGENT_PLANNER_A2A_URL", "http://planner-native:9000")
+    monkeypatch.setattr(config.settings, "ALLOW_PRIVATE_AGENT_ENDPOINTS", False)
+    monkeypatch.setattr(
+        "services.a2a_client.socket.getaddrinfo",
+        lambda *a, **k: [(socket.AF_INET, None, None, None, ("172.19.0.4", 0))],
+    )
+    with patch("services.a2a_client.httpx.AsyncClient") as mock_client:
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.json.return_value = {
+            "result": {"message": {"parts": [{"text": "native-planner-ok"}]}}
+        }
+        mock_client.return_value.__aenter__.return_value.post = AsyncMock(
+            return_value=mock_response
+        )
+        result = await send_message(
+            "http://planner-native:9000",
+            [{"text": "ping"}],
+        )
+    assert result["content"] == "native-planner-ok"
+
+
+@pytest.mark.asyncio
 async def test_send_message_allows_private_resolve_when_target_is_configured_adapter(monkeypatch):
     """Docker/internal adapter host resolves to a private IP; must not be blocked as SSRF."""
     from core import config

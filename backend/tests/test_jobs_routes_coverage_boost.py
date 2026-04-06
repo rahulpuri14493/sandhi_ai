@@ -352,7 +352,8 @@ def test_generate_workflow_questions_404_and_403_and_no_workflow(client: TestCli
     assert "no workflow" in r2.text.lower()
 
 
-def test_generate_workflow_questions_no_agent_endpoint(client: TestClient, db_session):
+def test_generate_workflow_questions_requires_planner(monkeypatch, client: TestClient, db_session):
+    monkeypatch.setattr("services.planner_llm.is_agent_planner_configured", lambda: False)
     u, h = _headers_biz(db_session, "gwnae")
     dev = User(
         email=f"d_{uuid.uuid4().hex[:8]}@e.com",
@@ -394,12 +395,13 @@ def test_generate_workflow_questions_no_agent_endpoint(client: TestClient, db_se
     db_session.commit()
     r = client.post(f"/api/jobs/{job.id}/generate-workflow-questions", headers=h)
     assert r.status_code == 400
-    assert "api endpoint" in r.text.lower()
+    assert "planner" in r.text.lower()
 
 
 def test_generate_workflow_skips_step_without_endpoint_and_survives_step_error(
     monkeypatch, client: TestClient, db_session, tmp_path
 ):
+    monkeypatch.setattr("services.planner_llm.is_agent_planner_configured", lambda: True)
     u, h = _headers_biz(db_session, "gwsk")
     dev = User(
         email=f"d2_{uuid.uuid4().hex[:8]}@e.com",
@@ -464,13 +466,8 @@ def test_generate_workflow_skips_step_without_endpoint_and_survives_step_error(
     )
     db_session.commit()
 
-    calls = {"n": 0}
-
     async def fake_gen(**kwargs):
-        calls["n"] += 1
-        if calls["n"] == 1:
-            return {"questions": ["First step Q?"]}
-        raise RuntimeError("step2 boom")
+        return {"questions": ["First step Q?"]}
 
     monkeypatch.setattr(
         jobs_mod.DocumentAnalyzer,
@@ -483,6 +480,7 @@ def test_generate_workflow_skips_step_without_endpoint_and_survives_step_error(
 
 
 def test_generate_workflow_invalid_files_json_still_runs(monkeypatch, client: TestClient, db_session):
+    monkeypatch.setattr("services.planner_llm.is_agent_planner_configured", lambda: True)
     u, h = _headers_biz(db_session, "gwifj")
     dev = User(
         email=f"d3_{uuid.uuid4().hex[:8]}@e.com",

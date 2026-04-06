@@ -3,7 +3,7 @@ import asyncio
 import json
 import time
 import uuid
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -12,6 +12,9 @@ from models.job import Job, JobStatus, WorkflowStep
 from models.user import User, UserRole
 from services import agent_executor as ae
 from services.agent_executor import AgentExecutor
+from core.config import settings as app_settings
+from services.task_splitter import PlannerSplitError
+from services.workflow_builder import WorkflowBuilder
 
 
 def _create_job_with_steps(
@@ -514,3 +517,109 @@ async def test_nested_exceptiongroup_unwraps_to_inner_exception(db_session):
     db_session.refresh(job)
     assert job.status == JobStatus.FAILED
     assert "inner leaf" in (job.failure_reason or "")
+
+
+@pytest.mark.asyncio
+async def test_execute_job_planner_replan_failure_marks_job_failed(db_session, monkeypatch):
+    """When execute-time replan is enabled and planner fails, job is FAILED without running steps."""
+    monkeypatch.setattr(app_settings, "AGENT_PLANNER_EXECUTE_REPLAN_ON_FAILURE", "fail")
+    job, _steps, _ = _create_job_with_steps(db_session, depends_on_previous_list=[False, False])
+    executor = AgentExecutor(db_session)
+    calc_mock = MagicMock()
+    pay_mock = MagicMock()
+    with patch("services.planner_llm.is_agent_planner_configured", return_value=True):
+        with patch.object(
+            WorkflowBuilder,
+            "replan_workflow_steps_at_execute_async",
+            new=AsyncMock(side_effect=PlannerSplitError("simulated planner failure", last_detail="invalid JSON")),
+        ):
+            with patch.object(executor.payment_processor, "calculate_job_cost", calc_mock):
+                with patch.object(executor.payment_processor, "process_payment", pay_mock):
+                    await executor.execute_job(job.id)
+    db_session.refresh(job)
+    assert job.status == JobStatus.FAILED
+    assert "simulated planner failure" in (job.failure_reason or "")
+    calc_mock.assert_not_called()
+    pay_mock.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_execute_job_planner_replan_failure_continue_runs_built_workflow(db_session, monkeypatch):
+    """AGENT_PLANNER_EXECUTE_REPLAN_ON_FAILURE=continue keeps the pre-built workflow and charges after failed replan."""
+    monkeypatch.setattr(app_settings, "AGENT_PLANNER_EXECUTE_REPLAN_ON_FAILURE", "continue")
+    job, _steps, _ = _create_job_with_steps(db_session, depends_on_previous_list=[False, False])
+    executor = AgentExecutor(db_session)
+    fake_tx = MagicMock()
+    fake_tx.id = 42
+
+    async def fake_core(self, job_id, step_id, prev):
+        return {"ok": True}
+
+    with patch("services.planner_llm.is_agent_planner_configured", return_value=True):
+        with patch.object(
+            WorkflowBuilder,
+            "replan_workflow_steps_at_execute_async",
+            new=AsyncMock(side_effect=PlannerSplitError("planner down")),
+        ):
+            with patch.object(executor.payment_processor, "calculate_job_cost", lambda jid: None):
+                with patch.object(executor.payment_processor, "process_payment", return_value=fake_tx):
+                    with patch.object(executor.payment_processor, "distribute_earnings", lambda jid: None):
+                        with patch.object(AgentExecutor, "_execute_one_step_core", new=fake_core):
+                            await executor.execute_job(job.id)
+    db_session.refresh(job)
+    assert job.status == JobStatus.COMPLETED
+
+
+@pytest.mark.asyncio
+async def test_execute_job_skips_replan_for_manual_workflow_origin(db_session):
+    """Manual workflows must not be overwritten by execute-time replan."""
+    job, _steps, _ = _create_job_with_steps(db_session, depends_on_previous_list=[False, False])
+    job.workflow_origin = "manual"
+    db_session.commit()
+    db_session.refresh(job)
+    executor = AgentExecutor(db_session)
+
+    async def fake_core(self, job_id, step_id, prev):
+        return {"ok": True}
+
+    replan_mock = AsyncMock()
+    fake_tx = MagicMock()
+    fake_tx.id = 43
+    with patch("services.planner_llm.is_agent_planner_configured", return_value=True):
+        with patch.object(WorkflowBuilder, "replan_workflow_steps_at_execute_async", replan_mock):
+            with patch.object(executor.payment_processor, "calculate_job_cost", lambda jid: None):
+                with patch.object(executor.payment_processor, "process_payment", return_value=fake_tx):
+                    with patch.object(executor.payment_processor, "distribute_earnings", lambda jid: None):
+                        with patch.object(AgentExecutor, "_execute_one_step_core", new=fake_core):
+                            await executor.execute_job(job.id)
+    replan_mock.assert_not_called()
+    db_session.refresh(job)
+    assert job.status == JobStatus.COMPLETED
+
+
+@pytest.mark.asyncio
+async def test_execute_job_calculates_cost_before_payment(db_session):
+    with patch("services.planner_llm.is_agent_planner_configured", return_value=False):
+        job, _steps, _ = _create_job_with_steps(db_session, depends_on_previous_list=[True])
+        executor = AgentExecutor(db_session)
+        order: list = []
+
+        def calc(jid):
+            order.append("calc")
+
+        fake_tx = MagicMock()
+        fake_tx.id = 44
+
+        def pay(jid):
+            order.append("pay")
+            return fake_tx
+
+        async def fake_core(self, job_id, step_id, prev):
+            return {"ok": True}
+
+        with patch.object(executor.payment_processor, "calculate_job_cost", side_effect=calc):
+            with patch.object(executor.payment_processor, "process_payment", side_effect=pay):
+                with patch.object(executor.payment_processor, "distribute_earnings", lambda jid: None):
+                    with patch.object(AgentExecutor, "_execute_one_step_core", new=fake_core):
+                        await executor.execute_job(job.id)
+        assert order == ["calc", "pay"]

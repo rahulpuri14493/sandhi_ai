@@ -1,77 +1,60 @@
 """Service to split a job into subtasks for multiple agents (generalized, no hardcoding)."""
+from __future__ import annotations
+
+import asyncio
 import logging
 import json
 import re
+from typing import Any, Awaitable, Callable, Dict, List, Optional
+
 from core.config import settings
-from services.llm_http_client import post_openai_compatible_raw
-from services.planner_llm import is_agent_planner_configured, planner_chat_completion
-from typing import List, Dict, Any, Optional
 from models.agent import Agent
+from services.planner_llm import is_agent_planner_configured, planner_chat_completion
 
 logger = logging.getLogger(__name__)
 
 
-def _optional_assignment_reason(entry: Dict[str, Any]) -> Optional[str]:
-    r = entry.get("assignment_reason")
-    if not isinstance(r, str):
-        return None
-    s = r.strip()
-    if not s:
-        return None
-    return s[:2000]
+class PlannerSplitError(Exception):
+    """Raised when the platform Agent Planner could not produce a valid multi-agent split after retries."""
+
+    def __init__(self, message: str, *, attempts: int = 0, last_detail: str = ""):
+        super().__init__(message)
+        self.attempts = attempts
+        self.last_detail = last_detail
 
 
-async def split_job_for_agents(
+def _strip_markdown_json(text: str) -> str:
+    t = (text or "").strip()
+    if t.startswith("```"):
+        parts = t.split("```")
+        if len(parts) >= 2:
+            t = parts[1]
+            if t.startswith("json"):
+                t = t[4:]
+            t = t.strip()
+    return t
+
+
+def _compose_split_messages(
     job_title: str,
     job_description: str,
     documents_content: List[Dict[str, Any]],
     conversation_data: Optional[List[Dict]],
     agents: List[Agent],
-    splitter_agent: Agent,
-    llm_audit: Optional[Dict[str, Any]] = None,
-) -> List[Dict[str, Any]]:
-    """
-    Split the job into N subtasks, one per agent.
-
-    LLM backend: when the platform Agent Planner is configured (AGENT_PLANNER_API_KEY set and enabled),
-    completions use that model. Otherwise the first workflow agent's OpenAI-compatible endpoint is used
-    (same credentials/model fields as that agent). If neither is available, returns fallback tasks.
-
-    Returns list of {"agent_index": int, "task": str, "assigned_document_ids": [..]?} for each agent.
-
-    If llm_audit is a dict, it is filled with raw_llm_response and source when an LLM response
-    was received (before JSON parse), for persisting planner artifacts.
-    """
-    if len(agents) <= 1:
-        all_doc_ids = [d.get("id") for d in documents_content if d.get("id")]
-        return [{
-            "agent_index": 0,
-            "task": _build_full_task_context(job_title, job_description, documents_content),
-            "assigned_document_ids": all_doc_ids if all_doc_ids else None,
-        }]
-
+) -> List[Dict[str, str]]:
     doc_catalog = _build_document_catalog(documents_content)
-
-    use_planner = is_agent_planner_configured()
-    url = (splitter_agent.api_endpoint or "").strip()
-    if not use_planner and not url:
-        return _fallback_tasks(agents, job_title, job_description, documents_content)
-
-    # Build context for the splitter (BRD = documents; use larger excerpt so division is based on full requirements)
     agents_desc = "\n".join(
         f"- Agent {i} ({a.name}): {a.description or 'No description'}"
         for i, a in enumerate(agents)
     )
     docs_text = ""
     if doc_catalog:
-        # Include more BRD content so work division is driven by requirements (up to ~5000 chars per doc)
         docs_text = "\n\n".join(
             f"Document ID: {d.get('id')}\nDocument Name: {d.get('name', 'Unknown')}\n{d.get('content', '')[:5000]}"
             for d in doc_catalog
         )
     conv_text = ""
     if conversation_data:
-        # Q&A from analyze-documents (BRD-driven); use for refining how work is divided
         conv_text = json.dumps(conversation_data, indent=2)[:3000]
 
     system_prompt = """You are a task planner for a multi-agent platform. Your job is to divide work among N agents.
@@ -117,98 +100,233 @@ AGENTS (each will perform one subtask):
 Return JSON array with agent_index, task, and assigned_document_ids for each agent (optional assignment_reason per row).
 If user text explicitly says mappings like "BRD1 handled by Agent1", enforce them strictly in assigned_document_ids."""
 
-    model = (getattr(splitter_agent, "llm_model", None) or "").strip() or "gpt-4o-mini"
-    temperature = (
-        getattr(splitter_agent, "temperature", None)
-        if getattr(splitter_agent, "temperature", None) is not None
-        else 0.3
+    return [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_content},
+    ]
+
+
+def _normalize_parsed_split(
+    text_for_parse: str,
+    agents: List[Agent],
+    doc_catalog: List[Dict[str, Any]],
+    job_title: str,
+    job_description: str,
+    *,
+    planner_strict: bool,
+) -> List[Dict[str, Any]]:
+    parsed = json.loads(text_for_parse)
+    if not isinstance(parsed, list) or len(parsed) < len(agents):
+        raise ValueError(
+            f"Expected a JSON array with at least {len(agents)} entries, got {type(parsed).__name__}"
+        )
+    explicit_map = _extract_explicit_document_agent_mapping(job_description, doc_catalog, agents)
+    has_model_scope = any(
+        isinstance(e.get("assigned_document_ids"), list) and len(e.get("assigned_document_ids")) > 0
+        for e in parsed
+        if isinstance(e, dict)
+    )
+    strict_scope = bool(explicit_map) or has_model_scope
+    normalized_scope = _normalize_agent_document_scope(
+        parsed_assignments=parsed,
+        explicit_assignments=explicit_map,
+        doc_catalog=doc_catalog,
+        agents=agents,
+        strict_scope=strict_scope,
+    )
+    result: List[Dict[str, Any]] = []
+    for i in range(len(agents)):
+        entry = next(
+            (e for e in parsed if isinstance(e, dict) and e.get("agent_index") == i),
+            None,
+        )
+        task_val = entry.get("task") if entry else None
+        if entry and isinstance(task_val, str) and task_val.strip():
+            row: Dict[str, Any] = {
+                "agent_index": i,
+                "task": task_val,
+                "assigned_document_ids": normalized_scope.get(i),
+            }
+            ar = _optional_assignment_reason(entry)
+            if ar:
+                row["assignment_reason"] = ar
+            result.append(row)
+        elif planner_strict:
+            raise ValueError(f"Missing or empty task string for agent_index={i}")
+        else:
+            result.append(
+                {
+                    "agent_index": i,
+                    "task": _build_agent_task_fallback(
+                        agents[i], job_title, job_description, i, len(agents)
+                    ),
+                    "assigned_document_ids": normalized_scope.get(i),
+                }
+            )
+    return result
+
+
+async def _planner_json_repair(raw_model_output: str, num_agents: int) -> str:
+    chunk = (raw_model_output or "")[:12000]
+    repair_messages = [
+        {
+            "role": "system",
+            "content": (
+                "You fix malformed model output. Reply with ONLY a valid JSON array, no markdown fences, "
+                "no commentary. Each element is an object with keys: agent_index (integer), task (string), "
+                "assigned_document_ids (array of strings, optional), assignment_reason (string, optional)."
+            ),
+        },
+        {
+            "role": "user",
+            "content": (
+                f"The following was supposed to be a JSON array of exactly {num_agents} task objects "
+                f"with agent_index 0..{num_agents - 1}. Fix it into valid JSON only.\n\n{chunk}"
+            ),
+        },
+    ]
+    planner_temperature = float(getattr(settings, "AGENT_PLANNER_TEMPERATURE", 0.3) or 0.3)
+    return await planner_chat_completion(
+        repair_messages,
+        temperature=min(0.2, planner_temperature),
+        max_tokens=min(8192, int(getattr(settings, "AGENT_PLANNER_MAX_TOKENS", 4096) or 4096)),
     )
 
-    payload = {
-        "model": model,
-        "messages": [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_content},
-        ],
-        "temperature": temperature,
-    }
 
-    headers = {"Content-Type": "application/json"}
-    if splitter_agent.api_key and (splitter_agent.api_key or "").strip():
-        headers["Authorization"] = f"Bearer {(splitter_agent.api_key or '').strip()}"
+def _optional_assignment_reason(entry: Dict[str, Any]) -> Optional[str]:
+    r = entry.get("assignment_reason")
+    if not isinstance(r, str):
+        return None
+    s = r.strip()
+    if not s:
+        return None
+    return s[:2000]
 
-    try:
-        if use_planner:
-            # Platform planner must follow AGENT_PLANNER_* settings, not the splitter agent profile.
-            planner_temperature = float(
-                getattr(settings, "AGENT_PLANNER_TEMPERATURE", 0.3) or 0.3
-            )
+
+async def split_job_for_agents(
+    job_title: str,
+    job_description: str,
+    documents_content: List[Dict[str, Any]],
+    conversation_data: Optional[List[Dict]],
+    agents: List[Agent],
+    llm_audit: Optional[Dict[str, Any]] = None,
+    *,
+    reload_documents_content: Optional[Callable[[], Awaitable[List[Dict[str, Any]]]]] = None,
+) -> List[Dict[str, Any]]:
+    """
+    Split the job into N subtasks, one per agent.
+
+    When the platform Agent Planner is configured, only that planner performs the split; failures use
+    retries (and optional JSON repair / document reload), then raise PlannerSplitError.
+
+    Without a configured planner, heuristic fallback tasks are returned (no hired-agent LLM for
+    planning).
+
+    If llm_audit is a dict, it is filled with raw_llm_response and source when an LLM response
+    was received (last successful or last repair attempt for the planner path).
+    """
+    if len(agents) <= 1:
+        all_doc_ids = [d.get("id") for d in documents_content if d.get("id")]
+        return [{
+            "agent_index": 0,
+            "task": _build_full_task_context(job_title, job_description, documents_content),
+            "assigned_document_ids": all_doc_ids if all_doc_ids else None,
+        }]
+
+    use_planner = is_agent_planner_configured()
+    if not use_planner:
+        return _fallback_tasks(agents, job_title, job_description, documents_content)
+
+    max_attempts = max(1, int(getattr(settings, "AGENT_PLANNER_SPLIT_MAX_ATTEMPTS", 4) or 4))
+    backoff = float(getattr(settings, "AGENT_PLANNER_SPLIT_RETRY_BACKOFF_SECONDS", 2.0) or 2.0)
+    repair_enabled = bool(getattr(settings, "AGENT_PLANNER_SPLIT_JSON_REPAIR", True))
+    reload_between = bool(getattr(settings, "AGENT_PLANNER_SPLIT_RELOAD_DOCS_BETWEEN_ATTEMPTS", True))
+
+    docs: List[Dict[str, Any]] = list(documents_content) if documents_content else []
+    last_exc: Optional[BaseException] = None
+    planner_temperature = float(getattr(settings, "AGENT_PLANNER_TEMPERATURE", 0.3) or 0.3)
+    max_tok = min(8192, int(getattr(settings, "AGENT_PLANNER_MAX_TOKENS", 4096) or 4096))
+
+    for attempt in range(max_attempts):
+        if attempt > 0 and reload_between and reload_documents_content is not None:
+            try:
+                docs = await reload_documents_content()
+            except Exception as reload_err:
+                logger.warning("Document reload between planner attempts failed: %s", reload_err)
+
+        messages = _compose_split_messages(job_title, job_description, docs, conversation_data, agents)
+        doc_catalog = _build_document_catalog(docs)
+        text = ""
+        try:
             text = await planner_chat_completion(
-                payload["messages"],
+                messages,
                 temperature=planner_temperature,
-                max_tokens=min(8192, int(getattr(settings, "AGENT_PLANNER_MAX_TOKENS", 4096) or 4096)),
+                max_tokens=max_tok,
             )
-        else:
-            fb = (getattr(settings, "LLM_HTTP_FALLBACK_MODEL", None) or "").strip() or None
-            resp = await post_openai_compatible_raw(
-                url, headers, payload, timeout=60.0, max_retries=2, fallback_model=fb
+        except Exception as call_err:
+            last_exc = call_err
+            logger.warning(
+                "Planner split attempt %s/%s HTTP/call failed: %s",
+                attempt + 1,
+                max_attempts,
+                call_err,
             )
-            if resp.status_code >= 400:
-                return _fallback_tasks(agents, job_title, job_description, documents_content)
+            if attempt < max_attempts - 1:
+                await asyncio.sleep(backoff * (2**attempt))
+            continue
 
-            data = resp.json()
-            text = (
-                data.get("choices", [{}])[0].get("message", {}).get("content", "")
-                or ""
-            ).strip()
-        if llm_audit is not None:
-            llm_audit["raw_llm_response"] = text
-            llm_audit["source"] = "planner" if use_planner else "agent_endpoint"
-        # Remove markdown code blocks if present
-        if text.startswith("```"):
-            text = text.split("```")[1]
-            if text.startswith("json"):
-                text = text[4:]
-            text = text.strip()
-        parsed = json.loads(text)
-        if isinstance(parsed, list) and len(parsed) >= len(agents):
-            explicit_map = _extract_explicit_document_agent_mapping(job_description, doc_catalog, agents)
-            has_model_scope = any(isinstance(e.get("assigned_document_ids"), list) and len(e.get("assigned_document_ids")) > 0 for e in parsed if isinstance(e, dict))
-            strict_scope = bool(explicit_map) or has_model_scope
-            normalized_scope = _normalize_agent_document_scope(
-                parsed_assignments=parsed,
-                explicit_assignments=explicit_map,
-                doc_catalog=doc_catalog,
-                agents=agents,
-                strict_scope=strict_scope,
+        try:
+            result = _normalize_parsed_split(
+                _strip_markdown_json(text),
+                agents,
+                doc_catalog,
+                job_title,
+                job_description,
+                planner_strict=True,
             )
-            # Ensure we have one entry per agent
-            result = []
-            for i in range(len(agents)):
-                entry = next((e for e in parsed if e.get("agent_index") == i), None)
-                if entry and isinstance(entry.get("task"), str):
-                    row: Dict[str, Any] = {
-                        "agent_index": i,
-                        "task": entry["task"],
-                        "assigned_document_ids": normalized_scope.get(i),
-                    }
-                    ar = _optional_assignment_reason(entry)
-                    if ar:
-                        row["assignment_reason"] = ar
-                    result.append(row)
-                else:
-                    result.append({
-                        "agent_index": i,
-                        "task": _build_agent_task_fallback(
-                            agents[i], job_title, job_description, i, len(agents)
-                        ),
-                        "assigned_document_ids": normalized_scope.get(i),
-                    })
+            if llm_audit is not None:
+                llm_audit["raw_llm_response"] = text
+                llm_audit["source"] = "planner"
             return result
-    except Exception as e:
-        logger.warning("Task split failed: %s, using fallback", e)
+        except Exception as parse_err:
+            last_exc = parse_err
+            logger.warning(
+                "Planner split attempt %s/%s parse/validate failed: %s",
+                attempt + 1,
+                max_attempts,
+                parse_err,
+            )
+            if repair_enabled and text.strip():
+                try:
+                    repaired = await _planner_json_repair(text, len(agents))
+                    result = _normalize_parsed_split(
+                        _strip_markdown_json(repaired),
+                        agents,
+                        doc_catalog,
+                        job_title,
+                        job_description,
+                        planner_strict=True,
+                    )
+                    if llm_audit is not None:
+                        llm_audit["raw_llm_response"] = repaired
+                        llm_audit["source"] = "planner_json_repair"
+                    return result
+                except Exception as repair_err:
+                    last_exc = repair_err
+                    logger.warning("Planner JSON repair failed: %s", repair_err)
+            if attempt < max_attempts - 1:
+                await asyncio.sleep(backoff * (2**attempt))
+                continue
+            break
 
-    return _fallback_tasks(agents, job_title, job_description, documents_content)
+    detail = ""
+    if last_exc is not None:
+        detail = str(last_exc)[:500]
+    raise PlannerSplitError(
+        "Platform task planner could not produce a valid multi-agent split after all attempts.",
+        attempts=max_attempts,
+        last_detail=detail,
+    ) from last_exc
 
 
 def _fallback_tasks(

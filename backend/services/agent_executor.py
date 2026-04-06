@@ -40,6 +40,11 @@ from schemas.sandhi_a2a_task import (
 from services.agent_tool_compatibility import filter_tools_for_agent, validate_tools_for_agent
 from services.a2a_outbound_validation import validate_outbound_a2a_payload
 from services.tool_assignment_engine import assign_tools_for_step, infer_task_type
+from services.planner_llm import (
+    resolve_runtime_planner_transport,
+    set_planner_runtime_transport,
+    reset_planner_runtime_transport,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -820,99 +825,153 @@ class AgentExecutor:
         job = self.db.query(Job).filter(Job.id == job_id).first()
         if not job:
             raise ValueError("Job not found")
-        
-        # Process payment first
-        self.payment_processor.process_payment(job_id)
-        
-        # Get workflow steps in order
-        workflow_steps = self.db.query(WorkflowStep).filter(
-            WorkflowStep.job_id == job_id
-        ).order_by(WorkflowStep.step_order).all()
-        
-        if not workflow_steps:
-            job.status = JobStatus.FAILED
-            job.execution_token = None
-            job.failure_reason = "No workflow steps found for this job"
-            self.db.commit()
-            return
-        
-        if getattr(settings, "WORKFLOW_PARALLEL_INDEPENDENT_STEPS", True):
-            waves = _partition_workflow_waves(workflow_steps)
-        else:
-            waves = [[s] for s in workflow_steps]
-
+        pre_steps = (
+            self.db.query(WorkflowStep.agent_id)
+            .filter(WorkflowStep.job_id == job_id)
+            .order_by(WorkflowStep.step_order)
+            .all()
+        )
+        decision = resolve_runtime_planner_transport(
+            self.db,
+            agent_ids=[int(r[0]) for r in pre_steps if r and r[0] is not None],
+        )
+        planner_ctx_token = set_planner_runtime_transport(decision)
         try:
-            max_parallel = getattr(settings, "WORKFLOW_MAX_PARALLEL_STEPS", 8) or 8
+            # Execute-time replan before payment so job.total_cost matches the workflow we charge for.
+            if getattr(settings, "AGENT_PLANNER_EXECUTE_REPLAN", True):
+                from services.planner_llm import is_agent_planner_configured
+                from services.task_splitter import PlannerSplitError
+                from services.workflow_builder import WorkflowBuilder
+
+                if is_agent_planner_configured():
+                    origin = (getattr(job, "workflow_origin", None) or "auto_split").strip().lower()
+                    if origin != "manual":
+                        try:
+                            await WorkflowBuilder(self.db).replan_workflow_steps_at_execute_async(job_id)
+                        except PlannerSplitError as e:
+                            policy = (
+                                getattr(settings, "AGENT_PLANNER_EXECUTE_REPLAN_ON_FAILURE", None) or "fail"
+                            ).strip().lower()
+                            if policy == "continue":
+                                logger.warning(
+                                    "Execute-time replan failed for job_id=%s; continuing with built workflow: %s",
+                                    job_id,
+                                    e,
+                                )
+                            else:
+                                job = self.db.query(Job).filter(Job.id == job_id).first()
+                                if job:
+                                    job.status = JobStatus.FAILED
+                                    job.execution_token = None
+                                    msg = (
+                                        str(e)
+                                        or "Platform task planner failed to refresh workflow before execution."
+                                    )
+                                    if getattr(e, "last_detail", None):
+                                        msg = f"{msg} ({e.last_detail})"
+                                    job.failure_reason = msg[:450]
+                                    self.db.commit()
+                                return
+                    self.db.expire_all()
+
             try:
-                max_parallel = max(1, int(max_parallel))
-            except (TypeError, ValueError):
-                max_parallel = 8
-            sem = asyncio.Semaphore(max_parallel)
-            previous_chain_output: Optional[Any] = None
+                self.payment_processor.calculate_job_cost(job_id)
+            except ValueError:
+                logger.warning("calculate_job_cost skipped: job %s missing", job_id)
 
-            async def _run_step_isolated(st: WorkflowStep, prev: Optional[Any]) -> Any:
-                async with sem:
-                    child_db = SessionLocal()
-                    try:
-                        child_ex = AgentExecutor(child_db)
-                        return await child_ex._execute_one_step_core(job_id, st.id, prev)
-                    finally:
-                        child_db.close()
-
-            for wave in waves:
-                wave_sorted = sorted(wave, key=lambda s: s.step_order)
-                if len(wave_sorted) == 1:
-                    st = wave_sorted[0]
-                    previous_chain_output = await self._execute_one_step_core(
-                        job_id, st.id, previous_chain_output
-                    )
-                else:
-                    async with asyncio.TaskGroup() as tg:
-                        task_objs = [
-                            tg.create_task(_run_step_isolated(st, previous_chain_output))
-                            for st in wave_sorted
-                        ]
-                    results = [t.result() for t in task_objs]
-                    previous_chain_output = results[-1]
-                self.db.expire_all()
-
-            # Mark job as completed
-            job.status = JobStatus.COMPLETED
-            job.execution_token = None
-            job.completed_at = datetime.utcnow()
-            self.db.commit()
+            self.payment_processor.process_payment(job_id)
             
-            # Distribute earnings
-            self.payment_processor.distribute_earnings(job_id)
+            # Get workflow steps in order
+            workflow_steps = self.db.query(WorkflowStep).filter(
+                WorkflowStep.job_id == job_id
+            ).order_by(WorkflowStep.step_order).all()
             
-            # Log job completion
-            self._log_action("job", job_id, "completed", {
-                "total_cost": job.total_cost
-            })
-        
-        except (Exception, BaseExceptionGroup) as caught:
-            # TaskGroup raises ExceptionGroup (not a subclass of Exception); unwrap to one Exception for logging.
-            err: BaseException = caught
-            if isinstance(err, BaseExceptionGroup):
-                while isinstance(err, BaseExceptionGroup) and err.exceptions:
-                    err = err.exceptions[0]
-            if not isinstance(err, Exception):
-                raise caught
-            e = err
-            # Mark job as failed with reason
-            logger.exception("Job execution failed job_id=%s", job_id)
-            job.status = JobStatus.FAILED
-            job.execution_token = None
-            detail = str(e).strip()
-            error_message = f"{type(e).__name__}: {detail}" if detail else type(e).__name__
-            job.failure_reason = error_message[:2000]
-            self.db.commit()
+            if not workflow_steps:
+                job.status = JobStatus.FAILED
+                job.execution_token = None
+                job.failure_reason = "No workflow steps found for this job"
+                self.db.commit()
+                return
+            
+            if getattr(settings, "WORKFLOW_PARALLEL_INDEPENDENT_STEPS", True):
+                waves = _partition_workflow_waves(workflow_steps)
+            else:
+                waves = [[s] for s in workflow_steps]
 
-            # Log error
-            self._log_action("job", job_id, "failed", {
-                "error": error_message
-            })
-            raise e
+            try:
+                max_parallel = getattr(settings, "WORKFLOW_MAX_PARALLEL_STEPS", 8) or 8
+                try:
+                    max_parallel = max(1, int(max_parallel))
+                except (TypeError, ValueError):
+                    max_parallel = 8
+                sem = asyncio.Semaphore(max_parallel)
+                previous_chain_output: Optional[Any] = None
+
+                async def _run_step_isolated(st: WorkflowStep, prev: Optional[Any]) -> Any:
+                    async with sem:
+                        child_db = SessionLocal()
+                        try:
+                            child_ex = AgentExecutor(child_db)
+                            return await child_ex._execute_one_step_core(job_id, st.id, prev)
+                        finally:
+                            child_db.close()
+
+                for wave in waves:
+                    wave_sorted = sorted(wave, key=lambda s: s.step_order)
+                    if len(wave_sorted) == 1:
+                        st = wave_sorted[0]
+                        previous_chain_output = await self._execute_one_step_core(
+                            job_id, st.id, previous_chain_output
+                        )
+                    else:
+                        async with asyncio.TaskGroup() as tg:
+                            task_objs = [
+                                tg.create_task(_run_step_isolated(st, previous_chain_output))
+                                for st in wave_sorted
+                            ]
+                        results = [t.result() for t in task_objs]
+                        previous_chain_output = results[-1]
+                    self.db.expire_all()
+
+                # Mark job as completed
+                job.status = JobStatus.COMPLETED
+                job.execution_token = None
+                job.completed_at = datetime.utcnow()
+                self.db.commit()
+                
+                # Distribute earnings
+                self.payment_processor.distribute_earnings(job_id)
+                
+                # Log job completion
+                self._log_action("job", job_id, "completed", {
+                    "total_cost": job.total_cost
+                })
+            
+            except (Exception, BaseExceptionGroup) as caught:
+                # TaskGroup raises ExceptionGroup (not a subclass of Exception); unwrap to one Exception for logging.
+                err: BaseException = caught
+                if isinstance(err, BaseExceptionGroup):
+                    while isinstance(err, BaseExceptionGroup) and err.exceptions:
+                        err = err.exceptions[0]
+                if not isinstance(err, Exception):
+                    raise caught
+                e = err
+                # Mark job as failed with reason
+                logger.exception("Job execution failed job_id=%s", job_id)
+                job.status = JobStatus.FAILED
+                job.execution_token = None
+                detail = str(e).strip()
+                error_message = f"{type(e).__name__}: {detail}" if detail else type(e).__name__
+                job.failure_reason = error_message[:2000]
+                self.db.commit()
+
+                # Log error
+                self._log_action("job", job_id, "failed", {
+                    "error": error_message
+                })
+                raise e
+        finally:
+            reset_planner_runtime_transport(planner_ctx_token)
     
     async def _execute_agent(self, agent: Agent, input_data: Dict[str, Any]) -> Dict[str, Any]:
         """Execute agent via plugin, A2A protocol, or OpenAI-compatible (via platform adapter). Architecture runs A2A everywhere: native A2A agents or OpenAI endpoints via the adapter."""
