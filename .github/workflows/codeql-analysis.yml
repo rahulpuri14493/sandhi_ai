@@ -16,7 +16,10 @@ permissions:
 
 jobs:
   analyze:
-    if: ${{ vars.CODEQL_ADVANCED_ENABLED == 'true' }}
+    # Run by default. Fork PR runs may not resolve repository variables the same way;
+    # treating unset as "enabled" avoids a skipped job blocking merge when CodeQL is required.
+    # Set repository variable CODEQL_ADVANCED_ENABLED=false to disable this workflow.
+    if: ${{ vars.CODEQL_ADVANCED_ENABLED != 'false' }}
     name: Analyze (${{ matrix.language }})
     runs-on: ubuntu-latest
     strategy:
