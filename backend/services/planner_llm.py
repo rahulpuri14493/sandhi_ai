@@ -477,10 +477,6 @@ async def planner_chat_completion(
         primary_adapter_url = _nonnull_str(getattr(settings, "AGENT_PLANNER_ADAPTER_URL", None))
         primary_adapter_key = _nonnull_str(getattr(settings, "AGENT_PLANNER_A2A_API_KEY", None)) or None
         secondary_base = _nonnull_str(getattr(settings, "AGENT_PLANNER_SECONDARY_BASE_URL", None))
-        secondary_native_a2a_url = _nonnull_str(getattr(settings, "AGENT_PLANNER_SECONDARY_A2A_URL", None))
-        secondary_native_a2a_key = _nonnull_str(getattr(settings, "AGENT_PLANNER_SECONDARY_A2A_API_KEY", None)) or None
-        secondary_adapter_url = _nonnull_str(getattr(settings, "AGENT_PLANNER_SECONDARY_ADAPTER_URL", None))
-        secondary_adapter_key = _nonnull_str(getattr(settings, "AGENT_PLANNER_SECONDARY_A2A_API_KEY", None)) or None
         return {
             "name": "secondary",
             "provider": provider,
@@ -489,10 +485,10 @@ async def planner_chat_completion(
             "fallback_model": fb_model,
             "base_url": secondary_base or primary_base,
             "timeout": float(getattr(settings, "AGENT_PLANNER_SECONDARY_HTTP_TIMEOUT_SECONDS", 120.0) or 120.0),
-            "native_a2a_url": secondary_native_a2a_url or primary_native_a2a_url,
-            "native_a2a_api_key": secondary_native_a2a_key or primary_native_a2a_key,
-            "adapter_url": secondary_adapter_url or primary_adapter_url,
-            "adapter_api_key": secondary_adapter_key or primary_adapter_key,
+            "native_a2a_url": primary_native_a2a_url,
+            "native_a2a_api_key": primary_native_a2a_key,
+            "adapter_url": primary_adapter_url,
+            "adapter_api_key": primary_adapter_key,
         }
 
     def _latency_ms() -> float:

@@ -80,8 +80,10 @@ def _prepare_single_step_workflow(integration_client: TestClient, business_user,
 
 
 def test_e2e_platform_mode_persists_artifact_and_calls_mcp_write(
-    integration_client: TestClient, integration_db_session, business_user, sample_agent
+    integration_client: TestClient, integration_db_session, business_user, sample_agent, monkeypatch
 ):
+    # This test asserts a filesystem artifact path; force local storage even when CI/Docker default is s3.
+    monkeypatch.setattr(settings, "OBJECT_STORAGE_BACKEND", "local")
     job_id = _create_job_with_output_contract(integration_client, business_user, write_execution_mode="platform")
     _prepare_single_step_workflow(integration_client, business_user, job_id, sample_agent.id)
 

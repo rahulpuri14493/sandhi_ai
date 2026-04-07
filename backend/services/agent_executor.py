@@ -381,6 +381,65 @@ class AgentExecutor:
             h["X-Sandhi-Trace-Id"] = str(tid)
         return h
 
+    def _is_retryable_step_exception(self, exc: BaseException) -> bool:
+        if isinstance(exc, asyncio.TimeoutError):
+            return True
+        if isinstance(exc, httpx.HTTPStatusError):
+            status = exc.response.status_code if exc.response is not None else None
+            return status in {408, 409, 425, 429, 500, 502, 503, 504}
+        if isinstance(exc, httpx.TransportError):
+            return True
+        msg = str(exc).lower()
+        retryable_markers = (
+            "timeout",
+            "timed out",
+            "temporarily unavailable",
+            "temporary failure",
+            "connection reset",
+            "connection refused",
+            "service unavailable",
+            "too many requests",
+            "rate limit",
+            "gateway",
+            "try again",
+            "retryable_error",
+        )
+        return any(m in msg for m in retryable_markers)
+
+    def _validate_agent_output_guardrails(self, output_data: Any) -> None:
+        if output_data is None and getattr(settings, "AGENT_OUTPUT_REQUIRE_NONEMPTY", True):
+            raise ValueError("Agent returned empty output")
+        if isinstance(output_data, str) and getattr(settings, "AGENT_OUTPUT_REQUIRE_NONEMPTY", True):
+            if not output_data.strip():
+                raise ValueError("Agent returned empty text output")
+        if isinstance(output_data, list) and getattr(settings, "AGENT_OUTPUT_REQUIRE_NONEMPTY", True):
+            if len(output_data) == 0:
+                raise ValueError("Agent returned empty list output")
+        if not isinstance(output_data, dict):
+            return
+
+        status_val = str(output_data.get("status") or "").strip().lower()
+        if status_val in {"retryable_error", "transient_error", "timeout"}:
+            raise RuntimeError(f"retryable_error: status={status_val}")
+        if status_val in {"failed", "error", "fatal_error"}:
+            raise ValueError(f"fatal agent status={status_val}")
+
+        min_conf = float(getattr(settings, "AGENT_OUTPUT_MIN_CONFIDENCE", 0.0) or 0.0)
+        confidence = output_data.get("confidence")
+        if isinstance(confidence, (int, float)):
+            if float(confidence) < min_conf:
+                raise ValueError(
+                    f"Low confidence output: confidence={float(confidence):.3f} < min={min_conf:.3f}"
+                )
+
+        err_blob = output_data.get("error") or output_data.get("errors")
+        has_useful_content = any(
+            output_data.get(k) not in (None, "", [], {})
+            for k in ("content", "result", "output", "text", "data", "records", "choices")
+        )
+        if err_blob and not has_useful_content:
+            raise ValueError(f"Agent output only contains error: {err_blob}")
+
     async def _persist_output_artifact(self, job: Job, step: WorkflowStep, output_data: Dict[str, Any]) -> Dict[str, Any]:
         output_format = (getattr(job, "output_artifact_format", None) or "jsonl").strip().lower()
         if output_format not in ("jsonl", "json"):
@@ -688,6 +747,12 @@ class AgentExecutor:
 
             output_data = None
             artifact_ref = None
+            guardrail_meta: Dict[str, Any] = {
+                "timeout_seconds": float(getattr(settings, "AGENT_STEP_TIMEOUT_SECONDS", 180.0) or 180.0),
+                "max_retries": max(1, int(getattr(settings, "AGENT_STEP_MAX_RETRIES", 2) or 2)),
+                "attempts_used": 0,
+                "retryable_failures": 0,
+            }
             contract = _parse_output_contract(getattr(job, "output_contract", None))
             write_mode = (getattr(job, "write_execution_mode", None) or "platform").strip().lower()
             write_targets: List[Dict[str, Any]] = contract.get("write_targets") if isinstance(contract, dict) else []
@@ -715,14 +780,49 @@ class AgentExecutor:
                     total_steps=len(workflow_steps),
                 )
             try:
-                output_data = await self._execute_agent(agent, input_data)
-                output_data = normalize_agent_output_for_artifact(output_data)
-                output_data = _normalize_placeholder_error_values(output_data)
-                output_data = _ensure_records_for_platform_write(
-                    output_data,
-                    write_mode=write_mode,
-                    write_targets=write_targets,
-                )
+                timeout_seconds = float(guardrail_meta["timeout_seconds"])
+                max_retries = int(guardrail_meta["max_retries"])
+                backoff_base = float(getattr(settings, "AGENT_STEP_RETRY_BACKOFF_SECONDS", 2.0) or 2.0)
+                last_exc: Optional[BaseException] = None
+                for attempt in range(1, max_retries + 1):
+                    guardrail_meta["attempts_used"] = attempt
+                    try:
+                        candidate = await asyncio.wait_for(
+                            self._execute_agent(agent, input_data),
+                            timeout=timeout_seconds,
+                        )
+                        candidate = normalize_agent_output_for_artifact(candidate)
+                        candidate = _normalize_placeholder_error_values(candidate)
+                        candidate = _ensure_records_for_platform_write(
+                            candidate,
+                            write_mode=write_mode,
+                            write_targets=write_targets,
+                        )
+                        self._validate_agent_output_guardrails(candidate)
+                        output_data = candidate
+                        break
+                    except Exception as exec_err:
+                        last_exc = exec_err
+                        is_retryable = self._is_retryable_step_exception(exec_err)
+                        if is_retryable:
+                            guardrail_meta["retryable_failures"] = int(guardrail_meta["retryable_failures"]) + 1
+                        if attempt < max_retries and is_retryable:
+                            sleep_s = backoff_base * (2 ** (attempt - 1))
+                            logger.warning(
+                                "step_guardrail_retry job_id=%s step_id=%s step_order=%s attempt=%s/%s sleep_seconds=%.2f reason=%s",
+                                job_id,
+                                step.id,
+                                step.step_order,
+                                attempt,
+                                max_retries,
+                                sleep_s,
+                                type(exec_err).__name__,
+                            )
+                            await asyncio.sleep(sleep_s)
+                            continue
+                        raise exec_err
+                if output_data is None and last_exc is not None:
+                    raise last_exc
                 if write_mode == "ui_only":
                     output_format = (getattr(job, "output_artifact_format", None) or "jsonl").strip().lower()
                     if output_format not in ("jsonl", "json"):
@@ -776,6 +876,7 @@ class AgentExecutor:
                     "write_execution_mode": write_mode,
                     "write_policy": write_policy,
                     "write_results": write_results,
+                    "guardrail_meta": guardrail_meta,
                 })
                 step.status = "completed"
                 step.completed_at = datetime.utcnow()
@@ -793,6 +894,7 @@ class AgentExecutor:
                     "write_execution_mode": write_mode,
                     "write_policy": write_policy,
                     "write_results": write_results,
+                    "guardrail_meta": guardrail_meta,
                 })
                 self.db.commit()
 

@@ -2,6 +2,7 @@
 
 import os
 import uuid
+from unittest.mock import MagicMock
 
 import pytest
 from starlette.applications import Starlette
@@ -39,26 +40,30 @@ def test_run_alembic_startup_with_retries_raises_last_error(monkeypatch):
         main_mod._run_alembic_startup_with_retries(max_attempts=3)
 
 
-def test_log_s3_startup_status_ok(monkeypatch, caplog):
+def test_log_s3_startup_status_ok(monkeypatch):
     monkeypatch.setattr(
         main_mod,
         "verify_s3_connectivity",
         lambda: {"ok": True, "detail": "all good"},
     )
-    with caplog.at_level("INFO"):
-        main_mod._log_s3_startup_status()
-    assert "passed" in caplog.text.lower()
+    mock_info = MagicMock()
+    monkeypatch.setattr(main_mod.logger, "info", mock_info)
+    main_mod._log_s3_startup_status()
+    mock_info.assert_called_once()
+    assert "passed" in str(mock_info.call_args[0][0]).lower()
 
 
-def test_log_s3_startup_status_warning(monkeypatch, caplog):
+def test_log_s3_startup_status_warning(monkeypatch):
     monkeypatch.setattr(
         main_mod,
         "verify_s3_connectivity",
         lambda: {"ok": False, "detail": "unreachable"},
     )
-    with caplog.at_level("WARNING"):
-        main_mod._log_s3_startup_status()
-    assert "FAILED" in caplog.text
+    mock_warn = MagicMock()
+    monkeypatch.setattr(main_mod.logger, "warning", mock_warn)
+    main_mod._log_s3_startup_status()
+    mock_warn.assert_called_once()
+    assert "FAILED" in str(mock_warn.call_args[0][0])
 
 
 @pytest.mark.asyncio
@@ -175,7 +180,7 @@ async def test_request_logging_middleware_print_failure_still_returns(monkeypatc
 
 
 @pytest.mark.asyncio
-async def test_request_logging_middleware_json_response_preview(monkeypatch, caplog):
+async def test_request_logging_middleware_json_response_preview(monkeypatch):
     monkeypatch.setenv("LOG_API_RESPONSE_BODY", "1")
     app = Starlette()
     mw = RequestLoggingMiddleware(app)
@@ -187,14 +192,20 @@ async def test_request_logging_middleware_json_response_preview(monkeypatch, cap
         )
 
     req = Request(_minimal_scope())
-    with caplog.at_level("INFO"):
-        resp = await mw.dispatch(req, ok_next)
+    mock_info = MagicMock(wraps=main_mod.request_logger.info)
+    monkeypatch.setattr(main_mod.request_logger, "info", mock_info)
+    resp = await mw.dispatch(req, ok_next)
     assert resp.status_code == 200
-    assert any("preview=" in r.message for r in caplog.records)
+    preview_calls = [
+        c
+        for c in mock_info.call_args_list
+        if c.args and any("preview=" in str(a) for a in c.args)
+    ]
+    assert preview_calls
 
 
 @pytest.mark.asyncio
-async def test_request_logging_middleware_json_preview_truncation(monkeypatch, caplog):
+async def test_request_logging_middleware_json_preview_truncation(monkeypatch):
     monkeypatch.setenv("LOG_API_RESPONSE_BODY", "true")
     app = Starlette()
     mw = RequestLoggingMiddleware(app)
@@ -204,9 +215,13 @@ async def test_request_logging_middleware_json_preview_truncation(monkeypatch, c
         return Response(content=big, media_type="application/json")
 
     req = Request(_minimal_scope())
-    with caplog.at_level("INFO"):
-        await mw.dispatch(req, ok_next)
-    assert any("truncated" in r.message for r in caplog.records)
+    mock_info = MagicMock(wraps=main_mod.request_logger.info)
+    monkeypatch.setattr(main_mod.request_logger, "info", mock_info)
+    await mw.dispatch(req, ok_next)
+    assert any(
+        c.args and any("truncated" in str(a) for a in c.args)
+        for c in mock_info.call_args_list
+    )
 
 
 @pytest.mark.asyncio

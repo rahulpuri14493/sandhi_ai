@@ -111,7 +111,8 @@ class Settings(BaseSettings):
     AGENT_PLANNER_A2A_API_KEY: str = ""
     # Dedicated planner A2A adapter URL (used when runtime policy picks a2a_adapter). Do not reuse A2A_ADAPTER_URL.
     AGENT_PLANNER_ADAPTER_URL: str = ""
-    # Secondary planner profile (automatic failover target after primary planner failure).
+    # Secondary planner profile (failover for another upstream API key / model / base URL only).
+    # Uses the same A2A hop and dedicated adapter URL as the primary.
     AGENT_PLANNER_SECONDARY_ENABLED: bool = False
     AGENT_PLANNER_SECONDARY_PROVIDER: str = ""  # empty -> inherit primary provider
     AGENT_PLANNER_SECONDARY_BASE_URL: str = ""
@@ -119,9 +120,6 @@ class Settings(BaseSettings):
     AGENT_PLANNER_SECONDARY_MODEL: str = ""
     AGENT_PLANNER_SECONDARY_FALLBACK_MODEL: str = ""
     AGENT_PLANNER_SECONDARY_HTTP_TIMEOUT_SECONDS: float = 120.0
-    AGENT_PLANNER_SECONDARY_A2A_URL: str = ""
-    AGENT_PLANNER_SECONDARY_A2A_API_KEY: str = ""
-    AGENT_PLANNER_SECONDARY_ADAPTER_URL: str = ""
     # Multi-agent task split: retries when platform planner is configured (no hired-agent split fallback).
     AGENT_PLANNER_SPLIT_MAX_ATTEMPTS: int = 4
     AGENT_PLANNER_SPLIT_RETRY_BACKOFF_SECONDS: float = 2.0
@@ -152,6 +150,13 @@ class Settings(BaseSettings):
     WORKFLOW_PARALLEL_INDEPENDENT_STEPS: bool = True
     # Cap concurrent step executions per job (semaphore inside each parallel wave).
     WORKFLOW_MAX_PARALLEL_STEPS: int = 8
+    # Step execution guardrails (sequential + async): hard timeout + bounded retries.
+    AGENT_STEP_TIMEOUT_SECONDS: float = 180.0
+    AGENT_STEP_MAX_RETRIES: int = 2
+    AGENT_STEP_RETRY_BACKOFF_SECONDS: float = 2.0
+    # Output quality gates before passing step output downstream.
+    AGENT_OUTPUT_REQUIRE_NONEMPTY: bool = True
+    AGENT_OUTPUT_MIN_CONFIDENCE: float = 0.0
     # --- Tool assignment registry + A2A task envelope ---
     # Absolute path to JSON registry; empty = packaged backend/resources/config/tool_assignment_registry.default.json
     TOOL_ASSIGNMENT_REGISTRY_PATH: str = ""
