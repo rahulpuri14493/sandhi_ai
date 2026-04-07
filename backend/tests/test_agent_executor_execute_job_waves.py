@@ -3,7 +3,7 @@ import asyncio
 import json
 import time
 import uuid
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -12,6 +12,9 @@ from models.job import Job, JobStatus, WorkflowStep
 from models.user import User, UserRole
 from services import agent_executor as ae
 from services.agent_executor import AgentExecutor
+from core.config import settings as app_settings
+from services.task_splitter import PlannerSplitError
+from services.workflow_builder import WorkflowBuilder
 
 
 def _create_job_with_steps(
@@ -428,6 +431,328 @@ async def test_core_skips_communication_when_step_independent_even_with_chain(db
 
 
 @pytest.mark.asyncio
+async def test_core_retryable_status_retries_then_succeeds(db_session):
+    job, steps, _ = _create_job_with_steps(db_session, depends_on_previous_list=[True])
+    s1 = steps[0]
+    ex = AgentExecutor(db_session)
+
+    with (
+        patch.object(ex, "_get_available_mcp_tools_async", new_callable=AsyncMock, return_value=[]),
+        patch.object(
+            ex,
+            "_execute_agent",
+            new_callable=AsyncMock,
+            side_effect=[{"status": "retryable_error"}, {"content": "ok"}],
+        ) as run_agent,
+        patch.object(ae.settings, "AGENT_STEP_TIMEOUT_SECONDS", 2.0),
+        patch.object(ae.settings, "AGENT_STEP_MAX_RETRIES", 2),
+        patch.object(ae.settings, "AGENT_STEP_RETRY_BACKOFF_SECONDS", 0.0),
+    ):
+        out = await ex._execute_one_step_core(job.id, s1.id, None)
+
+    assert out == {"content": "ok"}
+    assert run_agent.await_count == 2
+    db_session.refresh(s1)
+    payload = json.loads(s1.output_data or "{}")
+    gm = payload.get("guardrail_meta") or {}
+    assert gm.get("attempts_used") == 2
+    assert gm.get("retryable_failures") == 1
+
+
+@pytest.mark.asyncio
+async def test_core_low_confidence_fails_without_retry(db_session):
+    job, steps, _ = _create_job_with_steps(db_session, depends_on_previous_list=[True])
+    s1 = steps[0]
+    ex = AgentExecutor(db_session)
+
+    with (
+        patch.object(ex, "_get_available_mcp_tools_async", new_callable=AsyncMock, return_value=[]),
+        patch.object(ex, "_execute_agent", new_callable=AsyncMock, return_value={"content": "maybe", "confidence": 0.2}) as run_agent,
+        patch.object(ae.settings, "AGENT_OUTPUT_MIN_CONFIDENCE", 0.8),
+        patch.object(ae.settings, "AGENT_STEP_MAX_RETRIES", 3),
+    ):
+        with pytest.raises(Exception, match="Low confidence output"):
+            await ex._execute_one_step_core(job.id, s1.id, None)
+
+    # Low confidence is a hard quality gate (non-retryable ValueError).
+    assert run_agent.await_count == 1
+    db_session.refresh(s1)
+    assert s1.status == "failed"
+
+
+@pytest.mark.asyncio
+async def test_core_timeout_retries_then_succeeds(db_session):
+    job, steps, _ = _create_job_with_steps(db_session, depends_on_previous_list=[True])
+    s1 = steps[0]
+    ex = AgentExecutor(db_session)
+    call_count = {"n": 0}
+
+    async def flaky_execute(_agent, _input):
+        call_count["n"] += 1
+        if call_count["n"] == 1:
+            await asyncio.sleep(0.05)
+            return {"content": "late"}
+        return {"content": "ok"}
+
+    with (
+        patch.object(ex, "_get_available_mcp_tools_async", new_callable=AsyncMock, return_value=[]),
+        patch.object(ex, "_execute_agent", new=flaky_execute),
+        patch.object(ae.settings, "AGENT_STEP_TIMEOUT_SECONDS", 0.01),
+        patch.object(ae.settings, "AGENT_STEP_MAX_RETRIES", 2),
+        patch.object(ae.settings, "AGENT_STEP_RETRY_BACKOFF_SECONDS", 0.0),
+    ):
+        out = await ex._execute_one_step_core(job.id, s1.id, None)
+
+    assert out == {"content": "ok"}
+    assert call_count["n"] == 2
+    db_session.refresh(s1)
+    payload = json.loads(s1.output_data or "{}")
+    gm = payload.get("guardrail_meta") or {}
+    assert gm.get("attempts_used") == 2
+    assert gm.get("retryable_failures") == 1
+
+
+@pytest.mark.asyncio
+async def test_core_max_retries_exhausted_persists_guardrail_meta(db_session):
+    """When all attempts hit retryable failures, final step output still includes guardrail telemetry."""
+    job, steps, _ = _create_job_with_steps(db_session, depends_on_previous_list=[True])
+    s1 = steps[0]
+    ex = AgentExecutor(db_session)
+
+    with (
+        patch.object(ex, "_get_available_mcp_tools_async", new_callable=AsyncMock, return_value=[]),
+        patch.object(ex, "_execute_agent", new_callable=AsyncMock, return_value={"status": "retryable_error"}) as run_agent,
+        patch.object(ae.settings, "AGENT_STEP_TIMEOUT_SECONDS", 2.0),
+        patch.object(ae.settings, "AGENT_STEP_MAX_RETRIES", 3),
+        patch.object(ae.settings, "AGENT_STEP_RETRY_BACKOFF_SECONDS", 0.0),
+    ):
+        with pytest.raises(Exception, match="retryable_error"):
+            await ex._execute_one_step_core(job.id, s1.id, None)
+
+    assert run_agent.await_count == 3
+    db_session.refresh(s1)
+    assert s1.status == "failed"
+    payload = json.loads(s1.output_data or "{}")
+    assert "retryable_error" in (payload.get("error") or "")
+    gm = payload.get("guardrail_meta") or {}
+    assert gm.get("max_retries") == 3
+    assert gm.get("attempts_used") == 3
+    assert gm.get("retryable_failures") == 3
+    assert gm.get("timeout_seconds") == 2.0
+
+
+@pytest.mark.asyncio
+async def test_core_uses_trace_only_enrichment_when_payload_validation_disabled(db_session):
+    job, steps, _ = _create_job_with_steps(db_session, depends_on_previous_list=[True])
+    s1 = steps[0]
+    ex = AgentExecutor(db_session)
+
+    with (
+        patch.object(app_settings, "EXECUTOR_PAYLOAD_VALIDATE", False),
+        patch.object(ex, "_get_available_mcp_tools_async", new_callable=AsyncMock, return_value=[]),
+        patch.object(ex, "_execute_agent", new_callable=AsyncMock, return_value={"content": "ok"}),
+    ):
+        await ex._execute_one_step_core(job.id, s1.id, None)
+
+    db_session.refresh(s1)
+    assert s1.status == "completed"
+
+
+@pytest.mark.asyncio
+async def test_core_invalid_output_artifact_format_defaults_to_jsonl(db_session):
+    job, steps, _ = _create_job_with_steps(db_session, depends_on_previous_list=[True])
+    job.output_artifact_format = "weird"
+    db_session.commit()
+    db_session.refresh(job)
+    s1 = steps[0]
+    ex = AgentExecutor(db_session)
+
+    with (
+        patch.object(ex, "_get_available_mcp_tools_async", new_callable=AsyncMock, return_value=[]),
+        patch.object(ex, "_execute_agent", new_callable=AsyncMock, return_value={"content": "ok"}),
+    ):
+        await ex._execute_one_step_core(job.id, s1.id, None)
+
+    db_session.refresh(s1)
+    payload = json.loads(s1.output_data or "{}")
+    assert (payload.get("artifact_ref") or {}).get("format") == "jsonl"
+
+
+@pytest.mark.asyncio
+async def test_core_platform_write_json_artifact_skips_non_dict_targets(db_session):
+    job, steps, _ = _create_job_with_steps(
+        db_session,
+        depends_on_previous_list=[True],
+        write_execution_mode="platform",
+    )
+    job.output_artifact_format = "json"
+    job.output_contract = json.dumps(
+        {
+            "write_targets": [
+                "skip-me",
+                {
+                    "tool_name": "platform_1_postgres",
+                    "operation_type": "upsert",
+                    "target": {"schema": "public", "table": "events"},
+                },
+            ],
+            "write_policy": {"on_write_error": "continue", "min_successful_targets": 0},
+        }
+    )
+    db_session.commit()
+    db_session.refresh(job)
+    s1 = steps[0]
+    ex = AgentExecutor(db_session)
+
+    async def fake_persist(j, st, output_data):
+        assert st.id == s1.id
+        return {
+            "artifact_id": "art-1",
+            "storage": "local",
+            "bucket": None,
+            "key": "/tmp/out.json",
+            "format": "json",
+            "size_bytes": 12,
+            "created_at": "2026-01-01T00:00:00Z",
+        }
+
+    trigger = AsyncMock(return_value={"inserted": 1})
+
+    with (
+        patch.object(ex, "_get_available_mcp_tools_async", new_callable=AsyncMock, return_value=[]),
+        patch.object(
+            ex,
+            "_execute_agent",
+            new_callable=AsyncMock,
+            return_value={"records": [{"id": 1}]},
+        ),
+        patch.object(ex, "_persist_output_artifact", new_callable=AsyncMock, side_effect=fake_persist),
+        patch.object(ex, "_trigger_platform_write", new=trigger),
+    ):
+        await ex._execute_one_step_core(job.id, s1.id, None)
+
+    trigger.assert_awaited_once()
+    db_session.refresh(s1)
+    assert s1.status == "completed"
+    payload = json.loads(s1.output_data or "{}")
+    wr = payload.get("write_results") or []
+    assert len(wr) == 1
+    assert wr[0].get("status") == "success"
+
+
+@pytest.mark.asyncio
+async def test_core_platform_write_records_failed_target_when_mcp_raises(db_session):
+    job, steps, _ = _create_job_with_steps(
+        db_session,
+        depends_on_previous_list=[True],
+        write_execution_mode="platform",
+    )
+    job.output_contract = json.dumps(
+        {
+            "write_targets": [{"tool_name": "platform_1_postgres", "target": {"schema": "public", "table": "t"}}],
+            "write_policy": {"on_write_error": "continue", "min_successful_targets": 0},
+        }
+    )
+    db_session.commit()
+    s1 = steps[0]
+    ex = AgentExecutor(db_session)
+
+    async def fake_persist(j, st, output_data):
+        return {"artifact_id": "a1", "storage": "local", "key": "k", "format": "jsonl"}
+
+    with (
+        patch.object(ex, "_get_available_mcp_tools_async", new_callable=AsyncMock, return_value=[]),
+        patch.object(
+            ex,
+            "_execute_agent",
+            new_callable=AsyncMock,
+            return_value={"records": [{"id": 1}]},
+        ),
+        patch.object(ex, "_persist_output_artifact", new_callable=AsyncMock, side_effect=fake_persist),
+        patch.object(ex, "_trigger_platform_write", new_callable=AsyncMock, side_effect=RuntimeError("mcp down")),
+    ):
+        await ex._execute_one_step_core(job.id, s1.id, None)
+
+    db_session.refresh(s1)
+    assert s1.status == "completed"
+    payload = json.loads(s1.output_data or "{}")
+    wr = payload.get("write_results") or []
+    assert len(wr) == 1
+    assert wr[0].get("status") == "failed"
+    assert "mcp down" in (wr[0].get("error") or "")
+
+
+@pytest.mark.asyncio
+async def test_core_platform_write_fails_job_when_min_successful_not_met(db_session):
+    job, steps, _ = _create_job_with_steps(
+        db_session,
+        depends_on_previous_list=[True],
+        write_execution_mode="platform",
+    )
+    job.output_contract = json.dumps(
+        {
+            "write_targets": [{"tool_name": "platform_1_postgres", "target": {"schema": "public", "table": "t"}}],
+            "write_policy": {"on_write_error": "continue", "min_successful_targets": 1},
+        }
+    )
+    db_session.commit()
+    s1 = steps[0]
+    ex = AgentExecutor(db_session)
+
+    async def fake_persist(j, st, output_data):
+        return {"artifact_id": "a1", "storage": "local", "key": "k", "format": "jsonl"}
+
+    with (
+        patch.object(ex, "_get_available_mcp_tools_async", new_callable=AsyncMock, return_value=[]),
+        patch.object(
+            ex,
+            "_execute_agent",
+            new_callable=AsyncMock,
+            return_value={"records": [{"id": 1}]},
+        ),
+        patch.object(ex, "_persist_output_artifact", new_callable=AsyncMock, side_effect=fake_persist),
+        patch.object(ex, "_trigger_platform_write", new_callable=AsyncMock, side_effect=RuntimeError("mcp down")),
+    ):
+        with pytest.raises(Exception, match="Write policy violation"):
+            await ex._execute_one_step_core(job.id, s1.id, None)
+
+
+@pytest.mark.asyncio
+async def test_core_platform_write_fail_job_re_raises_from_trigger(db_session):
+    job, steps, _ = _create_job_with_steps(
+        db_session,
+        depends_on_previous_list=[True],
+        write_execution_mode="platform",
+    )
+    job.output_contract = json.dumps(
+        {
+            "write_targets": [{"tool_name": "platform_1_postgres", "target": {"schema": "public", "table": "t"}}],
+            "write_policy": {"on_write_error": "fail_job", "min_successful_targets": 0},
+        }
+    )
+    db_session.commit()
+    s1 = steps[0]
+    ex = AgentExecutor(db_session)
+
+    async def fake_persist(j, st, output_data):
+        return {"artifact_id": "a1", "storage": "local", "key": "k", "format": "jsonl"}
+
+    with (
+        patch.object(ex, "_get_available_mcp_tools_async", new_callable=AsyncMock, return_value=[]),
+        patch.object(
+            ex,
+            "_execute_agent",
+            new_callable=AsyncMock,
+            return_value={"records": [{"id": 1}]},
+        ),
+        patch.object(ex, "_persist_output_artifact", new_callable=AsyncMock, side_effect=fake_persist),
+        patch.object(ex, "_trigger_platform_write", new_callable=AsyncMock, side_effect=RuntimeError("mcp boom")),
+    ):
+        with pytest.raises(Exception, match="mcp boom"):
+            await ex._execute_one_step_core(job.id, s1.id, None)
+
+
+@pytest.mark.asyncio
 async def test_alternating_waves_sequential_then_parallel_then_sequential(db_session):
     """
     Partition T,F,T,F → waves [[s1,s2],[s3,s4]]. Step 3 and 4 both get chain from step 2 output.
@@ -514,3 +839,109 @@ async def test_nested_exceptiongroup_unwraps_to_inner_exception(db_session):
     db_session.refresh(job)
     assert job.status == JobStatus.FAILED
     assert "inner leaf" in (job.failure_reason or "")
+
+
+@pytest.mark.asyncio
+async def test_execute_job_planner_replan_failure_marks_job_failed(db_session, monkeypatch):
+    """When execute-time replan is enabled and planner fails, job is FAILED without running steps."""
+    monkeypatch.setattr(app_settings, "AGENT_PLANNER_EXECUTE_REPLAN_ON_FAILURE", "fail")
+    job, _steps, _ = _create_job_with_steps(db_session, depends_on_previous_list=[False, False])
+    executor = AgentExecutor(db_session)
+    calc_mock = MagicMock()
+    pay_mock = MagicMock()
+    with patch("services.planner_llm.is_agent_planner_configured", return_value=True):
+        with patch.object(
+            WorkflowBuilder,
+            "replan_workflow_steps_at_execute_async",
+            new=AsyncMock(side_effect=PlannerSplitError("simulated planner failure", last_detail="invalid JSON")),
+        ):
+            with patch.object(executor.payment_processor, "calculate_job_cost", calc_mock):
+                with patch.object(executor.payment_processor, "process_payment", pay_mock):
+                    await executor.execute_job(job.id)
+    db_session.refresh(job)
+    assert job.status == JobStatus.FAILED
+    assert "simulated planner failure" in (job.failure_reason or "")
+    calc_mock.assert_not_called()
+    pay_mock.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_execute_job_planner_replan_failure_continue_runs_built_workflow(db_session, monkeypatch):
+    """AGENT_PLANNER_EXECUTE_REPLAN_ON_FAILURE=continue keeps the pre-built workflow and charges after failed replan."""
+    monkeypatch.setattr(app_settings, "AGENT_PLANNER_EXECUTE_REPLAN_ON_FAILURE", "continue")
+    job, _steps, _ = _create_job_with_steps(db_session, depends_on_previous_list=[False, False])
+    executor = AgentExecutor(db_session)
+    fake_tx = MagicMock()
+    fake_tx.id = 42
+
+    async def fake_core(self, job_id, step_id, prev):
+        return {"ok": True}
+
+    with patch("services.planner_llm.is_agent_planner_configured", return_value=True):
+        with patch.object(
+            WorkflowBuilder,
+            "replan_workflow_steps_at_execute_async",
+            new=AsyncMock(side_effect=PlannerSplitError("planner down")),
+        ):
+            with patch.object(executor.payment_processor, "calculate_job_cost", lambda jid: None):
+                with patch.object(executor.payment_processor, "process_payment", return_value=fake_tx):
+                    with patch.object(executor.payment_processor, "distribute_earnings", lambda jid: None):
+                        with patch.object(AgentExecutor, "_execute_one_step_core", new=fake_core):
+                            await executor.execute_job(job.id)
+    db_session.refresh(job)
+    assert job.status == JobStatus.COMPLETED
+
+
+@pytest.mark.asyncio
+async def test_execute_job_skips_replan_for_manual_workflow_origin(db_session):
+    """Manual workflows must not be overwritten by execute-time replan."""
+    job, _steps, _ = _create_job_with_steps(db_session, depends_on_previous_list=[False, False])
+    job.workflow_origin = "manual"
+    db_session.commit()
+    db_session.refresh(job)
+    executor = AgentExecutor(db_session)
+
+    async def fake_core(self, job_id, step_id, prev):
+        return {"ok": True}
+
+    replan_mock = AsyncMock()
+    fake_tx = MagicMock()
+    fake_tx.id = 43
+    with patch("services.planner_llm.is_agent_planner_configured", return_value=True):
+        with patch.object(WorkflowBuilder, "replan_workflow_steps_at_execute_async", replan_mock):
+            with patch.object(executor.payment_processor, "calculate_job_cost", lambda jid: None):
+                with patch.object(executor.payment_processor, "process_payment", return_value=fake_tx):
+                    with patch.object(executor.payment_processor, "distribute_earnings", lambda jid: None):
+                        with patch.object(AgentExecutor, "_execute_one_step_core", new=fake_core):
+                            await executor.execute_job(job.id)
+    replan_mock.assert_not_called()
+    db_session.refresh(job)
+    assert job.status == JobStatus.COMPLETED
+
+
+@pytest.mark.asyncio
+async def test_execute_job_calculates_cost_before_payment(db_session):
+    with patch("services.planner_llm.is_agent_planner_configured", return_value=False):
+        job, _steps, _ = _create_job_with_steps(db_session, depends_on_previous_list=[True])
+        executor = AgentExecutor(db_session)
+        order: list = []
+
+        def calc(jid):
+            order.append("calc")
+
+        fake_tx = MagicMock()
+        fake_tx.id = 44
+
+        def pay(jid):
+            order.append("pay")
+            return fake_tx
+
+        async def fake_core(self, job_id, step_id, prev):
+            return {"ok": True}
+
+        with patch.object(executor.payment_processor, "calculate_job_cost", side_effect=calc):
+            with patch.object(executor.payment_processor, "process_payment", side_effect=pay):
+                with patch.object(executor.payment_processor, "distribute_earnings", lambda jid: None):
+                    with patch.object(AgentExecutor, "_execute_one_step_core", new=fake_core):
+                        await executor.execute_job(job.id)
+        assert order == ["calc", "pay"]

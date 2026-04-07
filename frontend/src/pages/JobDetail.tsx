@@ -335,10 +335,11 @@ export default function JobDetailPage() {
     setPlannerPipelineError(null)
     ;(async () => {
       try {
-        const [stRes, listRes, pipeRes] = await Promise.allSettled([
+        const [stRes, listRes, pipeRes, toolsRes] = await Promise.allSettled([
           jobsAPI.getAgentPlannerStatus(),
           jobsAPI.listPlannerArtifacts(jobId),
           jobsAPI.getPlannerPipeline(jobId),
+          mcpAPI.listTools(),
         ])
         if (cancelled) return
         if (stRes.status === 'fulfilled') setPlannerStatus(stRes.value)
@@ -355,6 +356,9 @@ export default function JobDetailPage() {
           setPlannerPipeline(null)
           setPlannerPipelineError('Could not load combined planning view.')
         }
+        if (toolsRes.status === 'fulfilled') {
+          setPlatformToolsList(Array.isArray(toolsRes.value) ? toolsRes.value : [])
+        }
       } finally {
         if (!cancelled) setPlannerSupportLoading(false)
       }
@@ -363,6 +367,53 @@ export default function JobDetailPage() {
       cancelled = true
     }
   }, [jobId, plannerSectionOpen])
+
+  const platformToolNamesForSuggestion = useCallback(
+    (row: Record<string, unknown>): string[] => {
+      const explicit = row.platform_tool_names
+      if (Array.isArray(explicit)) {
+        const names = explicit.map(ppStr).filter(Boolean)
+        if (names.length > 0) return names
+      }
+      const byId = new Map(platformToolsList.map((t) => [String(t.id), t.name]))
+      const ids = Array.isArray(row.platform_tool_ids) ? (row.platform_tool_ids as unknown[]) : []
+      return ids.map((id) => byId.get(ppStr(id)) || ppStr(id)).filter(Boolean)
+    },
+    [platformToolsList],
+  )
+
+  const enrichToolSuggestionForDisplay = useCallback(
+    (payload: unknown): unknown => {
+      if (!payload || typeof payload !== 'object') return payload
+      const byId = new Map(platformToolsList.map((t) => [String(t.id), t.name]))
+      const out = JSON.parse(JSON.stringify(payload)) as Record<string, unknown>
+      const enrichRows = (rows: unknown) => {
+        if (!Array.isArray(rows)) return
+        for (const row of rows) {
+          if (!row || typeof row !== 'object') continue
+          const r = row as Record<string, unknown>
+          if (Array.isArray(r.platform_tool_names) && r.platform_tool_names.length > 0) {
+            delete r.platform_tool_ids
+            continue
+          }
+          if (!Array.isArray(r.platform_tool_ids)) continue
+          const names = (r.platform_tool_ids as unknown[])
+            .map((id) => byId.get(ppStr(id)) || ppStr(id))
+            .filter(Boolean)
+          if (names.length > 0) {
+            r.platform_tool_names = names
+            delete r.platform_tool_ids
+          }
+        }
+      }
+      enrichRows(out.step_suggestions)
+      if (out.parsed_result && typeof out.parsed_result === 'object') {
+        enrichRows((out.parsed_result as Record<string, unknown>).step_suggestions)
+      }
+      return out
+    },
+    [platformToolsList],
+  )
 
   const refreshPlannerPipelineIfOpen = useCallback(async () => {
     if (!jobId || !plannerSectionOpen) return
@@ -778,10 +829,9 @@ export default function JobDetailPage() {
                                         {ppStr(s.rationale)}
                                       </p>
                                     ) : null}
-                                    {Array.isArray(s.platform_tool_ids) && s.platform_tool_ids.length > 0 ? (
+                                    {platformToolNamesForSuggestion(s).length > 0 ? (
                                       <p className="mt-1 text-xs text-white/50">
-                                        Platform tool IDs:{' '}
-                                        {(s.platform_tool_ids as unknown[]).map(ppStr).join(', ')}
+                                        Platform tools: {platformToolNamesForSuggestion(s).join(', ')}
                                       </p>
                                     ) : null}
                                   </li>
@@ -832,9 +882,13 @@ export default function JobDetailPage() {
                                     onClick={async () => {
                                       try {
                                         const data = await jobsAPI.getPlannerArtifactRaw(jobId, row.id)
+                                        const displayData =
+                                          row.artifact_type === 'tool_suggestion'
+                                            ? enrichToolSuggestionForDisplay(data)
+                                            : data
                                         setPlannerRawModal({
                                           title: `${row.artifact_type} (#${row.id})`,
-                                          body: JSON.stringify(data, null, 2),
+                                          body: JSON.stringify(displayData, null, 2),
                                         })
                                       } catch (e) {
                                         console.error(e)

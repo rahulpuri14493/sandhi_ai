@@ -150,9 +150,10 @@ class TestResetJobForExecution:
 # ---------------------------------------------------------------------------
 
 class TestExecuteSchedule:
+    @patch("services.job_scheduler.enqueue_execute_platform_job", return_value=False)
     @patch("services.job_scheduler.threading")
     @patch("services.job_scheduler.SessionLocal")
-    def test_triggers_execution_sets_in_progress(self, mock_session_local, mock_threading, db_session):
+    def test_triggers_execution_sets_in_progress(self, mock_session_local, mock_threading, _mock_enqueue, db_session):
         """Schedule fires → IN_QUEUE job set to IN_PROGRESS, thread started."""
 
         # Save original settings to restore after test
@@ -183,9 +184,10 @@ class TestExecuteSchedule:
         finally:
             settings.JOB_EXECUTION_BACKEND = original_backend
 
+    @patch("services.job_scheduler.enqueue_execute_platform_job", return_value=False)
     @patch("services.job_scheduler.threading")
     @patch("services.job_scheduler.SessionLocal")
-    def test_creates_execution_history(self, mock_session_local, mock_threading, db_session):
+    def test_creates_execution_history(self, mock_session_local, mock_threading, _mock_enqueue, db_session):
         """History entry created when schedule fires."""
         user = _make_user(db_session)
         dev = _make_user(db_session, UserRole.DEVELOPER)
@@ -284,10 +286,13 @@ class TestExecuteSchedule:
         assert job.status == JobStatus.IN_QUEUE
         mock_threading.Thread.assert_not_called()
 
+    @patch("services.job_scheduler.enqueue_execute_platform_job", return_value=False)
     @patch("services.job_scheduler.get_scheduler")
     @patch("services.job_scheduler.threading")
     @patch("services.job_scheduler.SessionLocal")
-    def test_deactivates_and_removes(self, mock_session_local, mock_threading, mock_get_sched, db_session):
+    def test_deactivates_and_removes(
+        self, mock_session_local, mock_threading, mock_get_sched, _mock_enqueue, db_session
+    ):
         """Schedule deactivates before thread starts, task ID cleaned from service state."""
         user = _make_user(db_session)
         dev = _make_user(db_session, UserRole.DEVELOPER)
@@ -309,7 +314,6 @@ class TestExecuteSchedule:
         assert schedule.next_run_time is None
         assert schedule.last_run_time is not None
         mock_svc.remove_schedule.assert_called_once_with(schedule.id)
-
 
     @patch("services.job_scheduler.get_scheduler")
     @patch("services.job_scheduler.SessionLocal")

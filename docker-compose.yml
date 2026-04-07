@@ -68,6 +68,8 @@ services:
       DATABASE_URL: postgresql://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@db:5432/${POSTGRES_DB:-agent_marketplace}
       # Hot-reload API when ./backend is bind-mounted (set UVICORN_RELOAD=false for production)
       UVICORN_RELOAD: ${UVICORN_RELOAD:-true}
+      # Windows/WSL bind-mounts can miss FS events; force polling so reload is reliable.
+      WATCHFILES_FORCE_POLLING: ${WATCHFILES_FORCE_POLLING:-true}
       A2A_ADAPTER_URL: http://a2a-openai-adapter:8080
       PLATFORM_MCP_SERVER_URL: http://platform-mcp-server:8081
       # Document storage backend: s3 (default) or local
@@ -127,6 +129,8 @@ services:
       DATABASE_URL: postgresql://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@db:5432/${POSTGRES_DB:-agent_marketplace}
       # Restart worker when ./backend changes (set CELERY_AUTORELOAD=false for production)
       CELERY_AUTORELOAD: ${CELERY_AUTORELOAD:-true}
+      # Keep watchfiles reliable on Windows/WSL bind-mounts.
+      WATCHFILES_FORCE_POLLING: ${WATCHFILES_FORCE_POLLING:-true}
       JOB_EXECUTION_BACKEND: ${JOB_EXECUTION_BACKEND:-celery}
       JOB_EXECUTION_STRICT_QUEUE: ${JOB_EXECUTION_STRICT_QUEUE:-false}
       CELERY_BROKER_URL: ${CELERY_BROKER_URL:-redis://redis:6379/0}
@@ -181,9 +185,24 @@ services:
     container_name: a2a-openai-adapter
     init: true
     restart: unless-stopped
+    # Host 8080 → hired-agent adapter (do not reuse this host port for the planner adapter).
     ports:
       - "8080:8080"
     # No OPENAI_* env needed: platform sends openai_url/openai_api_key/openai_model per request in metadata
+
+  # Optional second adapter instance for platform Agent Planner only (isolates planner traffic from hired agents).
+  # Both adapters listen on container port 8080; only host bindings must differ. Backend uses Docker DNS:
+  # AGENT_PLANNER_ADAPTER_URL=http://a2a-planner-adapter:8080
+  a2a-planner-adapter:
+    build:
+      context: ./tools/a2a_openai_adapter
+      dockerfile: Dockerfile
+    container_name: a2a-planner-adapter
+    init: true
+    restart: unless-stopped
+    # Host 8082 → planner adapter (8080 and 8081 already used by openai-adapter and platform-mcp-server).
+    ports:
+      - "8082:8080"
 
   platform-mcp-server:
     build:

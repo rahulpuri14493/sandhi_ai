@@ -212,60 +212,6 @@ def test_user_can_access_job_business_and_developer(db_session):
     assert jm._user_can_access_job(job, dev, db_session) is True
 
 
-def test_get_first_hired_agent_for_job_variants(db_session):
-    from core.security import get_password_hash
-
-    biz = User(
-        email=f"gh_{uuid.uuid4().hex[:8]}@t.com",
-        password_hash=get_password_hash("p"),
-        role=UserRole.BUSINESS,
-    )
-    dev = User(
-        email=f"gd_{uuid.uuid4().hex[:8]}@t.com",
-        password_hash=get_password_hash("p"),
-        role=UserRole.DEVELOPER,
-    )
-    db_session.add_all([biz, dev])
-    db_session.commit()
-    job = Job(business_id=biz.id, title="J", status=JobStatus.DRAFT)
-    db_session.add(job)
-    db_session.commit()
-    db_session.refresh(job)
-    assert jm._get_first_hired_agent_for_job(db_session, job.id) is None
-
-    ag = Agent(
-        developer_id=dev.id,
-        name="ag",
-        description="d",
-        status=AgentStatus.ACTIVE,
-        price_per_task=1.0,
-        price_per_communication=0.0,
-        api_endpoint="  https://api.example/v1  ",
-        api_key=" k ",
-        llm_model="gpt-4o-mini",
-        temperature=0.5,
-        a2a_enabled=True,
-    )
-    db_session.add(ag)
-    db_session.commit()
-    db_session.refresh(ag)
-    db_session.add(
-        WorkflowStep(job_id=job.id, agent_id=ag.id, step_order=1, input_data="{}")
-    )
-    db_session.commit()
-    tup = jm._get_first_hired_agent_for_job(db_session, job.id)
-    assert tup is not None
-    assert tup[0] == "https://api.example/v1"
-    assert tup[1] == "k"
-    assert tup[2] == "gpt-4o-mini"
-    assert tup[3] == 0.5
-    assert tup[4] is True
-
-    ag.api_endpoint = "   "
-    db_session.commit()
-    assert jm._get_first_hired_agent_for_job(db_session, job.id) is None
-
-
 def test_transition_job_status_if_current(db_session):
     from core.security import get_password_hash
 

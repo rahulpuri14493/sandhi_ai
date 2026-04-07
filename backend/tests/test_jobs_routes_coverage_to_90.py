@@ -334,6 +334,7 @@ def test_answer_question_process_raises_500(monkeypatch, client: TestClient, db_
 def test_generate_workflow_skips_step_logs_and_read_file_failure(
     monkeypatch, client: TestClient, db_session, tmp_path
 ):
+    monkeypatch.setattr("services.planner_llm.is_agent_planner_configured", lambda: True)
     u, h = _headers_biz(db_session, "gwsk2")
     dev = User(
         email=f"d_{uuid.uuid4().hex[:8]}@e.com",

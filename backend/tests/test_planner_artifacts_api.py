@@ -587,6 +587,125 @@ def test_download_planner_artifact_raw_happy_path(monkeypatch, client: TestClien
     assert r.json() == {"patched": True}
 
 
+def test_planner_pipeline_tool_suggestion_enriched_with_names(client: TestClient, db_session, tmp_path):
+    biz, headers = _biz_headers(db_session, "pipe_names")
+    job = Job(business_id=biz.id, title="J", status=JobStatus.DRAFT, conversation=json.dumps([]))
+    db_session.add(job)
+    db_session.commit()
+    db_session.refresh(job)
+
+    t1 = MCPToolConfig(
+        user_id=biz.id,
+        tool_type=MCPToolType.POSTGRES,
+        name="local_postgres",
+        encrypted_config="{}",
+        is_active=True,
+    )
+    t2 = MCPToolConfig(
+        user_id=biz.id,
+        tool_type=MCPToolType.MINIO,
+        name="local_minio",
+        encrypted_config="{}",
+        is_active=True,
+    )
+    db_session.add_all([t1, t2])
+    db_session.commit()
+    db_session.refresh(t1)
+    db_session.refresh(t2)
+
+    f = tmp_path / "pipe_tool.json"
+    f.write_text(
+        json.dumps(
+            {
+                "parsed_result": {
+                    "step_suggestions": [
+                        {
+                            "agent_index": 0,
+                            "platform_tool_ids": [t1.id, t2.id],
+                            "rationale": "x",
+                        }
+                    ]
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    db_session.add(
+        JobPlannerArtifact(
+            job_id=job.id,
+            artifact_type="tool_suggestion",
+            storage="local",
+            bucket=None,
+            object_key=str(f),
+            byte_size=len(f.read_bytes()),
+        )
+    )
+    db_session.commit()
+
+    r = client.get(f"/api/jobs/{job.id}/planner-pipeline", headers=headers)
+    assert r.status_code == 200, r.text
+    tool = r.json()["tool_suggestion"]
+    assert isinstance(tool, dict)
+    assert isinstance(tool.get("step_suggestions"), list)
+    row = tool["step_suggestions"][0]
+    assert row.get("platform_tool_names") == ["local_postgres", "local_minio"]
+    assert "platform_tool_ids" not in row
+
+
+def test_download_planner_artifact_raw_tool_suggestion_hides_ids(client: TestClient, db_session, tmp_path):
+    biz, headers = _biz_headers(db_session, "raw_names")
+    job = Job(business_id=biz.id, title="J", status=JobStatus.DRAFT, conversation=json.dumps([]))
+    db_session.add(job)
+    db_session.commit()
+    db_session.refresh(job)
+
+    tool = MCPToolConfig(
+        user_id=biz.id,
+        tool_type=MCPToolType.POSTGRES,
+        name="local_postgres",
+        encrypted_config="{}",
+        is_active=True,
+    )
+    db_session.add(tool)
+    db_session.commit()
+    db_session.refresh(tool)
+
+    f = tmp_path / "raw_tool.json"
+    f.write_text(
+        json.dumps(
+            {
+                "step_suggestions": [
+                    {
+                        "agent_index": 0,
+                        "platform_tool_ids": [tool.id],
+                        "rationale": "x",
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    art = JobPlannerArtifact(
+        job_id=job.id,
+        artifact_type="tool_suggestion",
+        storage="local",
+        bucket=None,
+        object_key=str(f),
+        byte_size=len(f.read_bytes()),
+    )
+    db_session.add(art)
+    db_session.commit()
+    db_session.refresh(art)
+
+    r = client.get(f"/api/jobs/{job.id}/planner-artifacts/{art.id}/raw", headers=headers)
+    assert r.status_code == 200, r.text
+    body = r.json()
+    rows = body.get("step_suggestions") or []
+    assert len(rows) == 1
+    assert rows[0].get("platform_tool_names") == ["local_postgres"]
+    assert "platform_tool_ids" not in rows[0]
+
+
 def test_download_planner_artifact_raw_storage_error_503(monkeypatch, client: TestClient, db_session, tmp_path):
     biz, headers = _biz_headers(db_session, "raw503")
     job = Job(business_id=biz.id, title="J", status=JobStatus.DRAFT, conversation=json.dumps([]))

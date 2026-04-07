@@ -12,7 +12,6 @@ from core.security import get_password_hash
 from services.planner_artifact_storage import (
     GENERIC_PLANNER_ARTIFACT_TYPES,
     PLANNER_PIPELINE_ARTIFACT_TYPES,
-    _agent_planner_enabled_for_meta,
     _should_persist_brd_payload,
     attach_planner_meta,
     load_latest_planner_pipeline_payloads,
@@ -202,7 +201,7 @@ def test_read_planner_artifact_bytes_s3_delegates(monkeypatch):
 
 def test_attach_planner_meta_preserves_keys_and_sets_envelope(monkeypatch):
     monkeypatch.setattr(
-        "services.planner_artifact_storage._agent_planner_enabled_for_meta",
+        "services.planner_artifact_storage.is_agent_planner_configured",
         lambda: True,
     )
     monkeypatch.setattr(
@@ -221,31 +220,34 @@ def test_attach_planner_meta_preserves_keys_and_sets_envelope(monkeypatch):
 
 def test_attach_planner_meta_uses_planner_disabled_when_not_enabled(monkeypatch):
     monkeypatch.setattr(
-        "services.planner_artifact_storage._agent_planner_enabled_for_meta",
+        "services.planner_artifact_storage.is_agent_planner_configured",
         lambda: False,
     )
     out = attach_planner_meta({"x": 1}, "brd_analysis")
     assert out["planner_meta"]["planner_model"] == "planner_disabled"
 
 
-def test_agent_planner_enabled_for_meta_respects_settings(monkeypatch):
-    import services.planner_artifact_storage as pas
+def test_attach_planner_meta_delegates_to_is_agent_planner_configured(monkeypatch):
+    """attach_planner_meta uses planner_llm.is_agent_planner_configured (transport-aware)."""
+    import services.planner_llm as plm
 
-    fake = type(
-        "S",
-        (),
-        {"AGENT_PLANNER_ENABLED": True, "AGENT_PLANNER_API_KEY": "  k  "},
-    )()
-    monkeypatch.setattr(pas, "settings", fake)
-    assert _agent_planner_enabled_for_meta() is True
+    monkeypatch.setattr(plm.settings, "AGENT_PLANNER_ENABLED", True)
+    monkeypatch.setattr(plm.settings, "AGENT_PLANNER_API_KEY", "  k  ")
+    # Ensure secondary planner config does not leak from the developer environment.
+    monkeypatch.setattr(plm.settings, "AGENT_PLANNER_SECONDARY_ENABLED", False)
+    monkeypatch.setattr(plm.settings, "AGENT_PLANNER_SECONDARY_API_KEY", "   ")
+    monkeypatch.setattr(plm.settings, "AGENT_PLANNER_A2A_URL", "")
+    monkeypatch.setattr(plm.settings, "AGENT_PLANNER_ADAPTER_URL", "")
+    from services.planner_llm import is_agent_planner_configured
 
-    fake2 = type("S", (), {"AGENT_PLANNER_ENABLED": True, "AGENT_PLANNER_API_KEY": "   "})()
-    monkeypatch.setattr(pas, "settings", fake2)
-    assert _agent_planner_enabled_for_meta() is False
+    assert is_agent_planner_configured() is True
 
-    fake3 = type("S", (), {"AGENT_PLANNER_ENABLED": False, "AGENT_PLANNER_API_KEY": "k"})()
-    monkeypatch.setattr(pas, "settings", fake3)
-    assert _agent_planner_enabled_for_meta() is False
+    monkeypatch.setattr(plm.settings, "AGENT_PLANNER_API_KEY", "   ")
+    assert is_agent_planner_configured() is False
+
+    monkeypatch.setattr(plm.settings, "AGENT_PLANNER_API_KEY", "k")
+    monkeypatch.setattr(plm.settings, "AGENT_PLANNER_ENABLED", False)
+    assert is_agent_planner_configured() is False
 
 
 def test_planner_pipeline_artifact_types_order():

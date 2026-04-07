@@ -270,6 +270,8 @@ class JobResponse(BaseModel):
     write_execution_mode: Optional[str] = "platform"  # platform | agent | ui_only
     output_artifact_format: Optional[str] = "jsonl"  # jsonl | json
     output_contract: Optional[Dict[str, Any]] = None
+    # auto_split | manual — manual jobs skip execute-time planner replan
+    workflow_origin: str = "auto_split"
     # Schedule-aware fields for frontend UX
     show_cancel_option: bool = False  # True when in_progress job exceeds stuck threshold
     scheduled_at: Optional[datetime] = None  # From job's schedule, for countdown timer

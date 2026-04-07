@@ -43,8 +43,11 @@ def temp_txt_file():
     Path(path).unlink(missing_ok=True)
 
 
-def test_analyze_documents_no_agent_extraction_only(temp_txt_file):
-    """When no agent_api_url, returns extraction-only response with empty questions."""
+def test_analyze_documents_no_agent_extraction_only(temp_txt_file, monkeypatch):
+    """Without platform planner, returns extraction-only guidance and empty questions."""
+    import services.document_analyzer as mod
+
+    monkeypatch.setattr(mod, "is_agent_planner_configured", lambda: False)
     analyzer = DocumentAnalyzer()
     result = asyncio.run(
         analyzer.analyze_documents_and_generate_questions(
@@ -52,14 +55,12 @@ def test_analyze_documents_no_agent_extraction_only(temp_txt_file):
             job_title="Test Job",
             job_description="Test description",
             conversation_history=[],
-            agent_api_url=None,
-            agent_api_key=None,
         )
     )
     assert "questions" in result
     assert result["questions"] == []
     assert "analysis" in result
-    assert "Select and assign agents" in result["analysis"] or "extracted" in result["analysis"].lower()
+    assert "Configure the platform Agent Planner" in result["analysis"] or "extracted" in result["analysis"].lower()
 
 
 def test_format_conversation_handles_dict_values():

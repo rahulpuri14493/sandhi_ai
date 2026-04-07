@@ -4,8 +4,8 @@ BRD-aware suggestion of which platform MCP tools to assign to each workflow step
 Mirrors task_splitter.split_job_for_agents: same job title, description, BRD excerpts,
 and optional Q&A — but output is per-agent platform_tool_ids (subset of the business tool pool).
 
-LLM backend: platform Agent Planner when configured (AGENT_PLANNER_API_KEY), otherwise the splitter
-agent's OpenAI-compatible endpoint (same as task split).
+LLM backend: platform Agent Planner when configured (AGENT_PLANNER_API_KEY); otherwise a deterministic
+tool partition fallback (no hired-agent LLM).
 """
 from __future__ import annotations
 
@@ -16,7 +16,6 @@ from typing import Any, Dict, List, Optional
 from core.config import settings
 from models.agent import Agent
 from models.mcp_server import MCPToolConfig
-from services.llm_http_client import post_openai_compatible_raw
 from services.planner_llm import is_agent_planner_configured, planner_chat_completion
 from services.mcp_tool_capabilities import normalize_tool_type, partition_tools_for_fallback, tool_access_summary
 
@@ -88,7 +87,6 @@ async def suggest_tool_assignments_for_agents(
     conversation_data: Optional[List[Dict[str, Any]]],
     agents: List[Agent],
     platform_tools: List[MCPToolConfig],
-    splitter_agent: Agent,
     llm_audit: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """
@@ -106,15 +104,7 @@ async def suggest_tool_assignments_for_agents(
     ]
 
     use_planner = is_agent_planner_configured()
-    url = (splitter_agent.api_endpoint or "").strip()
-    if len(agents) == 0:
-        fb = partition_tools_for_fallback(tool_dicts, len(agents))
-        return {
-            "step_suggestions": fb,
-            "output_contract_stub": _build_write_stub(platform_tools),
-            "fallback_used": True,
-        }
-    if not use_planner and not url:
+    if len(agents) == 0 or not use_planner:
         fb = partition_tools_for_fallback(tool_dicts, len(agents))
         return {
             "step_suggestions": fb,
@@ -176,52 +166,23 @@ AVAILABLE PLATFORM TOOLS (assign ONLY these ids: {", ".join(valid_ids)}):
     user_content += f"""
 Assign tools to each of the {len(agents)} agents. Return JSON array only."""
 
-    model = (getattr(splitter_agent, "llm_model", None) or "").strip() or "gpt-4o-mini"
-    temperature = (
-        getattr(splitter_agent, "temperature", None)
-        if getattr(splitter_agent, "temperature", None) is not None
-        else 0.3
-    )
-    payload = {
-        "model": model,
-        "messages": [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_content},
-        ],
-        "temperature": temperature,
-    }
-    headers = {"Content-Type": "application/json"}
-    if splitter_agent.api_key and (splitter_agent.api_key or "").strip():
-        headers["Authorization"] = f"Bearer {(splitter_agent.api_key or '').strip()}"
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_content},
+    ]
 
     valid_id_set = {int(x) for x in valid_ids}
 
     try:
-        if use_planner:
-            # Platform planner must follow AGENT_PLANNER_* settings, not the splitter agent profile.
-            planner_temperature = float(
-                getattr(settings, "AGENT_PLANNER_TEMPERATURE", 0.3) or 0.3
-            )
-            text = await planner_chat_completion(
-                payload["messages"],
-                temperature=planner_temperature,
-                max_tokens=min(8192, int(getattr(settings, "AGENT_PLANNER_MAX_TOKENS", 4096) or 4096)),
-            )
-        else:
-            fb = (getattr(settings, "LLM_HTTP_FALLBACK_MODEL", None) or "").strip() or None
-            resp = await post_openai_compatible_raw(
-                url, headers, payload, timeout=60.0, max_retries=2, fallback_model=fb
-            )
-            if resp.status_code >= 400:
-                raise RuntimeError(f"splitter HTTP {resp.status_code}")
-            data = resp.json()
-            text = (
-                data.get("choices", [{}])[0].get("message", {}).get("content", "")
-                or ""
-            ).strip()
+        planner_temperature = float(getattr(settings, "AGENT_PLANNER_TEMPERATURE", 0.3) or 0.3)
+        text = await planner_chat_completion(
+            messages,
+            temperature=planner_temperature,
+            max_tokens=min(8192, int(getattr(settings, "AGENT_PLANNER_MAX_TOKENS", 4096) or 4096)),
+        )
         if llm_audit is not None:
             llm_audit["raw_llm_response"] = text
-            llm_audit["source"] = "planner" if use_planner else "agent_endpoint"
+            llm_audit["source"] = "planner"
         if text.startswith("```"):
             text = text.split("```")[1]
             if text.startswith("json"):

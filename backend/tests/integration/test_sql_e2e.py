@@ -12,10 +12,10 @@ Run:
 from __future__ import annotations
 
 import asyncio
+import importlib.util
 import json
 import os
 import secrets
-import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 from unittest.mock import AsyncMock, patch
@@ -54,12 +54,23 @@ def _dotenv_value(name: str) -> str:
 
 
 def _load_execute_platform_tool():
-    p = str(PMCP_ROOT)
-    if p not in sys.path:
-        sys.path.insert(0, p)
-    from app import execute_platform_tool  # noqa: WPS433
-
-    return execute_platform_tool
+    """Load MCP server implementation by file path (avoids ``from app import`` shadowing ``/app`` in Docker)."""
+    app_py = PMCP_ROOT / "app.py"
+    if not app_py.is_file():
+        # Walk up from tests/integration in case REPO_ROOT resolution differs (monorepo / CI).
+        here = Path(__file__).resolve()
+        for i in range(2, min(7, len(here.parents))):
+            cand = here.parents[i] / "tools" / "platform_mcp_server" / "app.py"
+            if cand.is_file():
+                app_py = cand
+                break
+    if not app_py.is_file():
+        pytest.skip(f"platform_mcp_server app not found (expected {app_py})")
+    spec = importlib.util.spec_from_file_location("sandhi_platform_mcp_app", app_py)
+    mod = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(mod)
+    return mod.execute_platform_tool
 
 
 def _registry_tool_name(tool_id: int, name: str) -> str:

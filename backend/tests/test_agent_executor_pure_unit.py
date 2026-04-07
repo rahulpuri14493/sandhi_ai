@@ -1,9 +1,11 @@
 """Unit tests for module-level helpers in services.agent_executor (no DB execution)."""
 
+import asyncio
 import json
 from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
+import httpx
 import pytest
 
 import services.agent_executor as ae
@@ -281,3 +283,254 @@ def test_openai_tools_from_mcp(monkeypatch):
     assert tools[0]["function"]["name"] == "platform_1_pg"
     assert "schema" in tools[0]["function"]["description"].lower()
     assert tools[1]["function"]["parameters"] == {"type": "object"}
+
+
+def _exec_stub_db():
+    return MagicMock()
+
+
+def test_guardrail_is_retryable_asyncio_timeout():
+    ex = ae.AgentExecutor(_exec_stub_db())
+    assert ex._is_retryable_step_exception(asyncio.TimeoutError()) is True
+
+
+def test_guardrail_is_retryable_http_status_503():
+    ex = ae.AgentExecutor(_exec_stub_db())
+    req = httpx.Request("GET", "http://example.invalid/")
+    resp = httpx.Response(503, request=req)
+    err = httpx.HTTPStatusError("down", request=req, response=resp)
+    assert ex._is_retryable_step_exception(err) is True
+
+
+def test_guardrail_is_not_retryable_http_status_400():
+    ex = ae.AgentExecutor(_exec_stub_db())
+    req = httpx.Request("GET", "http://example.invalid/")
+    resp = httpx.Response(400, request=req)
+    err = httpx.HTTPStatusError("bad", request=req, response=resp)
+    assert ex._is_retryable_step_exception(err) is False
+
+
+def test_guardrail_is_retryable_transport_error():
+    ex = ae.AgentExecutor(_exec_stub_db())
+    req = httpx.Request("GET", "http://example.invalid/")
+    err = httpx.ConnectError("connection refused", request=req)
+    assert ex._is_retryable_step_exception(err) is True
+
+
+def test_guardrail_is_retryable_message_heuristic():
+    ex = ae.AgentExecutor(_exec_stub_db())
+    assert ex._is_retryable_step_exception(ValueError("upstream gateway timeout")) is True
+
+
+def test_guardrail_validate_empty_output_when_required(monkeypatch):
+    ex = ae.AgentExecutor(_exec_stub_db())
+    monkeypatch.setattr(ae.settings, "AGENT_OUTPUT_REQUIRE_NONEMPTY", True)
+    with pytest.raises(ValueError, match="empty output"):
+        ex._validate_agent_output_guardrails(None)
+    with pytest.raises(ValueError, match="empty text"):
+        ex._validate_agent_output_guardrails("   ")
+    with pytest.raises(ValueError, match="empty list"):
+        ex._validate_agent_output_guardrails([])
+
+
+def test_guardrail_validate_empty_allowed_when_disabled(monkeypatch):
+    ex = ae.AgentExecutor(_exec_stub_db())
+    monkeypatch.setattr(ae.settings, "AGENT_OUTPUT_REQUIRE_NONEMPTY", False)
+    ex._validate_agent_output_guardrails(None)
+    ex._validate_agent_output_guardrails([])
+
+
+def test_guardrail_validate_non_dict_passthrough(monkeypatch):
+    ex = ae.AgentExecutor(_exec_stub_db())
+    monkeypatch.setattr(ae.settings, "AGENT_OUTPUT_REQUIRE_NONEMPTY", False)
+    ex._validate_agent_output_guardrails(42)
+
+
+def test_guardrail_validate_retryable_and_fatal_status():
+    ex = ae.AgentExecutor(_exec_stub_db())
+    with pytest.raises(RuntimeError, match="retryable_error"):
+        ex._validate_agent_output_guardrails({"status": "transient_error"})
+    with pytest.raises(ValueError, match="fatal agent status"):
+        ex._validate_agent_output_guardrails({"status": "failed"})
+
+
+def test_guardrail_validate_confidence_threshold(monkeypatch):
+    ex = ae.AgentExecutor(_exec_stub_db())
+    monkeypatch.setattr(ae.settings, "AGENT_OUTPUT_MIN_CONFIDENCE", 0.9)
+    with pytest.raises(ValueError, match="Low confidence"):
+        ex._validate_agent_output_guardrails({"confidence": 0.1, "content": "x"})
+
+
+def test_guardrail_validate_error_only_payload():
+    ex = ae.AgentExecutor(_exec_stub_db())
+    with pytest.raises(ValueError, match="only contains error"):
+        ex._validate_agent_output_guardrails({"error": "nope"})
+
+
+def test_guardrail_validate_error_with_content_ok():
+    ex = ae.AgentExecutor(_exec_stub_db())
+    ex._validate_agent_output_guardrails({"error": "noise", "content": "ok"})
+
+
+@pytest.mark.asyncio
+async def test_trigger_platform_write_requires_tool_name():
+    ex = ae.AgentExecutor(_exec_stub_db())
+    step = MagicMock()
+    with pytest.raises(ValueError, match="tool_name"):
+        await ex._trigger_platform_write(
+            business_id=1,
+            write_spec={"target": {}},
+            artifact_ref={"artifact_id": "a"},
+            step=step,
+        )
+
+
+@pytest.mark.asyncio
+async def test_trigger_platform_write_calls_mcp_with_headers(monkeypatch):
+    ex = ae.AgentExecutor(_exec_stub_db())
+    ex._mcp_correlation_job_id = 7
+    ex._mcp_correlation_step_id = 8
+    ex._mcp_correlation_trace_id = "trace-z"
+    step = MagicMock()
+    step.job_id = 1
+    step.id = 2
+    step.step_order = 3
+    mcp = AsyncMock(return_value={"written": True})
+    monkeypatch.setattr(ae, "mcp_call_tool", mcp)
+    monkeypatch.setattr(ae.settings, "PLATFORM_MCP_SERVER_URL", "http://platform-mcp:9999")
+    monkeypatch.setattr(ae.settings, "MCP_TOOL_DEFAULT_TIMEOUT_SECONDS", 45.0)
+    out = await ex._trigger_platform_write(
+        business_id=42,
+        write_spec={
+            "tool_name": "platform_1_postgres",
+            "operation_type": "UPSERT",
+            "write_mode": "replace",
+            "merge_keys": ["id"],
+            "options": {"strict": True},
+            "timeout_seconds": 12.5,
+            "target": {"schema": "public", "table": "users"},
+        },
+        artifact_ref={"artifact_id": "art", "storage": "s3", "bucket": "b", "path": "p.jsonl", "format": "jsonl"},
+        step=step,
+    )
+    assert out == {"written": True}
+    mcp.assert_awaited_once()
+    kwargs = mcp.await_args.kwargs
+    assert kwargs["tool_name"] == "platform_1_postgres"
+    assert kwargs["timeout"] == 12.5
+    assert kwargs["extra_headers"]["X-Sandhi-Job-Id"] == "7"
+    assert kwargs["extra_headers"]["X-Sandhi-Workflow-Step-Id"] == "8"
+    assert kwargs["extra_headers"]["X-Sandhi-Trace-Id"] == "trace-z"
+
+
+@pytest.mark.asyncio
+async def test_trigger_platform_write_adds_trusted_bootstrap_when_signed(monkeypatch):
+    ex = ae.AgentExecutor(_exec_stub_db())
+    step = MagicMock()
+    step.job_id = 1
+    step.id = 2
+    step.step_order = 1
+    mcp = AsyncMock(return_value={})
+    monkeypatch.setattr(ae, "mcp_call_tool", mcp)
+    monkeypatch.setattr(ae.settings, "PLATFORM_MCP_SERVER_URL", "http://mcp/")
+    monkeypatch.setattr(ae.settings, "MCP_TOOL_DEFAULT_TIMEOUT_SECONDS", 60.0)
+    monkeypatch.setattr(ae, "_sign_trusted_bootstrap_payload", lambda **kwargs: "sighex")
+    await ex._trigger_platform_write(
+        business_id=1,
+        write_spec={
+            "tool_name": "platform_1_postgres",
+            "target": {
+                "schema": "public",
+                "table": "t",
+                "bootstrap_sql": "CREATE TABLE t (id int);",
+            },
+        },
+        artifact_ref={"artifact_id": "a", "storage": "local", "format": "json"},
+        step=step,
+    )
+    args = mcp.await_args.kwargs["arguments"]
+    assert args["trusted_bootstrap"]["bootstrap_sql"] == "CREATE TABLE t (id int);"
+    assert args["trusted_bootstrap"]["sig"] == "sighex"
+
+
+@pytest.mark.asyncio
+async def test_trigger_platform_write_omits_bootstrap_when_signature_none(monkeypatch):
+    ex = ae.AgentExecutor(_exec_stub_db())
+    step = MagicMock()
+    step.job_id = 1
+    step.id = 2
+    step.step_order = 1
+    mcp = AsyncMock(return_value={})
+    monkeypatch.setattr(ae, "mcp_call_tool", mcp)
+    monkeypatch.setattr(ae.settings, "PLATFORM_MCP_SERVER_URL", "http://mcp/")
+    monkeypatch.setattr(ae.settings, "MCP_TOOL_DEFAULT_TIMEOUT_SECONDS", 60.0)
+    monkeypatch.setattr(ae, "_sign_trusted_bootstrap_payload", lambda **kwargs: None)
+    await ex._trigger_platform_write(
+        business_id=1,
+        write_spec={
+            "tool_name": "platform_1_postgres",
+            "target": {"schema": "public", "table": "t", "bootstrap_sql": "SELECT 1"},
+        },
+        artifact_ref={"artifact_id": "a", "storage": "local", "format": "json"},
+        step=step,
+    )
+    args = mcp.await_args.kwargs["arguments"]
+    assert "trusted_bootstrap" not in args
+
+
+@pytest.mark.asyncio
+async def test_persist_output_artifact_json_and_jsonl_variants(monkeypatch):
+    ex = ae.AgentExecutor(_exec_stub_db())
+    job = MagicMock()
+    job.id = 100
+    step = MagicMock()
+    step.step_order = 2
+    files: list = []
+
+    async def capture_persist(filename, payload_bytes, mime, job_id=None):
+        files.append(filename)
+        return {"storage": "local", "path": "/tmp/x", "size": len(payload_bytes)}
+
+    monkeypatch.setattr(ae, "persist_file", capture_persist)
+
+    job.output_artifact_format = "json"
+    r1 = await ex._persist_output_artifact(job, step, {"x": 1})
+    assert r1["format"] == "json"
+    assert str(files[-1]).endswith("_output.json")
+
+    job.output_artifact_format = "jsonl"
+    r2 = await ex._persist_output_artifact(job, step, {"records": [{"a": 1}]})
+    assert r2["format"] == "jsonl"
+    assert str(files[-1]).endswith("_output.jsonl")
+
+    r3 = await ex._persist_output_artifact(job, step, {"records": None})
+    assert r3["format"] == "jsonl"
+
+    r4 = await ex._persist_output_artifact(job, step, "scalar-out")
+    assert r4["format"] == "jsonl"
+
+    job.output_artifact_format = "  PARQUET  "
+    r5 = await ex._persist_output_artifact(job, step, {"records": []})
+    assert r5["format"] == "jsonl"
+
+
+def test_openai_tools_external_wraps_non_dict_input_schema(monkeypatch):
+    monkeypatch.setattr(ae, "_input_schema_for_tool_type", lambda tt: {"type": "object", "properties": {}})
+    tools = ae._openai_tools_from_mcp(
+        [
+            {
+                "name": "ext_tool",
+                "description": "BYO",
+                "source": "external",
+                "input_schema": "bad",
+                "tool_type": "rest_api",
+            },
+        ]
+    )
+    assert len(tools) == 1
+    assert tools[0]["function"]["parameters"] == {"type": "object", "properties": {}}
+
+
+def test_input_schema_for_tool_type_delegates(monkeypatch):
+    monkeypatch.setattr(ae, "input_schema_for_platform_tool_type", lambda tt: {"t": tt})
+    assert ae._input_schema_for_tool_type("postgres") == {"t": "postgres"}

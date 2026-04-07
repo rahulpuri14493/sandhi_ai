@@ -17,15 +17,9 @@ from sqlalchemy.orm import Session
 from core.config import settings
 from models.job import JobPlannerArtifact
 from services.job_file_storage import download_s3_bytes, persist_file
+from services.planner_llm import is_agent_planner_configured
 
 logger = logging.getLogger(__name__)
-
-
-def _agent_planner_enabled_for_meta() -> bool:
-    """Mirror planner_llm.is_agent_planner_configured without importing planner_llm (import-cycle safe)."""
-    if not getattr(settings, "AGENT_PLANNER_ENABLED", True):
-        return False
-    return bool((getattr(settings, "AGENT_PLANNER_API_KEY", None) or "").strip())
 
 GENERIC_PLANNER_ARTIFACT_TYPES = frozenset({"task_split", "tool_suggestion"})
 
@@ -38,7 +32,7 @@ def attach_planner_meta(payload: Dict[str, Any], artifact_type: str) -> Dict[str
     Add provenance envelope under planner_meta without removing existing keys (backward compatible).
     """
     model = (getattr(settings, "AGENT_PLANNER_MODEL", None) or "").strip() or "unspecified"
-    if not _agent_planner_enabled_for_meta():
+    if not is_agent_planner_configured():
         model = "planner_disabled"
     out = dict(payload)
     out["planner_meta"] = {

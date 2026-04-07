@@ -163,6 +163,9 @@ def get_business_jobs(
                 depends_on_previous=getattr(step, "depends_on_previous", True),
             ))
         
+        wo = getattr(job, "workflow_origin", None) or "auto_split"
+        if wo not in ("manual", "auto_split"):
+            wo = "auto_split"
         job_dict = {
             "id": job.id,
             "business_id": job.business_id,
@@ -175,7 +178,8 @@ def get_business_jobs(
             "workflow_steps": workflow_steps_data,
             "files": files_data,
             "conversation": conversation_data,
-            "failure_reason": job.failure_reason
+            "failure_reason": job.failure_reason,
+            "workflow_origin": wo,
         }
         result.append(JobResponse(**job_dict))
     return result

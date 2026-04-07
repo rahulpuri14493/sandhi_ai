@@ -33,6 +33,31 @@ Most AI tools stop at generation. Sandhi AI is built for **execution at scale**.
 - **MCP-backed work** — Let agents discover and use approved tools and data (PostgreSQL, vector DBs, files) through the platform.
 - **Business oversight** — One place to review jobs, spend, and outputs with clear ownership and audit.
 
+## End user journey (business user)
+
+Typical path for someone using Sandhi AI as a **business customer**: from sign-in through hiring agents, defining work, running a multi-step job, and reviewing results. (Developers who publish agents follow a complementary path in the developer dashboard.)
+
+```mermaid
+flowchart TD
+  A([Business user starts]) --> B[Sign in to the app]
+  B --> C[Browse & compare marketplace agents]
+  C --> D[Hire agents the business needs]
+  D --> E[Create a job with title & description]
+  E --> F[Upload requirements / BRD documents]
+  F --> G{How to shape the workflow?}
+  G -->|Let the platform help| H[Auto-split into steps & optional tool suggestions]
+  G -->|Full control| I[Build a manual workflow step by step]
+  H --> J[Review workflow, allowed tools, and cost]
+  I --> J
+  J --> K[Approve when ready; pay if the flow requires it]
+  K --> L[Job runs: platform orchestrates each step]
+  L --> M[Follow live status, step outputs, and spend]
+  M --> N{Outcome}
+  N -->|Success| O([Review final outputs, artifacts, and planner audit if shown])
+  N -->|Failure or change needed| P[Inspect errors; adjust workflow or rerun]
+  P --> J
+```
+
 ## Architecture At A Glance
 
 Sandhi AI is built so the **platform owns orchestration** and **agents focus on execution**.
@@ -44,6 +69,11 @@ Sandhi AI is built so the **platform owns orchestration** and **agents focus on 
 - **Platform MCP Server**: A separate platform service that exposes tenant-safe enterprise tools such as PostgreSQL, Vector DB, and file system access.
 
 For implementation details on A2A behavior, see [A2A for developers](docs/A2A_DEVELOPERS.md).
+
+**Documentation folder** — Guides, schemas, and ops notes live under **[docs/](docs/)**. Highlights:
+
+- **[Agent planner (admin / ops)](docs/AGENT_PLANNER_OPS.md)** — Runtime transport, primary vs fallback model vs secondary failover, env cheat sheet, Mermaid flow, and `.env` examples (`AGENT_PLANNER_MODEL`, `AGENT_PLANNER_FALLBACK_MODEL`, `LLM_HTTP_FALLBACK_MODEL`, `AGENT_PLANNER_SECONDARY_*`, etc.).
+- [A2A task & assignment](docs/A2A_TASK_AND_ASSIGNMENT.md), [Object storage](docs/OBJECT_STORAGE.md), [Output contracts](docs/OUTPUT_CONTRACTS.md), [Codebase layout](docs/CODEBASE_LAYOUT.md)
 
 ### How each agent run is prepared (plain language)
 
@@ -58,7 +88,7 @@ If you are new to the codebase, these terms describe **what the platform puts in
 
 Full field names, JSON Schema, environment variables, and tests: **[A2A task & assignment](docs/A2A_TASK_AND_ASSIGNMENT.md)**.
 
-For where features live in the tree (backend vs frontend folders and naming), see [Codebase layout](docs/CODEBASE_LAYOUT.md).
+For where features live in the tree (backend vs frontend folders and naming), see [Codebase layout](docs/CODEBASE_LAYOUT.md). For platform planner configuration and failover behavior, see **[Agent planner (admin / ops)](docs/AGENT_PLANNER_OPS.md)** in **[docs/](docs/)**.
 
 ## Product Vision
 

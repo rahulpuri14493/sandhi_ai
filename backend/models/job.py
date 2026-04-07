@@ -48,6 +48,9 @@ class Job(Base):
     output_artifact_format = Column(String(20), nullable=False, default="jsonl")
     # User-defined output contract and write plan (JSON string)
     output_contract = Column(Text, nullable=True)
+    # How the current workflow was authored: auto_split (planner/UI auto) vs manual (step-by-step build).
+    # Execute-time planner replan skips jobs with workflow_origin=manual to preserve business intent.
+    workflow_origin = Column(String(32), nullable=False, default="auto_split")
 
     # Relationships
     business = relationship("User", back_populates="jobs", foreign_keys=[business_id])
@@ -58,6 +61,7 @@ class Job(Base):
         back_populates="job",
         cascade="all, delete-orphan",
     )
+
     # One schedule per job (uselist=False enforces singular access).
     # The DB UNIQUE constraint on job_schedules.job_id prevents duplicates.
     schedule = relationship("JobSchedule", back_populates="job", uselist=False, cascade="all, delete-orphan")
