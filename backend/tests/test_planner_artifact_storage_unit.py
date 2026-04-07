@@ -233,6 +233,9 @@ def test_attach_planner_meta_delegates_to_is_agent_planner_configured(monkeypatc
 
     monkeypatch.setattr(plm.settings, "AGENT_PLANNER_ENABLED", True)
     monkeypatch.setattr(plm.settings, "AGENT_PLANNER_API_KEY", "  k  ")
+    # Ensure secondary planner config does not leak from the developer environment.
+    monkeypatch.setattr(plm.settings, "AGENT_PLANNER_SECONDARY_ENABLED", False)
+    monkeypatch.setattr(plm.settings, "AGENT_PLANNER_SECONDARY_API_KEY", "   ")
     monkeypatch.setattr(plm.settings, "AGENT_PLANNER_A2A_URL", "")
     monkeypatch.setattr(plm.settings, "AGENT_PLANNER_ADAPTER_URL", "")
     from services.planner_llm import is_agent_planner_configured
