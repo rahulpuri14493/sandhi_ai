@@ -378,7 +378,6 @@ class JobSchedulerService:
 
         # Bootstrap: load all active schedules from the DB
         self.load_all_schedules()
-        self._is_running = True
         logger.info("Job scheduler started (Celery ETA tasks loaded)")
 
 

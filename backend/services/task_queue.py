@@ -189,7 +189,7 @@ if celery_app is not None:
         """
         from core.config import settings
         from datetime import datetime, timedelta
-        from db import SessionLocal
+        from db.database import SessionLocal
         from models.job import Job, JobStatus
         from models.job import (
             Job, JobSchedule, JobStatus, ScheduleStatus,

@@ -155,28 +155,33 @@ class TestExecuteSchedule:
     def test_triggers_execution_sets_in_progress(self, mock_session_local, mock_threading, db_session):
         """Schedule fires → IN_QUEUE job set to IN_PROGRESS, thread started."""
 
-        # Force fallback to local thread execution to test the core logic without Celery involved
-        settings.JOB_EXECUTION_BACKEND = "local"
+        # Save original settings to restore after test
+        original_backend = settings.JOB_EXECUTION_BACKEND
+        try:
+            # Force fallback to local thread execution to test the core logic without Celery involved
+            settings.JOB_EXECUTION_BACKEND = "local"
 
-        user = _make_user(db_session)
-        dev = _make_user(db_session, UserRole.DEVELOPER)
-        agent = _make_agent(db_session, dev)
-        job = _make_job(db_session, user, JobStatus.IN_QUEUE)
-        _make_step(db_session, job, agent)
-        schedule = _make_schedule(db_session, job)
+            user = _make_user(db_session)
+            dev = _make_user(db_session, UserRole.DEVELOPER)
+            agent = _make_agent(db_session, dev)
+            job = _make_job(db_session, user, JobStatus.IN_QUEUE)
+            _make_step(db_session, job, agent)
+            schedule = _make_schedule(db_session, job)
 
-        mock_session_local.return_value = db_session
-        db_session.close = lambda: None
-        mock_thread = MagicMock()
-        mock_threading.Thread.return_value = mock_thread
+            mock_session_local.return_value = db_session
+            db_session.close = lambda: None
+            mock_thread = MagicMock()
+            mock_threading.Thread.return_value = mock_thread
 
-        _execute_schedule(schedule.id)
+            _execute_schedule(schedule.id)
 
-        assert job.status == JobStatus.IN_PROGRESS
-        assert schedule.last_run_time is not None
-        assert schedule.status == ScheduleStatus.INACTIVE
-        assert schedule.next_run_time is None
-        mock_thread.start.assert_called_once()
+            assert job.status == JobStatus.IN_PROGRESS
+            assert schedule.last_run_time is not None
+            assert schedule.status == ScheduleStatus.INACTIVE
+            assert schedule.next_run_time is None
+            mock_thread.start.assert_called_once()
+        finally:
+            settings.JOB_EXECUTION_BACKEND = original_backend
 
     @patch("services.job_scheduler.threading")
     @patch("services.job_scheduler.SessionLocal")
@@ -459,3 +464,163 @@ class TestScheduleManagement:
         service.add_schedule(1, scheduled_at=future, timezone="UTC")
         service.update_schedule(1, scheduled_at=future, timezone="UTC")
         service.remove_schedule(1)
+
+
+# ---------------------------------------------------------------------------
+# Coverage Gap Fillers (Celery, Thread Execution, Bootstrap)
+# ---------------------------------------------------------------------------
+
+class TestSchedulerCoverageGaps:
+    @patch("services.job_scheduler.JobSchedulerService.add_schedule")
+    def test_load_all_schedules_past_and_future(self, mock_add, db_session):
+        """Tests the bootstrap loop: deactivates past schedules, loads future ones."""
+        user = _make_user(db_session)
+        
+        # 1. Past schedule (Needs its own job due to UNIQUE constraint)
+        job_past = _make_job(db_session, user, JobStatus.IN_QUEUE)
+        past_time = datetime.utcnow() - timedelta(hours=1)
+        sched_past = _make_schedule(db_session, job_past, status=ScheduleStatus.ACTIVE, scheduled_at=past_time)
+        sched_past_id = sched_past.id # Store ID for later
+        
+        # 2. Future schedule (Needs its own job)
+        job_future = _make_job(db_session, user, JobStatus.IN_QUEUE)
+        future_time = datetime.utcnow() + timedelta(hours=1)
+        sched_future = _make_schedule(db_session, job_future, status=ScheduleStatus.ACTIVE, scheduled_at=future_time)
+
+        service = JobSchedulerService()
+        
+        # Run the internal logic (which creates and closes its own session)
+        with patch("services.job_scheduler.SessionLocal", return_value=db_session):
+            service.load_all_schedules()
+
+        # Re-query the past schedule safely by ID
+        updated_past = db_session.query(JobSchedule).filter_by(id=sched_past_id).first()
+        
+        assert updated_past.status == ScheduleStatus.INACTIVE
+        assert updated_past.next_run_time is None
+
+        # Verify future was loaded into Celery
+        mock_add.assert_any_call(sched_future.id, scheduled_at=future_time, timezone="UTC")
+
+
+    @patch("services.job_scheduler.trigger_scheduled_job")
+    @patch("services.job_scheduler.celery_app")
+    def test_add_schedule_naive_datetime_tz_conversion(self, mock_app, mock_trigger):
+        """Tests the timezone conversion block in add_schedule."""
+        service = JobSchedulerService()
+        naive_dt = datetime.utcnow() # No tzinfo
+        
+        service.add_schedule(1, scheduled_at=naive_dt, timezone="America/New_York")
+        mock_trigger.apply_async.assert_called_once()
+
+    @patch("services.job_scheduler.enqueue_execute_platform_job", return_value=True)
+    @patch("services.job_scheduler.threading.Thread")
+    def test_queue_job_execution_celery_path(self, mock_thread, mock_enqueue):
+        """Tests that the thread fallback is skipped if Celery enqueue succeeds."""
+        from services.job_scheduler import queue_job_execution
+        queue_job_execution(1)
+        
+        mock_enqueue.assert_called_once()
+        mock_thread.assert_not_called()
+
+    @patch("services.job_scheduler.AgentExecutor")
+    def test_run_job_in_thread_success_and_failure(self, mock_executor_cls, db_session):
+        """Tests the actual execution block and exception handling."""
+        from unittest.mock import AsyncMock
+        
+        user = _make_user(db_session)
+        job = _make_job(db_session, user, JobStatus.IN_PROGRESS)
+        hist = ScheduleExecutionHistory(schedule_id=1, job_id=job.id, status="started")
+        db_session.add(hist)
+        db_session.commit()
+        
+        job_id = job.id
+        hist_id = hist.id
+
+        # mock the async execution
+        mock_executor = MagicMock()
+        mock_executor.execute_job = AsyncMock()
+        mock_executor_cls.return_value = mock_executor
+        
+        from services.job_scheduler import run_job_in_thread
+
+        # 1. Test Success Path
+        with patch("services.job_scheduler.SessionLocal", return_value=db_session):
+            run_job_in_thread(job_id, history_id=hist_id)
+            
+        # Re-query safely by ID
+        hist_updated = db_session.query(ScheduleExecutionHistory).filter_by(id=hist_id).first()
+        assert hist_updated.status == "completed"
+        
+        # 2. Test Failure Path
+        # Re-query job to reset state safely
+        job = db_session.query(Job).filter_by(id=job_id).first()
+        job.status = JobStatus.IN_PROGRESS
+        db_session.commit()
+        
+        # Make the async mock raise an exception
+        mock_executor.execute_job.side_effect = Exception("Simulated Executor Crash")
+        
+        with patch("services.job_scheduler.SessionLocal", return_value=db_session):
+            run_job_in_thread(job_id, history_id=hist_id)
+            
+        job_failed = db_session.query(Job).filter_by(id=job_id).first()
+        hist_failed = db_session.query(ScheduleExecutionHistory).filter_by(id=hist_id).first()
+        
+        assert job_failed.status == JobStatus.FAILED
+        assert "Simulated Executor Crash" in job_failed.failure_reason
+        assert hist_failed.status == "failed"
+
+    @patch("services.job_scheduler.celery_app")
+    def test_add_schedule_exception_handling(self, mock_app):
+        """Triggers the 'except Exception' block in add_schedule (Lines 380-382)."""
+        service = JobSchedulerService()
+        mock_app.control.revoke.side_effect = Exception("Celery Connection Refused")
+        
+        # This should not raise an error, but trigger the logger.exception
+        service.add_schedule(1, scheduled_at=datetime.utcnow())
+
+    @patch("services.job_scheduler.celery_app")
+    def test_remove_schedule_exception_handling(self, mock_app):
+        """Triggers the 'except Exception' block in remove_schedule (Lines 437-438)."""
+        service = JobSchedulerService()
+        mock_app.control.revoke.side_effect = Exception("Celery Revoke Failed")
+        
+        # This should trigger the logger.exception
+        service.remove_schedule(1)
+
+    @patch("services.job_scheduler.SessionLocal")
+    def test_load_all_schedules_exception_handling(self, mock_session_local):
+        """Triggers the 'except Exception' block in load_all_schedules (Lines 472-473)."""
+        service = JobSchedulerService()
+        
+        # Create a fake DB session
+        mock_db = MagicMock()
+        # Make the DB crash when it tries to run the query inside the 'try' block
+        mock_db.query.side_effect = Exception("DB Query Failed")
+        mock_session_local.return_value = mock_db
+        
+        # This will now hit the try block, crash on .query(), and successfully hit the except block
+        service.load_all_schedules()
+
+    @patch("services.job_scheduler.get_scheduler")
+    @patch("services.job_scheduler.SessionLocal")
+    def test_execute_schedule_missing_job_branch(self, mock_session_local, mock_get_sched):
+        """Verify that orphan schedules are automatically deactivated and cleaned up if the associated job is missing."""
+        mock_db = MagicMock()
+        # Mock finding the schedule but NOT finding the job
+        mock_sched = MagicMock(id=1, job_id=999, status=ScheduleStatus.ACTIVE)
+        mock_db.query.return_value.filter.return_value.first.side_effect = [mock_sched, None]
+        mock_session_local.return_value = mock_db
+        
+        from services.job_scheduler import _execute_schedule
+        _execute_schedule(1)
+        assert mock_sched.status == ScheduleStatus.INACTIVE
+
+    @patch("services.job_scheduler.celery_app")
+    def test_add_schedule_exception_path(self, mock_app):
+        """Verify that the service handles external queue failures gracefully without crashing."""
+        service = JobSchedulerService()
+        mock_app.control.revoke.side_effect = Exception("Redis Down")
+        # Should trigger the except block and logger
+        service.add_schedule(1, scheduled_at=datetime.utcnow())
