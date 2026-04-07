@@ -290,7 +290,9 @@ class TestExecuteSchedule:
     @patch("services.job_scheduler.get_scheduler")
     @patch("services.job_scheduler.threading")
     @patch("services.job_scheduler.SessionLocal")
-    def test_deactivates_and_removes(self, mock_session_local, mock_threading, mock_get_sched, db_session):
+    def test_deactivates_and_removes(
+        self, mock_session_local, mock_threading, mock_get_sched, _mock_enqueue, db_session
+    ):
         """Schedule deactivates before thread starts, task ID cleaned from service state."""
         user = _make_user(db_session)
         dev = _make_user(db_session, UserRole.DEVELOPER)
