@@ -2482,7 +2482,7 @@ def update_job_schedule(
     db.commit()
     db.refresh(schedule)
 
-    # Sync with APScheduler
+    # Sync with Celery ETA tasks
     svc = get_scheduler()
     if svc:
         if schedule.status == ScheduleStatus.ACTIVE:
