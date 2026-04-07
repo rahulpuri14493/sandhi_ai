@@ -79,7 +79,7 @@ class Settings(BaseSettings):
     S3_OPERATION_RETRY_MAX_DELAY_SECONDS: float = 2.0
     S3_OPERATION_RETRY_JITTER_SECONDS: float = 0.1
     JOB_UPLOAD_MAX_FILE_BYTES: int = 104857600  # 100 MB default
-    # Job scheduler: set DISABLE_SCHEDULER=true for tests/CI to prevent APScheduler from starting
+    # Job scheduler: set DISABLE_SCHEDULER=true for tests/CI to prevent Celery ETA tasks from being enqueued
     DISABLE_SCHEDULER: bool = False
     # Stuck job watchdog: jobs in IN_PROGRESS/IN_QUEUE longer than this are flagged
     STUCK_JOB_THRESHOLD_HOURS: int = 6

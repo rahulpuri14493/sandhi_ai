@@ -100,7 +100,7 @@ class JobSchedule(Base):
 
     Workflow:
       1. User creates a schedule with a future scheduled_at datetime.
-      2. APScheduler fires a DateTrigger at that time → job is reset and executed.
+      2. Celery worker fires an ETA task at that time → job is reset and executed.
       3. After execution, the schedule is deactivated (status=INACTIVE, next_run_time=NULL).
       4. If the job fails, the user can either "Run Now" (POST /rerun) or
          "Schedule Again" (PUT /schedule with a new scheduled_at).

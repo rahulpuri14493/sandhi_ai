@@ -38,7 +38,7 @@ class JobScheduleCreate(BaseModel):
     """Schema for creating a one-time job schedule.
 
     scheduled_at must be a future datetime. timezone is the IANA timezone
-    the user intended (used by APScheduler's DateTrigger).
+    the user intended (converted to UTC for Celery's distributed clock).
     """
     scheduled_at: datetime
     timezone: str = "UTC"

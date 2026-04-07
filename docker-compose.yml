@@ -151,6 +151,29 @@ services:
       redis:
         condition: service_healthy
 
+
+  celery-beat:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: sandhi-celery-beat
+    init: true
+    restart: unless-stopped
+    command: python run_celery_worker.py --beat
+    volumes:
+      - ./backend:/app
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@db:5432/${POSTGRES_DB:-agent_marketplace}
+      CELERY_BROKER_URL: ${CELERY_BROKER_URL:-redis://redis:6379/0}
+      CELERY_RESULT_BACKEND: ${CELERY_RESULT_BACKEND:-redis://redis:6379/1}
+    env_file:
+      - .env
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
   a2a-openai-adapter:
     build:
       context: ./tools/a2a_openai_adapter
