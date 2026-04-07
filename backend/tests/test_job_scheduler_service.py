@@ -358,6 +358,16 @@ class TestRunJobInThreadGuards:
 # ---------------------------------------------------------------------------
 
 class TestJobSchedulerServiceLifecycle:
+
+    def setup_method(self):
+        """Ensure the scheduler is not disabled by global settings for these tests."""
+        self._orig_disable = getattr(settings, "DISABLE_SCHEDULER", False)
+        settings.DISABLE_SCHEDULER = False
+
+    def teardown_method(self):
+        """Restore the original setting."""
+        settings.DISABLE_SCHEDULER = self._orig_disable
+
     @patch("services.job_scheduler.SessionLocal")
     def test_start_and_stop(self, mock_session_local):
         mock_db = MagicMock()
@@ -396,6 +406,16 @@ class TestJobSchedulerServiceLifecycle:
 # ---------------------------------------------------------------------------
 
 class TestScheduleManagement:
+
+    def setup_method(self):
+        """Ensure the scheduler is not disabled by global settings for these tests."""
+        self._orig_disable = getattr(settings, "DISABLE_SCHEDULER", False)
+        settings.DISABLE_SCHEDULER = False
+
+    def teardown_method(self):
+        """Restore the original setting."""
+        settings.DISABLE_SCHEDULER = self._orig_disable
+
     @patch("services.job_scheduler.trigger_scheduled_job")
     @patch("services.job_scheduler.celery_app")
     @patch("services.job_scheduler.SessionLocal")
@@ -508,6 +528,7 @@ class TestSchedulerCoverageGaps:
     def test_add_schedule_naive_datetime_tz_conversion(self, mock_app, mock_trigger):
         """Tests the timezone conversion block in add_schedule."""
         service = JobSchedulerService()
+        service._is_running = True # Manually set running state to test the logic without starting the full scheduler
         naive_dt = datetime.utcnow() # No tzinfo
         
         service.add_schedule(1, scheduled_at=naive_dt, timezone="America/New_York")
@@ -575,6 +596,7 @@ class TestSchedulerCoverageGaps:
     def test_add_schedule_exception_handling(self, mock_app):
         """Triggers the 'except Exception' block in add_schedule (Lines 380-382)."""
         service = JobSchedulerService()
+        service._is_running = True # Manually set running state to test the logic without starting the full scheduler
         mock_app.control.revoke.side_effect = Exception("Celery Connection Refused")
         
         # This should not raise an error, but trigger the logger.exception
@@ -584,6 +606,7 @@ class TestSchedulerCoverageGaps:
     def test_remove_schedule_exception_handling(self, mock_app):
         """Triggers the 'except Exception' block in remove_schedule (Lines 437-438)."""
         service = JobSchedulerService()
+        service._is_running = True # Manually set running state to test the logic without starting the full scheduler
         mock_app.control.revoke.side_effect = Exception("Celery Revoke Failed")
         
         # This should trigger the logger.exception
@@ -621,6 +644,7 @@ class TestSchedulerCoverageGaps:
     def test_add_schedule_exception_path(self, mock_app):
         """Verify that the service handles external queue failures gracefully without crashing."""
         service = JobSchedulerService()
+        service._is_running = True # Manually set running state to test the logic without starting the full scheduler
         mock_app.control.revoke.side_effect = Exception("Redis Down")
         # Should trigger the except block and logger
         service.add_schedule(1, scheduled_at=datetime.utcnow())

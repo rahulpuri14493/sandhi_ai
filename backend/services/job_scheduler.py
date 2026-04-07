@@ -368,13 +368,16 @@ class JobSchedulerService:
 
     def start(self):
         """Bootstrap: load all active schedules from the DB into Celery."""
-        global _scheduler_service
-        _scheduler_service = self
+        # 1. EARLY RETURN: Check if disabled before doing anything else
+        if getattr(settings, "DISABLE_SCHEDULER", False):
+            logger.info("Job scheduler is disabled via DISABLE_SCHEDULER setting.")
+            return
+        
+        # 2. Set ONLY state if we are acctually starting the scheduler. This ensures that if there is an error during startup (e.g. DB connection issue), we won't have a half-started scheduler that could cause issues with the Celery tasks.
         self._is_running = True
 
-        # Don't start if disabled (fixes test environment issues)
-        if getattr(settings, "DISABLE_SCHEDULER", False):
-            return
+        global _scheduler_service
+        _scheduler_service = self
 
         # Bootstrap: load all active schedules from the DB
         self.load_all_schedules()
@@ -392,6 +395,9 @@ class JobSchedulerService:
 
     def add_schedule(self, schedule_id: int, scheduled_at, timezone: str = "UTC"):
         """Register a new Celery ETA task for a schedule."""
+
+        if not self._is_running: 
+            return
 
         if not celery_app:
             return
@@ -421,11 +427,17 @@ class JobSchedulerService:
         
     def update_schedule(self, schedule_id: int, scheduled_at, timezone: str = "UTC"):
         """Reschedule by simply overwriting the ETA task."""
+        if not self._is_running: 
+            return
+        
         # Because we use a deterministic task_id based on schedule_id, add_schedule will revoke the old task and add the new one, effectively updating the schedule.
         self.add_schedule(schedule_id, scheduled_at, timezone) 
 
     def remove_schedule(self, schedule_id: int):
         """Remove an ETA task from the Celery queue."""
+        if not self._is_running: 
+            return
+        
         if not celery_app:
             return
         
