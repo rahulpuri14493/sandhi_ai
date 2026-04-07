@@ -564,40 +564,36 @@ async def planner_chat_completion(
     secondary = _build_profile(True) if secondary_enabled else None
 
     active_profile = primary
+    active_profile_name = "primary"
     try:
         out = await _run_with_profile(primary)
         logger.info(
-            "planner_llm_ok latency_ms=%s planner_profile=%s transport=%s transport_reason=%s provider=%s model=%s",
+            "planner_llm_ok latency_ms=%s planner_profile=%s transport=%s transport_reason=%s",
             _latency_ms(),
-            primary.get("name"),
+            active_profile_name,
             transport,
             transport_reason,
-            primary.get("provider"),
-            primary.get("model"),
         )
         return out
     except Exception as primary_exc:
         if secondary and (secondary.get("api_key") or "").strip():
             logger.warning(
-                "planner_llm_primary_failed latency_ms=%s transport=%s transport_reason=%s primary_provider=%s primary_model=%s exc_type=%s; switching_to=secondary",
+                "planner_llm_primary_failed latency_ms=%s transport=%s transport_reason=%s exc_type=%s; switching_to=secondary",
                 _latency_ms(),
                 transport,
                 transport_reason,
-                primary.get("provider"),
-                primary.get("model"),
                 type(primary_exc).__name__,
             )
             active_profile = secondary
+            active_profile_name = "secondary"
             try:
                 out = await _run_with_profile(secondary)
                 logger.info(
-                    "planner_llm_ok latency_ms=%s planner_profile=%s transport=%s transport_reason=%s provider=%s model=%s",
+                    "planner_llm_ok latency_ms=%s planner_profile=%s transport=%s transport_reason=%s",
                     _latency_ms(),
-                    secondary.get("name"),
+                    active_profile_name,
                     transport,
                     transport_reason,
-                    secondary.get("provider"),
-                    secondary.get("model"),
                 )
                 return out
             except Exception as secondary_exc:
@@ -607,25 +603,21 @@ async def planner_chat_completion(
     except httpx.HTTPStatusError as e:
         status = e.response.status_code if e.response is not None else None
         logger.warning(
-            "planner_llm_http_error latency_ms=%s planner_profile=%s transport=%s transport_reason=%s provider=%s model=%s http_status=%s",
+            "planner_llm_http_error latency_ms=%s planner_profile=%s transport=%s transport_reason=%s http_status=%s",
             _latency_ms(),
-            active_profile.get("name"),
+            active_profile_name,
             transport,
             transport_reason,
-            active_profile.get("provider"),
-            active_profile.get("model"),
             status,
         )
         raise
     except Exception as e:
         logger.warning(
-            "planner_llm_error latency_ms=%s planner_profile=%s transport=%s transport_reason=%s provider=%s model=%s exc_type=%s",
+            "planner_llm_error latency_ms=%s planner_profile=%s transport=%s transport_reason=%s exc_type=%s",
             _latency_ms(),
-            active_profile.get("name"),
+            active_profile_name,
             transport,
             transport_reason,
-            active_profile.get("provider"),
-            active_profile.get("model"),
             type(e).__name__,
         )
         raise
