@@ -22,14 +22,19 @@ jobs:
   submit:
     name: Submit Python dependency snapshot
     runs-on: ubuntu-latest
-    # Fork PRs: GITHUB_TOKEN cannot write dependency graph snapshots.
-    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      # Fork PRs: default GITHUB_TOKEN cannot write dependency graph snapshots.
+      # Keep this job green (same job name) so branch protection is not blocked by "skipped".
       - name: Component detection (pip)
+        if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
         uses: advanced-security/component-detection-dependency-submission-action@v0.1.1
         with:
           filePath: "."
           detectorArgs: Pip=EnableIfDefaultOff,SimplePip=EnableIfDefaultOff
+
+      - name: Fork PR — skip dependency snapshot (read-only token)
+        if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository
+        run: echo "Skipping dependency graph submission for fork PR (token cannot write snapshots)."
