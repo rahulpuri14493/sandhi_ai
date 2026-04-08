@@ -101,7 +101,10 @@ if Celery is not None:
         enable_utc=True,
         task_track_started=True,
         worker_prefetch_multiplier=1,
+
+        # --- Reliability settings ---
         task_acks_late=True,
+        task_reject_on_worker_lost=True, # Requeues job if worker processing it is lost (e.g crash, OOM)
     )
 
     # Configure Celery Beat
@@ -124,6 +127,55 @@ if Celery is not None:
 # Fallback symbol for imports when Celery is unavailable in the environment.
 def trigger_scheduled_job(*args, **kwargs):  # pragma: no cover - runtime fallback
     raise RuntimeError("Celery is not installed; trigger_scheduled_job task is unavailable")
+
+
+class ExecutePlatformJobTask:
+    """
+    Task-like fallback used by tests and non-celery environments.
+    """
+
+    def on_failure(self, exc, task_id, args, kwargs, einfo):  # pragma: no cover - exercised via tests
+        job_id = kwargs.get("job_id") or (args[0] if args else None)
+        history_id = kwargs.get("history_id")
+        logger.error("Job %s permanently failed after retries exhausted. Error: %s", job_id, exc)
+
+        from db.database import SessionLocal
+        from models.job import Job, JobStatus, ScheduleExecutionHistory
+        from datetime import datetime as _dt
+
+        db = SessionLocal()
+        try:
+            job = db.query(Job).filter(Job.id == job_id).first()
+            if job and job.status == JobStatus.IN_PROGRESS:
+                job.status = JobStatus.FAILED
+                job.failure_reason = f"Execution permanently failed: {str(exc)[:450]}"
+                if history_id:
+                    hist = db.query(ScheduleExecutionHistory).filter(
+                        ScheduleExecutionHistory.id == history_id
+                    ).first()
+                    if hist:
+                        hist.status = "failed"
+                        hist.failure_reason = f"Permanent failure after retries: {str(exc)[:450]}"
+                        hist.completed_at = _dt.utcnow()
+                db.commit()
+        except Exception:
+            logger.exception("Failed to mark job as FAILED in on_failure hook")
+        finally:
+            db.close()
+
+
+def execute_platform_job(job_id: int, history_id: Optional[int] = None, execution_token: Optional[str] = None):
+    """
+    Shared execution entrypoint. Raises so Celery retry policies can apply.
+    """
+    from services.job_scheduler import run_job_in_thread
+
+    return run_job_in_thread(
+        job_id=job_id,
+        history_id=history_id,
+        execution_token=execution_token,
+        reraise_exceptions=True,
+    )
 
 
 def enqueue_execute_platform_job(
@@ -220,20 +272,73 @@ def get_queue_stats() -> dict:
 
 
 if celery_app is not None:
-    @celery_app.task(name="execute_platform_job", bind=True)
+
+    class ExecutePlatformJobTask(celery_app.Task):
+        """Custom Task class to handle final failure after retries exhausted, if needed."""
+        def on_failure(self, exc, task_id, args, kwargs, einfo):
+            # This triggers ONLY when max_retries is exceeded or a non retryable exception is raised.
+            job_id = kwargs.get("job_id") or (args[0] if args else None)
+            history_id = kwargs.get("history_id")
+            logger.error("Job %s permanently failed after retries exhausted. Error: %s", job_id, exc)
+
+            from db.database import SessionLocal
+            from models.job import Job, JobStatus, ScheduleExecutionHistory
+            from datetime import datetime
+
+            db = SessionLocal()
+            try:
+                # 1. Upate Job Status
+                job = db.query(Job).filter(Job.id == job_id).first()
+                if job and job.status == JobStatus.IN_PROGRESS:
+                    job.status = JobStatus.FAILED
+                    job.failure_reason = f"Execution permanently failed: {str(exc)[:450]}"
+
+                    # 2. Update Execution History
+                    if history_id:
+                        hist = db.query(ScheduleExecutionHistory).filter(
+                            ScheduleExecutionHistory.id == history_id
+                        ).first()
+                        if hist:
+                            hist.status = "failed"
+                            hist.failure_reason = f"Permanent failure after retries: {str(exc)[:450]}"
+                            hist.completed_at = datetime.utcnow()
+                            logger.info("Updated execution history %s to FAILED", history_id)
+
+
+                    db.commit()
+                    logger.info("Marked job %s as FAILED in database after permanent failure", job_id)
+
+            except Exception as e:
+                logger.error("Failed to update job status to FAILED for job %s: %s", job_id, e)
+            finally:
+                db.close()
+
+            super().on_failure(exc, task_id, args, kwargs, einfo)
+    @celery_app.task(
+        name="execute_platform_job",
+        bind=True,
+        base=ExecutePlatformJobTask,
+
+        # --- Retry Policy ---
+        autoretry_for=(Exception,),  # Retry for all exceptions
+        max_retries= max(0, int(getattr(settings, "CELERY_EXECUTE_MAX_RETRIES", 3))),
+        retry_backoff=getattr(settings, "CELERY_EXECUTE_RETRY_BACKOFF_SECONDS", 5),  # Exponential backoff base in seconds
+        retry_backoff_max=getattr(settings, "CELERY_EXECUTE_RETRY_BACKOFF_MAX_SECONDS", 600),  # Max backoff time in seconds
+        retry_jitter=True,  # Add random jitter to avoid thundering herd on retries
+
+        # --- Worker Crash Handling ---
+        acks_late=True,  # Acknowledge task only after execution
+        reject_on_worker_lost=True,  # Requeue task if worker processing it is lost (e.g., crash, OOM)
+    )
     def execute_platform_job(self, job_id: int, history_id: Optional[int] = None, execution_token: Optional[str] = None):
         """
         Celery worker task. Uses fresh DB session + event loop through shared runner.
         """
-        from services.job_scheduler import run_job_in_thread
-        try:
-            return run_job_in_thread(job_id=job_id, history_id=history_id, execution_token=execution_token)
-        except Exception as e:
-            max_retries = max(0, int(getattr(settings, "CELERY_EXECUTE_MAX_RETRIES", 3)))
-            if self.request.retries < max_retries:
-                countdown = max(1, int(getattr(settings, "CELERY_EXECUTE_RETRY_BACKOFF_SECONDS", 5)))
-                raise self.retry(exc=e, countdown=countdown)
-            raise
+        return globals()["execute_platform_job"](
+            job_id=job_id,
+            history_id=history_id,
+            execution_token=execution_token,
+        )
 
     @celery_app.task(name="trigger_scheduled_job", bind=True)
     def trigger_scheduled_job(self, schedule_id: int):

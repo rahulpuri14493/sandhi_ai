@@ -53,6 +53,7 @@ class Settings(BaseSettings):
     CELERY_WORKER_CONCURRENCY: int = 4
     CELERY_EXECUTE_MAX_RETRIES: int = 3
     CELERY_EXECUTE_RETRY_BACKOFF_SECONDS: int = 5
+    CELERY_EXECUTE_RETRY_BACKOFF_MAX_SECONDS: int = 600
     # Execution heartbeat runtime visibility.
     # Redis live-state defaults to CELERY_BROKER_URL when HEARTBEAT_REDIS_URL is empty.
     HEARTBEAT_ENABLE_REDIS: bool = True
