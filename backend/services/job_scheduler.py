@@ -78,6 +78,16 @@ def reset_job_for_execution(db: Session, job: Job):
         step.started_at = None
         step.completed_at = None
         step.cost = 0.0
+        step.last_progress_at = None
+        step.last_activity_at = None
+        step.live_phase = None
+        step.live_phase_started_at = None
+        step.live_reason_code = None
+        step.live_reason_detail = None
+        step.live_trace_id = None
+        step.live_attempt = None
+        step.stuck_since = None
+        step.stuck_reason = None
 
     job.completed_at = None
     job.failure_reason = None

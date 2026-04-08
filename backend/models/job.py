@@ -86,6 +86,18 @@ class WorkflowStep(Base):
     cost = Column(Float, default=0.0)
     started_at = Column(DateTime, nullable=True)
     completed_at = Column(DateTime, nullable=True)
+    # Durable runtime telemetry snapshot (phase/reason/progress timestamps).
+    # Updated on meaningful phase transitions and progress points (not fixed-interval heartbeats).
+    last_progress_at = Column(DateTime, nullable=True)
+    last_activity_at = Column(DateTime, nullable=True)
+    live_phase = Column(String(32), nullable=True)
+    live_phase_started_at = Column(DateTime, nullable=True)
+    live_reason_code = Column(String(64), nullable=True)
+    live_reason_detail = Column(Text, nullable=True)
+    live_trace_id = Column(String(64), nullable=True)
+    live_attempt = Column(Integer, nullable=True)
+    stuck_since = Column(DateTime, nullable=True)
+    stuck_reason = Column(String(128), nullable=True)
     # Tools this step (agent) can use: JSON arrays (empty/null = use job-level allowed tools)
     allowed_platform_tool_ids = Column(Text, nullable=True)
     allowed_connection_ids = Column(Text, nullable=True)

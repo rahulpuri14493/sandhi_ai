@@ -45,7 +45,16 @@ if Celery is not None:
             "task": "check_stuck_jobs",
             "schedule": 1800.0,  # 30 minutes in seconds
         },
+        "check-stuck-workflow-steps-every-2-mins": {
+            "task": "check_stuck_workflow_steps",
+            "schedule": 120.0,
+        },
     }
+
+
+# Fallback symbol for imports when Celery is unavailable in the environment.
+def trigger_scheduled_job(*args, **kwargs):  # pragma: no cover - runtime fallback
+    raise RuntimeError("Celery is not installed; trigger_scheduled_job task is unavailable")
 
 
 def enqueue_execute_platform_job(
@@ -238,6 +247,108 @@ if celery_app is not None:
             db.commit()
         except Exception:
             logger.exception("Error in stuck job watchdog")
+            db.rollback()
+        finally:
+            db.close()
+
+    @celery_app.task(name="check_stuck_workflow_steps")
+    def _check_stuck_workflow_steps():
+        """
+        Step-level watchdog using durable workflow-step telemetry snapshots.
+
+        This path does not depend on Redis liveness, so stuck diagnosis survives Redis restarts.
+        """
+        from datetime import datetime, timedelta
+
+        from db.database import SessionLocal
+        from models.job import Job, JobStatus, WorkflowStep
+
+        default_threshold = max(60, int(getattr(settings, "STEP_STUCK_THRESHOLD_SECONDS", 600)))
+        blocked_threshold = max(
+            default_threshold,
+            int(getattr(settings, "STEP_STUCK_BLOCKED_THRESHOLD_SECONDS", 900)),
+        )
+        loop_round_threshold = max(3, int(getattr(settings, "STEP_LOOP_ROUND_THRESHOLD", 10)))
+        repeat_tool_threshold = max(3, int(getattr(settings, "STEP_REPEAT_TOOLCALL_THRESHOLD", 6)))
+        now = datetime.utcnow()
+
+        db = SessionLocal()
+        try:
+            rows = (
+                db.query(WorkflowStep, Job)
+                .join(Job, Job.id == WorkflowStep.job_id)
+                .filter(
+                    WorkflowStep.status == "in_progress",
+                    Job.status == JobStatus.IN_PROGRESS,
+                )
+                .all()
+            )
+            changed = 0
+            for step, _job in rows:
+                phase = (getattr(step, "live_phase", None) or "").strip().lower()
+                effective_threshold = blocked_threshold if phase == "blocked" else default_threshold
+                since = (
+                    getattr(step, "last_progress_at", None)
+                    or getattr(step, "last_activity_at", None)
+                    or getattr(step, "started_at", None)
+                )
+                if since is None:
+                    continue
+                age_s = (now - since).total_seconds()
+                if age_s >= float(effective_threshold):
+                    if getattr(step, "stuck_since", None) is None:
+                        step.stuck_since = now
+                        # Best-effort classify looping vs slow external dependency.
+                        detail_raw = getattr(step, "live_reason_detail", None) or ""
+                        loop_round = None
+                        same_tool_count = None
+                        tool_name = None
+                        try:
+                            import json as _json
+                            parsed = _json.loads(detail_raw) if detail_raw and detail_raw.strip().startswith("{") else None
+                            if isinstance(parsed, dict):
+                                loop = parsed.get("loop") if isinstance(parsed.get("loop"), dict) else None
+                                if loop:
+                                    loop_round = loop.get("round_idx")
+                                same_tool_count = parsed.get("same_tool_count")
+                                tool_name = parsed.get("tool_name")
+                        except Exception:
+                            parsed = None
+                        kind = "stuck"
+                        if (
+                            (loop_round is not None and int(loop_round) >= loop_round_threshold)
+                            or (same_tool_count is not None and int(same_tool_count) >= repeat_tool_threshold)
+                        ):
+                            kind = "looping"
+                        if phase == "calling_tool" and kind != "looping":
+                            kind = "slow_dependency"
+                        base = f"{kind}: no meaningful progress for {int(age_s)}s"
+                        extra = f" phase={phase or 'unknown'}"
+                        if tool_name:
+                            extra += f" tool={tool_name}"
+                        step.stuck_reason = (base + ";" + extra)[:128]
+                        changed += 1
+                        logger.warning(
+                            "workflow_step_potentially_stuck job_id=%s step_id=%s step_order=%s "
+                            "phase=%s age_seconds=%s threshold_seconds=%s trace_id=%s",
+                            step.job_id,
+                            step.id,
+                            step.step_order,
+                            phase or "unknown",
+                            int(age_s),
+                            effective_threshold,
+                            getattr(step, "live_trace_id", None),
+                        )
+                else:
+                    # Auto-clear stale stuck flags once progress resumes.
+                    if getattr(step, "stuck_since", None) is not None:
+                        step.stuck_since = None
+                        step.stuck_reason = None
+                        changed += 1
+            if changed:
+                db.commit()
+        except Exception:
+            logger.exception("Error in step-level stuck watchdog")
             db.rollback()
         finally:
             db.close()
