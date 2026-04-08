@@ -2003,6 +2003,13 @@ def update_workflow_step_tools(
         step.allowed_connection_ids = json.dumps(cids) if (cids is not None and len(cids) > 0) else None
     if body.tool_visibility is not None:
         step.tool_visibility = _validate_tool_visibility(body.tool_visibility)
+        # If a step is explicitly hidden, clear step-level allowlists so this update remains valid.
+        # This preserves backwards compatibility for PATCH tool_visibility-only requests.
+        if step.tool_visibility == "none" and (
+            body.allowed_platform_tool_ids is None and body.allowed_connection_ids is None
+        ):
+            step.allowed_platform_tool_ids = None
+            step.allowed_connection_ids = None
     eff_tv = getattr(step, "tool_visibility", None) or getattr(job, "tool_visibility", None) or "full"
     step_platform_ids = _parse_int_list(getattr(step, "allowed_platform_tool_ids", None))
     step_conn_ids = _parse_int_list(getattr(step, "allowed_connection_ids", None))

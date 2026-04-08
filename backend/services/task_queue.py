@@ -164,7 +164,7 @@ class ExecutePlatformJobTask:
             db.close()
 
 
-def execute_platform_job(job_id: int, history_id: Optional[int] = None, execution_token: Optional[str] = None):
+def _execute_platform_job_core(job_id: int, history_id: Optional[int] = None, execution_token: Optional[str] = None):
     """
     Shared execution entrypoint. Raises so Celery retry policies can apply.
     """
@@ -175,6 +175,15 @@ def execute_platform_job(job_id: int, history_id: Optional[int] = None, executio
         history_id=history_id,
         execution_token=execution_token,
         reraise_exceptions=True,
+    )
+
+
+def execute_platform_job(job_id: int, history_id: Optional[int] = None, execution_token: Optional[str] = None):
+    """Public callable used by tests and non-celery paths."""
+    return _execute_platform_job_core(
+        job_id=job_id,
+        history_id=history_id,
+        execution_token=execution_token,
     )
 
 
@@ -334,7 +343,7 @@ if celery_app is not None:
         """
         Celery worker task. Uses fresh DB session + event loop through shared runner.
         """
-        return globals()["execute_platform_job"](
+        return _execute_platform_job_core(
             job_id=job_id,
             history_id=history_id,
             execution_token=execution_token,

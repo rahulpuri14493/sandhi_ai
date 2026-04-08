@@ -316,7 +316,7 @@ def send_heartbeat():
   "workflow_step_id": 301,
   "step_order": 2,
   "agent_id": 17,
-  "execution_token": "sched-9-a1b2c3",
+  "execution_token": "<redacted>",
   "phase": "calling_tool",
   "phase_started_at": "2026-04-08T13:45:10.201Z",
   "message": "Calling platform tool",
@@ -339,7 +339,7 @@ def send_heartbeat():
 {
   "job_id": 42,
   "job_status": "in_progress",
-  "execution_token": "sched-9-a1b2c3",
+  "execution_token": "<redacted>",
   "step": {
     "workflow_step_id": 301,
     "step_order": 2,

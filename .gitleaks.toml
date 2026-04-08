@@ -7,10 +7,12 @@ commits = ["5d46632c9ad1a15f381e80812eff0d45157cd05b"]
 paths = [
   '''backend/tests/test_mcp\.py''',
   '''backend/tests/integration/test_vector_e2e\.py''',
+  '''docs/HEARTBEAT_AND_KPI_GUIDE\.md''',
 ]
 regexTarget = "line"
 # docker-compose dev fallback (${MCP_INTERNAL_SECRET:-dev-mcp-internal-secret}); not a committed production secret.
 regexes = [
   '''"idempotency_key"\s*:\s*"[A-Za-z0-9_-]{8,}"''',
   '''\$\{MCP_INTERNAL_SECRET:-dev-mcp-internal-secret\}''',
+  '''"execution_token"\s*:\s*"(?:sched-[^"]+|<redacted>)"''',
 ]
