@@ -92,8 +92,23 @@ export default function JobDetailPage() {
     if (searchParams.get('qa') === 'true') {
       setMode('qa')
     }
+    const requestedMode = searchParams.get('mode')
+    if (requestedMode === 'status' || requestedMode === 'workflow' || requestedMode === 'preview' || requestedMode === 'qa') {
+      setMode(requestedMode)
+    }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [jobId, searchParams])
+
+  useEffect(() => {
+    const focusStep = searchParams.get('focus_step')
+    if (!focusStep || !job?.workflow_steps?.length) return
+    const sid = parseInt(focusStep, 10)
+    if (!Number.isFinite(sid)) return
+    const target = document.getElementById(`workflow-step-${sid}`)
+    if (target) {
+      target.scrollIntoView({ behavior: 'smooth', block: 'center' })
+    }
+  }, [job, searchParams])
 
   useEffect(() => {
     if (job && mode === 'preview') {
@@ -769,7 +784,7 @@ export default function JobDetailPage() {
                                   return (
                                     <li key={idx} className="pl-1">
                                       <span className="font-semibold text-white">
-                                        Agent index {ppStr(row.agent_index) || String(idx)}
+                                        {ppStr(row.agent_name) || `Agent ${ppStr(row.agent_index) || String(idx + 1)}`}
                                       </span>
                                       {ppStr(row.task) ? (
                                         <p className="mt-1 text-white/80 whitespace-pre-wrap">{ppStr(row.task)}</p>
@@ -818,11 +833,11 @@ export default function JobDetailPage() {
                                     <p className="font-semibold text-white">
                                       Step {idx + 1}
                                       {' · '}
-                                      agent index{' '}
-                                      {typeof s.agent_index === 'number' ||
+                                      {ppStr(s.agent_name) ||
+                                      (typeof s.agent_index === 'number' ||
                                       (typeof s.agent_index === 'string' && s.agent_index !== '')
-                                        ? ppStr(s.agent_index)
-                                        : '—'}
+                                        ? `Agent ${ppStr(s.agent_index)}`
+                                        : 'Agent —')}
                                     </p>
                                     {ppStr(s.rationale) ? (
                                       <p className="mt-1 text-white/75 text-xs whitespace-pre-wrap">
@@ -1223,7 +1238,12 @@ export default function JobDetailPage() {
         )}
 
         {mode === 'status' && (
-          <JobStatusTracker jobId={jobId} job={job} onJobUpdate={loadJob} />
+          <JobStatusTracker
+            jobId={jobId}
+            job={job}
+            onJobUpdate={loadJob}
+            focusedStepId={Number(searchParams.get('focus_step') || 0) || undefined}
+          />
         )}
 
         {mode === 'status' && job.status !== 'draft' && job.workflow_steps && job.workflow_steps.length > 0 && (

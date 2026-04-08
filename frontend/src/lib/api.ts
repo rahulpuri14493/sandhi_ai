@@ -214,7 +214,7 @@ export const jobsAPI = {
   suggestWorkflowTools(jobId: number, agentIds: number[]) {
     return api
       .post<{
-        step_suggestions: Array<{ agent_index: number; platform_tool_ids: number[]; rationale?: string }>
+        step_suggestions: Array<{ agent_index: number; agent_name?: string | null; platform_tool_ids: number[]; rationale?: string }>
         output_contract_stub: Record<string, unknown> | null
         fallback_used: boolean
         detail?: string
@@ -286,6 +286,11 @@ export const dashboardsAPI = {
   },
   getBusinessJobs() {
     return api.get('/businesses/jobs').then((res) => res.data)
+  },
+  getBusinessAgentPerformance(limitSteps = 500) {
+    return api
+      .get('/businesses/agents/performance?limit_steps=' + encodeURIComponent(String(limitSteps)))
+      .then((res) => res.data)
   },
   getDeveloperEarnings() {
     return api.get('/developers/earnings').then((res) => res.data)

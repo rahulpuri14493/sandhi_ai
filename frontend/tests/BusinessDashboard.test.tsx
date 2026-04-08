@@ -11,11 +11,36 @@ vi.mock('../src/lib/api', () => ({
       { id: 2, title: 'KYC Analysis', description: 'Verify documents', status: 'draft', total_cost: 0, created_at: '2024-01-02' },
       { id: 3, title: 'Financial Report', description: 'Generate report', status: 'in_progress', total_cost: 10, created_at: '2024-01-03' },
     ]),
+    getBusinessAgentPerformance: vi.fn().mockResolvedValue({
+      agents: [
+        {
+          agent_id: 10,
+          agent_name: 'Perf Agent',
+          api_endpoint: 'https://agent.perf.example.com',
+          totals: { steps: 4, completed_steps: 3, failed_steps: 1, in_progress_steps: 0, cost: 10, total_tokens: 1200 },
+          quality: { success_rate: 0.75, average_confidence: 0.9 },
+          latest_runtime: {
+            job_id: 42,
+            workflow_step_id: 5,
+            phase: 'calling_agent',
+            reason_code: 'agent_endpoint_http_error',
+            stuck_reason: null,
+            status: 'failed',
+          },
+        },
+      ],
+    }),
   },
   jobsAPI: {
     getShareLink: vi.fn(),
     rerun: vi.fn(),
     delete: vi.fn(),
+  },
+  mcpAPI: {
+    listTools: vi.fn().mockResolvedValue([
+      { id: 1, name: 'local_minio', tool_type: 'minio' },
+      { id: 2, name: 'postgres_main', tool_type: 'postgres' },
+    ]),
   },
 }))
 
@@ -49,6 +74,15 @@ describe('BusinessDashboard', () => {
     expect(screen.getByText('List of Jobs')).toBeInTheDocument()
   })
 
+  it('displays hired agent performance section', async () => {
+    render(wrapWithRouter(<BusinessDashboard />))
+    await screen.findByText('Hired Agent Performance')
+    expect(screen.getByText('Perf Agent')).toBeInTheDocument()
+    expect(screen.getByText('75.0%')).toBeInTheDocument()
+    expect(screen.getByText('1,200')).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: /open runtime/i })).toBeInTheDocument()
+  })
+
   it('displays job titles from API', async () => {
     render(wrapWithRouter(<BusinessDashboard />))
     await screen.findByText('Math Job')
@@ -70,7 +104,7 @@ describe('BusinessDashboard', () => {
   it('filters jobs by status', async () => {
     render(wrapWithRouter(<BusinessDashboard />))
     await screen.findByText('Math Job')
-    const statusSelect = screen.getByRole('combobox')
+    const statusSelect = screen.getByDisplayValue('All statuses')
     fireEvent.change(statusSelect, { target: { value: 'completed' } })
     expect(screen.getByText('Math Job')).toBeInTheDocument()
     expect(screen.queryByText('KYC Analysis')).not.toBeInTheDocument()
