@@ -9,6 +9,7 @@ Provides merged step live state:
 from __future__ import annotations
 
 import json
+import re
 from datetime import datetime
 from typing import Any, Dict, Optional
 
@@ -38,6 +39,7 @@ HB_TS_HEADER = "x-heartbeat-timestamp"
 HB_NONCE_HEADER = "x-heartbeat-nonce"
 HB_SIG_HEADER = "x-heartbeat-signature"
 HB_EXECUTION_TOKEN_HEADER = "x-execution-token"
+NONCE_RE = re.compile(r"^[A-Za-z0-9._:-]{8,128}$")
 
 
 def _verify_internal_secret(
@@ -225,7 +227,7 @@ def internal_ingest_step_heartbeat(
     if (x_heartbeat_key_id or "").strip() != "exec_token_v1":
         raise HTTPException(status_code=400, detail="Unsupported heartbeat key id")
     nonce = (x_heartbeat_nonce or "").strip()
-    if not nonce or len(nonce) > 128:
+    if not NONCE_RE.fullmatch(nonce):
         raise HTTPException(status_code=400, detail="Invalid heartbeat nonce")
     sig = (x_heartbeat_signature or "").strip()
     if not sig:
@@ -280,16 +282,18 @@ def internal_ingest_step_heartbeat(
 
     r = _get_replay_redis()
     nonce_ttl = max(30, int(getattr(settings, "HEARTBEAT_NONCE_TTL_SECONDS", 300) or 300))
-    if r is not None:
-        try:
-            ok = r.set(_nonce_key(job_id=job_id, step_id=step_id, nonce=nonce), b"1", ex=nonce_ttl, nx=True)
-            if not ok:
-                raise HTTPException(status_code=409, detail="Duplicate heartbeat nonce")
-        except HTTPException:
-            raise
-        except Exception:
-            # Fail closed when anti-replay backend is unhealthy.
-            raise HTTPException(status_code=503, detail="Heartbeat replay guard unavailable")
+    if r is None:
+        # Fail closed if anti-replay backend is unavailable.
+        raise HTTPException(status_code=503, detail="Heartbeat replay guard unavailable")
+    try:
+        ok = r.set(_nonce_key(job_id=job_id, step_id=step_id, nonce=nonce), b"1", ex=nonce_ttl, nx=True)
+        if not ok:
+            raise HTTPException(status_code=409, detail="Duplicate heartbeat nonce")
+    except HTTPException:
+        raise
+    except Exception:
+        # Fail closed when anti-replay backend is unhealthy.
+        raise HTTPException(status_code=503, detail="Heartbeat replay guard unavailable")
 
     publish_step_heartbeat(
         db=db,

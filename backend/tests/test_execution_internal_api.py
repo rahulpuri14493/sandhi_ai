@@ -248,6 +248,35 @@ def _signed_headers(*, job_id: int, step_id: int, execution_token: str, body: di
     }
 
 
+def _signed_headers_with_nonce(*, job_id: int, step_id: int, execution_token: str, body: dict, nonce: str) -> dict:
+    ts = int(time.time())
+    version = "sandhi.heartbeat.v1"
+    key_id = "exec_token_v1"
+    path = f"/api/internal/execution/jobs/{job_id}/steps/{step_id}/heartbeat"
+    body_hash = heartbeat_body_sha256(body)
+    signing = heartbeat_signing_string(
+        method="POST",
+        route_path=path,
+        version=version,
+        key_id=key_id,
+        timestamp=ts,
+        nonce=nonce,
+        body_sha256=body_hash,
+        job_id=job_id,
+        workflow_step_id=step_id,
+    )
+    key = derive_execution_hmac_key(job_id=job_id, execution_token=execution_token)
+    sig = sign_heartbeat_string(key=key, signing_string=signing)
+    return {
+        "X-Heartbeat-Version": version,
+        "X-Heartbeat-Key-Id": key_id,
+        "X-Heartbeat-Timestamp": str(ts),
+        "X-Heartbeat-Nonce": nonce,
+        "X-Heartbeat-Signature": sig,
+        "X-Execution-Token": execution_token,
+    }
+
+
 def test_internal_execution_heartbeat_ingest_success(client_internal_exec, internal_secret, monkeypatch):
     client, db_session = client_internal_exec
     job, step = _seed_job_with_step(db_session)
@@ -317,3 +346,41 @@ def test_internal_execution_heartbeat_ingest_replay_nonce(client_internal_exec, 
     assert r1.status_code == 200
     r2 = client.post(f"/api/internal/execution/jobs/{job.id}/steps/{step.id}/heartbeat", headers=hdr, json=body)
     assert r2.status_code == 409
+
+
+def test_internal_execution_heartbeat_ingest_replay_guard_unavailable(client_internal_exec, internal_secret, monkeypatch):
+    client, db_session = client_internal_exec
+    job, step = _seed_job_with_step(db_session)
+    body = {"phase": "calling_agent", "reason_code": "agent_call_start"}
+    hdr = _signed_headers(job_id=job.id, step_id=step.id, execution_token=job.execution_token, body=body)
+    hdr["X-Internal-Secret"] = internal_secret
+
+    import api.routes.execution_internal as route_mod
+
+    monkeypatch.setattr(route_mod, "_get_replay_redis", lambda: None)
+    r = client.post(f"/api/internal/execution/jobs/{job.id}/steps/{step.id}/heartbeat", headers=hdr, json=body)
+    assert r.status_code == 503
+
+
+def test_internal_execution_heartbeat_ingest_invalid_nonce_shape(client_internal_exec, internal_secret, monkeypatch):
+    client, db_session = client_internal_exec
+    job, step = _seed_job_with_step(db_session)
+    body = {"phase": "calling_agent", "reason_code": "agent_call_start"}
+    hdr = _signed_headers_with_nonce(
+        job_id=job.id,
+        step_id=step.id,
+        execution_token=job.execution_token,
+        body=body,
+        nonce="bad nonce",
+    )
+    hdr["X-Internal-Secret"] = internal_secret
+
+    class _R:
+        def set(self, *args, **kwargs):
+            return True
+
+    import api.routes.execution_internal as route_mod
+
+    monkeypatch.setattr(route_mod, "_get_replay_redis", lambda: _R())
+    r = client.post(f"/api/internal/execution/jobs/{job.id}/steps/{step.id}/heartbeat", headers=hdr, json=body)
+    assert r.status_code == 400
