@@ -151,17 +151,32 @@ if celery_app is not None:
         def on_failure(self, exc, task_id, args, kwargs, einfo):
             # This triggers ONLY when max_retries is exceeded or a non retryable exception is raised.
             job_id = kwargs.get("job_id") or (args[0] if args else None)
+            history_id = kwargs.get("history_id")
             logger.error("Job %s permanently failed after retries exhausted. Error: %s", job_id, exc)
 
             from db.database import SessionLocal
-            from models.job import Job, JobStatus
+            from models.job import Job, JobStatus, ScheduleExecutionHistory
+            from datetime import datetime
 
             db = SessionLocal()
             try:
+                # 1. Upate Job Status
                 job = db.query(Job).filter(Job.id == job_id).first()
                 if job and job.status == JobStatus.IN_PROGRESS:
                     job.status = JobStatus.FAILED
                     job.failure_reason = f"Execution permanently failed: {str(exc)[:450]}"
+
+                    # 2. Update Execution History
+                    if history_id:
+                        hist = db.query(ScheduleExecutionHistory).filter(
+                            ScheduleExecutionHistory.id == history_id
+                        ).first()
+                        if hist:
+                            hist.status = "failed"
+                            hist.failure_reason = f"Permanent failure after retries: {str(exc)[:450]}"
+                            hist.completed_at = datetime.utcnow()
+                            logger.info("Updated execution history %s to FAILED", history_id)
+
 
                     db.commit()
                     logger.info("Marked job %s as FAILED in database after permanent failure", job_id)

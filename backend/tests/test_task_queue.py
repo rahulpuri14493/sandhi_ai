@@ -112,3 +112,33 @@ class TestCeleryTaskReliability:
         # No commit should happen if the job isn't found
         mock_db.commit.assert_not_called()
         mock_db.close.assert_called_once()
+
+    @patch("db.database.SessionLocal")
+    def test_on_failure_hook_updates_db_and_history(self, mock_session_local):
+        """Verify the custom Task class marks both Job and History as FAILED."""
+        from services.task_queue import ExecutePlatformJobTask
+        
+        mock_db = MagicMock()
+        mock_session_local.return_value = mock_db
+        
+        # Mock Job and History objects
+        mock_job = MagicMock(status=JobStatus.IN_PROGRESS)
+        mock_hist = MagicMock(status="started")
+        
+        # Setup the mock query to return job first, then history
+        mock_db.query.return_value.filter.return_value.first.side_effect = [mock_job, mock_hist]
+
+        task = ExecutePlatformJobTask()
+        task.on_failure(
+            exc=RuntimeError("Final exhaustion"),
+            task_id="test-id",
+            args=[],
+            kwargs={"job_id": 99, "history_id": 101},
+            einfo=None
+        )
+
+        # Assertions
+        assert mock_job.status == JobStatus.FAILED
+        assert mock_hist.status == "failed"
+        assert mock_hist.completed_at is not None
+        mock_db.commit.assert_called_once()
