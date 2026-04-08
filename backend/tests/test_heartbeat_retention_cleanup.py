@@ -115,3 +115,22 @@ def test_heartbeat_retention_cleanup_keeps_recent_steps(monkeypatch, db_session)
     refreshed = db_session.query(WorkflowStep).filter(WorkflowStep.id == step_id).first()
     assert refreshed.live_phase is not None
     assert refreshed.live_reason_code is not None
+
+
+def test_heartbeat_retention_cleanup_keeps_active_step_even_if_phase_started_old(monkeypatch, db_session):
+    step = _seed_step(db_session, old=True)
+    step_id = step.id
+    step.status = "in_progress"
+    step.last_activity_at = datetime.utcnow() - timedelta(minutes=3)
+    step.last_progress_at = datetime.utcnow() - timedelta(minutes=2)
+    db_session.commit()
+
+    monkeypatch.setattr(tq.settings, "HEARTBEAT_RETENTION_DAYS", 30)
+    import db.database as dbmod
+
+    monkeypatch.setattr(dbmod, "SessionLocal", lambda: db_session)
+    tq.cleanup_heartbeat_retention_once()
+
+    refreshed = db_session.query(WorkflowStep).filter(WorkflowStep.id == step_id).first()
+    assert refreshed.live_phase is not None
+    assert refreshed.live_reason_code is not None

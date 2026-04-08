@@ -20,7 +20,6 @@ def cleanup_heartbeat_retention_once() -> dict:
     durable DB snapshot fields on workflow steps to control storage growth.
     """
     from db.database import SessionLocal
-    from sqlalchemy import or_
     from models.job import WorkflowStep
 
     retention_days = max(1, int(getattr(settings, "HEARTBEAT_RETENTION_DAYS", 30) or 30))
@@ -28,16 +27,11 @@ def cleanup_heartbeat_retention_once() -> dict:
     db = SessionLocal()
     cleared = 0
     try:
+        # Only clean non-active steps and only when the newest known runtime signal
+        # is older than the retention cutoff.
         rows = (
             db.query(WorkflowStep)
-            .filter(
-                or_(
-                    WorkflowStep.completed_at < cutoff,
-                    WorkflowStep.last_activity_at < cutoff,
-                    WorkflowStep.last_progress_at < cutoff,
-                    WorkflowStep.live_phase_started_at < cutoff,
-                )
-            )
+            .filter(WorkflowStep.status != "in_progress")
             .all()
         )
         for step in rows:
@@ -54,6 +48,22 @@ def cleanup_heartbeat_retention_once() -> dict:
                 ]
             )
             if not has_live:
+                continue
+            latest_ts = max(
+                [
+                    ts
+                    for ts in [
+                        getattr(step, "completed_at", None),
+                        getattr(step, "last_activity_at", None),
+                        getattr(step, "last_progress_at", None),
+                        getattr(step, "live_phase_started_at", None),
+                        getattr(step, "started_at", None),
+                    ]
+                    if ts is not None
+                ],
+                default=None,
+            )
+            if latest_ts is None or latest_ts >= cutoff:
                 continue
             step.live_phase = None
             step.live_phase_started_at = None
