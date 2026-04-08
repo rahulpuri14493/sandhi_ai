@@ -36,7 +36,10 @@ if Celery is not None:
         enable_utc=True,
         task_track_started=True,
         worker_prefetch_multiplier=1,
+
+        # --- Reliability settings ---
         task_acks_late=True,
+        task_reject_on_worker_lost=True, # Requeues job if worker processing it is lost (e.g crash, OOM)
     )
 
     # Configure Celery Beat
@@ -142,20 +145,63 @@ def get_queue_stats() -> dict:
 
 
 if celery_app is not None:
-    @celery_app.task(name="execute_platform_job", bind=True)
+
+    class ExecutePlatformJobTask(celery_app.Task):
+        """Custom Task class to handle final failure after retries exhausted, if needed."""
+        def on_failure(self, exc, task_id, args, kwargs, einfo):
+            # This triggers ONLY when max_retries is exceeded or a non retryable exception is raised.
+            job_id = kwargs.get("job_id") or (args[0] if args else None)
+            logger.error("Job %s permanently failed after retries exhausted. Error: %s", job_id, exc)
+
+            from db.database import SessionLocal
+            from models.job import Job, JobStatus
+
+            db = SessionLocal()
+            try:
+                job = db.query(Job).filter(Job.id == job_id).first()
+                if job and job.status == JobStatus.IN_PROGRESS:
+                    job.status = JobStatus.FAILED
+                    job.failure_reason = f"Execution permanently failed: {str(exc)[:450]}"
+
+                    db.commit()
+                    logger.info("Marked job %s as FAILED in database after permanent failure", job_id)
+
+            except Exception as e:
+                logger.error("Failed to update job status to FAILED for job %s: %s", job_id, e)
+            finally:
+                db.close()
+
+            super().on_failure(exc, task_id, args, kwargs, einfo)
+    @celery_app.task(
+        name="execute_platform_job",
+        bind=True,
+        base=ExecutePlatformJobTask,
+
+        # --- Retry Policy ---
+        autoretry_for=(Exception,),  # Retry for all exceptions
+        max_retries= max(0, int(getattr(settings, "CELERY_EXECUTE_MAX_RETRIES", 3))),
+        retry_backoff=getattr(settings, "CELERY_EXECUTE_RETRY_BACKOFF_SECONDS", 5),  # Exponential backoff base in seconds
+        retry_backoff_max=getattr(settings, "CELERY_EXECUTE_RETRY_BACKOFF_MAX_SECONDS", 600),  # Max backoff time in seconds
+        retry_jitter=True,  # Add random jitter to avoid thundering herd on retries
+
+        # --- Worker Crash Handling ---
+        acks_late=True,  # Acknowledge task only after execution
+        reject_on_worker_lost=True,  # Requeue task if worker processing it is lost (e.g., crash, OOM)
+    )
     def execute_platform_job(self, job_id: int, history_id: Optional[int] = None, execution_token: Optional[str] = None):
         """
         Celery worker task. Uses fresh DB session + event loop through shared runner.
         """
         from services.job_scheduler import run_job_in_thread
-        try:
-            return run_job_in_thread(job_id=job_id, history_id=history_id, execution_token=execution_token)
-        except Exception as e:
-            max_retries = max(0, int(getattr(settings, "CELERY_EXECUTE_MAX_RETRIES", 3)))
-            if self.request.retries < max_retries:
-                countdown = max(1, int(getattr(settings, "CELERY_EXECUTE_RETRY_BACKOFF_SECONDS", 5)))
-                raise self.retry(exc=e, countdown=countdown)
-            raise
+        # The try/except block is removed.
+        # Celery automatically ctches the exception, delays the task with exponential backoff, retries up to max_retries.
+        # We pass reraise_exceptions=True so Celery actually knows when it fails
+        return run_job_in_thread(
+            job_id=job_id,
+            history_id=history_id,
+            execution_token=execution_token,
+            reraise_exceptions=True,
+        )
 
     @celery_app.task(name="trigger_scheduled_job", bind=True)
     def trigger_scheduled_job(self, schedule_id: int):

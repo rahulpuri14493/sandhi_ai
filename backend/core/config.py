@@ -53,6 +53,7 @@ class Settings(BaseSettings):
     CELERY_WORKER_CONCURRENCY: int = 4
     CELERY_EXECUTE_MAX_RETRIES: int = 3
     CELERY_EXECUTE_RETRY_BACKOFF_SECONDS: int = 5
+    CELERY_EXECUTE_RETRY_BACKOFF_MAX_SECONDS: int = 600
     # When True, allow agent endpoints that resolve to private/loopback IPs (dev, Docker, same host). Default False in production.
     ALLOW_PRIVATE_AGENT_ENDPOINTS: bool = False
     # Job document storage backend: S3-compatible object storage (default) or local filesystem
