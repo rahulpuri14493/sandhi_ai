@@ -83,13 +83,21 @@ def reset_job_for_execution(db: Session, job: Job):
     job.failure_reason = None
 
 
-def run_job_in_thread(job_id: int, history_id: int = None, execution_token: Optional[str] = None):
-    """Execute a job in a dedicated thread with its own DB session and event loop.
+def run_job_in_thread(job_id: int, history_id: int = None, execution_token: Optional[str] = None, reraise_exceptions: bool = False):
+    """
+    Execute a job in a dedicated thread with its own DB session and event loop.
 
-    The caller is responsible for setting the job status to IN_PROGRESS before
-    spawning this thread. On success the job transitions to COMPLETED (handled
-    by AgentExecutor). On failure the job is set to FAILED here so the user
-    can choose "Run Now" or "Schedule Again" from the frontend.
+    This function supports two execution modes:
+    1. DISTRIBUTED (Celery): If reraise_exceptions=True, exceptions bubble up to the 
+       caller. This allows Celery to manage retries via its native policy and 
+       handle final failure via the Task.on_failure hook.
+    2. LOCAL (Thread Fallback): If reraise_exceptions=False, exceptions are caught 
+       locally. The function manually transitions the job and history status to 
+       FAILED to ensure the job doesn't stay stuck in IN_PROGRESS.
+
+    On success, the job transitions to COMPLETED (handled by AgentExecutor).
+    The caller is responsible for setting the job status to IN_PROGRESS before 
+    invoking this runner.
     """
     db = SessionLocal()
     loop = asyncio.new_event_loop()
@@ -155,8 +163,21 @@ def run_job_in_thread(job_id: int, history_id: int = None, execution_token: Opti
                 db.commit()
     except Exception as e:
         logger.exception("Job execution failed for job_id=%s", job_id)
+
+        # --- Dual failure handling ---
+        # 1. CELERY FAILURE: if this is running in Celery, we want to RERAISE the exception so Celery
+        # knows the task failed and can trigger retries according to the retry policy.
+        # Celery will also log the exception and handle retries automatically.
+
+        if reraise_exceptions:
+            loop.close()
+            db.close()
+            logger.info("Reraising exceptions for Celery to handle retries for job_id=%s", job_id)
+            raise e
+        
+        # 2. LOCAL THREAD FAILURE: if this is running in local thread (no Celery), we want to CATCH the exception here,
+        # log it, and mark the job as FAILED in the DB so it doesn't stay stuck in IN_PROGRESS.
         try:
-            # Mark job as FAILED so it doesn't stay stuck in IN_PROGRESS.
             job = db.query(Job).filter(Job.id == job_id).first()
             if job and job.status == JobStatus.IN_PROGRESS:
                 job.status = JobStatus.FAILED
