@@ -301,6 +301,11 @@ export const dashboardsAPI = {
   getDeveloperStats() {
     return api.get('/developers/stats').then((res) => res.data)
   },
+  getDeveloperAgentPerformance(limitSteps = 800) {
+    return api
+      .get('/developers/agents/performance?limit_steps=' + encodeURIComponent(String(limitSteps)))
+      .then((res) => res.data)
+  },
 }
 
 export const hiringAPI = {

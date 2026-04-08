@@ -15,10 +15,9 @@ export default defineConfig({
     coverage: {
       provider: 'v8',
       include: [
-        'src/lib/**/*.{ts,tsx}',
-        'src/components/AgentCard.tsx',
-        'src/components/Navbar.tsx',
-        'src/components/CostCalculator.tsx',
+        '**/src/components/AgentCard.tsx',
+        '**/src/components/Navbar.tsx',
+        '**/src/components/CostCalculator.tsx',
       ],
       excludeAfterRemap: true,
       exclude: [

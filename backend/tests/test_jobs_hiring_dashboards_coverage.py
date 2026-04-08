@@ -213,3 +213,61 @@ def test_business_agent_performance_endpoint(client: TestClient, db_session):
     assert first["totals"]["total_tokens"] >= 18
     assert first["quality"]["success_rate"] >= 0.0
 
+
+def test_developer_agent_performance_endpoint(client: TestClient, db_session):
+    developer, dev_token = _make_user(db_session, role=UserRole.DEVELOPER, email="dev-kpi@example.com")
+    business, _biz_token = _make_user(db_session, role=UserRole.BUSINESS, email="biz-kpi@example.com")
+    dev_headers = {"Authorization": f"Bearer {dev_token}"}
+
+    agent = Agent(
+        developer_id=developer.id,
+        name="Dev KPI Agent",
+        description="Perf",
+        capabilities=["analyze"],
+        input_schema={},
+        output_schema={},
+        pricing_model=PricingModel.PAY_PER_USE,
+        price_per_task=3.0,
+        price_per_communication=0.3,
+        status=AgentStatus.ACTIVE,
+        api_endpoint="https://agent.devkpi.example.com",
+    )
+    db_session.add(agent)
+    db_session.commit()
+    db_session.refresh(agent)
+
+    job = Job(
+        business_id=business.id,
+        title="Dev KPI Job",
+        description="KPI",
+        status=JobStatus.COMPLETED,
+    )
+    db_session.add(job)
+    db_session.commit()
+    db_session.refresh(job)
+
+    step = WorkflowStep(
+        job_id=job.id,
+        agent_id=agent.id,
+        step_order=1,
+        status="completed",
+        cost=3.0,
+        output_data='{"agent_output":{"usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}}}',
+        live_phase="completed",
+        live_reason_code="step_completed",
+    )
+    db_session.add(step)
+    db_session.commit()
+
+    resp = client.get("/api/developers/agents/performance", headers=dev_headers)
+    assert resp.status_code == 200, resp.text
+    data = resp.json()
+    assert data["developer_id"] == developer.id
+    assert "kpis" in data
+    assert data["kpis"]["overview"]["output_tokens_reported"] >= 5
+    assert data["kpis"]["sla"]["status"] in ("healthy", "at_risk", "breached")
+    assert "alerts" in data["kpis"]
+    assert "last_alert_sent_at" in data["kpis"]["alerts"]
+    assert isinstance(data.get("agents"), list)
+    assert data["agents"][0]["sla"]["status"] in ("healthy", "at_risk", "breached")
+

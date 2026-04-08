@@ -217,15 +217,6 @@ def _enrich_tool_suggestion_json_bytes(
         payload = json.loads(data.decode("utf-8"))
     except Exception:
         return data
-
-
-def _attach_agent_names_to_task_split(
-    task_split: Optional[Dict[str, Any]], agent_name_by_index: Dict[int, str]
-) -> Optional[Dict[str, Any]]:
-    if not isinstance(task_split, dict):
-        return task_split
-    _attach_agent_names_by_index(task_split.get("parsed_assignments"), agent_name_by_index)
-    return task_split
     if not isinstance(payload, dict):
         return data
     tool_name_by_id = _platform_tool_name_map_for_business(db, business_id)
@@ -236,6 +227,15 @@ def _attach_agent_names_to_task_split(
         return json.dumps(enriched, ensure_ascii=False).encode("utf-8")
     except Exception:
         return data
+
+
+def _attach_agent_names_to_task_split(
+    task_split: Optional[Dict[str, Any]], agent_name_by_index: Dict[int, str]
+) -> Optional[Dict[str, Any]]:
+    if not isinstance(task_split, dict):
+        return task_split
+    _attach_agent_names_by_index(task_split.get("parsed_assignments"), agent_name_by_index)
+    return task_split
 
 
 # Allowed file extensions (including .zip; zip contents are extracted and only allowed types kept)
@@ -425,6 +425,30 @@ def _parse_int_list_form(value: Optional[str]) -> Optional[List[int]]:
         return [int(x) for x in out] if isinstance(out, list) else None
     except (json.JSONDecodeError, TypeError, ValueError):
         return None
+
+
+def _parse_int_list(value: Any) -> Optional[List[int]]:
+    """Parse list[int] from JSON string or iterable; None on invalid."""
+    if value is None:
+        return None
+    raw = value
+    if isinstance(raw, str):
+        txt = raw.strip()
+        if not txt:
+            return None
+        try:
+            raw = json.loads(txt)
+        except Exception:
+            return None
+    if isinstance(raw, (list, tuple, set)):
+        out: List[int] = []
+        for item in raw:
+            try:
+                out.append(int(item))
+            except (TypeError, ValueError):
+                return None
+        return out
+    return None
 
 
 def _validate_tool_visibility(v: Optional[str]) -> Optional[str]:

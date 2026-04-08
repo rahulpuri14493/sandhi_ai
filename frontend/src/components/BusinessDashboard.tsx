@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { dashboardsAPI, jobsAPI, mcpAPI } from '../lib/api'
 import { getStepOutputDisplayText } from '../lib/formatStepOutput'
 import type { Job } from '../lib/types'
@@ -39,6 +39,15 @@ export function BusinessDashboard() {
     efficiency?: { cost_per_completed_step?: number; completion_tokens_per_completed_step?: number }
     failure_mix?: Array<{ reason: string; count: number }>
     risk?: { stuck_steps?: number; loop_signals?: number; drift_signals?: number; retry_signals?: number }
+    sla?: {
+      status?: 'healthy' | 'at_risk' | 'breached'
+      success_rate_min?: number
+      p95_latency_seconds_max?: number
+      current_success_rate?: number
+      current_p95_latency_seconds?: number
+      reason?: string
+    }
+    alerts?: { last_alert_sent_at?: string | null; last_alert_status?: string | null }
   } | null>(null)
   const [agentPerf, setAgentPerf] = useState<Array<{
     agent_id: number
@@ -60,6 +69,7 @@ export function BusinessDashboard() {
       job_id?: number
       workflow_step_id?: number
       step_order?: number
+      live_source?: 'redis' | 'db_fallback' | string
       phase?: string
       reason_code?: string
       reason_detail?: Record<string, unknown> | null
@@ -80,6 +90,7 @@ export function BusinessDashboard() {
       job_id?: number
       workflow_step_id?: number
       step_order?: number
+      live_source?: 'redis' | 'db_fallback' | string
       phase?: string
       reason_code?: string
       reason_detail?: Record<string, unknown> | null
@@ -104,6 +115,8 @@ export function BusinessDashboard() {
   const [sortBy, setSortBy] = useState<'created_desc' | 'created_asc' | 'last_executed_desc' | 'last_executed_asc'>(
     'created_desc',
   )
+  const perfPollInFlight = useRef(false)
+  const queuePollInFlight = useRef(false)
   const navigate = useNavigate()
 
   useEffect(() => {
@@ -112,35 +125,98 @@ export function BusinessDashboard() {
   }, [])
 
   useEffect(() => {
-    // Lightweight live refresh for end-user observability.
-    const timer = setInterval(async () => {
+    // Adaptive polling: pause on hidden tabs, avoid overlap, back off on failures.
+    let stopped = false
+    let failCount = 0
+    let timer: number | null = null
+    const schedule = (ms: number) => {
+      if (stopped) return
+      timer = window.setTimeout(run, ms)
+    }
+    const run = async () => {
+      if (stopped) return
+      if (document.visibilityState !== 'visible') {
+        schedule(45000)
+        return
+      }
+      if (perfPollInFlight.current) {
+        schedule(5000)
+        return
+      }
+      perfPollInFlight.current = true
       try {
         const perfData = await dashboardsAPI.getBusinessAgentPerformance(800)
         setAgentPerf(perfData?.agents || [])
         setPerfKpis(perfData?.kpis || null)
         setLastPerfRefreshAt(Date.now())
+        failCount = 0
       } catch {
-        // Keep previous data on transient failures.
+        failCount = Math.min(4, failCount + 1)
+      } finally {
+        perfPollInFlight.current = false
+        const nextMs = 15000 + failCount * 5000 + Math.floor(Math.random() * 1200)
+        schedule(nextMs)
       }
-    }, 15000)
-    return () => clearInterval(timer)
+    }
+    const onVisibility = () => {
+      if (document.visibilityState === 'visible') {
+        if (timer !== null) window.clearTimeout(timer)
+        schedule(500)
+      }
+    }
+    schedule(15000)
+    document.addEventListener('visibilitychange', onVisibility)
+    return () => {
+      stopped = true
+      if (timer !== null) window.clearTimeout(timer)
+      document.removeEventListener('visibilitychange', onVisibility)
+    }
   }, [])
 
   useEffect(() => {
-    let mounted = true
-    const loadQueueStats = async () => {
+    let stopped = false
+    let failCount = 0
+    let timer: number | null = null
+    const schedule = (ms: number) => {
+      if (stopped) return
+      timer = window.setTimeout(run, ms)
+    }
+    const run = async () => {
+      if (stopped) return
+      if (document.visibilityState !== 'visible') {
+        schedule(45000)
+        return
+      }
+      if (queuePollInFlight.current) {
+        schedule(5000)
+        return
+      }
+      queuePollInFlight.current = true
       try {
         const stats = await jobsAPI.getQueueStats()
-        if (mounted) setQueueStats(stats)
+        setQueueStats(stats)
+        failCount = 0
       } catch {
-        if (mounted) setQueueStats(null)
+        setQueueStats(null)
+        failCount = Math.min(4, failCount + 1)
+      } finally {
+        queuePollInFlight.current = false
+        const nextMs = 10000 + failCount * 5000 + Math.floor(Math.random() * 1200)
+        schedule(nextMs)
       }
     }
-    loadQueueStats()
-    const timer = setInterval(loadQueueStats, 10000)
+    const onVisibility = () => {
+      if (document.visibilityState === 'visible') {
+        if (timer !== null) window.clearTimeout(timer)
+        schedule(500)
+      }
+    }
+    run()
+    document.addEventListener('visibilitychange', onVisibility)
     return () => {
-      mounted = false
-      clearInterval(timer)
+      stopped = true
+      if (timer !== null) window.clearTimeout(timer)
+      document.removeEventListener('visibilitychange', onVisibility)
     }
   }, [])
 
@@ -388,6 +464,14 @@ export function BusinessDashboard() {
     if (ageMs <= 60_000) return { label: 'Healthy', className: 'bg-green-500/15 border-green-500/40 text-green-300' }
     if (ageMs <= 180_000) return { label: 'Delayed', className: 'bg-amber-500/15 border-amber-500/40 text-amber-300' }
     return { label: 'Stale', className: 'bg-red-500/15 border-red-500/40 text-red-300' }
+  }
+
+  const statusDotClass = (status?: string | null) => {
+    const s = (status || '').toLowerCase()
+    if (s === 'healthy' || s === 'ok' || s === 'completed') return 'bg-green-400'
+    if (s === 'at_risk' || s === 'warning') return 'bg-amber-400'
+    if (s === 'breached' || s === 'failed' || s === 'error') return 'bg-red-400'
+    return 'bg-slate-400'
   }
 
   const normalizeKey = (v?: string | null) =>
@@ -688,6 +772,30 @@ export function BusinessDashboard() {
               </p>
             </div>
           </div>
+          <div className="mt-3 rounded-xl border border-dark-200/60 bg-dark-200/25 p-4">
+            <p className="text-[11px] uppercase tracking-wide text-white/50 mb-1">KPI SLA Alerting</p>
+            <p className="text-sm font-semibold text-white inline-flex items-center gap-2">
+              <span className={`h-2 w-2 rounded-full ${statusDotClass(perfKpis?.sla?.status || 'healthy')}`} />
+              {(perfKpis?.sla?.status || 'healthy').replace('_', ' ').toUpperCase()}
+            </p>
+            {(perfKpis?.sla?.reason || '').trim() !== '' && (
+              <p className="text-xs text-amber-200/90 mt-1">Reason: {perfKpis?.sla?.reason}</p>
+            )}
+            <p className="text-xs text-white/60 mt-1">
+              Target: {(Number(perfKpis?.sla?.success_rate_min || 0) * 100).toFixed(1)}% success, p95 &lt;= {(perfKpis?.sla?.p95_latency_seconds_max || 0).toFixed(0)}s
+            </p>
+            <p className="text-xs text-white/55 mt-1">
+              Last webhook alert:{' '}
+              {perfKpis?.alerts?.last_alert_sent_at ? (
+                <span className="inline-flex items-center gap-1">
+                  <span className={`h-1.5 w-1.5 rounded-full ${statusDotClass(perfKpis?.alerts?.last_alert_status || 'unknown')}`} />
+                  {`${new Date(perfKpis.alerts.last_alert_sent_at).toLocaleString()} (${(perfKpis?.alerts?.last_alert_status || 'unknown').replace('_', ' ')})`}
+                </span>
+              ) : (
+                'No alert sent yet'
+              )}
+            </p>
+          </div>
 
           <div className="mt-4 rounded-xl border border-dark-200/60 bg-dark-200/25 p-4">
             <p className="text-[11px] uppercase tracking-wide text-white/50 mb-2">Top Failure Reasons</p>
@@ -874,6 +982,14 @@ export function BusinessDashboard() {
                     <p className="text-white">{selectedRuntime.runtime.step_order ?? '-'}</p>
                     <p className="text-white/65">Trace ID</p>
                     <p className="text-white break-all">{selectedRuntime.runtime.trace_id || '-'}</p>
+                    <p className="text-white/65">Telemetry Source</p>
+                    <p className="text-white">
+                      {(selectedRuntime.runtime.live_source || 'unknown') === 'redis'
+                        ? 'Live Redis'
+                        : (selectedRuntime.runtime.live_source || 'unknown') === 'db_fallback'
+                          ? 'DB Fallback'
+                          : String(selectedRuntime.runtime.live_source || 'unknown')}
+                    </p>
                   </div>
                 </div>
 

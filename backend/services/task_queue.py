@@ -6,6 +6,7 @@ import logging
 from typing import Optional
 
 from core.config import settings
+from services.business_job_alerts import send_business_job_alert
 
 logger = logging.getLogger(__name__)
 
@@ -244,6 +245,18 @@ if celery_app is not None:
                         triggered_by="watchdog",
                     )
                     db.add(history)
+                    try:
+                        send_business_job_alert(
+                            event_type="job_stuck",
+                            job_id=int(job.id),
+                            business_id=int(job.business_id),
+                            title=str(job.title or f"Job {job.id}"),
+                            status=str(job.status.value),
+                            stage="watchdog",
+                            reason=f"Potentially stuck for over {threshold_hours}h",
+                        )
+                    except Exception:
+                        pass
             db.commit()
         except Exception:
             logger.exception("Error in stuck job watchdog")

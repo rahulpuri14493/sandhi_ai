@@ -73,6 +73,7 @@ For implementation details on A2A behavior, see [A2A for developers](docs/A2A_DE
 **Documentation folder** — Guides, schemas, and ops notes live under **[docs/](docs/)**. Highlights:
 
 - **[Agent planner (admin / ops)](docs/AGENT_PLANNER_OPS.md)** — Runtime transport, primary vs fallback model vs secondary failover, env cheat sheet, Mermaid flow, and `.env` examples (`AGENT_PLANNER_MODEL`, `AGENT_PLANNER_FALLBACK_MODEL`, `LLM_HTTP_FALLBACK_MODEL`, `AGENT_PLANNER_SECONDARY_*`, etc.).
+- **[Heartbeat, telemetry, and KPI guide](docs/HEARTBEAT_AND_KPI_GUIDE.md)** — Redis + DB heartbeat internals, stuck detection, internal execution APIs, dashboard KPI/SLA logic, webhook alerts, env setup, and troubleshooting playbook.
 - [A2A task & assignment](docs/A2A_TASK_AND_ASSIGNMENT.md), [Object storage](docs/OBJECT_STORAGE.md), [Output contracts](docs/OUTPUT_CONTRACTS.md), [Codebase layout](docs/CODEBASE_LAYOUT.md)
 
 ### How each agent run is prepared (plain language)
@@ -252,6 +253,51 @@ Every pull request runs backend tests, frontend tests, and a Docker Compose smok
 
 Once the backend is running, open `http://localhost:8000/docs` for interactive API documentation.
 
+## Alerts Quick Start
+
+Use this when you want heartbeat visibility + webhook notifications for job lifecycle and KPI SLA changes.
+For full internals, payload examples, and diagrams, see
+[`docs/HEARTBEAT_AND_KPI_GUIDE.md`](docs/HEARTBEAT_AND_KPI_GUIDE.md).
+
+```env
+# Heartbeat runtime telemetry
+HEARTBEAT_ENABLE_REDIS=true
+HEARTBEAT_REDIS_URL=redis://redis:6379/0
+HEARTBEAT_REDIS_TTL_SECONDS=180
+HEARTBEAT_ENABLE_DB_SNAPSHOT=true
+HEARTBEAT_DB_MIN_UPDATE_SECONDS=45
+STEP_STUCK_THRESHOLD_SECONDS=600
+STEP_STUCK_BLOCKED_THRESHOLD_SECONDS=900
+STEP_LOOP_ROUND_THRESHOLD=10
+STEP_REPEAT_TOOLCALL_THRESHOLD=6
+
+# Business job lifecycle alerts (started/stuck/failed/completed)
+BUSINESS_JOB_ALERTS_ENABLED=true
+BUSINESS_JOB_ALERT_WEBHOOK_URL=https://example.com/webhooks/business-jobs
+BUSINESS_JOB_ALERT_COOLDOWN_SECONDS=180
+
+# Business KPI/SLA alerts (at_risk/breached + recovered)
+BUSINESS_KPI_ALERTS_ENABLED=true
+BUSINESS_KPI_ALERT_WEBHOOK_URL=https://example.com/webhooks/business-kpi
+BUSINESS_KPI_ALERT_COOLDOWN_SECONDS=900
+BUSINESS_KPI_SLA_SUCCESS_RATE_MIN=0.95
+BUSINESS_KPI_SLA_P95_LATENCY_SECONDS_MAX=45.0
+
+# Developer KPI/SLA alerts (at_risk/breached + recovered)
+DEVELOPER_KPI_ALERTS_ENABLED=true
+DEVELOPER_KPI_ALERT_WEBHOOK_URL=https://example.com/webhooks/developer-kpi
+DEVELOPER_KPI_ALERT_COOLDOWN_SECONDS=900
+DEVELOPER_KPI_SLA_SUCCESS_RATE_MIN=0.95
+DEVELOPER_KPI_SLA_P95_LATENCY_SECONDS_MAX=30.0
+```
+
+Operational API notes:
+
+- Queue runtime telemetry: `GET /api/jobs/queue/stats` (pending jobs + worker activity).
+- KPI endpoints support `limit_steps` to tune sample size:
+  - `GET /api/businesses/agents/performance?limit_steps=800`
+  - `GET /api/developers/agents/performance?limit_steps=1200`
+
 ## Project Structure
 
 ```text
@@ -267,6 +313,7 @@ Once the backend is running, open `http://localhost:8000/docs` for interactive A
 │   └── setup_env.py               # First-time .env setup
 ├── docs/
 │   ├── A2A_DEVELOPERS.md          # Developer-facing A2A guidance
+│   ├── HEARTBEAT_AND_KPI_GUIDE.md # Runtime heartbeat, KPI/SLA, and alerting guide
 │   └── OBJECT_STORAGE.md          # S3-compatible storage setup and tuning
 ├── docker-compose.yml             # Core platform services
 ├── docker-compose.s3.yml          # MinIO S3 overlay

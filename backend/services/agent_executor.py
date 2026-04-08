@@ -47,6 +47,7 @@ from services.planner_llm import (
     reset_planner_runtime_transport,
 )
 from services.execution_heartbeat import publish_step_heartbeat
+from services.business_job_alerts import send_business_job_alert
 
 logger = logging.getLogger(__name__)
 
@@ -1325,6 +1326,17 @@ class AgentExecutor:
                                         msg = f"{msg} ({e.last_detail})"
                                     job.failure_reason = msg[:450]
                                     self.db.commit()
+                                    try:
+                                        send_business_job_alert(
+                                            event_type="job_failed",
+                                            job_id=int(job.id),
+                                            business_id=int(job.business_id),
+                                            title=str(job.title or f"Job {job.id}"),
+                                            status="failed",
+                                            reason=str(job.failure_reason or ""),
+                                        )
+                                    except Exception:
+                                        pass
                                 return
                     self.db.expire_all()
 
@@ -1345,6 +1357,17 @@ class AgentExecutor:
                 job.execution_token = None
                 job.failure_reason = "No workflow steps found for this job"
                 self.db.commit()
+                try:
+                    send_business_job_alert(
+                        event_type="job_failed",
+                        job_id=int(job.id),
+                        business_id=int(job.business_id),
+                        title=str(job.title or f"Job {job.id}"),
+                        status="failed",
+                        reason=str(job.failure_reason or ""),
+                    )
+                except Exception:
+                    pass
                 return
             
             if getattr(settings, "WORKFLOW_PARALLEL_INDEPENDENT_STEPS", True):
@@ -1392,6 +1415,17 @@ class AgentExecutor:
                 job.execution_token = None
                 job.completed_at = datetime.utcnow()
                 self.db.commit()
+                try:
+                    send_business_job_alert(
+                        event_type="job_completed",
+                        job_id=int(job.id),
+                        business_id=int(job.business_id),
+                        title=str(job.title or f"Job {job.id}"),
+                        status="completed",
+                        stage="done",
+                    )
+                except Exception:
+                    pass
                 
                 # Distribute earnings
                 self.payment_processor.distribute_earnings(job_id)
@@ -1418,6 +1452,17 @@ class AgentExecutor:
                 error_message = f"{type(e).__name__}: {detail}" if detail else type(e).__name__
                 job.failure_reason = error_message[:2000]
                 self.db.commit()
+                try:
+                    send_business_job_alert(
+                        event_type="job_failed",
+                        job_id=int(job.id),
+                        business_id=int(job.business_id),
+                        title=str(job.title or f"Job {job.id}"),
+                        status="failed",
+                        reason=str(job.failure_reason or ""),
+                    )
+                except Exception:
+                    pass
 
                 # Log error
                 self._log_action("job", job_id, "failed", {

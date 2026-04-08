@@ -172,6 +172,22 @@ class Settings(BaseSettings):
     AGENT_OUTPUT_MIN_CONFIDENCE: float = 0.0
     # Use a fixed seed for tool-calling agent rounds to reduce SQL/output drift across identical prompts.
     AGENT_TOOLCALL_OPENAI_SEED: int = 42
+    # Developer (publish-user) KPI/SLA thresholds.
+    DEVELOPER_KPI_SLA_SUCCESS_RATE_MIN: float = 0.95
+    DEVELOPER_KPI_SLA_P95_LATENCY_SECONDS_MAX: float = 30.0
+    # Optional webhook alerts for developer KPI SLA changes.
+    DEVELOPER_KPI_ALERTS_ENABLED: bool = False
+    DEVELOPER_KPI_ALERT_WEBHOOK_URL: str = ""
+    DEVELOPER_KPI_ALERT_COOLDOWN_SECONDS: int = 900
+    # Optional business/end-user job lifecycle webhook alerts.
+    BUSINESS_JOB_ALERTS_ENABLED: bool = False
+    BUSINESS_JOB_ALERT_WEBHOOK_URL: str = ""
+    BUSINESS_JOB_ALERT_COOLDOWN_SECONDS: int = 180
+    BUSINESS_KPI_ALERTS_ENABLED: bool = False
+    BUSINESS_KPI_ALERT_WEBHOOK_URL: str = ""
+    BUSINESS_KPI_ALERT_COOLDOWN_SECONDS: int = 900
+    BUSINESS_KPI_SLA_SUCCESS_RATE_MIN: float = 0.95
+    BUSINESS_KPI_SLA_P95_LATENCY_SECONDS_MAX: float = 45.0
     # --- Tool assignment registry + A2A task envelope ---
     # Absolute path to JSON registry; empty = packaged backend/resources/config/tool_assignment_registry.default.json
     TOOL_ASSIGNMENT_REGISTRY_PATH: str = ""
