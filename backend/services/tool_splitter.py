@@ -106,6 +106,9 @@ async def suggest_tool_assignments_for_agents(
     use_planner = is_agent_planner_configured()
     if len(agents) == 0 or not use_planner:
         fb = partition_tools_for_fallback(tool_dicts, len(agents))
+        for i, row in enumerate(fb):
+            if isinstance(row, dict):
+                row["agent_name"] = (agents[i].name or "").strip() if i < len(agents) and getattr(agents[i], "name", None) else None
         return {
             "step_suggestions": fb,
             "output_contract_stub": _build_write_stub(platform_tools),
@@ -210,6 +213,7 @@ Assign tools to each of the {len(agents)} agents. Return JSON array only."""
             out.append(
                 {
                     "agent_index": i,
+                    "agent_name": (agents[i].name or "").strip() if getattr(agents[i], "name", None) else None,
                     "platform_tool_ids": ids,
                     "rationale": rationale or "Suggested from BRD and job prompt.",
                 }
@@ -226,6 +230,9 @@ Assign tools to each of the {len(agents)} agents. Return JSON array only."""
     except Exception as e:
         logger.warning("Tool split LLM failed: %s, using fallback", e)
         fb = partition_tools_for_fallback(tool_dicts, len(agents))
+        for i, row in enumerate(fb):
+            if isinstance(row, dict):
+                row["agent_name"] = (agents[i].name or "").strip() if i < len(agents) and getattr(agents[i], "name", None) else None
         return {
             "step_suggestions": fb,
             "output_contract_stub": _build_write_stub(platform_tools),

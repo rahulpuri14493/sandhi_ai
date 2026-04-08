@@ -327,6 +327,11 @@ async def _upstream_openai_chat(
         "messages": messages,
         "temperature": _float_meta(metadata, "openai_temperature", 0.7),
     }
+    seed_val = metadata.get("openai_seed")
+    if isinstance(seed_val, int):
+        payload["seed"] = seed_val
+    elif isinstance(seed_val, str) and seed_val.strip().isdigit():
+        payload["seed"] = int(seed_val.strip())
     max_tok = _int_meta(metadata, "openai_max_tokens", 0)
     if max_tok > 0:
         payload["max_tokens"] = max_tok
@@ -391,14 +396,21 @@ async def _upstream_openai_chat(
         msg = choices[0].get("message") or {}
         content = _openai_content_to_text(msg.get("content"))
         tool_calls = msg.get("tool_calls")
+    usage = data.get("usage")
 
     logger.info(
-        "A2A OpenAI response req_id=%s content_len=%s tool_calls=%s",
-        req_id, len(content or ""), len(tool_calls) if tool_calls else 0,
+        "A2A OpenAI response req_id=%s content_len=%s tool_calls=%s usage_total=%s",
+        req_id,
+        len(content or ""),
+        len(tool_calls) if tool_calls else 0,
+        (usage or {}).get("total_tokens") if isinstance(usage, dict) else None,
     )
     result: Dict[str, Any] = {
         "message": {"role": ROLE_AGENT, "parts": [{"text": content}]},
     }
+    if isinstance(usage, dict):
+        result["usage"] = usage
+        result["token_usage"] = usage
     if tool_calls:
         result["tool_calls"] = tool_calls
     return JSONResponse(

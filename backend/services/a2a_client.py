@@ -75,6 +75,10 @@ def _extract_result_from_send_message_response(response_body: Dict[str, Any]) ->
         out = {"content": content, "raw_message": msg}
         if "tool_calls" in result:
             out["tool_calls"] = result["tool_calls"]
+        if isinstance(result.get("usage"), dict):
+            out["usage"] = result["usage"]
+        if isinstance(result.get("token_usage"), dict):
+            out["token_usage"] = result["token_usage"]
         return out
 
     # Task response

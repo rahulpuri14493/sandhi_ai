@@ -53,6 +53,19 @@ class Settings(BaseSettings):
     CELERY_WORKER_CONCURRENCY: int = 4
     CELERY_EXECUTE_MAX_RETRIES: int = 3
     CELERY_EXECUTE_RETRY_BACKOFF_SECONDS: int = 5
+    # Execution heartbeat runtime visibility.
+    # Redis live-state defaults to CELERY_BROKER_URL when HEARTBEAT_REDIS_URL is empty.
+    HEARTBEAT_ENABLE_REDIS: bool = True
+    HEARTBEAT_REDIS_URL: str = ""
+    HEARTBEAT_REDIS_TTL_SECONDS: int = 180
+    HEARTBEAT_ENABLE_DB_SNAPSHOT: bool = True
+    HEARTBEAT_DB_MIN_UPDATE_SECONDS: int = 45
+    # Step-level stuck watchdog thresholds (durable DB fallback; independent from Redis liveness).
+    STEP_STUCK_THRESHOLD_SECONDS: int = 600
+    STEP_STUCK_BLOCKED_THRESHOLD_SECONDS: int = 900
+    # Loop detection for stuck diagnosis (adapter/tool loops under heavy load).
+    STEP_LOOP_ROUND_THRESHOLD: int = 10
+    STEP_REPEAT_TOOLCALL_THRESHOLD: int = 6
     # When True, allow agent endpoints that resolve to private/loopback IPs (dev, Docker, same host). Default False in production.
     ALLOW_PRIVATE_AGENT_ENDPOINTS: bool = False
     # Job document storage backend: S3-compatible object storage (default) or local filesystem
@@ -157,6 +170,8 @@ class Settings(BaseSettings):
     # Output quality gates before passing step output downstream.
     AGENT_OUTPUT_REQUIRE_NONEMPTY: bool = True
     AGENT_OUTPUT_MIN_CONFIDENCE: float = 0.0
+    # Use a fixed seed for tool-calling agent rounds to reduce SQL/output drift across identical prompts.
+    AGENT_TOOLCALL_OPENAI_SEED: int = 42
     # --- Tool assignment registry + A2A task envelope ---
     # Absolute path to JSON registry; empty = packaged backend/resources/config/tool_assignment_registry.default.json
     TOOL_ASSIGNMENT_REGISTRY_PATH: str = ""

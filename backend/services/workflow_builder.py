@@ -394,8 +394,8 @@ class WorkflowBuilder:
                 input_data=json.dumps(step_input_data),
                 status="pending",
                 depends_on_previous=depends_on_previous,
-                allowed_platform_tool_ids=json.dumps(step_platform) if step_platform is not None else None,
-                allowed_connection_ids=json.dumps(step_conn) if step_conn is not None else None,
+                allowed_platform_tool_ids=json.dumps(step_platform) if (step_platform is not None and len(step_platform) > 0) else None,
+                allowed_connection_ids=json.dumps(step_conn) if (step_conn is not None and len(step_conn) > 0) else None,
                 tool_visibility=step_visibility,
             )
             self.db.add(step)
