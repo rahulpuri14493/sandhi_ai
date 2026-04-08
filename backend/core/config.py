@@ -60,6 +60,12 @@ class Settings(BaseSettings):
     HEARTBEAT_REDIS_TTL_SECONDS: int = 180
     HEARTBEAT_ENABLE_DB_SNAPSHOT: bool = True
     HEARTBEAT_DB_MIN_UPDATE_SECONDS: int = 45
+    # Signed heartbeat ingestion contract (worker -> internal API).
+    HEARTBEAT_SIGNED_API_ENABLED: bool = True
+    HEARTBEAT_SIGNED_API_VERSION: str = "sandhi.heartbeat.v1"
+    HEARTBEAT_SIGNED_API_SKEW_SECONDS: int = 120
+    HEARTBEAT_NONCE_TTL_SECONDS: int = 300
+    HEARTBEAT_RETENTION_DAYS: int = 30
     # Step-level stuck watchdog thresholds (durable DB fallback; independent from Redis liveness).
     STEP_STUCK_THRESHOLD_SECONDS: int = 600
     STEP_STUCK_BLOCKED_THRESHOLD_SECONDS: int = 900

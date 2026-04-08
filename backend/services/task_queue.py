@@ -3,12 +3,76 @@
 from __future__ import annotations
 
 import logging
+from datetime import datetime, timedelta
 from typing import Optional
 
 from core.config import settings
 from services.business_job_alerts import send_business_job_alert
 
 logger = logging.getLogger(__name__)
+
+
+def cleanup_heartbeat_retention_once() -> dict:
+    """
+    Cleanup durable heartbeat telemetry older than retention window.
+
+    Redis heartbeat and nonce keys already use short TTLs; this task focuses on
+    durable DB snapshot fields on workflow steps to control storage growth.
+    """
+    from db.database import SessionLocal
+    from sqlalchemy import or_
+    from models.job import WorkflowStep
+
+    retention_days = max(1, int(getattr(settings, "HEARTBEAT_RETENTION_DAYS", 30) or 30))
+    cutoff = datetime.utcnow() - timedelta(days=retention_days)
+    db = SessionLocal()
+    cleared = 0
+    try:
+        rows = (
+            db.query(WorkflowStep)
+            .filter(
+                or_(
+                    WorkflowStep.completed_at < cutoff,
+                    WorkflowStep.last_activity_at < cutoff,
+                    WorkflowStep.last_progress_at < cutoff,
+                    WorkflowStep.live_phase_started_at < cutoff,
+                )
+            )
+            .all()
+        )
+        for step in rows:
+            has_live = any(
+                [
+                    getattr(step, "live_phase", None),
+                    getattr(step, "live_phase_started_at", None),
+                    getattr(step, "live_reason_code", None),
+                    getattr(step, "live_reason_detail", None),
+                    getattr(step, "live_trace_id", None),
+                    getattr(step, "live_attempt", None) is not None,
+                    getattr(step, "stuck_since", None),
+                    getattr(step, "stuck_reason", None),
+                ]
+            )
+            if not has_live:
+                continue
+            step.live_phase = None
+            step.live_phase_started_at = None
+            step.live_reason_code = None
+            step.live_reason_detail = None
+            step.live_trace_id = None
+            step.live_attempt = None
+            step.stuck_since = None
+            step.stuck_reason = None
+            cleared += 1
+        if cleared:
+            db.commit()
+        return {"retention_days": retention_days, "cutoff": cutoff.isoformat(), "cleared_steps": int(cleared)}
+    except Exception:
+        db.rollback()
+        logger.exception("heartbeat_retention_cleanup_failed")
+        return {"retention_days": retention_days, "cutoff": cutoff.isoformat(), "cleared_steps": int(cleared), "error": True}
+    finally:
+        db.close()
 
 
 class QueueEnqueueError(RuntimeError):
@@ -49,6 +113,10 @@ if Celery is not None:
         "check-stuck-workflow-steps-every-2-mins": {
             "task": "check_stuck_workflow_steps",
             "schedule": 120.0,
+        },
+        "heartbeat-retention-cleanup-daily": {
+            "task": "cleanup_heartbeat_retention",
+            "schedule": 86400.0,
         },
     }
 
@@ -365,4 +433,14 @@ if celery_app is not None:
             db.rollback()
         finally:
             db.close()
+
+    @celery_app.task(name="cleanup_heartbeat_retention")
+    def _cleanup_heartbeat_retention():
+        result = cleanup_heartbeat_retention_once()
+        logger.info(
+            "heartbeat_retention_cleanup_done retention_days=%s cleared_steps=%s cutoff=%s",
+            result.get("retention_days"),
+            result.get("cleared_steps"),
+            result.get("cutoff"),
+        )
 

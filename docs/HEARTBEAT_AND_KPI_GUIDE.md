@@ -126,6 +126,183 @@ Behavior:
   - Job steps endpoint defaults to compact mode.
   - Single-step endpoint defaults to non-compact mode.
 
+### Signed heartbeat ingestion (versioned contract)
+
+Endpoint:
+
+- `POST /api/internal/execution/jobs/{job_id}/steps/{step_id}/heartbeat`
+
+Purpose:
+
+- Ingest trusted runtime heartbeats from internal execution paths
+- Enforce execution-scoped auth + HMAC integrity + anti-replay
+
+Required headers:
+
+- `x-internal-secret: <MCP_INTERNAL_SECRET>`
+- `x-heartbeat-version: sandhi.heartbeat.v1`
+- `x-heartbeat-key-id: exec_token_v1`
+- `x-heartbeat-timestamp: <unix_epoch_seconds>`
+- `x-heartbeat-nonce: <unique_nonce_per_request>`
+- `x-heartbeat-signature: <hex_hmac_sha256>`
+- `x-execution-token: <job.execution_token>`
+
+Canonical signing string:
+
+```text
+POST
+/api/internal/execution/jobs/{job_id}/steps/{step_id}/heartbeat
+{version}
+{key_id}
+{timestamp}
+{nonce}
+{body_sha256}
+{job_id}
+{workflow_step_id}
+```
+
+Where:
+
+- `body_sha256` is SHA-256 of canonical JSON body (sorted keys, compact separators)
+- signing key is derived from `SECRET_KEY` + execution scope (`job_id`, `execution_token`)
+
+Minimal request body (v1):
+
+```json
+{
+  "phase": "calling_tool",
+  "reason_code": "tool_call_started",
+  "message": "Running SQL tool",
+  "reason_detail": {
+    "tool_name": "platform_1_postgres",
+    "round_idx": 2
+  },
+  "trace_id": "trc_abc123",
+  "attempt": 1,
+  "max_retries": 2,
+  "meaningful_progress": true
+}
+```
+
+Failure semantics:
+
+- `400` invalid contract version / header shape
+- `401` timestamp outside allowed skew window
+- `403` invalid signature or invalid execution scope
+- `409` duplicate nonce (replay detected)
+- `503` replay guard backend unavailable
+
+Python signing example (reference implementation):
+
+```python
+import hashlib
+import hmac
+import json
+import secrets
+import time
+
+import requests
+
+
+def canonical_json_bytes(obj: dict) -> bytes:
+    return json.dumps(
+        obj,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+
+
+def derive_exec_key(secret_key: str, job_id: int, execution_token: str) -> bytes:
+    material = f"hb:{job_id}:{execution_token}".encode("utf-8")
+    return hmac.new(secret_key.encode("utf-8"), material, hashlib.sha256).digest()
+
+
+def sign_heartbeat(
+    *,
+    secret_key: str,
+    method: str,
+    route_path: str,
+    version: str,
+    key_id: str,
+    timestamp: int,
+    nonce: str,
+    body_sha256: str,
+    job_id: int,
+    workflow_step_id: int,
+    execution_token: str,
+) -> str:
+    signing_string = "\n".join(
+        [
+            method.upper(),
+            route_path,
+            version,
+            key_id,
+            str(timestamp),
+            nonce,
+            body_sha256,
+            str(job_id),
+            str(workflow_step_id),
+        ]
+    )
+    key = derive_exec_key(secret_key, job_id, execution_token)
+    return hmac.new(key, signing_string.encode("utf-8"), hashlib.sha256).hexdigest()
+
+
+def send_heartbeat():
+    base_url = "http://localhost:8000"
+    job_id = 42
+    step_id = 301
+    execution_token = "current-exec-token"
+    internal_secret = "mcp-internal-secret"
+    secret_key = "platform-secret-key"
+
+    version = "sandhi.heartbeat.v1"
+    key_id = "exec_token_v1"
+    timestamp = int(time.time())
+    nonce = secrets.token_hex(16)
+    route_path = f"/api/internal/execution/jobs/{job_id}/steps/{step_id}/heartbeat"
+
+    body = {
+        "phase": "calling_tool",
+        "reason_code": "tool_call_started",
+        "message": "Running SQL tool",
+        "reason_detail": {"tool_name": "platform_1_postgres", "round_idx": 2},
+        "meaningful_progress": True,
+    }
+    body_sha256 = hashlib.sha256(canonical_json_bytes(body)).hexdigest()
+    signature = sign_heartbeat(
+        secret_key=secret_key,
+        method="POST",
+        route_path=route_path,
+        version=version,
+        key_id=key_id,
+        timestamp=timestamp,
+        nonce=nonce,
+        body_sha256=body_sha256,
+        job_id=job_id,
+        workflow_step_id=step_id,
+        execution_token=execution_token,
+    )
+
+    headers = {
+        "x-internal-secret": internal_secret,
+        "x-heartbeat-version": version,
+        "x-heartbeat-key-id": key_id,
+        "x-heartbeat-timestamp": str(timestamp),
+        "x-heartbeat-nonce": nonce,
+        "x-heartbeat-signature": signature,
+        "x-execution-token": execution_token,
+        "content-type": "application/json",
+    }
+
+    url = f"{base_url}{route_path}"
+    resp = requests.post(url, headers=headers, json=body, timeout=8)
+    resp.raise_for_status()
+    print(resp.json())
+
+```
+
 ---
 
 ## Example Payloads
@@ -313,6 +490,10 @@ STEP_STUCK_THRESHOLD_SECONDS=600
 STEP_STUCK_BLOCKED_THRESHOLD_SECONDS=900
 STEP_LOOP_ROUND_THRESHOLD=10
 STEP_REPEAT_TOOLCALL_THRESHOLD=6
+HEARTBEAT_SIGNED_API_ENABLED=true
+HEARTBEAT_SIGNED_API_VERSION=sandhi.heartbeat.v1
+HEARTBEAT_SIGNED_API_SKEW_SECONDS=120
+HEARTBEAT_NONCE_TTL_SECONDS=300
 ```
 
 ### Developer KPI webhook
@@ -340,6 +521,28 @@ BUSINESS_KPI_SLA_P95_LATENCY_SECONDS_MAX=45.0
 ```
 
 ---
+
+## Retention Cleanup (Operational)
+
+To keep long-running production data lean, a scheduled cleanup task removes stale
+durable runtime heartbeat fields from `workflow_steps`.
+
+- **Task name**: `cleanup_heartbeat_retention`
+- **Schedule**: daily (Celery beat, every `86400` seconds)
+- **Config**: `HEARTBEAT_RETENTION_DAYS` (default `30`, min `1`)
+- **Scope**: clears old live telemetry snapshot fields:
+  - `live_phase`, `live_phase_started_at`
+  - `live_reason_code`, `live_reason_detail`
+  - `live_trace_id`, `live_attempt`
+  - `stuck_since`, `stuck_reason`
+- **Safety**: recent rows are preserved; short-lived Redis heartbeat keys continue
+  to expire via TTL as before.
+
+Why this helps:
+
+- prevents unbounded growth of stale step-level telemetry
+- keeps dashboards focused on actionable recent runtime context
+- provides a predictable operational retention window for audits and cost control
 
 ## Troubleshooting Playbook
 
