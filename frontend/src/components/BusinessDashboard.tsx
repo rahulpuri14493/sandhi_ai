@@ -1,5 +1,8 @@
 import { useEffect, useRef, useState } from 'react'
 import { dashboardsAPI, jobsAPI, mcpAPI } from '../lib/api'
+import { FlashToast } from './FlashToast'
+import { RerunModeModal } from './RerunModeModal'
+import { formatRerunStartedMessage } from '../lib/rerunFeedback'
 import { getStepOutputDisplayText } from '../lib/formatStepOutput'
 import type { Job } from '../lib/types'
 import { Link, useNavigate } from 'react-router-dom'
@@ -105,6 +108,9 @@ export function BusinessDashboard() {
     } | null
   } | null>(null)
   const [expandedJobId, setExpandedJobId] = useState<number | null>(null)
+  const [rerunJobId, setRerunJobId] = useState<number | null>(null)
+  const [isRerunning, setIsRerunning] = useState(false)
+  const [rerunToast, setRerunToast] = useState<string | null>(null)
   const [searchTerm, setSearchTerm] = useState('')
   const [statusFilter, setStatusFilter] = useState<'all' | Job['status']>('all')
   const [riskFilter, setRiskFilter] = useState<'all' | 'stable' | 'possible_drift'>('all')
@@ -1369,18 +1375,8 @@ export function BusinessDashboard() {
                         </button>
                         {(job.status === 'failed' || job.status === 'cancelled') && (
                           <button
-                            onClick={async () => {
-                              if (window.confirm('Are you sure you want to rerun this job? This will reset the workflow and execute it again.')) {
-                                try {
-                                  await jobsAPI.rerun(job.id)
-                                  loadData()
-                                  navigate(`/jobs/${job.id}`)
-                                } catch (error) {
-                                  console.error('Failed to rerun job:', error)
-                                  alert('Failed to rerun job. Only completed or failed jobs can be rerun.')
-                                }
-                              }
-                            }}
+                            onClick={() => setRerunJobId(job.id)}
+                            disabled={isRerunning}
                             className="px-4 py-2 text-xs font-bold text-white bg-green-500/20 border border-green-500/50 rounded-xl hover:bg-green-500/30 hover:border-green-400 transition-all duration-200 flex items-center gap-2"
                           >
                             <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -1472,6 +1468,29 @@ export function BusinessDashboard() {
           )}
         </div>
       </div>
+      <RerunModeModal
+        isOpen={rerunJobId !== null}
+        isSubmitting={isRerunning}
+        onClose={() => setRerunJobId(null)}
+        onSelect={async (mode) => {
+          if (rerunJobId == null) return
+          const targetJobId = rerunJobId
+          setIsRerunning(true)
+          try {
+            const resp = await jobsAPI.rerun(targetJobId, mode)
+            setRerunJobId(null)
+            setRerunToast(formatRerunStartedMessage(resp))
+            await loadData()
+            navigate(`/jobs/${targetJobId}`)
+          } catch (error) {
+            console.error('Failed to rerun job:', error)
+            setRerunToast('Failed to rerun job. Only completed or failed jobs can be rerun.')
+          } finally {
+            setIsRerunning(false)
+          }
+        }}
+      />
+      <FlashToast message={rerunToast} onDismiss={() => setRerunToast(null)} />
     </div>
   )
 }

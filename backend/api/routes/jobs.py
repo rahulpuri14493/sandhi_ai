@@ -10,7 +10,7 @@ from typing import Any, Dict, List, Optional
 from fastapi import APIRouter, Depends, HTTPException, status, UploadFile, File, Form, Query
 from fastapi.responses import FileResponse, Response, StreamingResponse
 from sqlalchemy.orm import Session
-from pydantic import BaseModel
+from pydantic import BaseModel, model_validator
 from db.database import get_db
 from models.job import Job, JobStatus, WorkflowStep, JobSchedule, ScheduleStatus, ScheduleExecutionHistory, JobPlannerArtifact
 from models.agent import Agent
@@ -1828,8 +1828,22 @@ async def auto_split_workflow(
 
 
 class SuggestWorkflowToolsBody(BaseModel):
-    """Agents in workflow order (same as auto-split). Tool suggestions use platform planner or a deterministic fallback."""
+    """Agents in workflow order (same as auto-split). Optional step_tool_visibility matches agent_ids; else job.tool_visibility applies."""
+
     agent_ids: List[int]
+    step_tool_visibility: Optional[List[str]] = None
+
+    @model_validator(mode="after")
+    def _step_vis_len_matches_agents(self) -> "SuggestWorkflowToolsBody":
+        if self.step_tool_visibility is not None and len(self.step_tool_visibility) != len(self.agent_ids):
+            raise ValueError("step_tool_visibility must have the same length as agent_ids")
+        for v in self.step_tool_visibility or []:
+            if v is None or str(v).strip() == "":
+                continue
+            sv = str(v).strip().lower()
+            if sv not in ("full", "names_only", "none"):
+                raise ValueError("step_tool_visibility values must be full, names_only, or none")
+        return self
 
 
 @router.get("/{job_id}/suggest-workflow-tools", include_in_schema=True)
@@ -1923,24 +1937,36 @@ async def suggest_workflow_tools(
             agents=agents_ordered,
             platform_tools=platform_tools,
             llm_audit=llm_audit,
+            step_tool_visibility=body.step_tool_visibility,
+            job_tool_visibility=getattr(job, "tool_visibility", None),
         )
+    persist_payload: Optional[Dict[str, Any]] = None
     if llm_audit.get("raw_llm_response"):
-        aid = await persist_json_planner_artifact(
-            db,
-            job_id,
-            "tool_suggestion",
-            {
-                "raw_llm_response": llm_audit["raw_llm_response"],
-                "source": llm_audit.get("source"),
-                "job_title": job.title or "",
-                "job_description": job.description or "",
-                "parsed_result": {
-                    "step_suggestions": result.get("step_suggestions"),
-                    "output_contract_stub": result.get("output_contract_stub"),
-                    "fallback_used": result.get("fallback_used"),
-                },
+        persist_payload = {
+            "raw_llm_response": llm_audit["raw_llm_response"],
+            "source": llm_audit.get("source"),
+            "job_title": job.title or "",
+            "job_description": job.description or "",
+            "parsed_result": {
+                "step_suggestions": result.get("step_suggestions"),
+                "output_contract_stub": result.get("output_contract_stub"),
+                "fallback_used": result.get("fallback_used"),
             },
-        )
+        }
+    elif llm_audit.get("persist_tool_suggestion_without_llm"):
+        persist_payload = {
+            "source": llm_audit.get("source"),
+            "detail": "No platform tool suggestions: all workflow steps have tool_visibility=none.",
+            "job_title": job.title or "",
+            "job_description": job.description or "",
+            "parsed_result": {
+                "step_suggestions": result.get("step_suggestions"),
+                "output_contract_stub": result.get("output_contract_stub"),
+                "fallback_used": result.get("fallback_used"),
+            },
+        }
+    if persist_payload is not None:
+        aid = await persist_json_planner_artifact(db, job_id, "tool_suggestion", persist_payload)
         if aid is not None:
             db.commit()
     return result
@@ -2676,15 +2702,20 @@ def update_job_schedule(
 @router.post("/{job_id}/rerun", response_model=RerunResponse)
 def rerun_job(
     job_id: int,
+    mode: Optional[str] = Query(
+        default=None,
+        description="Optional rerun mode override: full (reset all steps) or resume (rerun only non-completed steps).",
+        pattern="^(full|resume)$",
+    ),
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
     """Immediately re-execute a failed or cancelled job ("Run Now" button).
 
     Only available when job status is FAILED or CANCELLED.
-    Behavior is automatic (no input mode required):
-    - Resume from incomplete/failed steps when possible.
-    - Fallback to full rerun when all steps are already completed.
+    Rerun behavior supports both:
+    - Automatic mode (no query param): resume when possible, full fallback if all steps completed.
+    - Explicit mode override: mode=resume or mode=full.
     """
     job = db.query(Job).filter(Job.id == job_id, Job.business_id == current_user.id).first()
     if not job:
@@ -2722,18 +2753,36 @@ def rerun_job(
         .order_by(WorkflowStep.step_order)
         .all()
     )
-    mode_effective = "resume"
     completed_steps = [s for s in steps if s.status == "completed"]
     rerun_steps = [s for s in steps if s.status != "completed"]
-    if not rerun_steps:
+    requested_mode = (mode or "").strip().lower() or None
+    if requested_mode == "full":
         mode_effective = "full"
         resume_start_step_order = 1
         steps_reused_count = 0
         steps_rerun_count = len(steps)
-    else:
+    elif requested_mode == "resume":
+        if not rerun_steps:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="No incomplete workflow steps to resume; use full rerun if needed.",
+            )
+        mode_effective = "resume"
         resume_start_step_order = min(s.step_order for s in rerun_steps)
         steps_reused_count = len(completed_steps)
         steps_rerun_count = len(rerun_steps)
+    else:
+        # Automatic default mode (no query): resume if possible, otherwise full fallback.
+        mode_effective = "resume"
+        if not rerun_steps:
+            mode_effective = "full"
+            resume_start_step_order = 1
+            steps_reused_count = 0
+            steps_rerun_count = len(steps)
+        else:
+            resume_start_step_order = min(s.step_order for s in rerun_steps)
+            steps_reused_count = len(completed_steps)
+            steps_rerun_count = len(rerun_steps)
 
     # Acquire execution claim atomically, then reset steps for re-execution.
     execution_token = uuid.uuid4().hex

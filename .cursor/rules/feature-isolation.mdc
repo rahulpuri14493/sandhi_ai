@@ -1,0 +1,11 @@
+---
+description: Scope control — avoid unrelated regressions when changing one feature
+alwaysApply: true
+---
+
+When implementing or fixing a **single** feature or bug:
+
+- **Touch only what that change requires.** Do not refactor, rename, or reformat unrelated modules, routes, or UI.
+- **Preserve existing behavior** for paths you are not explicitly changing; add tests when the fix crosses layers (API, workflow builder, executor, UI).
+- **Prefer additive, localized changes** (guard clauses, explicit branches) over broad behavior changes that could surprise other workflows.
+- If a fix needs both backend and frontend, keep contracts backward-compatible unless the task explicitly allows breaking changes.

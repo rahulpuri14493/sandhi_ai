@@ -802,18 +802,32 @@ class AgentExecutor:
             job_conn_ids = _parse_allowed_ids(getattr(job, "allowed_connection_ids", None))
             step_platform_ids = _parse_allowed_ids(getattr(step, "allowed_platform_tool_ids", None))
             step_conn_ids = _parse_allowed_ids(getattr(step, "allowed_connection_ids", None))
-            # Step-level empty arrays mean "inherit job scope", not "no tools".
-            if isinstance(step_platform_ids, list) and len(step_platform_ids) == 0:
-                step_platform_ids = None
-            if isinstance(step_conn_ids, list) and len(step_conn_ids) == 0:
-                step_conn_ids = None
-            effective_platform = step_platform_ids if step_platform_ids is not None else job_platform_ids
-            effective_conn = step_conn_ids if step_conn_ids is not None else job_conn_ids
-            if job_platform_ids is not None and effective_platform is not None:
-                effective_platform = [x for x in effective_platform if x in job_platform_ids]
-            if job_conn_ids is not None and effective_conn is not None:
-                effective_conn = [x for x in effective_conn if x in job_conn_ids]
-            tool_visibility = getattr(step, "tool_visibility", None) or getattr(job, "tool_visibility", None) or "full"
+
+            def _norm_tool_visibility(raw: object) -> Optional[str]:
+                if not isinstance(raw, str):
+                    return None
+                s = raw.strip().lower()
+                return s if s in ("full", "names_only", "none") else None
+
+            step_tv_norm = _norm_tool_visibility(getattr(step, "tool_visibility", None))
+            job_tv_norm = _norm_tool_visibility(getattr(job, "tool_visibility", None))
+            tool_visibility = step_tv_norm or job_tv_norm or "full"
+            # Step-level "none" must not inherit job tool lists (otherwise DB null/[] is treated as inherit).
+            if step_tv_norm == "none":
+                effective_platform = []
+                effective_conn = []
+            else:
+                # Step-level empty arrays mean "inherit job scope", not "no tools".
+                if isinstance(step_platform_ids, list) and len(step_platform_ids) == 0:
+                    step_platform_ids = None
+                if isinstance(step_conn_ids, list) and len(step_conn_ids) == 0:
+                    step_conn_ids = None
+                effective_platform = step_platform_ids if step_platform_ids is not None else job_platform_ids
+                effective_conn = step_conn_ids if step_conn_ids is not None else job_conn_ids
+                if job_platform_ids is not None and effective_platform is not None:
+                    effective_platform = [x for x in effective_platform if x in job_platform_ids]
+                if job_conn_ids is not None and effective_conn is not None:
+                    effective_conn = [x for x in effective_conn if x in job_conn_ids]
             has_configured_tool_scope = bool((effective_platform is not None and len(effective_platform) > 0) or (effective_conn is not None and len(effective_conn) > 0))
             if tool_visibility == "none" and has_configured_tool_scope:
                 raise ValueError(

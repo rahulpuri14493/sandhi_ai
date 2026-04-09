@@ -122,6 +122,16 @@ export interface Job {
   scheduled_at?: string | null;
 }
 
+export interface JobRerunResponse {
+  message: string
+  job_id: number
+  status: string
+  mode?: 'resume' | 'full' | string | null
+  resume_start_step_order?: number | null
+  steps_reused_count?: number | null
+  steps_rerun_count?: number | null
+}
+
 export interface WorkflowStep {
   id: number;
   job_id: number;
