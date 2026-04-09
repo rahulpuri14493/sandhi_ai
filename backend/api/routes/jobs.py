@@ -7,7 +7,7 @@ import random
 import uuid
 from pathlib import Path
 from typing import Any, Dict, List, Optional
-from fastapi import APIRouter, Depends, HTTPException, status, UploadFile, File, Form, Query, Request
+from fastapi import APIRouter, Depends, HTTPException, status, UploadFile, File, Form, Query
 from fastapi.responses import FileResponse, Response, StreamingResponse
 from sqlalchemy.orm import Session
 from pydantic import BaseModel
@@ -2676,20 +2676,15 @@ def update_job_schedule(
 @router.post("/{job_id}/rerun", response_model=RerunResponse)
 def rerun_job(
     job_id: int,
-    request: Request,
-    mode: str = Query(
-        default="resume",
-        description="Rerun mode: full (reset all steps) or resume (rerun only non-completed steps).",
-        pattern="^(full|resume)$",
-    ),
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
     """Immediately re-execute a failed or cancelled job ("Run Now" button).
 
     Only available when job status is FAILED or CANCELLED.
-    - full: reset all steps and clear outputs (legacy behavior).
-    - resume: keep completed outputs and rerun only incomplete/failed steps.
+    Behavior is automatic (no input mode required):
+    - Resume from incomplete/failed steps when possible.
+    - Fallback to full rerun when all steps are already completed.
     """
     job = db.query(Job).filter(Job.id == job_id, Job.business_id == current_user.id).first()
     if not job:
@@ -2727,31 +2722,18 @@ def rerun_job(
         .order_by(WorkflowStep.step_order)
         .all()
     )
-    mode_effective = mode
-    if mode == "resume":
-        completed_steps = [s for s in steps if s.status == "completed"]
-        rerun_steps = [s for s in steps if s.status != "completed"]
-        if not rerun_steps:
-            # Default mode is resume. If caller did not explicitly request mode=resume,
-            # auto-fallback to full so "Run now" still works when all steps are completed.
-            explicit_resume = "mode" in request.query_params
-            if explicit_resume:
-                raise HTTPException(
-                    status_code=status.HTTP_400_BAD_REQUEST,
-                    detail="No incomplete workflow steps to resume; use full rerun if needed.",
-                )
-            mode_effective = "full"
-            resume_start_step_order = 1
-            steps_reused_count = 0
-            steps_rerun_count = len(steps)
-        else:
-            resume_start_step_order = min(s.step_order for s in rerun_steps)
-            steps_reused_count = len(completed_steps)
-            steps_rerun_count = len(rerun_steps)
-    else:
+    mode_effective = "resume"
+    completed_steps = [s for s in steps if s.status == "completed"]
+    rerun_steps = [s for s in steps if s.status != "completed"]
+    if not rerun_steps:
+        mode_effective = "full"
         resume_start_step_order = 1
         steps_reused_count = 0
         steps_rerun_count = len(steps)
+    else:
+        resume_start_step_order = min(s.step_order for s in rerun_steps)
+        steps_reused_count = len(completed_steps)
+        steps_rerun_count = len(rerun_steps)
 
     # Acquire execution claim atomically, then reset steps for re-execution.
     execution_token = uuid.uuid4().hex

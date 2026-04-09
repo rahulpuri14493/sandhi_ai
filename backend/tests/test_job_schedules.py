@@ -1109,7 +1109,7 @@ class TestRerunCancelledJob:
 
         with patch("api.routes.jobs.queue_job_execution") as mock_queue:
             resp = client.post(
-                f"/api/jobs/{job.id}/rerun?mode=resume",
+                f"/api/jobs/{job.id}/rerun",
                 headers=_auth_headers(user),
             )
 
@@ -1168,20 +1168,7 @@ class TestRerunCancelledJob:
         assert data["steps_reused_count"] == 1
         assert data["steps_rerun_count"] == 1
 
-    def test_rerun_mode_invalid_rejected(self, schedule_client, db_session):
-        client, user, job = schedule_client
-        dev = _make_user(db_session, UserRole.DEVELOPER)
-        agent = _make_agent(db_session, dev)
-        _make_step(db_session, job, agent)
-        job.status = JobStatus.FAILED
-        db_session.commit()
-        resp = client.post(
-            f"/api/jobs/{job.id}/rerun?mode=bad",
-            headers=_auth_headers(user),
-        )
-        assert resp.status_code == 422
-
-    def test_rerun_full_reports_metadata_counts(self, schedule_client, db_session):
+    def test_rerun_default_reports_resume_metadata_counts(self, schedule_client, db_session):
         client, user, job = schedule_client
         dev = _make_user(db_session, UserRole.DEVELOPER)
         a1 = _make_agent(db_session, dev)
@@ -1209,16 +1196,13 @@ class TestRerunCancelledJob:
         db_session.commit()
 
         with patch("api.routes.jobs.queue_job_execution"):
-            resp = client.post(
-                f"/api/jobs/{job.id}/rerun?mode=full",
-                headers=_auth_headers(user),
-            )
+            resp = client.post(f"/api/jobs/{job.id}/rerun", headers=_auth_headers(user))
         assert resp.status_code == 200
         data = resp.json()
-        assert data["mode"] == "full"
-        assert data["resume_start_step_order"] == 1
-        assert data["steps_reused_count"] == 0
-        assert data["steps_rerun_count"] == 2
+        assert data["mode"] == "resume"
+        assert data["resume_start_step_order"] == 2
+        assert data["steps_reused_count"] == 1
+        assert data["steps_rerun_count"] == 1
 
     def test_rerun_resume_rejects_when_all_steps_completed(self, schedule_client, db_session):
         client, user, job = schedule_client
@@ -1248,8 +1232,11 @@ class TestRerunCancelledJob:
         db_session.commit()
 
         resp = client.post(
-            f"/api/jobs/{job.id}/rerun?mode=resume",
+            f"/api/jobs/{job.id}/rerun",
             headers=_auth_headers(user),
         )
-        assert resp.status_code == 400
-        assert "no incomplete workflow steps" in resp.json()["detail"].lower()
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["mode"] == "full"
+        assert data["steps_reused_count"] == 0
+        assert data["steps_rerun_count"] == 2
