@@ -33,6 +33,17 @@ def test_create_job_rejects_invalid_tool_visibility(client: TestClient, db_sessi
     assert r.status_code == 400
 
 
+def test_suggest_workflow_tools_body_accepts_null_step_visibility_entries():
+    """Null JSON elements per step inherit job.tool_visibility (not 422 from list item typing)."""
+    import api.routes.jobs as jobs_mod
+
+    body = jobs_mod.SuggestWorkflowToolsBody(
+        agent_ids=[1, 2, 3],
+        step_tool_visibility=["full", None, "none"],
+    )
+    assert body.step_tool_visibility == ["full", None, "none"]
+
+
 def test_create_job_rejects_invalid_write_execution_mode(client: TestClient, db_session):
     _, headers = _make_business(db_session)
     r = client.post("/api/jobs", data={"title": "T", "write_execution_mode": "bad"}, headers=headers)

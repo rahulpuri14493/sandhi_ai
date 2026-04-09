@@ -1831,14 +1831,17 @@ class SuggestWorkflowToolsBody(BaseModel):
     """Agents in workflow order (same as auto-split). Optional step_tool_visibility matches agent_ids; else job.tool_visibility applies."""
 
     agent_ids: List[int]
-    step_tool_visibility: Optional[List[str]] = None
+    # Use Optional elements so JSON null per step inherits job.tool_visibility (not rejected before validator).
+    step_tool_visibility: Optional[List[Optional[str]]] = None
 
     @model_validator(mode="after")
     def _step_vis_len_matches_agents(self) -> "SuggestWorkflowToolsBody":
         if self.step_tool_visibility is not None and len(self.step_tool_visibility) != len(self.agent_ids):
             raise ValueError("step_tool_visibility must have the same length as agent_ids")
         for v in self.step_tool_visibility or []:
-            if v is None or str(v).strip() == "":
+            if v is None:
+                continue
+            if not str(v).strip():
                 continue
             sv = str(v).strip().lower()
             if sv not in ("full", "names_only", "none"):
