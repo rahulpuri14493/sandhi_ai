@@ -44,6 +44,7 @@ from models.job import (
     WorkflowStep, ScheduleExecutionHistory,
 )
 from services.agent_executor import AgentExecutor
+from services.business_job_alerts import send_business_job_alert
 from services.task_queue import enqueue_execute_platform_job
 
 from services.task_queue import celery_app, trigger_scheduled_job
@@ -78,6 +79,16 @@ def reset_job_for_execution(db: Session, job: Job):
         step.started_at = None
         step.completed_at = None
         step.cost = 0.0
+        step.last_progress_at = None
+        step.last_activity_at = None
+        step.live_phase = None
+        step.live_phase_started_at = None
+        step.live_reason_code = None
+        step.live_reason_detail = None
+        step.live_trace_id = None
+        step.live_attempt = None
+        step.stuck_since = None
+        step.stuck_reason = None
 
     job.completed_at = None
     job.failure_reason = None
@@ -322,6 +333,17 @@ def _execute_schedule(schedule_id: int):
         schedule.status = ScheduleStatus.INACTIVE
         schedule.next_run_time = None
         db.commit()
+        try:
+            send_business_job_alert(
+                event_type="job_started",
+                job_id=int(job.id),
+                business_id=int(job.business_id),
+                title=str(job.title or f"Job {job.id}"),
+                status="in_progress",
+                stage="execution_started",
+            )
+        except Exception:
+            pass
 
         # Internal cleanup of the scheduler singleton state (task has already fired)
         svc = get_scheduler()
@@ -346,6 +368,17 @@ def _execute_schedule(schedule_id: int):
             history.failure_reason = job.failure_reason
             history.completed_at = datetime.utcnow()
             db.commit()
+            try:
+                send_business_job_alert(
+                    event_type="job_failed",
+                    job_id=int(job.id),
+                    business_id=int(job.business_id),
+                    title=str(job.title or f"Job {job.id}"),
+                    status="failed",
+                    reason=str(job.failure_reason or ""),
+                )
+            except Exception:
+                pass
     except Exception:
         logger.exception("Error executing schedule %s", schedule_id)
         db.rollback()

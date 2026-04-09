@@ -7,12 +7,14 @@ interface JobStatusTrackerProps {
   jobId: number
   job: Job
   onJobUpdate?: () => void
+  focusedStepId?: number
 }
 
-export function JobStatusTracker({ jobId, job: initialJob, onJobUpdate }: JobStatusTrackerProps) {
+export function JobStatusTracker({ jobId, job: initialJob, onJobUpdate, focusedStepId }: JobStatusTrackerProps) {
   const [job, setJob] = useState(initialJob)
   const [isPolling, setIsPolling] = useState(false)
   const [isRerunning, setIsRerunning] = useState(false)
+  const [highlightedStepId, setHighlightedStepId] = useState<number | null>(null)
 
   useEffect(() => {
     if (job.status === 'in_progress') {
@@ -35,6 +37,13 @@ export function JobStatusTracker({ jobId, job: initialJob, onJobUpdate }: JobSta
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [jobId, job.status])
+
+  useEffect(() => {
+    if (!focusedStepId) return
+    setHighlightedStepId(focusedStepId)
+    const timer = window.setTimeout(() => setHighlightedStepId(null), 3000)
+    return () => window.clearTimeout(timer)
+  }, [focusedStepId])
 
   const getStatusBadge = (status: string) => {
     const statusMap: Record<string, { bg: string; text: string; border: string; icon: string }> = {
@@ -161,7 +170,10 @@ export function JobStatusTracker({ jobId, job: initialJob, onJobUpdate }: JobSta
               return (
                 <div
                   key={step.id}
-                  className={`border-2 rounded-2xl p-6 bg-dark-200/30 backdrop-blur-sm hover:shadow-2xl transition-all duration-200 ${getStepBorderColor()}`}
+                  id={`workflow-step-${step.id}`}
+                  className={`border-2 rounded-2xl p-6 bg-dark-200/30 backdrop-blur-sm hover:shadow-2xl transition-all duration-200 ${getStepBorderColor()} ${
+                    highlightedStepId === step.id ? 'ring-2 ring-yellow-400/80 shadow-[0_0_30px_rgba(250,204,21,0.35)] animate-pulse' : ''
+                  }`}
                 >
                   <div className="flex items-center justify-between mb-5">
                     <div className="flex items-center gap-4">

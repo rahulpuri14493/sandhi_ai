@@ -140,6 +140,16 @@ export interface WorkflowStep {
   allowed_connection_ids?: number[] | null;
   /** Override job tool_visibility for this step: full | names_only | none. */
   tool_visibility?: 'full' | 'names_only' | 'none' | null;
+  live_phase?: string | null;
+  live_phase_started_at?: string | null;
+  live_reason_code?: string | null;
+  live_reason_detail?: string | null;
+  live_trace_id?: string | null;
+  live_attempt?: number | null;
+  last_progress_at?: string | null;
+  last_activity_at?: string | null;
+  stuck_since?: string | null;
+  stuck_reason?: string | null;
 }
 
 export interface WorkflowPreview {

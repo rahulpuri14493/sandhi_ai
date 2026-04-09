@@ -106,6 +106,10 @@ def test_external_get_job_with_query_token(client_with_data):
     assert data["status"] == "completed"
     assert len(data["workflow_steps"]) == 1
     assert data["workflow_steps"][0]["agent_name"] == "Test Agent"
+    assert "kpis" in data
+    assert data["kpis"]["steps_total"] == 1
+    assert data["kpis"]["steps_completed"] == 1
+    assert "output_tokens_reported" in data["kpis"]
 
 
 def test_external_get_job_with_header_token(client_with_data):
@@ -151,6 +155,9 @@ def test_external_get_status(client_with_data):
     assert data["id"] == job.id
     assert data["status"] == "completed"
     assert "workflow_steps" in data
+    assert "kpis" in data
+    assert data["kpis"]["steps_total"] == 1
+    assert data["kpis"]["success_rate"] == 1.0
 
 
 @patch("api.routes.external_jobs._get_external_api_key")
