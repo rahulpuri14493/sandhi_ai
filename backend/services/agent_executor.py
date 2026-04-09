@@ -217,6 +217,21 @@ def _parallel_context_for_step(
     return None
 
 
+def _load_step_output_json(step: WorkflowStep) -> Optional[Any]:
+    """Parse persisted output_data JSON for resume mode handoff."""
+    raw = getattr(step, "output_data", None)
+    if not raw:
+        return None
+    if isinstance(raw, (dict, list)):
+        return raw
+    if isinstance(raw, str):
+        try:
+            return json.loads(raw)
+        except (TypeError, json.JSONDecodeError):
+            return None
+    return None
+
+
 # Tool types that fetch text from an external corpus (vector DB, PageIndex, etc.)
 _RETRIEVAL_MCP_TOOL_TYPES = frozenset(
     {"pinecone", "vector_db", "weaviate", "qdrant", "chroma", "elasticsearch", "pageindex"}
@@ -1395,19 +1410,33 @@ class AgentExecutor:
 
                 for wave in waves:
                     wave_sorted = sorted(wave, key=lambda s: s.step_order)
-                    if len(wave_sorted) == 1:
-                        st = wave_sorted[0]
-                        previous_chain_output = await self._execute_one_step_core(
+                    runnable = [st for st in wave_sorted if st.status != "completed"]
+                    wave_outputs: Dict[int, Any] = {}
+                    for st in wave_sorted:
+                        if st.status == "completed":
+                            out = _load_step_output_json(st)
+                            if out is not None:
+                                wave_outputs[st.id] = out
+                    if not runnable:
+                        last_step = wave_sorted[-1]
+                        previous_chain_output = wave_outputs.get(last_step.id, previous_chain_output)
+                        self.db.expire_all()
+                        continue
+                    if len(runnable) == 1:
+                        st = runnable[0]
+                        result = await self._execute_one_step_core(
                             job_id, st.id, previous_chain_output
                         )
+                        wave_outputs[st.id] = result
                     else:
                         async with asyncio.TaskGroup() as tg:
-                            task_objs = [
-                                tg.create_task(_run_step_isolated(st, previous_chain_output))
-                                for st in wave_sorted
-                            ]
-                        results = [t.result() for t in task_objs]
-                        previous_chain_output = results[-1]
+                            task_objs = {
+                                st.id: tg.create_task(_run_step_isolated(st, previous_chain_output))
+                                for st in runnable
+                            }
+                        for st in runnable:
+                            wave_outputs[st.id] = task_objs[st.id].result()
+                    previous_chain_output = wave_outputs.get(wave_sorted[-1].id, previous_chain_output)
                     self.db.expire_all()
 
                 # Mark job as completed

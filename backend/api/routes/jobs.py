@@ -2676,14 +2676,19 @@ def update_job_schedule(
 @router.post("/{job_id}/rerun", response_model=RerunResponse)
 def rerun_job(
     job_id: int,
+    mode: str = Query(
+        default="full",
+        description="Rerun mode: full (reset all steps) or resume (rerun only non-completed steps).",
+        pattern="^(full|resume)$",
+    ),
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
     """Immediately re-execute a failed or cancelled job ("Run Now" button).
 
-    Only available when job status is FAILED or CANCELLED. Resets all workflow
-    steps, transitions to IN_PROGRESS, and triggers execution in a background thread.
-    For "Schedule Again", the frontend uses PUT /schedule with a new scheduled_at.
+    Only available when job status is FAILED or CANCELLED.
+    - full: reset all steps and clear outputs (legacy behavior).
+    - resume: keep completed outputs and rerun only incomplete/failed steps.
     """
     job = db.query(Job).filter(Job.id == job_id, Job.business_id == current_user.id).first()
     if not job:
@@ -2715,7 +2720,29 @@ def rerun_job(
         db.flush()
         history_id = history.id
 
-    # Acquire execution claim atomically, then reset steps for a clean run.
+    steps = (
+        db.query(WorkflowStep)
+        .filter(WorkflowStep.job_id == job.id)
+        .order_by(WorkflowStep.step_order)
+        .all()
+    )
+    if mode == "resume":
+        completed_steps = [s for s in steps if s.status == "completed"]
+        rerun_steps = [s for s in steps if s.status != "completed"]
+        if not rerun_steps:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="No incomplete workflow steps to resume; use full rerun if needed.",
+            )
+        resume_start_step_order = min(s.step_order for s in rerun_steps)
+        steps_reused_count = len(completed_steps)
+        steps_rerun_count = len(rerun_steps)
+    else:
+        resume_start_step_order = 1
+        steps_reused_count = 0
+        steps_rerun_count = len(steps)
+
+    # Acquire execution claim atomically, then reset steps for re-execution.
     execution_token = uuid.uuid4().hex
     transitioned = _transition_job_status_if_current(
         db,
@@ -2733,7 +2760,7 @@ def rerun_job(
         )
 
     db.refresh(job)
-    reset_job_for_execution(db, job)
+    reset_job_for_execution(db, job, mode=mode)
     db.commit()
 
     # Spawn execution thread — job is already IN_PROGRESS
@@ -2761,9 +2788,13 @@ def rerun_job(
         )
 
     return RerunResponse(
-        message="Job re-execution started",
+        message=f"Job re-execution started ({mode})",
         job_id=job.id,
         status=job.status.value,
+        mode=mode,
+        resume_start_step_order=resume_start_step_order,
+        steps_reused_count=steps_reused_count,
+        steps_rerun_count=steps_rerun_count,
     )
 
 
