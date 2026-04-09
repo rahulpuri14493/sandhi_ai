@@ -7,7 +7,7 @@ import random
 import uuid
 from pathlib import Path
 from typing import Any, Dict, List, Optional
-from fastapi import APIRouter, Depends, HTTPException, status, UploadFile, File, Form, Query
+from fastapi import APIRouter, Depends, HTTPException, status, UploadFile, File, Form, Query, Request
 from fastapi.responses import FileResponse, Response, StreamingResponse
 from sqlalchemy.orm import Session
 from pydantic import BaseModel
@@ -2676,8 +2676,9 @@ def update_job_schedule(
 @router.post("/{job_id}/rerun", response_model=RerunResponse)
 def rerun_job(
     job_id: int,
+    request: Request,
     mode: str = Query(
-        default="full",
+        default="resume",
         description="Rerun mode: full (reset all steps) or resume (rerun only non-completed steps).",
         pattern="^(full|resume)$",
     ),
@@ -2726,17 +2727,27 @@ def rerun_job(
         .order_by(WorkflowStep.step_order)
         .all()
     )
+    mode_effective = mode
     if mode == "resume":
         completed_steps = [s for s in steps if s.status == "completed"]
         rerun_steps = [s for s in steps if s.status != "completed"]
         if not rerun_steps:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="No incomplete workflow steps to resume; use full rerun if needed.",
-            )
-        resume_start_step_order = min(s.step_order for s in rerun_steps)
-        steps_reused_count = len(completed_steps)
-        steps_rerun_count = len(rerun_steps)
+            # Default mode is resume. If caller did not explicitly request mode=resume,
+            # auto-fallback to full so "Run now" still works when all steps are completed.
+            explicit_resume = "mode" in request.query_params
+            if explicit_resume:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="No incomplete workflow steps to resume; use full rerun if needed.",
+                )
+            mode_effective = "full"
+            resume_start_step_order = 1
+            steps_reused_count = 0
+            steps_rerun_count = len(steps)
+        else:
+            resume_start_step_order = min(s.step_order for s in rerun_steps)
+            steps_reused_count = len(completed_steps)
+            steps_rerun_count = len(rerun_steps)
     else:
         resume_start_step_order = 1
         steps_reused_count = 0
@@ -2760,7 +2771,7 @@ def rerun_job(
         )
 
     db.refresh(job)
-    reset_job_for_execution(db, job, mode=mode)
+    reset_job_for_execution(db, job, mode=mode_effective)
     db.commit()
 
     # Spawn execution thread — job is already IN_PROGRESS
@@ -2788,10 +2799,10 @@ def rerun_job(
         )
 
     return RerunResponse(
-        message=f"Job re-execution started ({mode})",
+        message=f"Job re-execution started ({mode_effective})",
         job_id=job.id,
         status=job.status.value,
-        mode=mode,
+        mode=mode_effective,
         resume_start_step_order=resume_start_step_order,
         steps_reused_count=steps_reused_count,
         steps_rerun_count=steps_rerun_count,

@@ -1130,6 +1130,44 @@ class TestRerunCancelledJob:
         assert s3.status == "pending"
         assert s3.output_data is None
 
+    def test_rerun_default_mode_is_resume(self, schedule_client, db_session):
+        client, user, job = schedule_client
+        dev = _make_user(db_session, UserRole.DEVELOPER)
+        a1 = _make_agent(db_session, dev)
+        a2 = _make_agent(db_session, dev)
+        s1 = WorkflowStep(
+            job_id=job.id,
+            agent_id=a1.id,
+            step_order=1,
+            status="completed",
+            output_data='{"ok":1}',
+            input_data="{}",
+            depends_on_previous=True,
+        )
+        s2 = WorkflowStep(
+            job_id=job.id,
+            agent_id=a2.id,
+            step_order=2,
+            status="failed",
+            output_data='{"old":"x"}',
+            input_data="{}",
+            depends_on_previous=True,
+        )
+        db_session.add_all([s1, s2])
+        job.status = JobStatus.FAILED
+        db_session.commit()
+
+        with patch("api.routes.jobs.queue_job_execution"):
+            resp = client.post(
+                f"/api/jobs/{job.id}/rerun",
+                headers=_auth_headers(user),
+            )
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["mode"] == "resume"
+        assert data["steps_reused_count"] == 1
+        assert data["steps_rerun_count"] == 1
+
     def test_rerun_mode_invalid_rejected(self, schedule_client, db_session):
         client, user, job = schedule_client
         dev = _make_user(db_session, UserRole.DEVELOPER)
