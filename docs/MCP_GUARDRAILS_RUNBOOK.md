@@ -101,3 +101,15 @@ Alert suggestion:
 
 - Use tenant tiers (`bronze/silver/gold`) for controlled capacity rollout.
 - Per-tool policies should be the first tuning lever for persistent hotspots.
+
+## Load-Test Harness (500 Concurrency)
+
+Run from repo root:
+
+`python backend/scripts/load_test_mcp_guardrails.py --concurrency 500 --total-requests 3000 --distinct-tools 10 --slo-min-success-rate 0.99 --slo-max-p95-seconds 2.5 --slo-max-quota-exceeded-ratio 0.03`
+
+Notes:
+
+- Returns exit code `0` on SLO pass, `2` on SLO fail.
+- Tune `--distinct-tools` to model same-tool contention (lower means hotter targets).
+- Tune `--write-every` to increase/decrease write-like call share.
