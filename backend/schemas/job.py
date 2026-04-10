@@ -155,6 +155,10 @@ class RerunResponse(BaseModel):
     message: str
     job_id: int
     status: str
+    mode: Optional[str] = None
+    resume_start_step_order: Optional[int] = None
+    steps_reused_count: Optional[int] = None
+    steps_rerun_count: Optional[int] = None
 
 
 def _parse_int_list(v):

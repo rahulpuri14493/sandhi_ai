@@ -203,6 +203,73 @@ async def test_single_step_job_completes(db_session):
 
 
 @pytest.mark.asyncio
+async def test_resume_skips_completed_step_and_preserves_chain_output(db_session):
+    job, steps, _ = _create_job_with_steps(db_session, depends_on_previous_list=[True, True])
+    steps[0].status = "completed"
+    steps[0].output_data = json.dumps({"from_completed": True})
+    db_session.commit()
+
+    calls = []
+
+    async def fake_core(self, job_id, step_id, prev):
+        calls.append((step_id, prev))
+        return {"executed_step": step_id}
+
+    with patch.object(AgentExecutor, "_execute_one_step_core", new=fake_core):
+        executor = AgentExecutor(db_session)
+        await executor.execute_job(job.id)
+
+    assert len(calls) == 1
+    assert calls[0][0] == steps[1].id
+    assert calls[0][1] == {"from_completed": True}
+    db_session.refresh(job)
+    assert job.status == JobStatus.COMPLETED
+
+
+@pytest.mark.asyncio
+async def test_resume_mixed_wave_runs_only_incomplete_steps_in_wave(db_session):
+    # Waves: [step1], [step2, step3]
+    job, steps, _ = _create_job_with_steps(db_session, depends_on_previous_list=[True, True, False])
+    steps[1].status = "completed"
+    steps[1].output_data = json.dumps({"already_done": 2})
+    db_session.commit()
+
+    calls = []
+
+    async def fake_core(self, job_id, step_id, prev):
+        calls.append(step_id)
+        return {"executed_step": step_id}
+
+    with patch.object(AgentExecutor, "_execute_one_step_core", new=fake_core):
+        executor = AgentExecutor(db_session)
+        await executor.execute_job(job.id)
+
+    # step1 and step3 execute; completed step2 is skipped.
+    assert calls == [steps[0].id, steps[2].id]
+    db_session.refresh(job)
+    assert job.status == JobStatus.COMPLETED
+
+
+@pytest.mark.asyncio
+async def test_execute_job_all_steps_completed_does_not_reexecute(db_session):
+    job, steps, _ = _create_job_with_steps(db_session, depends_on_previous_list=[True, True])
+    for st in steps:
+        st.status = "completed"
+        st.output_data = json.dumps({"done": st.id})
+    db_session.commit()
+
+    async def should_not_run(self, job_id, step_id, prev):
+        raise AssertionError("completed steps should not be re-executed")
+
+    with patch.object(AgentExecutor, "_execute_one_step_core", new=should_not_run):
+        executor = AgentExecutor(db_session)
+        await executor.execute_job(job.id)
+
+    db_session.refresh(job)
+    assert job.status == JobStatus.COMPLETED
+
+
+@pytest.mark.asyncio
 async def test_parallel_wave_invokes_core_concurrently(db_session):
     """Two independent steps in one wave should start both cores before either long sleep ends."""
     job, s1, s2 = _minimal_job_with_two_independent_steps(db_session)
