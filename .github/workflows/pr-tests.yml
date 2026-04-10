@@ -112,6 +112,45 @@ jobs:
         run: |
           pytest --cov=. --cov-report=term-missing --cov-fail-under=76 -v
 
+  backend-redis-integration:
+    name: Backend Redis integration tests
+    runs-on: ubuntu-latest
+    env:
+      SECRET_KEY: ci-secret-key
+      OBJECT_STORAGE_BACKEND: local
+      MCP_GUARDRAILS_DISTRIBUTED_ENABLED: "true"
+      MCP_GUARDRAILS_REDIS_URL: redis://localhost:6379/15
+    services:
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 20
+    defaults:
+      run:
+        working-directory: backend
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run redis-backed MCP integration tests
+        run: |
+          pytest tests/integration/test_mcp_guardrails_redis_integration.py -m redis_integration -v --tb=short
+
   platform-mcp-tests:
     name: Platform MCP server tests (unit + integration + e2e)
     runs-on: ubuntu-latest

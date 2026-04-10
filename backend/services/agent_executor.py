@@ -710,11 +710,15 @@ class AgentExecutor:
         extra_headers.update(self._sandhi_mcp_correlation_headers())
         guard = get_mcp_guardrails()
         target_key = f"platform:{settings.PLATFORM_MCP_SERVER_URL.rstrip('/')}:/mcp:{tool_name}"
+        tenant_tier = self._resolve_business_tier(int(business_id))
         return await guard.call_tool_with_guardrails(
             business_id=int(business_id),
             target_key=target_key,
             timeout_seconds=timeout,
             operation_class="write_like",
+            tool_name=tool_name,
+            tenant_tier=tenant_tier,
+            idempotency_key=str(arguments.get("idempotency_key") or ""),
             execute_call=lambda bounded_timeout: mcp_call_tool(
                 base_url=settings.PLATFORM_MCP_SERVER_URL.rstrip("/"),
                 tool_name=tool_name,
@@ -2445,6 +2449,7 @@ END DOCUMENT {i+1}: {doc_name}
             xh = self._sandhi_mcp_correlation_headers()
             guard = get_mcp_guardrails()
             target_key = f"external:{meta.get('connection_id')}:{conn.base_url.rstrip('/')}:{conn.endpoint_path or '/mcp'}:{ext_name}"
+            tenant_tier = self._resolve_business_tier(int(business_id))
             try:
                 logger.info(
                     "byo_mcp_tools_call connection_id=%s tool=%s job_id=%s workflow_step_id=%s trace_id=%s",
@@ -2459,6 +2464,9 @@ END DOCUMENT {i+1}: {doc_name}
                     target_key=target_key,
                     timeout_seconds=timeout,
                     operation_class=self._infer_mcp_operation_class(ext_name, arguments or {}),
+                    tool_name=ext_name,
+                    tenant_tier=tenant_tier,
+                    idempotency_key=str((arguments or {}).get("idempotency_key") or ""),
                     execute_call=lambda bounded_timeout: mcp_call_tool(
                         base_url=conn.base_url.rstrip("/"),
                         tool_name=ext_name,
@@ -2613,6 +2621,7 @@ END DOCUMENT {i+1}: {doc_name}
         timeout = float(getattr(settings, "MCP_TOOL_DEFAULT_TIMEOUT_SECONDS", 60.0))
         target_key = f"platform:{base}:/mcp:{tool_name}"
         operation_class = self._infer_mcp_operation_class(tool_name, arguments)
+        tenant_tier = self._resolve_business_tier(int(business_id))
         try:
             logger.info(
                 "platform_mcp_tools_call tool_name=%s business_id=%s job_id=%s workflow_step_id=%s trace_id=%s",
@@ -2627,6 +2636,9 @@ END DOCUMENT {i+1}: {doc_name}
                 target_key=target_key,
                 timeout_seconds=timeout,
                 operation_class=operation_class,
+                tool_name=tool_name,
+                tenant_tier=tenant_tier,
+                idempotency_key=str((arguments or {}).get("idempotency_key") or ""),
                 execute_call=lambda bounded_timeout: mcp_call_tool(
                     base_url=base,
                     tool_name=tool_name,
@@ -2673,6 +2685,18 @@ END DOCUMENT {i+1}: {doc_name}
         ):
             return "write_like"
         return "read_like"
+
+    def _resolve_business_tier(self, business_id: int) -> str:
+        try:
+            raw = str(getattr(settings, "MCP_BUSINESS_TIER_BY_ID_JSON", "{}") or "{}")
+            mapping = json.loads(raw)
+            if isinstance(mapping, dict):
+                v = str(mapping.get(str(int(business_id))) or "").strip().lower()
+                if v in {"bronze", "silver", "gold"}:
+                    return v
+        except Exception:
+            pass
+        return str(getattr(settings, "MCP_DEFAULT_BUSINESS_TIER", "bronze") or "bronze").strip().lower()
 
     def _log_action(self, entity_type: str, entity_id: int, action: str, details: Dict[str, Any]):
         """Log an action to the audit log"""

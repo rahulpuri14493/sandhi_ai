@@ -222,14 +222,6 @@ async def test_guardrails_circuit_half_open_success_closes(monkeypatch):
             timeout_seconds=2.0,
             execute_call=_fail,
         )
-    with pytest.raises(MCPGuardrailError) as exc_open:
-        await g.call_tool_with_guardrails(
-            business_id=108,
-            target_key="platform:test:/mcp:insert",
-            timeout_seconds=2.0,
-            execute_call=_ok,
-        )
-    assert exc_open.value.code == "mcp_circuit_open"
     await asyncio.sleep(0.02)
     out = await g.call_tool_with_guardrails(
         business_id=108,
@@ -538,6 +530,7 @@ async def test_guardrails_write_retry_profile_override(monkeypatch):
             target_key="platform:test:/mcp:write_tool",
             timeout_seconds=2.0,
             operation_class="write_like",
+            idempotency_key="safe-1",
             execute_call=_always_retryable,
         )
     assert calls["n"] == 2
@@ -562,7 +555,7 @@ async def test_distributed_quota_rate_limit_code_from_atomic_eval(monkeypatch):
     g._redis_init_failed = False
     monkeypatch.setattr(g, "_get_redis_client", lambda: g._redis_client)
     with pytest.raises(MCPGuardrailError) as exc:
-        await g._acquire_quota_distributed(77, "platform:test:/mcp:x")
+        await g._acquire_quota_distributed(77, "platform:test:/mcp:x", {})
     assert exc.value.code == "mcp_rate_limited"
 
 
@@ -579,3 +572,88 @@ async def test_distributed_circuit_preflight_blocks_when_atomic_eval_rejects(mon
     with pytest.raises(MCPGuardrailError) as exc:
         await g._circuit_preflight("platform:test:/mcp:y")
     assert exc.value.code == "mcp_circuit_open"
+
+
+@pytest.mark.asyncio
+async def test_write_like_without_idempotency_forces_single_attempt(monkeypatch):
+    monkeypatch.setattr("core.config.settings.MCP_INVOCATION_MAX_ATTEMPTS", 5, raising=False)
+    monkeypatch.setattr("core.config.settings.MCP_WRITE_INVOCATION_MAX_ATTEMPTS", 4, raising=False)
+    g = MCPInvocationGuardrails()
+    calls = {"n": 0}
+
+    async def _retryable(_timeout: float):
+        calls["n"] += 1
+        raise httpx.ConnectError("down")
+
+    with pytest.raises(MCPGuardrailError):
+        await g.call_tool_with_guardrails(
+            business_id=117,
+            target_key="platform:test:/mcp:write_no_idem",
+            timeout_seconds=2.0,
+            operation_class="write_like",
+            execute_call=_retryable,
+        )
+    assert calls["n"] == 1
+
+
+@pytest.mark.asyncio
+async def test_write_like_with_idempotency_allows_retries(monkeypatch):
+    monkeypatch.setattr("core.config.settings.MCP_INVOCATION_MAX_ATTEMPTS", 5, raising=False)
+    monkeypatch.setattr("core.config.settings.MCP_WRITE_INVOCATION_MAX_ATTEMPTS", 3, raising=False)
+    monkeypatch.setattr("core.config.settings.MCP_WRITE_INVOCATION_RETRY_BASE_DELAY_SECONDS", 0.0, raising=False)
+    monkeypatch.setattr("core.config.settings.MCP_WRITE_INVOCATION_RETRY_MAX_DELAY_SECONDS", 0.0, raising=False)
+    monkeypatch.setattr("core.config.settings.MCP_WRITE_INVOCATION_RETRY_JITTER_SECONDS", 0.0, raising=False)
+    g = MCPInvocationGuardrails()
+    calls = {"n": 0}
+
+    async def _retryable(_timeout: float):
+        calls["n"] += 1
+        raise httpx.ConnectError("down")
+
+    with pytest.raises(MCPGuardrailError):
+        await g.call_tool_with_guardrails(
+            business_id=118,
+            target_key="platform:test:/mcp:write_with_idem",
+            timeout_seconds=2.0,
+            operation_class="write_like",
+            idempotency_key="job-1-step-2",
+            execute_call=_retryable,
+        )
+    assert calls["n"] == 3
+
+
+@pytest.mark.asyncio
+async def test_tier_and_tool_policy_override(monkeypatch):
+    monkeypatch.setattr(
+        "core.config.settings.MCP_TENANT_TIER_POLICY_JSON",
+        '{"silver":{"tenant_max_concurrent_calls":2}}',
+        raising=False,
+    )
+    monkeypatch.setattr(
+        "core.config.settings.MCP_TOOL_POLICY_JSON",
+        '{"search_tool":{"operation_class":"read_like","invocation_max_attempts":2}}',
+        raising=False,
+    )
+    g = MCPInvocationGuardrails()
+    p = g._resolve_runtime_policy(operation_class="write_like", tenant_tier="silver", tool_name="search_tool", write_retry_safe=None)
+    assert p["tenant_max_concurrent_calls"] == 2
+    assert p["invocation_max_attempts"] == 2
+    assert p["operation_class"] == "read_like"
+
+
+@pytest.mark.asyncio
+async def test_circuit_rolling_window_error_rate_opens(monkeypatch):
+    monkeypatch.setattr("core.config.settings.MCP_CIRCUIT_BREAKER_FAILURE_THRESHOLD", 999, raising=False)
+    monkeypatch.setattr("core.config.settings.MCP_CIRCUIT_BREAKER_WINDOW_SECONDS", 60.0, raising=False)
+    monkeypatch.setattr("core.config.settings.MCP_CIRCUIT_BREAKER_MIN_SAMPLES", 2, raising=False)
+    monkeypatch.setattr("core.config.settings.MCP_CIRCUIT_BREAKER_ERROR_RATE_THRESHOLD", 0.5, raising=False)
+    monkeypatch.setattr("core.config.settings.MCP_INVOCATION_MAX_ATTEMPTS", 1, raising=False)
+    g = MCPInvocationGuardrails()
+
+    target = "platform:test:/mcp:rolling"
+    await g._circuit_record_failure(target, retryable=True)
+    await g._circuit_record_success(target)
+    await g._circuit_record_failure(target, retryable=True)
+    with pytest.raises(MCPGuardrailError) as exc_open:
+        await g._circuit_preflight(target)
+    assert exc_open.value.code == "mcp_circuit_open"

@@ -1,6 +1,8 @@
 import asyncio
+import json
 import random
 import time
+import uuid
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable, Dict, Literal, Optional
 
@@ -8,6 +10,7 @@ import httpx
 
 from core.config import settings
 from services.mcp_client import MCPJSONRPCError
+from services.mcp_metrics import increment_event, observe_duration
 
 import logging
 
@@ -44,6 +47,7 @@ class MCPInvocationGuardrails:
         self._target_inflight: Dict[str, int] = {}
         self._tenant_window: Dict[int, tuple[float, int]] = {}
         self._breakers: Dict[str, Dict[str, Any]] = {}
+        self._fair_queue_local: Dict[str, list[str]] = {}
         self._redis_client: Any = None
         self._redis_init_failed = False
         self._redis_error_logged = False
@@ -115,6 +119,18 @@ end
 return 1
 """
 
+    _LUA_FAIR_QUEUE_NEXT = """
+local queue_key = KEYS[1]
+local token = ARGV[1]
+local now = tonumber(ARGV[2]) or 0
+local stale_before = tonumber(ARGV[3]) or 0
+redis.call("ZREMRANGEBYSCORE", queue_key, 0, stale_before)
+local head = redis.call("ZRANGE", queue_key, 0, 0)
+if not head or #head == 0 then return 0 end
+if head[1] == token then return 1 end
+return 0
+"""
+
     @staticmethod
     def _redis_prefix() -> str:
         return (getattr(settings, "MCP_GUARDRAILS_REDIS_PREFIX", None) or "sandhi:mcp_guardrails:v1").strip()
@@ -160,6 +176,39 @@ return 1
         if not self._redis_error_logged:
             logger.warning("mcp_guardrails: disabling distributed mode after redis error in %s", context)
             self._redis_error_logged = True
+
+    @staticmethod
+    def _parse_json_map(raw: str) -> Dict[str, Any]:
+        try:
+            parsed = json.loads(raw or "{}")
+            if isinstance(parsed, dict):
+                return parsed
+        except Exception:
+            pass
+        return {}
+
+    def _resolve_runtime_policy(
+        self,
+        *,
+        operation_class: str,
+        tenant_tier: Optional[str],
+        tool_name: Optional[str],
+        write_retry_safe: Optional[bool],
+    ) -> Dict[str, Any]:
+        tier_name = str(tenant_tier or getattr(settings, "MCP_DEFAULT_BUSINESS_TIER", "bronze") or "bronze").strip().lower()
+        tier_map = self._parse_json_map(getattr(settings, "MCP_TENANT_TIER_POLICY_JSON", "{}"))
+        tool_map = self._parse_json_map(getattr(settings, "MCP_TOOL_POLICY_JSON", "{}"))
+        tool_key = str(tool_name or "").strip()
+        policy: Dict[str, Any] = {}
+        if isinstance(tier_map.get(tier_name), dict):
+            policy.update(tier_map[tier_name])
+        if tool_key and isinstance(tool_map.get(tool_key), dict):
+            policy.update(tool_map[tool_key])
+        if write_retry_safe is not None:
+            policy["write_retry_safe"] = bool(write_retry_safe)
+        if "operation_class" not in policy:
+            policy["operation_class"] = operation_class
+        return policy
 
     @staticmethod
     def _bounded_timeout(timeout_seconds: Optional[float]) -> float:
@@ -242,6 +291,8 @@ return 1
             return f"{p}:inflight:tenant:{business_id}"
         if kind == "target":
             return f"{p}:inflight:target:{target_key}"
+        if kind == "queue":
+            return f"{p}:queue:target:{target_key}"
         return f"{p}:inflight:unknown:{business_id}:{target_key}"
 
     def _redis_rate_key(self, business_id: int, now_epoch_seconds: float) -> str:
@@ -249,19 +300,50 @@ return 1
         minute_bucket = int(now_epoch_seconds // 60)
         return f"{p}:rate:tenant:{business_id}:{minute_bucket}"
 
-    async def _acquire_quota_distributed(self, business_id: int, target_key: str) -> bool:
+    async def _acquire_quota_distributed(self, business_id: int, target_key: str, policy: Dict[str, Any]) -> bool:
         r = self._get_redis_client()
         if r is None:
             return False
-        tenant_limit = int(getattr(settings, "MCP_TENANT_MAX_CONCURRENT_CALLS", 0) or 0)
-        target_limit = int(getattr(settings, "MCP_TARGET_MAX_CONCURRENT_CALLS", 0) or 0)
-        rpm_limit = int(getattr(settings, "MCP_TENANT_RATE_LIMIT_PER_MINUTE", 0) or 0)
+        tenant_limit = int(policy.get("tenant_max_concurrent_calls") or getattr(settings, "MCP_TENANT_MAX_CONCURRENT_CALLS", 0) or 0)
+        target_limit = int(policy.get("target_max_concurrent_calls") or getattr(settings, "MCP_TARGET_MAX_CONCURRENT_CALLS", 0) or 0)
+        rpm_limit = int(policy.get("tenant_rate_limit_per_minute") or getattr(settings, "MCP_TENANT_RATE_LIMIT_PER_MINUTE", 0) or 0)
         wait_s = float(getattr(settings, "MCP_CONCURRENCY_WAIT_SECONDS", 10.0) or 10.0)
         counter_ttl = int(getattr(settings, "MCP_GUARDRAILS_COUNTER_TTL_SECONDS", 120) or 120)
+        fair_enabled = bool(getattr(settings, "MCP_GUARDRAILS_FAIR_QUEUE_ENABLED", False))
+        fair_stale = float(getattr(settings, "MCP_GUARDRAILS_FAIR_QUEUE_STALE_SECONDS", 30.0) or 30.0)
+        queue_key = self._redis_counter_key("queue", business_id, target_key)
+        queue_token = f"{time.time():.6f}:{uuid.uuid4().hex}"
+        enqueued = False
         deadline = time.monotonic() + max(0.0, wait_s)
         while True:
             now = time.monotonic()
             epoch_now = time.time()
+            if fair_enabled:
+                if not enqueued:
+                    try:
+                        r.zadd(queue_key, {queue_token: epoch_now})
+                        enqueued = True
+                    except Exception:
+                        self._disable_distributed_due_error("fair_queue_enqueue")
+                        return False
+                try:
+                    can_try = int(r.eval(self._LUA_FAIR_QUEUE_NEXT, 1, queue_key, queue_token, float(epoch_now), float(epoch_now - fair_stale)))
+                except Exception:
+                    self._disable_distributed_due_error("fair_queue_next")
+                    return False
+                if can_try != 1:
+                    if now >= deadline:
+                        try:
+                            r.zrem(queue_key, queue_token)
+                        except Exception:
+                            pass
+                        raise MCPGuardrailError(
+                            "mcp_quota_exceeded",
+                            f"MCP concurrency saturated for tenant={business_id} target={target_key}",
+                            retryable=True,
+                        )
+                    await asyncio.sleep(min(0.05, max(0.005, deadline - now)))
+                    continue
             tenant_key = self._redis_counter_key("tenant", business_id, target_key)
             target_counter_key = self._redis_counter_key("target", business_id, target_key)
             rate_key = self._redis_rate_key(business_id, epoch_now)
@@ -283,10 +365,25 @@ return 1
                 self._disable_distributed_due_error("quota_admission")
                 return False
             if admit_code == 1:
+                if fair_enabled:
+                    try:
+                        r.zrem(queue_key, queue_token)
+                    except Exception:
+                        pass
                 return True
             if admit_code == -1:
+                if fair_enabled:
+                    try:
+                        r.zrem(queue_key, queue_token)
+                    except Exception:
+                        pass
                 raise MCPGuardrailError("mcp_rate_limited", f"Tenant {business_id} exceeded MCP rate limit", retryable=True)
             if now >= deadline:
+                if fair_enabled:
+                    try:
+                        r.zrem(queue_key, queue_token)
+                    except Exception:
+                        pass
                 raise MCPGuardrailError(
                     "mcp_quota_exceeded",
                     f"MCP concurrency saturated for tenant={business_id} target={target_key}",
@@ -294,14 +391,14 @@ return 1
                 )
             await asyncio.sleep(min(0.05, max(0.005, deadline - now)))
 
-    async def _acquire_quota(self, business_id: int, target_key: str) -> None:
+    async def _acquire_quota(self, business_id: int, target_key: str, policy: Dict[str, Any]) -> None:
         # Prefer distributed guardrails when configured and Redis is reachable.
-        used_distributed = await self._acquire_quota_distributed(business_id, target_key)
+        used_distributed = await self._acquire_quota_distributed(business_id, target_key, policy)
         if used_distributed:
             return
-        tenant_limit = int(getattr(settings, "MCP_TENANT_MAX_CONCURRENT_CALLS", 0) or 0)
-        target_limit = int(getattr(settings, "MCP_TARGET_MAX_CONCURRENT_CALLS", 0) or 0)
-        rpm_limit = int(getattr(settings, "MCP_TENANT_RATE_LIMIT_PER_MINUTE", 0) or 0)
+        tenant_limit = int(policy.get("tenant_max_concurrent_calls") or getattr(settings, "MCP_TENANT_MAX_CONCURRENT_CALLS", 0) or 0)
+        target_limit = int(policy.get("target_max_concurrent_calls") or getattr(settings, "MCP_TARGET_MAX_CONCURRENT_CALLS", 0) or 0)
+        rpm_limit = int(policy.get("tenant_rate_limit_per_minute") or getattr(settings, "MCP_TENANT_RATE_LIMIT_PER_MINUTE", 0) or 0)
         wait_s = float(getattr(settings, "MCP_CONCURRENCY_WAIT_SECONDS", 10.0) or 10.0)
         deadline = time.monotonic() + max(0.0, wait_s)
         while True:
@@ -429,7 +526,14 @@ return 1
         if r is not None:
             p = self._redis_prefix()
             key = f"{p}:breaker:{target_key}"
+            now = time.monotonic()
+            window_s = float(getattr(settings, "MCP_CIRCUIT_BREAKER_WINDOW_SECONDS", 60.0) or 60.0)
+            start = float(r.hget(key, "window_start") or 0.0)
+            if start <= 0.0 or (now - start) >= window_s:
+                start = now
+                r.hset(key, mapping={"window_start": start, "window_total": 0, "window_failures": 0})
             r.hset(key, mapping={"state": "closed", "failures": 0, "half_open_probes": 0})
+            r.hincrby(key, "window_total", 1)
             r.expire(key, int(getattr(settings, "MCP_GUARDRAILS_BREAKER_TTL_SECONDS", 300) or 300))
             return
         async with self._lock:
@@ -440,6 +544,14 @@ return 1
             st["state"] = "closed"
             st["failures"] = 0
             st["half_open_probes"] = 0
+            now = time.monotonic()
+            window_s = float(getattr(settings, "MCP_CIRCUIT_BREAKER_WINDOW_SECONDS", 60.0) or 60.0)
+            start = float(st.get("window_start", 0.0) or 0.0)
+            if start <= 0.0 or (now - start) >= window_s:
+                st["window_start"] = now
+                st["window_total"] = 0
+                st["window_failures"] = 0
+            st["window_total"] = int(st.get("window_total", 0) or 0) + 1
 
     async def _circuit_record_failure(self, target_key: str, *, retryable: bool) -> None:
         r = self._get_redis_client()
@@ -447,26 +559,45 @@ return 1
             p = self._redis_prefix()
             key = f"{p}:breaker:{target_key}"
             threshold = int(getattr(settings, "MCP_CIRCUIT_BREAKER_FAILURE_THRESHOLD", 5) or 5)
+            min_samples = int(getattr(settings, "MCP_CIRCUIT_BREAKER_MIN_SAMPLES", 10) or 10)
+            error_rate_threshold = float(getattr(settings, "MCP_CIRCUIT_BREAKER_ERROR_RATE_THRESHOLD", 0.5) or 0.5)
+            window_s = float(getattr(settings, "MCP_CIRCUIT_BREAKER_WINDOW_SECONDS", 60.0) or 60.0)
             open_secs = float(getattr(settings, "MCP_CIRCUIT_BREAKER_OPEN_SECONDS", 30.0) or 30.0)
             now = time.monotonic()
             raw_state = r.hget(key, "state")
             state = raw_state.decode() if isinstance(raw_state, (bytes, bytearray)) else (raw_state or "closed")
+            win_start_raw = r.hget(key, "window_start")
+            try:
+                win_start = float(win_start_raw.decode() if isinstance(win_start_raw, (bytes, bytearray)) else (win_start_raw or 0.0))
+            except Exception:
+                win_start = 0.0
+            if win_start <= 0.0 or (now - win_start) >= window_s:
+                r.hset(key, mapping={"window_start": now, "window_total": 0, "window_failures": 0})
             if state == "half_open" and retryable:
                 r.hset(key, mapping={"state": "open", "opened_until": now + open_secs, "half_open_probes": 0})
                 r.hincrby(key, "failures", 1)
+                r.hincrby(key, "window_total", 1)
+                r.hincrby(key, "window_failures", 1)
                 r.expire(key, int(getattr(settings, "MCP_GUARDRAILS_BREAKER_TTL_SECONDS", 300) or 300))
                 return
             if not retryable:
                 if state == "half_open":
                     r.hset(key, mapping={"state": "closed", "half_open_probes": 0})
+                r.hincrby(key, "window_total", 1)
                 return
             failures = int(r.hincrby(key, "failures", 1))
-            if failures >= max(1, threshold):
+            window_total = int(r.hincrby(key, "window_total", 1))
+            window_failures = int(r.hincrby(key, "window_failures", 1))
+            error_rate_open = window_total >= max(1, min_samples) and (window_failures / max(1, window_total)) >= error_rate_threshold
+            if failures >= max(1, threshold) or error_rate_open:
                 r.hset(key, mapping={"state": "open", "opened_until": now + open_secs, "half_open_probes": 0})
             r.expire(key, int(getattr(settings, "MCP_GUARDRAILS_BREAKER_TTL_SECONDS", 300) or 300))
             return
         threshold = int(getattr(settings, "MCP_CIRCUIT_BREAKER_FAILURE_THRESHOLD", 5) or 5)
         open_secs = float(getattr(settings, "MCP_CIRCUIT_BREAKER_OPEN_SECONDS", 30.0) or 30.0)
+        min_samples = int(getattr(settings, "MCP_CIRCUIT_BREAKER_MIN_SAMPLES", 10) or 10)
+        error_rate_threshold = float(getattr(settings, "MCP_CIRCUIT_BREAKER_ERROR_RATE_THRESHOLD", 0.5) or 0.5)
+        window_s = float(getattr(settings, "MCP_CIRCUIT_BREAKER_WINDOW_SECONDS", 60.0) or 60.0)
         now = time.monotonic()
         async with self._lock:
             st = self._breakers.get(target_key)
@@ -479,15 +610,38 @@ return 1
                 st["opened_until"] = now + open_secs
                 st["failures"] = max(1, int(st.get("failures", 0) or 0) + 1)
                 st["half_open_probes"] = 0
+                start = float(st.get("window_start", 0.0) or 0.0)
+                if start <= 0.0 or (now - start) >= window_s:
+                    st["window_start"] = now
+                    st["window_total"] = 0
+                    st["window_failures"] = 0
+                st["window_total"] = int(st.get("window_total", 0) or 0) + 1
+                st["window_failures"] = int(st.get("window_failures", 0) or 0) + 1
                 return
             if not retryable:
                 if state == "half_open":
                     st["state"] = "closed"
                     st["half_open_probes"] = 0
+                start = float(st.get("window_start", 0.0) or 0.0)
+                if start <= 0.0 or (now - start) >= window_s:
+                    st["window_start"] = now
+                    st["window_total"] = 0
+                    st["window_failures"] = 0
+                st["window_total"] = int(st.get("window_total", 0) or 0) + 1
                 return
             failures = int(st.get("failures", 0) or 0) + 1
             st["failures"] = failures
-            if failures >= max(1, threshold):
+            start = float(st.get("window_start", 0.0) or 0.0)
+            if start <= 0.0 or (now - start) >= window_s:
+                st["window_start"] = now
+                st["window_total"] = 0
+                st["window_failures"] = 0
+            st["window_total"] = int(st.get("window_total", 0) or 0) + 1
+            st["window_failures"] = int(st.get("window_failures", 0) or 0) + 1
+            window_total = int(st.get("window_total", 0) or 0)
+            window_failures = int(st.get("window_failures", 0) or 0)
+            error_rate_open = window_total >= max(1, min_samples) and (window_failures / max(1, window_total)) >= error_rate_threshold
+            if failures >= max(1, threshold) or error_rate_open:
                 st["state"] = "open"
                 st["opened_until"] = now + open_secs
                 st["half_open_probes"] = 0
@@ -500,7 +654,18 @@ return 1
         timeout_seconds: Optional[float],
         execute_call: Callable[[float], Awaitable[Dict[str, Any]]],
         operation_class: Literal["read_like", "write_like"] = "read_like",
+        tool_name: Optional[str] = None,
+        tenant_tier: Optional[str] = None,
+        idempotency_key: Optional[str] = None,
+        write_retry_safe: Optional[bool] = None,
     ) -> Dict[str, Any]:
+        policy = self._resolve_runtime_policy(
+            operation_class=operation_class,
+            tenant_tier=tenant_tier,
+            tool_name=tool_name,
+            write_retry_safe=write_retry_safe,
+        )
+        operation_class = str(policy.get("operation_class") or operation_class)
         legacy_attempts = int(getattr(settings, "MCP_INVOCATION_MAX_ATTEMPTS", 3) or 3)
         legacy_base_delay = float(getattr(settings, "MCP_INVOCATION_RETRY_BASE_DELAY_SECONDS", 0.25) or 0.25)
         legacy_max_delay = float(getattr(settings, "MCP_INVOCATION_RETRY_MAX_DELAY_SECONDS", 3.0) or 3.0)
@@ -518,6 +683,10 @@ return 1
                 max_delay = legacy_max_delay
             if jitter <= 0.0:
                 jitter = legacy_jitter
+            if policy.get("write_retry_safe") is True or (idempotency_key and str(idempotency_key).strip()):
+                pass
+            else:
+                attempts = min(attempts, 1)
         else:
             attempts = int(getattr(settings, "MCP_READ_INVOCATION_MAX_ATTEMPTS", 0) or 0)
             if attempts <= 0:
@@ -531,15 +700,37 @@ return 1
                 max_delay = legacy_max_delay
             if jitter <= 0.0:
                 jitter = legacy_jitter
+        if policy.get("invocation_max_attempts") is not None:
+            try:
+                attempts = int(policy.get("invocation_max_attempts") or attempts)
+            except Exception:
+                pass
+        if policy.get("retry_base_delay_seconds") is not None:
+            try:
+                base_delay = float(policy.get("retry_base_delay_seconds") or base_delay)
+            except Exception:
+                pass
+        if policy.get("retry_max_delay_seconds") is not None:
+            try:
+                max_delay = float(policy.get("retry_max_delay_seconds") or max_delay)
+            except Exception:
+                pass
+        if policy.get("retry_jitter_seconds") is not None:
+            try:
+                jitter = float(policy.get("retry_jitter_seconds") or jitter)
+            except Exception:
+                pass
         attempts = max(1, attempts)
         bounded_timeout = self._bounded_timeout(timeout_seconds)
         last_exc: Optional[BaseException] = None
 
         for attempt in range(1, attempts + 1):
+            started = time.perf_counter()
             acquired_quota = False
             await self._circuit_preflight(target_key)
-            await self._acquire_quota(business_id, target_key)
+            await self._acquire_quota(business_id, target_key, policy)
             acquired_quota = True
+            increment_event("admitted", code="none", operation_class=operation_class, target_key=target_key)
             logger.info(
                 "mcp_guardrail_event event=admitted business_id=%s target=%s op=%s attempt=%s/%s timeout=%.2f",
                 business_id,
@@ -552,6 +743,13 @@ return 1
             try:
                 out = await execute_call(bounded_timeout)
                 await self._circuit_record_success(target_key)
+                observe_duration(
+                    time.perf_counter() - started,
+                    operation_class=operation_class,
+                    target_key=target_key,
+                    outcome="success",
+                )
+                increment_event("success", code="none", operation_class=operation_class, target_key=target_key)
                 logger.info(
                     "mcp_guardrail_event event=success business_id=%s target=%s op=%s attempt=%s/%s",
                     business_id,
@@ -576,6 +774,13 @@ return 1
                     attempts,
                     str(ge),
                 )
+                observe_duration(
+                    time.perf_counter() - started,
+                    operation_class=operation_class,
+                    target_key=target_key,
+                    outcome="guardrail_error",
+                )
+                increment_event("rejected", code=ge.code, operation_class=operation_class, target_key=target_key)
                 if attempt < attempts and ge.retryable:
                     sleep_s = min(max_delay, base_delay * (2 ** (attempt - 1))) + (random.random() * max(0.0, jitter))
                     logger.info(
@@ -586,6 +791,7 @@ return 1
                         ge.code,
                         sleep_s,
                     )
+                    increment_event("retry", code=ge.code, operation_class=operation_class, target_key=target_key)
                     await asyncio.sleep(sleep_s)
                     continue
                 raise
@@ -604,6 +810,13 @@ return 1
                     attempts,
                     cls.detail,
                 )
+                observe_duration(
+                    time.perf_counter() - started,
+                    operation_class=operation_class,
+                    target_key=target_key,
+                    outcome="call_error",
+                )
+                increment_event("error", code=cls.code, operation_class=operation_class, target_key=target_key)
                 if attempt < attempts and cls.retryable:
                     sleep_s = min(max_delay, base_delay * (2 ** (attempt - 1))) + (random.random() * max(0.0, jitter))
                     logger.info(
@@ -614,6 +827,7 @@ return 1
                         cls.code,
                         sleep_s,
                     )
+                    increment_event("retry", code=cls.code, operation_class=operation_class, target_key=target_key)
                     await asyncio.sleep(sleep_s)
                     continue
                 raise MCPGuardrailError(cls.code, cls.detail, retryable=cls.retryable, cause=exc) from exc

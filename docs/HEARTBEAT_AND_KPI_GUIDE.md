@@ -2,6 +2,8 @@
 
 This guide explains how Sandhi AI tracks execution in real time, how it remains durable during Redis disruptions, and how KPI/SLA metrics and webhooks are produced for business and developer dashboards.
 
+For MCP-specific quota/circuit/retry operations under high concurrency, see `docs/MCP_GUARDRAILS_RUNBOOK.md`.
+
 ---
 
 ## Why This Exists
