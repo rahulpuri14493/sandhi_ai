@@ -6,7 +6,7 @@ name: Dependency submission
 
 on:
   pull_request:
-    branches: ["main"]
+    branches: ["**"]
   push:
     branches: ["main"]
 
@@ -15,8 +15,8 @@ permissions:
   id-token: write
 
 concurrency:
-  group: dependency-submission-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  group: dependency-submission-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   submit:

@@ -217,6 +217,21 @@ def _parallel_context_for_step(
     return None
 
 
+def _load_step_output_json(step: WorkflowStep) -> Optional[Any]:
+    """Parse persisted output_data JSON for resume mode handoff."""
+    raw = getattr(step, "output_data", None)
+    if not raw:
+        return None
+    if isinstance(raw, (dict, list)):
+        return raw
+    if isinstance(raw, str):
+        try:
+            return json.loads(raw)
+        except (TypeError, json.JSONDecodeError):
+            return None
+    return None
+
+
 # Tool types that fetch text from an external corpus (vector DB, PageIndex, etc.)
 _RETRIEVAL_MCP_TOOL_TYPES = frozenset(
     {"pinecone", "vector_db", "weaviate", "qdrant", "chroma", "elasticsearch", "pageindex"}
@@ -787,18 +802,32 @@ class AgentExecutor:
             job_conn_ids = _parse_allowed_ids(getattr(job, "allowed_connection_ids", None))
             step_platform_ids = _parse_allowed_ids(getattr(step, "allowed_platform_tool_ids", None))
             step_conn_ids = _parse_allowed_ids(getattr(step, "allowed_connection_ids", None))
-            # Step-level empty arrays mean "inherit job scope", not "no tools".
-            if isinstance(step_platform_ids, list) and len(step_platform_ids) == 0:
-                step_platform_ids = None
-            if isinstance(step_conn_ids, list) and len(step_conn_ids) == 0:
-                step_conn_ids = None
-            effective_platform = step_platform_ids if step_platform_ids is not None else job_platform_ids
-            effective_conn = step_conn_ids if step_conn_ids is not None else job_conn_ids
-            if job_platform_ids is not None and effective_platform is not None:
-                effective_platform = [x for x in effective_platform if x in job_platform_ids]
-            if job_conn_ids is not None and effective_conn is not None:
-                effective_conn = [x for x in effective_conn if x in job_conn_ids]
-            tool_visibility = getattr(step, "tool_visibility", None) or getattr(job, "tool_visibility", None) or "full"
+
+            def _norm_tool_visibility(raw: object) -> Optional[str]:
+                if not isinstance(raw, str):
+                    return None
+                s = raw.strip().lower()
+                return s if s in ("full", "names_only", "none") else None
+
+            step_tv_norm = _norm_tool_visibility(getattr(step, "tool_visibility", None))
+            job_tv_norm = _norm_tool_visibility(getattr(job, "tool_visibility", None))
+            tool_visibility = step_tv_norm or job_tv_norm or "full"
+            # Step-level "none" must not inherit job tool lists (otherwise DB null/[] is treated as inherit).
+            if step_tv_norm == "none":
+                effective_platform = []
+                effective_conn = []
+            else:
+                # Step-level empty arrays mean "inherit job scope", not "no tools".
+                if isinstance(step_platform_ids, list) and len(step_platform_ids) == 0:
+                    step_platform_ids = None
+                if isinstance(step_conn_ids, list) and len(step_conn_ids) == 0:
+                    step_conn_ids = None
+                effective_platform = step_platform_ids if step_platform_ids is not None else job_platform_ids
+                effective_conn = step_conn_ids if step_conn_ids is not None else job_conn_ids
+                if job_platform_ids is not None and effective_platform is not None:
+                    effective_platform = [x for x in effective_platform if x in job_platform_ids]
+                if job_conn_ids is not None and effective_conn is not None:
+                    effective_conn = [x for x in effective_conn if x in job_conn_ids]
             has_configured_tool_scope = bool((effective_platform is not None and len(effective_platform) > 0) or (effective_conn is not None and len(effective_conn) > 0))
             if tool_visibility == "none" and has_configured_tool_scope:
                 raise ValueError(
@@ -1395,19 +1424,33 @@ class AgentExecutor:
 
                 for wave in waves:
                     wave_sorted = sorted(wave, key=lambda s: s.step_order)
-                    if len(wave_sorted) == 1:
-                        st = wave_sorted[0]
-                        previous_chain_output = await self._execute_one_step_core(
+                    runnable = [st for st in wave_sorted if st.status != "completed"]
+                    wave_outputs: Dict[int, Any] = {}
+                    for st in wave_sorted:
+                        if st.status == "completed":
+                            out = _load_step_output_json(st)
+                            if out is not None:
+                                wave_outputs[st.id] = out
+                    if not runnable:
+                        last_step = wave_sorted[-1]
+                        previous_chain_output = wave_outputs.get(last_step.id, previous_chain_output)
+                        self.db.expire_all()
+                        continue
+                    if len(runnable) == 1:
+                        st = runnable[0]
+                        result = await self._execute_one_step_core(
                             job_id, st.id, previous_chain_output
                         )
+                        wave_outputs[st.id] = result
                     else:
                         async with asyncio.TaskGroup() as tg:
-                            task_objs = [
-                                tg.create_task(_run_step_isolated(st, previous_chain_output))
-                                for st in wave_sorted
-                            ]
-                        results = [t.result() for t in task_objs]
-                        previous_chain_output = results[-1]
+                            task_objs = {
+                                st.id: tg.create_task(_run_step_isolated(st, previous_chain_output))
+                                for st in runnable
+                            }
+                        for st in runnable:
+                            wave_outputs[st.id] = task_objs[st.id].result()
+                    previous_chain_output = wave_outputs.get(wave_sorted[-1].id, previous_chain_output)
                     self.db.expire_all()
 
                 # Mark job as completed

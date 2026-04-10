@@ -1,9 +1,14 @@
-# Run frontend and backend tests on every pull request
+# Fork PRs: runs on untrusted PR head with secrets unavailable; use only public CI env vars here.
+# Uses pull_request (not pull_request_target) so checkout is the contributor's commit.
 name: PR Tests
 
 on:
   pull_request:
     branches: ["**"]
+
+concurrency:
+  group: pr-tests-${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: true
 
 env:
   POSTGRES_USER: postgres

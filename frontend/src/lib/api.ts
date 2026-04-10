@@ -1,5 +1,5 @@
 import axios from 'axios'
-import type { PlannerPipelineBundle, User } from './types'
+import type { JobRerunResponse, PlannerPipelineBundle, User } from './types'
 
 const API_BASE = '/api'
 
@@ -158,8 +158,9 @@ export const jobsAPI = {
   execute(jobId: number) {
     return api.post('/jobs/' + jobId + '/execute').then((res) => res.data)
   },
-  rerun(jobId: number) {
-    return api.post('/jobs/' + jobId + '/rerun').then((res) => res.data)
+  rerun(jobId: number, mode?: 'resume' | 'full') {
+    const qs = mode ? `?mode=${encodeURIComponent(mode)}` : ''
+    return api.post<JobRerunResponse>('/jobs/' + jobId + '/rerun' + qs).then((res) => res.data)
   },
   getShareLink(jobId: number) {
     return api.get('/jobs/' + jobId + '/share-link').then((res) => res.data)
@@ -211,14 +212,29 @@ export const jobsAPI = {
   getPlannerPipeline(jobId: number) {
     return api.get<PlannerPipelineBundle>(`/jobs/${jobId}/planner-pipeline`).then((res) => res.data)
   },
-  suggestWorkflowTools(jobId: number, agentIds: number[]) {
+  suggestWorkflowTools(
+    jobId: number,
+    agentIds: number[],
+    stepToolVisibility?: Array<'full' | 'names_only' | 'none'>
+  ) {
+    const body: {
+      agent_ids: number[]
+      step_tool_visibility?: Array<'full' | 'names_only' | 'none'>
+    } = { agent_ids: agentIds }
+    if (
+      stepToolVisibility &&
+      stepToolVisibility.length > 0 &&
+      stepToolVisibility.length === agentIds.length
+    ) {
+      body.step_tool_visibility = stepToolVisibility
+    }
     return api
       .post<{
         step_suggestions: Array<{ agent_index: number; agent_name?: string | null; platform_tool_ids: number[]; rationale?: string }>
         output_contract_stub: Record<string, unknown> | null
         fallback_used: boolean
         detail?: string
-      }>('/jobs/' + jobId + '/suggest-workflow-tools', { agent_ids: agentIds })
+      }>('/jobs/' + jobId + '/suggest-workflow-tools', body)
       .then((res) => res.data)
   },
   autoSplitWorkflow(

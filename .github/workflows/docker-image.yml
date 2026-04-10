@@ -1,10 +1,18 @@
+# Fork PRs: build/validate only; no push to registries (none configured here). Least privilege: contents read.
 name: Docker Image CI
 
 on:
   push:
     branches: ["main"]
   pull_request:
-    branches: ["main"]
+    branches: ["**"]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: docker-image-${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   POSTGRES_USER: postgres
