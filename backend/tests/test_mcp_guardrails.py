@@ -7,6 +7,19 @@ from services.mcp_guardrails import MCPGuardrailError, MCPInvocationGuardrails
 from services.mcp_client import MCPJSONRPCError
 
 
+@pytest.fixture(autouse=True)
+def _guardrails_retry_profile_defaults(monkeypatch):
+    # Keep legacy retry knobs authoritative unless a test explicitly overrides read/write profiles.
+    monkeypatch.setattr("core.config.settings.MCP_READ_INVOCATION_MAX_ATTEMPTS", 0, raising=False)
+    monkeypatch.setattr("core.config.settings.MCP_READ_INVOCATION_RETRY_BASE_DELAY_SECONDS", 0.0, raising=False)
+    monkeypatch.setattr("core.config.settings.MCP_READ_INVOCATION_RETRY_MAX_DELAY_SECONDS", 0.0, raising=False)
+    monkeypatch.setattr("core.config.settings.MCP_READ_INVOCATION_RETRY_JITTER_SECONDS", 0.0, raising=False)
+    monkeypatch.setattr("core.config.settings.MCP_WRITE_INVOCATION_MAX_ATTEMPTS", 0, raising=False)
+    monkeypatch.setattr("core.config.settings.MCP_WRITE_INVOCATION_RETRY_BASE_DELAY_SECONDS", 0.0, raising=False)
+    monkeypatch.setattr("core.config.settings.MCP_WRITE_INVOCATION_RETRY_MAX_DELAY_SECONDS", 0.0, raising=False)
+    monkeypatch.setattr("core.config.settings.MCP_WRITE_INVOCATION_RETRY_JITTER_SECONDS", 0.0, raising=False)
+
+
 @pytest.mark.asyncio
 async def test_guardrails_retry_transient_then_success(monkeypatch):
     monkeypatch.setattr("core.config.settings.MCP_INVOCATION_MAX_ATTEMPTS", 3, raising=False)
@@ -528,3 +541,41 @@ async def test_guardrails_write_retry_profile_override(monkeypatch):
             execute_call=_always_retryable,
         )
     assert calls["n"] == 2
+
+
+def test_redis_rate_key_uses_epoch_minute_bucket():
+    g = MCPInvocationGuardrails()
+    k = g._redis_rate_key(42, 125.0)
+    assert k.endswith(":rate:tenant:42:2")
+
+
+@pytest.mark.asyncio
+async def test_distributed_quota_rate_limit_code_from_atomic_eval(monkeypatch):
+    class _FakeRedis:
+        def eval(self, *_args, **_kwargs):
+            return -1  # rate limited
+
+    monkeypatch.setattr("core.config.settings.MCP_TENANT_RATE_LIMIT_PER_MINUTE", 10, raising=False)
+    monkeypatch.setattr("core.config.settings.MCP_CONCURRENCY_WAIT_SECONDS", 0.0, raising=False)
+    g = MCPInvocationGuardrails()
+    g._redis_client = _FakeRedis()
+    g._redis_init_failed = False
+    monkeypatch.setattr(g, "_get_redis_client", lambda: g._redis_client)
+    with pytest.raises(MCPGuardrailError) as exc:
+        await g._acquire_quota_distributed(77, "platform:test:/mcp:x")
+    assert exc.value.code == "mcp_rate_limited"
+
+
+@pytest.mark.asyncio
+async def test_distributed_circuit_preflight_blocks_when_atomic_eval_rejects(monkeypatch):
+    class _FakeRedis:
+        def eval(self, *_args, **_kwargs):
+            return 0  # open
+
+    g = MCPInvocationGuardrails()
+    g._redis_client = _FakeRedis()
+    g._redis_init_failed = False
+    monkeypatch.setattr(g, "_get_redis_client", lambda: g._redis_client)
+    with pytest.raises(MCPGuardrailError) as exc:
+        await g._circuit_preflight("platform:test:/mcp:y")
+    assert exc.value.code == "mcp_circuit_open"

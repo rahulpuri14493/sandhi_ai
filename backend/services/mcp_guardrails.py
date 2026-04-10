@@ -46,6 +46,74 @@ class MCPInvocationGuardrails:
         self._breakers: Dict[str, Dict[str, Any]] = {}
         self._redis_client: Any = None
         self._redis_init_failed = False
+        self._redis_error_logged = False
+
+    _LUA_ADMIT = """
+local tenant_key = KEYS[1]
+local target_key = KEYS[2]
+local rate_key = KEYS[3]
+local tenant_limit = tonumber(ARGV[1]) or 0
+local target_limit = tonumber(ARGV[2]) or 0
+local rpm_limit = tonumber(ARGV[3]) or 0
+local counter_ttl = tonumber(ARGV[4]) or 120
+
+if rpm_limit > 0 then
+  local rate_count = redis.call("INCR", rate_key)
+  if rate_count == 1 then redis.call("EXPIRE", rate_key, 60) end
+  if rate_count > rpm_limit then return -1 end
+end
+
+local tenant_val = 0
+local target_val = 0
+
+if tenant_limit > 0 then
+  tenant_val = redis.call("INCR", tenant_key)
+  if tenant_val == 1 then redis.call("EXPIRE", tenant_key, counter_ttl) end
+end
+if target_limit > 0 then
+  target_val = redis.call("INCR", target_key)
+  if target_val == 1 then redis.call("EXPIRE", target_key, counter_ttl) end
+end
+
+if (tenant_limit <= 0 or tenant_val <= tenant_limit) and (target_limit <= 0 or target_val <= target_limit) then
+  return 1
+end
+
+if tenant_limit > 0 and tenant_val > 0 then redis.call("DECR", tenant_key) end
+if target_limit > 0 and target_val > 0 then redis.call("DECR", target_key) end
+return 0
+"""
+
+    _LUA_CIRCUIT_PREFLIGHT = """
+local key = KEYS[1]
+local now = tonumber(ARGV[1]) or 0
+local open_secs = tonumber(ARGV[2]) or 30
+local half_open_max = tonumber(ARGV[3]) or 1
+local ttl = tonumber(ARGV[4]) or 300
+
+local state = redis.call("HGET", key, "state")
+if not state then
+  redis.call("HSET", key, "state", "closed", "failures", 0, "opened_until", 0, "half_open_probes", 0)
+  redis.call("EXPIRE", key, ttl)
+  return 1
+end
+
+if state == "open" then
+  local opened_until = tonumber(redis.call("HGET", key, "opened_until") or "0")
+  if now < opened_until then return 0 end
+  redis.call("HSET", key, "state", "half_open", "half_open_probes", 0, "opened_until", now + open_secs)
+  redis.call("EXPIRE", key, ttl)
+end
+
+state = redis.call("HGET", key, "state")
+if state == "half_open" then
+  local probes = tonumber(redis.call("HGET", key, "half_open_probes") or "0")
+  if probes >= half_open_max then return 0 end
+  redis.call("HINCRBY", key, "half_open_probes", 1)
+  redis.call("EXPIRE", key, ttl)
+end
+return 1
+"""
 
     @staticmethod
     def _redis_prefix() -> str:
@@ -85,6 +153,13 @@ class MCPInvocationGuardrails:
             self._redis_init_failed = True
             logger.warning("mcp_guardrails: redis unavailable; falling back to process-local state")
             return None
+
+    def _disable_distributed_due_error(self, context: str) -> None:
+        self._redis_client = None
+        self._redis_init_failed = True
+        if not self._redis_error_logged:
+            logger.warning("mcp_guardrails: disabling distributed mode after redis error in %s", context)
+            self._redis_error_logged = True
 
     @staticmethod
     def _bounded_timeout(timeout_seconds: Optional[float]) -> float:
@@ -169,10 +244,9 @@ class MCPInvocationGuardrails:
             return f"{p}:inflight:target:{target_key}"
         return f"{p}:inflight:unknown:{business_id}:{target_key}"
 
-    def _redis_rate_key(self, business_id: int, now_monotonic: float) -> str:
+    def _redis_rate_key(self, business_id: int, now_epoch_seconds: float) -> str:
         p = self._redis_prefix()
-        # time.monotonic not epoch, but minute bucketing consistency per process is enough for key reuse window.
-        minute_bucket = int(now_monotonic // 60)
+        minute_bucket = int(now_epoch_seconds // 60)
         return f"{p}:rate:tenant:{business_id}:{minute_bucket}"
 
     async def _acquire_quota_distributed(self, business_id: int, target_key: str) -> bool:
@@ -187,38 +261,31 @@ class MCPInvocationGuardrails:
         deadline = time.monotonic() + max(0.0, wait_s)
         while True:
             now = time.monotonic()
-            # Rate limit first.
-            if rpm_limit > 0:
-                rate_key = self._redis_rate_key(business_id, now)
-                count = int(r.incr(rate_key))
-                if count == 1:
-                    r.expire(rate_key, 60)
-                if count > rpm_limit:
-                    raise MCPGuardrailError("mcp_rate_limited", f"Tenant {business_id} exceeded MCP rate limit", retryable=True)
-
+            epoch_now = time.time()
             tenant_key = self._redis_counter_key("tenant", business_id, target_key)
             target_counter_key = self._redis_counter_key("target", business_id, target_key)
-            tenant_ok = True
-            target_ok = True
-            tenant_val = 0
-            target_val = 0
-            if tenant_limit > 0:
-                tenant_val = int(r.incr(tenant_key))
-                if tenant_val == 1:
-                    r.expire(tenant_key, counter_ttl)
-                tenant_ok = tenant_val <= tenant_limit
-            if target_limit > 0:
-                target_val = int(r.incr(target_counter_key))
-                if target_val == 1:
-                    r.expire(target_counter_key, counter_ttl)
-                target_ok = target_val <= target_limit
-            if tenant_ok and target_ok:
+            rate_key = self._redis_rate_key(business_id, epoch_now)
+            try:
+                admit_code = int(
+                    r.eval(
+                        self._LUA_ADMIT,
+                        3,
+                        tenant_key,
+                        target_counter_key,
+                        rate_key,
+                        int(tenant_limit),
+                        int(target_limit),
+                        int(rpm_limit),
+                        int(counter_ttl),
+                    )
+                )
+            except Exception:
+                self._disable_distributed_due_error("quota_admission")
+                return False
+            if admit_code == 1:
                 return True
-            # rollback this attempt increments
-            if tenant_limit > 0 and tenant_val > 0:
-                r.decr(tenant_key)
-            if target_limit > 0 and target_val > 0:
-                r.decr(target_counter_key)
+            if admit_code == -1:
+                raise MCPGuardrailError("mcp_rate_limited", f"Tenant {business_id} exceeded MCP rate limit", retryable=True)
             if now >= deadline:
                 raise MCPGuardrailError(
                     "mcp_quota_exceeded",
@@ -315,28 +382,24 @@ class MCPInvocationGuardrails:
             open_secs = float(getattr(settings, "MCP_CIRCUIT_BREAKER_OPEN_SECONDS", 30.0) or 30.0)
             half_open_max = int(getattr(settings, "MCP_CIRCUIT_BREAKER_HALF_OPEN_MAX_PROBES", 1) or 1)
             now = time.monotonic()
-            raw_state = r.hget(key, "state")
-            state = raw_state.decode() if isinstance(raw_state, (bytes, bytearray)) else (raw_state or "closed")
-            if state == "open":
-                opened_until_raw = r.hget(key, "opened_until")
-                try:
-                    opened_until = float(opened_until_raw.decode() if isinstance(opened_until_raw, (bytes, bytearray)) else opened_until_raw)
-                except Exception:
-                    opened_until = 0.0
-                if now < opened_until:
-                    raise MCPGuardrailError("mcp_circuit_open", f"Circuit open for target {target_key}", retryable=True)
-                r.hset(key, mapping={"state": "half_open", "half_open_probes": 0, "opened_until": now + open_secs})
-                r.expire(key, int(getattr(settings, "MCP_GUARDRAILS_BREAKER_TTL_SECONDS", 300) or 300))
-                state = "half_open"
-            if state == "half_open":
-                probes_raw = r.hget(key, "half_open_probes")
-                try:
-                    probes = int(probes_raw.decode() if isinstance(probes_raw, (bytes, bytearray)) else probes_raw or 0)
-                except Exception:
-                    probes = 0
-                if probes >= max(1, half_open_max):
-                    raise MCPGuardrailError("mcp_circuit_open", f"Circuit half-open probe limit reached for {target_key}", retryable=True)
-                r.hincrby(key, "half_open_probes", 1)
+            breaker_ttl = int(getattr(settings, "MCP_GUARDRAILS_BREAKER_TTL_SECONDS", 300) or 300)
+            try:
+                admitted = int(
+                    r.eval(
+                        self._LUA_CIRCUIT_PREFLIGHT,
+                        1,
+                        key,
+                        float(now),
+                        float(open_secs),
+                        max(1, int(half_open_max)),
+                        int(breaker_ttl),
+                    )
+                )
+            except Exception:
+                self._disable_distributed_due_error("circuit_preflight")
+                admitted = 1
+            if admitted != 1:
+                raise MCPGuardrailError("mcp_circuit_open", f"Circuit open for target {target_key}", retryable=True)
             return
         open_secs = float(getattr(settings, "MCP_CIRCUIT_BREAKER_OPEN_SECONDS", 30.0) or 30.0)
         half_open_max = int(getattr(settings, "MCP_CIRCUIT_BREAKER_HALF_OPEN_MAX_PROBES", 1) or 1)
