@@ -1,4 +1,5 @@
 import logging
+import hashlib
 from typing import Dict, Optional
 
 from core.config import settings
@@ -11,6 +12,27 @@ _PROM_HIST = None
 _OTEL_METER = None
 _OTEL_COUNTER = None
 _OTEL_HIST = None
+
+
+def _normalize_target_key(target_key: str) -> str:
+    raw = str(target_key or "unknown")
+    mode = str(getattr(settings, "MCP_GUARDRAILS_METRICS_TARGET_KEY_MODE", "raw") or "raw").strip().lower()
+    max_len = int(getattr(settings, "MCP_GUARDRAILS_METRICS_TARGET_KEY_MAX_LEN", 120) or 120)
+    if mode == "hash":
+        return f"h:{hashlib.sha1(raw.encode('utf-8', errors='ignore')).hexdigest()[:16]}"
+    if mode == "normalized":
+        # Keep source + tool suffix, collapse middle cardinality-heavy path details.
+        parts = raw.split(":")
+        if len(parts) >= 2:
+            source = parts[0]
+            tool = parts[-1]
+            norm = f"{source}:*: {tool}".replace(": ", ":")
+        else:
+            norm = raw
+        raw = norm
+    if len(raw) > max(16, max_len):
+        return raw[: max(16, max_len)]
+    return raw
 
 
 def _ensure_prom():
@@ -65,10 +87,11 @@ def _ensure_otlp():
 
 
 def increment_event(event: str, *, code: str = "none", operation_class: str = "read_like", target_key: str = "unknown") -> None:
+    label_target = _normalize_target_key(target_key)
     _ensure_prom()
     _ensure_otlp()
     if _PROM_COUNTER is not None:
-        _PROM_COUNTER.labels(event=event, code=code, operation_class=operation_class, target_key=target_key).inc()
+        _PROM_COUNTER.labels(event=event, code=code, operation_class=operation_class, target_key=label_target).inc()
     if _OTEL_COUNTER is not None:
         _OTEL_COUNTER.add(
             1,
@@ -76,20 +99,21 @@ def increment_event(event: str, *, code: str = "none", operation_class: str = "r
                 "event": event,
                 "code": code,
                 "operation_class": operation_class,
-                "target_key": target_key,
+                "target_key": label_target,
             },
         )
 
 
 def observe_duration(seconds: float, *, operation_class: str, target_key: str, outcome: str) -> None:
+    label_target = _normalize_target_key(target_key)
     _ensure_prom()
     _ensure_otlp()
     if _PROM_HIST is not None:
-        _PROM_HIST.labels(operation_class=operation_class, target_key=target_key, outcome=outcome).observe(max(0.0, float(seconds)))
+        _PROM_HIST.labels(operation_class=operation_class, target_key=label_target, outcome=outcome).observe(max(0.0, float(seconds)))
     if _OTEL_HIST is not None:
         _OTEL_HIST.record(
             max(0.0, float(seconds)),
-            {"operation_class": operation_class, "target_key": target_key, "outcome": outcome},
+            {"operation_class": operation_class, "target_key": label_target, "outcome": outcome},
         )
 
 

@@ -57,6 +57,7 @@ class Settings(BaseSettings):
     MCP_GUARDRAILS_REDIS_PREFIX: str = "sandhi:mcp_guardrails:v1"
     MCP_GUARDRAILS_REDIS_SOCKET_TIMEOUT_SECONDS: float = 2.0
     MCP_GUARDRAILS_REDIS_CONNECT_TIMEOUT_SECONDS: float = 2.0
+    MCP_GUARDRAILS_REDIS_RETRY_SECONDS: float = 30.0
     MCP_GUARDRAILS_COUNTER_TTL_SECONDS: int = 120
     MCP_GUARDRAILS_BREAKER_TTL_SECONDS: int = 300
     MCP_GUARDRAILS_FAIR_QUEUE_ENABLED: bool = False
@@ -96,6 +97,8 @@ class Settings(BaseSettings):
     MCP_GUARDRAILS_OTLP_ENABLED: bool = False
     MCP_GUARDRAILS_OTLP_ENDPOINT: str = ""
     MCP_GUARDRAILS_OTLP_INSECURE: bool = True
+    MCP_GUARDRAILS_METRICS_TARGET_KEY_MODE: str = "raw"  # raw | normalized | hash
+    MCP_GUARDRAILS_METRICS_TARGET_KEY_MAX_LEN: int = 120
     # Job execution backend: celery (Redis queue) or local_thread fallback.
     JOB_EXECUTION_BACKEND: str = "celery"
     JOB_EXECUTION_STRICT_QUEUE: bool = False  # True: no local fallback when enqueue fails

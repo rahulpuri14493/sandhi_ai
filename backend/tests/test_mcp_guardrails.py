@@ -5,6 +5,7 @@ import httpx
 
 from services.mcp_guardrails import MCPGuardrailError, MCPInvocationGuardrails
 from services.mcp_client import MCPJSONRPCError
+from services import mcp_metrics
 
 
 @pytest.fixture(autouse=True)
@@ -657,3 +658,30 @@ async def test_circuit_rolling_window_error_rate_opens(monkeypatch):
     with pytest.raises(MCPGuardrailError) as exc_open:
         await g._circuit_preflight(target)
     assert exc_open.value.code == "mcp_circuit_open"
+
+
+def test_metrics_target_key_hash_mode(monkeypatch):
+    monkeypatch.setattr("core.config.settings.MCP_GUARDRAILS_METRICS_TARGET_KEY_MODE", "hash", raising=False)
+    out = mcp_metrics._normalize_target_key("platform:https://host:/mcp:very_long_tool_name")
+    assert out.startswith("h:")
+    assert len(out) <= 18
+
+
+def test_metrics_target_key_normalized_mode(monkeypatch):
+    monkeypatch.setattr("core.config.settings.MCP_GUARDRAILS_METRICS_TARGET_KEY_MODE", "normalized", raising=False)
+    out = mcp_metrics._normalize_target_key("external:99:https://foo:/mcp:write_row")
+    assert out.startswith("external:")
+    assert out.endswith(":write_row")
+
+
+def test_redis_recovery_window_allows_reenable(monkeypatch):
+    monkeypatch.setattr("core.config.settings.MCP_GUARDRAILS_DISTRIBUTED_ENABLED", True, raising=False)
+    monkeypatch.setattr("core.config.settings.MCP_GUARDRAILS_REDIS_RETRY_SECONDS", 1.0, raising=False)
+    g = MCPInvocationGuardrails()
+    dummy = object()
+    g._redis_client = dummy
+    g._redis_init_failed = True
+    g._redis_retry_after_monotonic = 0.0  # expired; should retry path and then reuse client
+    out = g._get_redis_client()
+    assert out is dummy
+    assert g._redis_init_failed is False

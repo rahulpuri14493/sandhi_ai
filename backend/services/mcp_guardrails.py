@@ -50,6 +50,7 @@ class MCPInvocationGuardrails:
         self._fair_queue_local: Dict[str, list[str]] = {}
         self._redis_client: Any = None
         self._redis_init_failed = False
+        self._redis_retry_after_monotonic: float = 0.0
         self._redis_error_logged = False
 
     _LUA_ADMIT = """
@@ -141,8 +142,12 @@ return 0
     def _get_redis_client(self):
         if not self._is_distributed_enabled():
             return None
+        now_mono = time.monotonic()
         if self._redis_init_failed:
-            return None
+            if now_mono < float(self._redis_retry_after_monotonic or 0.0):
+                return None
+            # retry window reached; allow re-init attempts
+            self._redis_init_failed = False
         if self._redis_client is not None:
             return self._redis_client
         url = (getattr(settings, "MCP_GUARDRAILS_REDIS_URL", None) or "").strip()
@@ -152,6 +157,8 @@ return 0
             import redis  # lazy import
         except ModuleNotFoundError:
             self._redis_init_failed = True
+            retry_s = float(getattr(settings, "MCP_GUARDRAILS_REDIS_RETRY_SECONDS", 30.0) or 30.0)
+            self._redis_retry_after_monotonic = time.monotonic() + max(1.0, retry_s)
             logger.warning("mcp_guardrails: redis package missing; falling back to process-local state")
             return None
         try:
@@ -167,12 +174,16 @@ return 0
             return self._redis_client
         except Exception:
             self._redis_init_failed = True
+            retry_s = float(getattr(settings, "MCP_GUARDRAILS_REDIS_RETRY_SECONDS", 30.0) or 30.0)
+            self._redis_retry_after_monotonic = time.monotonic() + max(1.0, retry_s)
             logger.warning("mcp_guardrails: redis unavailable; falling back to process-local state")
             return None
 
     def _disable_distributed_due_error(self, context: str) -> None:
         self._redis_client = None
         self._redis_init_failed = True
+        retry_s = float(getattr(settings, "MCP_GUARDRAILS_REDIS_RETRY_SECONDS", 30.0) or 30.0)
+        self._redis_retry_after_monotonic = time.monotonic() + max(1.0, retry_s)
         if not self._redis_error_logged:
             logger.warning("mcp_guardrails: disabling distributed mode after redis error in %s", context)
             self._redis_error_logged = True
