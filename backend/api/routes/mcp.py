@@ -6,8 +6,6 @@ import json
 import logging
 import uuid
 from datetime import datetime
-import time
-import random
 from fastapi import APIRouter, Depends, HTTPException, status, BackgroundTasks
 from sqlalchemy.orm import Session
 from sqlalchemy.exc import IntegrityError
@@ -34,6 +32,14 @@ from core.security import get_current_business_user
 from core.encryption import encrypt_json, decrypt_json
 from db.database import SessionLocal
 from services.mcp_platform_naming import platform_tool_id_from_mcp_function_name
+from services.mcp_guardrails import (
+    MCPGuardrailError,
+    get_mcp_guardrails,
+    guarded_mcp_jsonrpc,
+    guarded_mcp_list_tools,
+    infer_mcp_tool_operation_class,
+    resolve_mcp_tenant_tier,
+)
 
 router = APIRouter(prefix="/api/mcp", tags=["mcp"])
 logger = logging.getLogger(__name__)
@@ -64,6 +70,22 @@ def _estimate_json_size_bytes(data: dict) -> int:
         return len(json.dumps(data, separators=(",", ":"), ensure_ascii=False).encode("utf-8"))
     except Exception:
         return 0
+
+
+def _http_exception_from_mcp_guardrail_error(ge: MCPGuardrailError) -> HTTPException:
+    """Map MCPGuardrailError codes to HTTP status for platform HTTP routes."""
+    # Detail is passed to RuntimeError.__init__; MCPGuardrailError does not store a .detail attribute.
+    payload = {"error": ge.code, "message": str(ge)}
+    if ge.code in ("mcp_quota_exceeded", "mcp_rate_limited"):
+        return HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS, detail=payload)
+    if ge.code in ("mcp_circuit_open", "mcp_upstream_unavailable"):
+        # 503: dependency temporarily unavailable (breaker open or MCP host unreachable / bad HTTP).
+        return HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=payload)
+    if ge.code == "mcp_tool_validation_failed":
+        return HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=payload)
+    if ge.code == "mcp_timeout":
+        return HTTPException(status_code=status.HTTP_504_GATEWAY_TIMEOUT, detail=payload)
+    return HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=payload)
 
 
 def _op_to_response(op: MCPWriteOperation) -> MCPWriteOperationResponse:
@@ -140,19 +162,41 @@ async def _invoke_platform_tool_call(
             status_code=400,
             detail=f"timeout_seconds must be > 0 and <= {max_timeout}",
         )
-    from services.mcp_client import call_tool
     base = settings.PLATFORM_MCP_SERVER_URL.rstrip("/")
     extra_headers = {"X-MCP-Business-Id": str(user_id)}
-    try:
-        result = await call_tool(
+    guard = get_mcp_guardrails()
+    target_key = f"platform:{base}:/mcp:{body.tool_name}"
+    operation_class = infer_mcp_tool_operation_class(body.tool_name, body.arguments or {})
+    tenant_tier = resolve_mcp_tenant_tier(int(user_id))
+    args = body.arguments if isinstance(body.arguments, dict) else {}
+    idem_key = str(args.get("idempotency_key") or "")
+
+    async def _platform_tool_execute(bounded_timeout: float):
+        # Import inside coroutine so tests can patch services.mcp_client.call_tool.
+        from services.mcp_client import call_tool
+
+        return await call_tool(
             base_url=base,
             tool_name=body.tool_name,
-            arguments=body.arguments,
+            arguments=body.arguments or {},
             endpoint_path="/mcp",
             extra_headers=extra_headers,
-            timeout=timeout,
+            timeout=bounded_timeout,
         )
-        return result
+
+    try:
+        return await guard.call_tool_with_guardrails(
+            business_id=int(user_id),
+            target_key=target_key,
+            timeout_seconds=timeout,
+            operation_class=operation_class,
+            tool_name=body.tool_name,
+            tenant_tier=tenant_tier,
+            idempotency_key=idem_key,
+            execute_call=_platform_tool_execute,
+        )
+    except MCPGuardrailError as ge:
+        raise _http_exception_from_mcp_guardrail_error(ge) from ge
     except Exception as e:
         logger.exception("call_platform_tool failed tool_name=%s", body.tool_name)
         raise HTTPException(
@@ -162,7 +206,6 @@ async def _invoke_platform_tool_call(
 
 
 def _run_platform_write_operation(operation_id: str, user_id: int) -> None:
-    from services.mcp_client import call_tool
     from core.config import settings
     from services.async_runner import run_coroutine_sync
 
@@ -180,42 +223,51 @@ def _run_platform_write_operation(operation_id: str, user_id: int) -> None:
 
         payload = json.loads(op.request_payload)
         timeout = float(payload.get("timeout_seconds") or getattr(settings, "MCP_TOOL_DEFAULT_TIMEOUT_SECONDS", 60.0))
-        max_attempts = max(1, int(getattr(settings, "MCP_WRITE_OPERATION_MAX_ATTEMPTS", 3)))
-        base_delay = max(0.01, float(getattr(settings, "MCP_WRITE_OPERATION_RETRY_BASE_DELAY_SECONDS", 0.5)))
-        max_delay = max(base_delay, float(getattr(settings, "MCP_WRITE_OPERATION_RETRY_MAX_DELAY_SECONDS", 5.0)))
-        jitter = max(0.0, float(getattr(settings, "MCP_WRITE_OPERATION_RETRY_JITTER_SECONDS", 0.2)))
+        base = settings.PLATFORM_MCP_SERVER_URL.rstrip("/")
+        extra_headers = {"X-MCP-Business-Id": str(user_id)}
+        target_key = f"platform:{base}:/mcp:{op.tool_name}"
+        tenant_tier = resolve_mcp_tenant_tier(int(user_id))
+        idem_key = str(payload.get("idempotency_key") or op.idempotency_key or "")
 
-        last_error = None
-        result = None
-        for attempt in range(max_attempts):
-            try:
-                result = run_coroutine_sync(
-                    call_tool(
-                        base_url=settings.PLATFORM_MCP_SERVER_URL.rstrip("/"),
-                        tool_name=op.tool_name,
-                        arguments=payload["arguments"],
-                        endpoint_path="/mcp",
-                        extra_headers={"X-MCP-Business-Id": str(user_id)},
-                        timeout=timeout,
-                    )
-                )
-                break
-            except Exception as e:
-                last_error = e
-                if attempt >= max_attempts - 1:
-                    break
-                delay = min(max_delay, base_delay * (2 ** attempt)) + random.uniform(0, jitter)
-                time.sleep(delay)
+        async def _execute_async_write(bounded_timeout: float):
+            from services.mcp_client import call_tool
 
-        if result is None:
-            err = RuntimeError(
-                f"MCP write operation failed ({type(last_error).__name__})"
-                if last_error
-                else "MCP write operation failed"
+            return await call_tool(
+                base_url=base,
+                tool_name=op.tool_name,
+                arguments=payload["arguments"],
+                endpoint_path="/mcp",
+                extra_headers=extra_headers,
+                timeout=bounded_timeout,
             )
-            if last_error:
-                raise err from last_error
-            raise err
+
+        async def _guarded_write():
+            guard = get_mcp_guardrails()
+            return await guard.call_tool_with_guardrails(
+                business_id=int(user_id),
+                target_key=target_key,
+                timeout_seconds=timeout,
+                operation_class="write_like",
+                tool_name=op.tool_name,
+                tenant_tier=tenant_tier,
+                idempotency_key=idem_key,
+                execute_call=_execute_async_write,
+            )
+
+        try:
+            result = run_coroutine_sync(_guarded_write())
+        except MCPGuardrailError as ge:
+            op = db.query(MCPWriteOperation).filter(
+                MCPWriteOperation.operation_id == operation_id,
+                MCPWriteOperation.user_id == user_id,
+            ).first()
+            if op:
+                op.status = "failure"
+                op.error_message = f"{ge.code}: {str(ge)[:1950]}"
+                op.completed_at = datetime.utcnow()
+                db.commit()
+            return
+
         op.status = "success"
         op.response_payload = json.dumps(result)
         op.completed_at = datetime.utcnow()
@@ -291,7 +343,6 @@ async def validate_connection(
     Test MCP server connectivity (JSON-RPC initialize) without saving.
     Returns { "valid": true, "message": "..." } or { "valid": false, "message": "..." }.
     """
-    from services.mcp_client import call_mcp_server
     base_url = (body.base_url or "").strip().rstrip("/")
     if not base_url:
         return {"valid": False, "message": "Server URL is required"}
@@ -301,7 +352,10 @@ async def validate_connection(
     auth_type = body.auth_type or "none"
     credentials = body.credentials
     try:
-        await call_mcp_server(
+        await guarded_mcp_jsonrpc(
+            business_id=int(current_user.id),
+            # Per-tenant ephemeral id (negative) — connection_id=0 would share one breaker across all users.
+            connection_id=-(int(current_user.id) + 1),
             base_url=base_url,
             endpoint_path=endpoint_path,
             method="initialize",
@@ -312,9 +366,21 @@ async def validate_connection(
             },
             auth_type=auth_type,
             credentials=credentials,
-            timeout=15.0,
+            timeout_seconds=15.0,
+            operation_class="read_like",
         )
         return {"valid": True, "message": "MCP server connection successful"}
+    except MCPGuardrailError as ge:
+        logger.warning(
+            "MCP validate guardrail blocked base_url=%s endpoint=%s code=%s",
+            base_url,
+            endpoint_path,
+            ge.code,
+        )
+        return {
+            "valid": False,
+            "message": f"MCP server unavailable ({ge.code}). Please verify the server URL, endpoint, and credentials.",
+        }
     except Exception:
         logging.exception("MCP server connection validation failed for base_url=%s, endpoint_path=%s", base_url, endpoint_path)
         return {
@@ -335,7 +401,6 @@ async def certify_connection_for_production(
     - tools/list works
     - at least one write-capable tool is discoverable
     """
-    from services.mcp_client import call_mcp_server, list_tools as mcp_list_tools
     conn = db.query(MCPServerConnection).filter(
         MCPServerConnection.id == connection_id,
         MCPServerConnection.user_id == current_user.id,
@@ -346,7 +411,9 @@ async def certify_connection_for_production(
     credentials = decrypt_json(conn.encrypted_credentials) if conn.encrypted_credentials else None
     checks = []
     try:
-        await call_mcp_server(
+        await guarded_mcp_jsonrpc(
+            business_id=int(current_user.id),
+            connection_id=int(conn.id),
             base_url=conn.base_url,
             endpoint_path=conn.endpoint_path or "/mcp",
             method="initialize",
@@ -357,24 +424,35 @@ async def certify_connection_for_production(
             },
             auth_type=conn.auth_type,
             credentials=credentials,
-            timeout=20.0,
+            timeout_seconds=20.0,
+            operation_class="read_like",
         )
         checks.append({"name": "initialize", "passed": True})
+    except MCPGuardrailError as ge:
+        logger.warning("MCP certify: initialize guardrail connection_id=%s code=%s", conn.id, ge.code)
+        checks.append({"name": "initialize", "passed": False, "error": ge.code})
+        return {"certified": False, "checks": checks, "recommended_policy": "fix_connection"}
     except Exception as e:
         logger.exception("MCP certify: initialize failed")
         checks.append({"name": "initialize", "passed": False, "error": type(e).__name__})
         return {"certified": False, "checks": checks, "recommended_policy": "fix_connection"}
 
     try:
-        tools_result = await mcp_list_tools(
+        tools_result = await guarded_mcp_list_tools(
+            business_id=int(current_user.id),
+            connection_id=int(conn.id),
             base_url=conn.base_url,
             endpoint_path=conn.endpoint_path or "/mcp",
             auth_type=conn.auth_type,
             credentials=credentials,
-            timeout=20.0,
+            timeout_seconds=20.0,
         )
         tools = tools_result.get("tools", []) if isinstance(tools_result, dict) else []
         checks.append({"name": "tools_list", "passed": True, "tool_count": len(tools)})
+    except MCPGuardrailError as ge:
+        logger.warning("MCP certify: tools/list guardrail connection_id=%s code=%s", conn.id, ge.code)
+        checks.append({"name": "tools_list", "passed": False, "error": ge.code})
+        return {"certified": False, "checks": checks, "recommended_policy": "fix_tools_list"}
     except Exception as e:
         logger.exception("MCP certify: tools/list failed")
         checks.append({"name": "tools_list", "passed": False, "error": type(e).__name__})
@@ -709,16 +787,26 @@ async def mcp_proxy(
     )
     db.add(log_entry)
     db.commit()
-    from services.mcp_client import call_mcp_server
-    result = await call_mcp_server(
-        base_url=conn.base_url,
-        endpoint_path=conn.endpoint_path or "/mcp",
-        method=body.method,
-        params=body.params,
-        auth_type=conn.auth_type,
-        credentials=credentials,
-    )
-    return result
+    from core.config import settings as _settings
+
+    proxy_timeout = float(getattr(_settings, "MCP_TOOL_DEFAULT_TIMEOUT_SECONDS", 60.0) or 60.0)
+    max_proxy = float(getattr(_settings, "MCP_TOOL_MAX_TIMEOUT_SECONDS", 300.0) or 300.0)
+    proxy_timeout = min(max(5.0, proxy_timeout), max(5.0, max_proxy))
+    try:
+        result = await guarded_mcp_jsonrpc(
+            business_id=int(current_user.id),
+            connection_id=int(conn.id),
+            base_url=conn.base_url,
+            endpoint_path=conn.endpoint_path or "/mcp",
+            method=body.method,
+            params=body.params,
+            auth_type=conn.auth_type,
+            credentials=credentials,
+            timeout_seconds=proxy_timeout,
+        )
+        return result
+    except MCPGuardrailError as ge:
+        raise _http_exception_from_mcp_guardrail_error(ge) from ge
 
 
 # --- Invoke platform MCP tool (for UI or agent-driven invocation) ---
@@ -847,8 +935,6 @@ async def get_registry(
     - connection_tools: per external MCP connection, the tools exposed by that server (tools/list).
     Also returns combined "tools" for backward compatibility.
     """
-    from services.mcp_client import list_tools as mcp_list_tools
-
     platform_tools = db.query(MCPToolConfig).filter(
         MCPToolConfig.user_id == current_user.id,
         MCPToolConfig.is_active == True,
@@ -886,18 +972,28 @@ async def get_registry(
         tools_list = []
         error_msg = None
         try:
-            result = await mcp_list_tools(
+            result = await guarded_mcp_list_tools(
+                business_id=int(current_user.id),
+                connection_id=int(c.id),
                 base_url=base_url,
                 endpoint_path=endpoint_path,
                 auth_type=c.auth_type or "none",
                 credentials=creds,
-                timeout=15.0,
+                timeout_seconds=15.0,
             )
             for tool in (result.get("tools") or []):
                 tools_list.append({
                     "name": tool.get("name") or "",
                     "description": (tool.get("description") or "")[:500],
                 })
+        except MCPGuardrailError as ge:
+            logger.warning(
+                "Registry tools/list guardrail connection=%s base=%s code=%s",
+                c.id,
+                base_url,
+                ge.code,
+            )
+            error_msg = f"Failed to list tools ({ge.code})."
         except Exception as e:
             logging.getLogger(__name__).warning("Failed to list tools for connection %s (%s): %s", c.name, base_url, e)
             error_msg = "Failed to list tools for this connection."

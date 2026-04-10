@@ -113,3 +113,17 @@ Notes:
 - Returns exit code `0` on SLO pass, `2` on SLO fail.
 - Tune `--distinct-tools` to model same-tool contention (lower means hotter targets).
 - Tune `--write-every` to increase/decrease write-like call share.
+
+## Tracking: issues #115 and #116
+
+This module is the **single MCP invocation safety layer** for Sandhi (timeouts, classified retries, circuit breaker, tenant/target quotas when enabled, structured error codes, metrics).
+
+| Theme | Where it lives |
+| ----- | -------------- |
+| Retry only on transient failures | `MCPInvocationGuardrails._classify_exception` + `classify_mcp_failure()` (public alias) |
+| Circuit breaker / quotas | `MCPInvocationGuardrails` + `core.config` `MCP_CIRCUIT_*`, `MCP_TENANT_*`, `MCP_GUARDRAILS_*` |
+| HTTP + worker entrypoints | `guarded_mcp_jsonrpc`, `guarded_mcp_list_tools`, `api/routes/mcp.py`, `agent_executor` tool paths; HTTP **503** for `mcp_circuit_open` and `mcp_upstream_unavailable` (`_http_exception_from_mcp_guardrail_error`); unsaved **validate** uses per-tenant negative `connection_id` in `byo_mcp_target_key` (not `0`) |
+| Error codes (`mcp_timeout`, `mcp_circuit_open`, …) | `MCPGuardrailError.code` |
+| Metrics / logs | `mcp_metrics`, `mcp_guardrail_event` log lines, `GET /metrics` |
+
+Upstream issue references: [MCP reliability guardrails #115](https://github.com/rahulpuri14493/sandhi_ai/issues/115), [MCP resilience hardening #116](https://github.com/rahulpuri14493/sandhi_ai/issues/116).

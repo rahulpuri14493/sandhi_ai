@@ -17,8 +17,14 @@ from models.audit_log import AuditLog
 from models.mcp_server import MCPToolConfig, MCPServerConnection
 from services.payment_processor import PaymentProcessor
 from services.a2a_client import execute_via_a2a
-from services.mcp_client import call_tool as mcp_call_tool, list_tools as mcp_list_tools
-from services.mcp_guardrails import MCPGuardrailError, get_mcp_guardrails
+from services.mcp_client import call_tool as mcp_call_tool
+from services.mcp_guardrails import (
+    MCPGuardrailError,
+    get_mcp_guardrails,
+    guarded_mcp_list_tools,
+    infer_mcp_tool_operation_class,
+    resolve_mcp_tenant_tier,
+)
 from core.encryption import decrypt_json
 from services.db_schema_introspection import format_schema_for_prompt
 from services.job_file_storage import persist_file
@@ -2351,15 +2357,26 @@ END DOCUMENT {i+1}: {doc_name}
             remote_tools: list = []
             try:
                 xh = self._sandhi_mcp_correlation_headers()
-                res = await mcp_list_tools(
+                res = await guarded_mcp_list_tools(
+                    business_id=int(business_id),
+                    connection_id=int(c.id),
                     base_url=base_url,
                     endpoint_path=endpoint_path,
                     auth_type=c.auth_type or "none",
                     credentials=creds,
-                    timeout=20.0,
+                    timeout_seconds=20.0,
                     extra_headers=xh if xh else None,
                 )
                 remote_tools = res.get("tools") or []
+            except MCPGuardrailError as ge:
+                logger.warning(
+                    "BYO MCP tools/list guardrail connection id=%s name=%s url=%s code=%s",
+                    c.id,
+                    c.name,
+                    base_url,
+                    ge.code,
+                )
+                continue
             except Exception as e:
                 logger.warning(
                     "BYO MCP tools/list failed for connection id=%s name=%s url=%s: %s",
@@ -2671,32 +2688,10 @@ END DOCUMENT {i+1}: {doc_name}
 
     @staticmethod
     def _infer_mcp_operation_class(tool_name: str, arguments: Optional[Dict[str, Any]]) -> str:
-        name = (tool_name or "").strip().lower()
-        args = arguments or {}
-        operation_type = str(args.get("operation_type") or "").strip().lower()
-        write_mode = str(args.get("write_mode") or "").strip().lower()
-        if operation_type in {"write", "create", "update", "delete", "insert", "upsert", "merge"}:
-            return "write_like"
-        if write_mode in {"replace", "append", "merge", "upsert"}:
-            return "write_like"
-        if any(
-            token in name
-            for token in ("write", "create", "update", "delete", "insert", "upsert", "patch", "save", "merge", "sync")
-        ):
-            return "write_like"
-        return "read_like"
+        return infer_mcp_tool_operation_class(tool_name, arguments)
 
     def _resolve_business_tier(self, business_id: int) -> str:
-        try:
-            raw = str(getattr(settings, "MCP_BUSINESS_TIER_BY_ID_JSON", "{}") or "{}")
-            mapping = json.loads(raw)
-            if isinstance(mapping, dict):
-                v = str(mapping.get(str(int(business_id))) or "").strip().lower()
-                if v in {"bronze", "silver", "gold"}:
-                    return v
-        except Exception:
-            pass
-        return str(getattr(settings, "MCP_DEFAULT_BUSINESS_TIER", "bronze") or "bronze").strip().lower()
+        return resolve_mcp_tenant_tier(int(business_id))
 
     def _log_action(self, entity_type: str, entity_id: int, action: str, details: Dict[str, Any]):
         """Log an action to the audit log"""

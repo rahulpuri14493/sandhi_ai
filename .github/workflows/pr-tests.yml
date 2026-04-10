@@ -70,8 +70,8 @@ jobs:
         if: always()
         run: docker compose down -v || true
 
-  backend-tests:
-    name: Backend tests
+  backend-unit-tests:
+    name: Backend unit/service/API tests
     runs-on: ubuntu-latest
     env:
       SECRET_KEY: ci-secret-key
@@ -108,9 +108,79 @@ jobs:
           rm -rf .pytest_cache || true
           find . -type d -name "__pycache__" -prune -exec rm -rf {} +
 
-      - name: Run pytest with coverage gate (>=80%)
+      - name: Run backend unit/service/API pytest with coverage gate
         run: |
-          pytest --cov=. --cov-report=term-missing --cov-fail-under=76 -v
+          # Use --ignore (not -k "not integration"): many unit files/names contain "integration"
+          # and would be wrongly skipped (e.g. test_workflow_builder_integration_coverage.py).
+          pytest tests --ignore=tests/integration --cov=. --cov-report=term-missing --cov-fail-under=76 -v
+
+  backend-integration-tests:
+    name: Backend integration tests (non-e2e)
+    runs-on: ubuntu-latest
+    env:
+      SECRET_KEY: ci-secret-key
+      OBJECT_STORAGE_BACKEND: local
+    defaults:
+      run:
+        working-directory: backend
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run backend integration pytest (non-e2e)
+        run: |
+          # Prefer --ignore over -k "not e2e" (substring "e2e" can appear inside unrelated names/paths).
+          # When adding a new e2e-only module under tests/integration, add it here and in backend-e2e-tests.
+          pytest tests/integration \
+            --ignore=tests/integration/test_e2e_flows.py \
+            --ignore=tests/integration/test_mcp_job_ai_data_output_e2e.py \
+            --ignore=tests/integration/test_sql_e2e.py \
+            --ignore=tests/integration/test_vector_e2e.py \
+            --ignore=tests/integration/test_vector_e2e_deployed.py \
+            -v --tb=short
+
+  backend-e2e-tests:
+    name: Backend e2e tests
+    runs-on: ubuntu-latest
+    env:
+      SECRET_KEY: ci-secret-key
+      OBJECT_STORAGE_BACKEND: local
+    defaults:
+      run:
+        working-directory: backend
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run backend e2e pytest
+        run: |
+          pytest \
+            tests/integration/test_e2e_flows.py \
+            tests/integration/test_mcp_job_ai_data_output_e2e.py \
+            tests/integration/test_sql_e2e.py \
+            tests/integration/test_vector_e2e.py \
+            tests/integration/test_vector_e2e_deployed.py \
+            -v --tb=short
 
   backend-redis-integration:
     name: Backend Redis integration tests

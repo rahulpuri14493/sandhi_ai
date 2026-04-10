@@ -3,7 +3,12 @@ import asyncio
 import pytest
 import httpx
 
-from services.mcp_guardrails import MCPGuardrailError, MCPInvocationGuardrails
+from services.mcp_guardrails import (
+    MCPGuardrailError,
+    MCPInvocationGuardrails,
+    classify_mcp_failure,
+    infer_mcp_tool_operation_class,
+)
 from services.mcp_client import MCPJSONRPCError
 from services import mcp_metrics
 
@@ -685,3 +690,27 @@ def test_redis_recovery_window_allows_reenable(monkeypatch):
     out = g._get_redis_client()
     assert out is dummy
     assert g._redis_init_failed is False
+
+
+def test_infer_mcp_tool_operation_class_matches_platform_and_byo_naming():
+    """Shared helper must stay aligned with HTTP platform routes and AgentExecutor."""
+    assert infer_mcp_tool_operation_class("platform_9_snowflake", {"query": "SELECT 1"}) == "read_like"
+    assert infer_mcp_tool_operation_class("platform_9_snowflake", {"operation_type": "insert"}) == "write_like"
+    assert infer_mcp_tool_operation_class("byo_1_write_record", {}) == "write_like"
+
+
+def test_classify_mcp_failure_public_alias_matches_transport_errors():
+    """#116: stable classifier API for policy and diagnostics."""
+    c = classify_mcp_failure(httpx.TransportError("connection failed"))
+    assert c.retryable is True
+    assert c.code == "mcp_upstream_unavailable"
+
+
+def test_http_exception_maps_upstream_unavailable_to_503():
+    """#116: MCP HTTP routes treat classified upstream failure as 503 (retryable dependency down)."""
+    from api.routes.mcp import _http_exception_from_mcp_guardrail_error
+
+    ge = MCPGuardrailError("mcp_upstream_unavailable", "MCP transport failure", retryable=True)
+    http_exc = _http_exception_from_mcp_guardrail_error(ge)
+    assert http_exc.status_code == 503
+    assert http_exc.detail["error"] == "mcp_upstream_unavailable"

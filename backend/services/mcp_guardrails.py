@@ -4,7 +4,7 @@ import random
 import time
 import uuid
 from dataclasses import dataclass
-from typing import Any, Awaitable, Callable, Dict, Literal, Optional
+from typing import Any, Awaitable, Callable, Dict, Literal, Optional, cast
 
 import httpx
 
@@ -862,3 +862,166 @@ def get_mcp_guardrails() -> MCPInvocationGuardrails:
     if _MCP_GUARDRAILS is None:
         _MCP_GUARDRAILS = MCPInvocationGuardrails()
     return _MCP_GUARDRAILS
+
+
+def resolve_mcp_tenant_tier(business_id: int) -> str:
+    """Tenant tier for MCP guardrail policy (bronze/silver/gold). Single source for routes + executor."""
+    try:
+        raw = str(getattr(settings, "MCP_BUSINESS_TIER_BY_ID_JSON", "{}") or "{}")
+        mapping = json.loads(raw)
+        if isinstance(mapping, dict):
+            v = str(mapping.get(str(int(business_id))) or "").strip().lower()
+            if v in {"bronze", "silver", "gold"}:
+                return v
+    except Exception:
+        pass
+    return str(getattr(settings, "MCP_DEFAULT_BUSINESS_TIER", "bronze") or "bronze").strip().lower()
+
+
+def byo_mcp_target_key(connection_id: int, base_url: str, endpoint_path: str, method: str) -> str:
+    """
+    Stable breaker/quota key for BYO MCP JSON-RPC (matches agent external tool_key shape).
+
+    connection_id is a positive DB id for saved connections. For unsaved validate flows, pass a
+    negative sentinel ``-(user_id + 1)`` so keys are per-tenant and never collide with real rows.
+    """
+    base = (base_url or "").strip().rstrip("/")
+    ep = (endpoint_path or "/mcp").strip()
+    if not ep.startswith("/"):
+        ep = "/" + ep
+    return f"external:{int(connection_id)}:{base}:{ep}:rpc:{method}"
+
+
+def infer_rpc_operation_class(method: str) -> Literal["read_like", "write_like"]:
+    """tools/call may mutate upstream; use write_like retry policy."""
+    if (method or "").strip().lower() == "tools/call":
+        return "write_like"
+    return "read_like"
+
+
+def infer_mcp_tool_operation_class(
+    tool_name: str, arguments: Optional[Dict[str, Any]]
+) -> Literal["read_like", "write_like"]:
+    """
+    Classify platform / agent MCP tool invocations for guardrail retry policy.
+
+    Shared by ``AgentExecutor`` and HTTP platform tool routes so read vs write profiles stay aligned.
+    """
+    name = (tool_name or "").strip().lower()
+    args = arguments or {}
+    operation_type = str(args.get("operation_type") or "").strip().lower()
+    write_mode = str(args.get("write_mode") or "").strip().lower()
+    if operation_type in {"write", "create", "update", "delete", "insert", "upsert", "merge"}:
+        return "write_like"
+    if write_mode in {"replace", "append", "merge", "upsert"}:
+        return "write_like"
+    if any(
+        token in name
+        for token in ("write", "create", "update", "delete", "insert", "upsert", "patch", "save", "merge", "sync")
+    ):
+        return "write_like"
+    return "read_like"
+
+
+def classify_mcp_failure(exc: BaseException) -> MCPErrorClassification:
+    """
+    Public classifier for MCP-related failures (GitHub #116): stable code + retryable flag + detail.
+    Used by guardrails internally; exposed for tests and diagnostics.
+    """
+    return MCPInvocationGuardrails._classify_exception(exc)
+
+
+async def guarded_mcp_jsonrpc(
+    *,
+    business_id: int,
+    connection_id: int,
+    base_url: str,
+    endpoint_path: str,
+    method: str,
+    params: Optional[Dict[str, Any]],
+    auth_type: str,
+    credentials: Optional[Dict[str, Any]],
+    timeout_seconds: float,
+    operation_class: Optional[Literal["read_like", "write_like"]] = None,
+) -> Dict[str, Any]:
+    """
+    JSON-RPC to an MCP server under shared guardrails (timeouts, classified retries, breaker, quotas).
+    Imports call_mcp_server inside execute_call so tests can patch services.mcp_client.call_mcp_server.
+    """
+    op_cls = operation_class if operation_class is not None else infer_rpc_operation_class(method)
+    op_cls = cast(Literal["read_like", "write_like"], op_cls)
+    guard = get_mcp_guardrails()
+    ep = (endpoint_path or "/mcp").strip()
+    if not ep.startswith("/"):
+        ep = "/" + ep
+    target_key = byo_mcp_target_key(connection_id, base_url, ep, method)
+    tenant_tier = resolve_mcp_tenant_tier(int(business_id))
+
+    async def _exec(bounded_timeout: float):
+        from services.mcp_client import call_mcp_server
+
+        return await call_mcp_server(
+            base_url=base_url.strip().rstrip("/"),
+            endpoint_path=ep,
+            method=method,
+            params=params,
+            auth_type=auth_type,
+            credentials=credentials,
+            timeout=bounded_timeout,
+        )
+
+    return await guard.call_tool_with_guardrails(
+        business_id=int(business_id),
+        target_key=target_key,
+        timeout_seconds=timeout_seconds,
+        operation_class=op_cls,
+        tool_name=f"rpc:{method}",
+        tenant_tier=tenant_tier,
+        idempotency_key="",
+        execute_call=_exec,
+    )
+
+
+async def guarded_mcp_list_tools(
+    *,
+    business_id: int,
+    connection_id: int,
+    base_url: str,
+    endpoint_path: str,
+    auth_type: str,
+    credentials: Optional[Dict[str, Any]],
+    timeout_seconds: float,
+    extra_headers: Optional[Dict[str, str]] = None,
+) -> Dict[str, Any]:
+    """
+    MCP tools/list under guardrails. Lazy-imports list_tools for test patches.
+    """
+    guard = get_mcp_guardrails()
+    ep = (endpoint_path or "/mcp").strip()
+    if not ep.startswith("/"):
+        ep = "/" + ep
+    target_key = byo_mcp_target_key(connection_id, base_url, ep, "tools/list")
+    tenant_tier = resolve_mcp_tenant_tier(int(business_id))
+
+    async def _exec(bounded_timeout: float):
+        from services.mcp_client import list_tools as mcp_list_tools
+
+        return await mcp_list_tools(
+            base_url=base_url.strip().rstrip("/"),
+            endpoint_path=ep,
+            auth_type=auth_type,
+            credentials=credentials,
+            timeout=bounded_timeout,
+            extra_headers=extra_headers,
+        )
+
+    return await guard.call_tool_with_guardrails(
+        business_id=int(business_id),
+        target_key=target_key,
+        timeout_seconds=timeout_seconds,
+        operation_class="read_like",
+        tool_name="rpc:tools/list",
+        tenant_tier=tenant_tier,
+        idempotency_key="",
+        execute_call=_exec,
+    )
