@@ -28,7 +28,7 @@ from schemas.job import (
 from core.security import get_current_user, get_current_business_user
 from core.config import settings
 from services.job_scheduler import get_scheduler, reset_job_for_execution, queue_job_execution
-from services.task_queue import get_queue_stats
+from services.task_queue import get_queue_stats, QueueEnqueueError
 from services.task_splitter import PlannerSplitError
 from services.workflow_builder import WorkflowBuilder
 from services.tool_splitter import suggest_tool_assignments_for_agents
@@ -2061,6 +2061,12 @@ def execute_job(
             execution_token=execution_token,
             strict=bool(getattr(settings, "JOB_EXECUTION_STRICT_QUEUE", False)),
         )
+    except QueueEnqueueError as e:
+        raise HTTPException(
+            status_code=503,
+            headers={"Retry-After": "30"},
+            detail={"error": "queue_overloaded"}
+        )
     except Exception as exc:
         job.status = JobStatus.PENDING_APPROVAL
         job.execution_token = None
@@ -2621,6 +2627,12 @@ def rerun_job(
             history_id=history_id,
             execution_token=execution_token,
             strict=bool(getattr(settings, "JOB_EXECUTION_STRICT_QUEUE", False)),
+        )
+    except QueueEnqueueError as e:
+        raise HTTPException(
+            status_code=503,
+            headers={"Retry-After": "30"},
+            detail={"error": "queue_overloaded"}
         )
     except Exception as exc:
         logger.exception("Failed to enqueue execution for job %s", job.id)

@@ -46,6 +46,7 @@ class Settings(BaseSettings):
     # Job execution backend: celery (Redis queue) or local_thread fallback.
     JOB_EXECUTION_BACKEND: str = "celery"
     JOB_EXECUTION_STRICT_QUEUE: bool = False  # True: no local fallback when enqueue fails
+
     CELERY_BROKER_URL: str = "redis://redis:6379/0"
     CELERY_RESULT_BACKEND: str = "redis://redis:6379/1"
     CELERY_WORKER_AUTOSCALE_MAX: int = 16
@@ -54,6 +55,16 @@ class Settings(BaseSettings):
     CELERY_EXECUTE_MAX_RETRIES: int = 3
     CELERY_EXECUTE_RETRY_BACKOFF_SECONDS: int = 5
     CELERY_EXECUTE_RETRY_BACKOFF_MAX_SECONDS: int = 600
+
+    CELERY_TASK_DEFAULT_QUEUE: str = "interactive" # default queue for tasks without explicit queue
+    CELERY_MAX_QUEUE_DEPTH: int = 100 # ~1 hour of backlog at typical throughput before backpressure kicks in
+    CELERY_CIRCUIT_BREACH_THRESHOLD: int = 30  # stable under burst traffic spikes; tripped when breaches in the last minute exceeds this
+    CELERY_QUEUE_PREFIX: str = "" # The _kombu.binding keys are just metadata.
+
+    # Queue SLO thresholds used for alerting via /api/jobs/queue/stats
+    CELERY_SLO_ENQUEUE_TO_START_P95_SECONDS: int = 300   # 5 minutes
+    CELERY_SLO_MAX_QUEUE_AGE_SECONDS: int = 1800          # 30 minutes, flag if oldest job older than this
+
     # When True, allow agent endpoints that resolve to private/loopback IPs (dev, Docker, same host). Default False in production.
     ALLOW_PRIVATE_AGENT_ENDPOINTS: bool = False
     # Job document storage backend: S3-compatible object storage (default) or local filesystem
