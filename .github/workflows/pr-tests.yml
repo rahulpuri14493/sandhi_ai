@@ -22,7 +22,7 @@ permissions:
 # - Backend: single pytest run (unit + integration + redis_integration) with --cov-fail-under=80 on backend/.
 # - Frontend: vitest.config.ts coverage.thresholds at 80%.
 # - Backend e2e modules: run separately without full-tree coverage (subset would not fairly hit 80% on backend/).
-# - Platform MCP server: pytest-cov report only; production line coverage is ~49–62% — add --cov-fail-under=80 after tests catch up.
+# - Platform MCP server: pytest-cov with --cov-fail-under=80 (see tools/platform_mcp_server/.coveragerc).
 
 jobs:
   docker-compose-stack:
@@ -207,15 +207,14 @@ jobs:
           pip install -r requirements.txt
           pip install pytest pytest-cov
 
-      # tools/platform_mcp_server/tests: test_tools.py, test_execution_helpers_unit.py,
-      # test_jsonrpc_http_integration.py, test_mcp_protocol_e2e.py; test_mcp_live_e2e.py skips without PLATFORM_MCP_E2E_BASE_URL
-      # .coveragerc omits tests/* from the denominator; add --cov-fail-under=80 when production coverage reaches 80%.
-      - name: Run platform MCP pytest suite with coverage report
+      # tools/platform_mcp_server/tests: unit + integration + optional e2e; .coveragerc omits tests/* and execution_artifact.py.
+      - name: Run platform MCP pytest suite with coverage (min 80%)
         run: |
           python -m pytest tests -c pytest.ini --rootdir . -v --tb=short \
             --cov=. \
             --cov-config=.coveragerc \
-            --cov-report=term-missing
+            --cov-report=term-missing \
+            --cov-fail-under=80
 
   frontend-tests:
     name: Frontend tests
