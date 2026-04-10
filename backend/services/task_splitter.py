@@ -144,6 +144,7 @@ def _normalize_parsed_split(
         if entry and isinstance(task_val, str) and task_val.strip():
             row: Dict[str, Any] = {
                 "agent_index": i,
+                "agent_name": (agents[i].name or "").strip() if getattr(agents[i], "name", None) else None,
                 "task": task_val,
                 "assigned_document_ids": normalized_scope.get(i),
             }
@@ -157,6 +158,7 @@ def _normalize_parsed_split(
             result.append(
                 {
                     "agent_index": i,
+                    "agent_name": (agents[i].name or "").strip() if getattr(agents[i], "name", None) else None,
                     "task": _build_agent_task_fallback(
                         agents[i], job_title, job_description, i, len(agents)
                     ),
@@ -229,6 +231,7 @@ async def split_job_for_agents(
         all_doc_ids = [d.get("id") for d in documents_content if d.get("id")]
         return [{
             "agent_index": 0,
+            "agent_name": (agents[0].name or "").strip() if agents and getattr(agents[0], "name", None) else None,
             "task": _build_full_task_context(job_title, job_description, documents_content),
             "assigned_document_ids": all_doc_ids if all_doc_ids else None,
         }]
@@ -339,6 +342,7 @@ def _fallback_tasks(
     return [
         {
             "agent_index": i,
+            "agent_name": (a.name or "").strip() if getattr(a, "name", None) else None,
             "task": _build_agent_task_fallback(
                 a, job_title, job_description, i, len(agents)
             ),

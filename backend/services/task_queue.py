@@ -5,13 +5,87 @@ from __future__ import annotations
 import logging
 import redis
 import json
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 from kombu import Queue
 
 from core.config import settings
+from services.business_job_alerts import send_business_job_alert
 
 logger = logging.getLogger(__name__)
+
+
+def cleanup_heartbeat_retention_once() -> dict:
+    """
+    Cleanup durable heartbeat telemetry older than retention window.
+
+    Redis heartbeat and nonce keys already use short TTLs; this task focuses on
+    durable DB snapshot fields on workflow steps to control storage growth.
+    """
+    from db.database import SessionLocal
+    from models.job import WorkflowStep
+
+    retention_days = max(1, int(getattr(settings, "HEARTBEAT_RETENTION_DAYS", 30) or 30))
+    cutoff = datetime.utcnow() - timedelta(days=retention_days)
+    db = SessionLocal()
+    cleared = 0
+    try:
+        # Only clean non-active steps and only when the newest known runtime signal
+        # is older than the retention cutoff.
+        rows = (
+            db.query(WorkflowStep)
+            .filter(WorkflowStep.status != "in_progress")
+            .all()
+        )
+        for step in rows:
+            has_live = any(
+                [
+                    getattr(step, "live_phase", None),
+                    getattr(step, "live_phase_started_at", None),
+                    getattr(step, "live_reason_code", None),
+                    getattr(step, "live_reason_detail", None),
+                    getattr(step, "live_trace_id", None),
+                    getattr(step, "live_attempt", None) is not None,
+                    getattr(step, "stuck_since", None),
+                    getattr(step, "stuck_reason", None),
+                ]
+            )
+            if not has_live:
+                continue
+            latest_ts = max(
+                [
+                    ts
+                    for ts in [
+                        getattr(step, "completed_at", None),
+                        getattr(step, "last_activity_at", None),
+                        getattr(step, "last_progress_at", None),
+                        getattr(step, "live_phase_started_at", None),
+                        getattr(step, "started_at", None),
+                    ]
+                    if ts is not None
+                ],
+                default=None,
+            )
+            if latest_ts is None or latest_ts >= cutoff:
+                continue
+            step.live_phase = None
+            step.live_phase_started_at = None
+            step.live_reason_code = None
+            step.live_reason_detail = None
+            step.live_trace_id = None
+            step.live_attempt = None
+            step.stuck_since = None
+            step.stuck_reason = None
+            cleared += 1
+        if cleared:
+            db.commit()
+        return {"retention_days": retention_days, "cutoff": cutoff.isoformat(), "cleared_steps": int(cleared)}
+    except Exception:
+        db.rollback()
+        logger.exception("heartbeat_retention_cleanup_failed")
+        return {"retention_days": retention_days, "cutoff": cutoff.isoformat(), "cleared_steps": int(cleared), "error": True}
+    finally:
+        db.close()
 
 
 class QueueEnqueueError(RuntimeError):
@@ -65,6 +139,14 @@ if Celery is not None:
             "task": "check_stuck_jobs",
             "schedule": 1800.0,  # 30 minutes in seconds
         },
+        "check-stuck-workflow-steps-every-2-mins": {
+            "task": "check_stuck_workflow_steps",
+            "schedule": 120.0,
+        },
+        "heartbeat-retention-cleanup-daily": {
+            "task": "cleanup_heartbeat_retention",
+            "schedule": 86400.0,
+        },
     }
 
 # ---------------------------------------------------------------------------
@@ -106,6 +188,69 @@ def _get_queue_oldest_age_seconds(client: redis.Redis, redis_key: str) -> Option
 # ---------------------------------------------------------------------------
 # Main enqueue function with admission control and backpressure
 # ---------------------------------------------------------------------------
+
+
+# Fallback symbol for imports when Celery is unavailable in the environment.
+def trigger_scheduled_job(*args, **kwargs):  # pragma: no cover - runtime fallback
+    raise RuntimeError("Celery is not installed; trigger_scheduled_job task is unavailable")
+
+
+class ExecutePlatformJobTask:
+    """
+    Task-like fallback used by tests and non-celery environments.
+    """
+
+    def on_failure(self, exc, task_id, args, kwargs, einfo):  # pragma: no cover - exercised via tests
+        job_id = kwargs.get("job_id") or (args[0] if args else None)
+        history_id = kwargs.get("history_id")
+        logger.error("Job %s permanently failed after retries exhausted. Error: %s", job_id, exc)
+
+        from db.database import SessionLocal
+        from models.job import Job, JobStatus, ScheduleExecutionHistory
+        from datetime import datetime as _dt
+
+        db = SessionLocal()
+        try:
+            job = db.query(Job).filter(Job.id == job_id).first()
+            if job and job.status == JobStatus.IN_PROGRESS:
+                job.status = JobStatus.FAILED
+                job.failure_reason = f"Execution permanently failed: {str(exc)[:450]}"
+                if history_id:
+                    hist = db.query(ScheduleExecutionHistory).filter(
+                        ScheduleExecutionHistory.id == history_id
+                    ).first()
+                    if hist:
+                        hist.status = "failed"
+                        hist.failure_reason = f"Permanent failure after retries: {str(exc)[:450]}"
+                        hist.completed_at = _dt.utcnow()
+                db.commit()
+        except Exception:
+            logger.exception("Failed to mark job as FAILED in on_failure hook")
+        finally:
+            db.close()
+
+
+def _execute_platform_job_core(job_id: int, history_id: Optional[int] = None, execution_token: Optional[str] = None):
+    """
+    Shared execution entrypoint. Raises so Celery retry policies can apply.
+    """
+    from services.job_scheduler import run_job_in_thread
+
+    return run_job_in_thread(
+        job_id=job_id,
+        history_id=history_id,
+        execution_token=execution_token,
+        reraise_exceptions=True,
+    )
+
+
+def execute_platform_job(job_id: int, history_id: Optional[int] = None, execution_token: Optional[str] = None):
+    """Public callable used by tests and non-celery paths."""
+    return _execute_platform_job_core(
+        job_id=job_id,
+        history_id=history_id,
+        execution_token=execution_token,
+    )
 
 
 def enqueue_execute_platform_job(
@@ -368,15 +513,10 @@ if celery_app is not None:
         """
         Celery worker task. Uses fresh DB session + event loop through shared runner.
         """
-        from services.job_scheduler import run_job_in_thread
-        # The try/except block is removed.
-        # Celery automatically catches the exception, delays the task with exponential backoff, retries up to max_retries.
-        # We pass reraise_exceptions=True so Celery actually knows when it fails
-        return run_job_in_thread(
+        return _execute_platform_job_core(
             job_id=job_id,
             history_id=history_id,
             execution_token=execution_token,
-            reraise_exceptions=True,
         )
 
     @celery_app.task(name="trigger_scheduled_job", bind=True)
@@ -457,10 +597,134 @@ if celery_app is not None:
                         triggered_by="watchdog",
                     )
                     db.add(history)
+                    try:
+                        send_business_job_alert(
+                            event_type="job_stuck",
+                            job_id=int(job.id),
+                            business_id=int(job.business_id),
+                            title=str(job.title or f"Job {job.id}"),
+                            status=str(job.status.value),
+                            stage="watchdog",
+                            reason=f"Potentially stuck for over {threshold_hours}h",
+                        )
+                    except Exception:
+                        pass
             db.commit()
         except Exception:
             logger.exception("Error in stuck job watchdog")
             db.rollback()
         finally:
             db.close()
+
+    @celery_app.task(name="check_stuck_workflow_steps")
+    def _check_stuck_workflow_steps():
+        """
+        Step-level watchdog using durable workflow-step telemetry snapshots.
+
+        This path does not depend on Redis liveness, so stuck diagnosis survives Redis restarts.
+        """
+        from datetime import datetime, timedelta
+
+        from db.database import SessionLocal
+        from models.job import Job, JobStatus, WorkflowStep
+
+        default_threshold = max(60, int(getattr(settings, "STEP_STUCK_THRESHOLD_SECONDS", 600)))
+        blocked_threshold = max(
+            default_threshold,
+            int(getattr(settings, "STEP_STUCK_BLOCKED_THRESHOLD_SECONDS", 900)),
+        )
+        loop_round_threshold = max(3, int(getattr(settings, "STEP_LOOP_ROUND_THRESHOLD", 10)))
+        repeat_tool_threshold = max(3, int(getattr(settings, "STEP_REPEAT_TOOLCALL_THRESHOLD", 6)))
+        now = datetime.utcnow()
+
+        db = SessionLocal()
+        try:
+            rows = (
+                db.query(WorkflowStep, Job)
+                .join(Job, Job.id == WorkflowStep.job_id)
+                .filter(
+                    WorkflowStep.status == "in_progress",
+                    Job.status == JobStatus.IN_PROGRESS,
+                )
+                .all()
+            )
+            changed = 0
+            for step, _job in rows:
+                phase = (getattr(step, "live_phase", None) or "").strip().lower()
+                effective_threshold = blocked_threshold if phase == "blocked" else default_threshold
+                since = (
+                    getattr(step, "last_progress_at", None)
+                    or getattr(step, "last_activity_at", None)
+                    or getattr(step, "started_at", None)
+                )
+                if since is None:
+                    continue
+                age_s = (now - since).total_seconds()
+                if age_s >= float(effective_threshold):
+                    if getattr(step, "stuck_since", None) is None:
+                        step.stuck_since = now
+                        # Best-effort classify looping vs slow external dependency.
+                        detail_raw = getattr(step, "live_reason_detail", None) or ""
+                        loop_round = None
+                        same_tool_count = None
+                        tool_name = None
+                        try:
+                            import json as _json
+                            parsed = _json.loads(detail_raw) if detail_raw and detail_raw.strip().startswith("{") else None
+                            if isinstance(parsed, dict):
+                                loop = parsed.get("loop") if isinstance(parsed.get("loop"), dict) else None
+                                if loop:
+                                    loop_round = loop.get("round_idx")
+                                same_tool_count = parsed.get("same_tool_count")
+                                tool_name = parsed.get("tool_name")
+                        except Exception:
+                            parsed = None
+                        kind = "stuck"
+                        if (
+                            (loop_round is not None and int(loop_round) >= loop_round_threshold)
+                            or (same_tool_count is not None and int(same_tool_count) >= repeat_tool_threshold)
+                        ):
+                            kind = "looping"
+                        if phase == "calling_tool" and kind != "looping":
+                            kind = "slow_dependency"
+                        base = f"{kind}: no meaningful progress for {int(age_s)}s"
+                        extra = f" phase={phase or 'unknown'}"
+                        if tool_name:
+                            extra += f" tool={tool_name}"
+                        step.stuck_reason = (base + ";" + extra)[:128]
+                        changed += 1
+                        logger.warning(
+                            "workflow_step_potentially_stuck job_id=%s step_id=%s step_order=%s "
+                            "phase=%s age_seconds=%s threshold_seconds=%s trace_id=%s",
+                            step.job_id,
+                            step.id,
+                            step.step_order,
+                            phase or "unknown",
+                            int(age_s),
+                            effective_threshold,
+                            getattr(step, "live_trace_id", None),
+                        )
+                else:
+                    # Auto-clear stale stuck flags once progress resumes.
+                    if getattr(step, "stuck_since", None) is not None:
+                        step.stuck_since = None
+                        step.stuck_reason = None
+                        changed += 1
+            if changed:
+                db.commit()
+        except Exception:
+            logger.exception("Error in step-level stuck watchdog")
+            db.rollback()
+        finally:
+            db.close()
+
+    @celery_app.task(name="cleanup_heartbeat_retention")
+    def _cleanup_heartbeat_retention():
+        result = cleanup_heartbeat_retention_once()
+        logger.info(
+            "heartbeat_retention_cleanup_done retention_days=%s cleared_steps=%s cutoff=%s",
+            result.get("retention_days"),
+            result.get("cleared_steps"),
+            result.get("cutoff"),
+        )
 

@@ -1069,3 +1069,210 @@ class TestRerunCancelledJob:
                 headers=_auth_headers(user),
             )
         assert resp.status_code == 503
+
+    def test_rerun_resume_preserves_completed_steps(self, schedule_client, db_session):
+        client, user, job = schedule_client
+        dev = _make_user(db_session, UserRole.DEVELOPER)
+        a1 = _make_agent(db_session, dev)
+        a2 = _make_agent(db_session, dev)
+        a3 = _make_agent(db_session, dev)
+        s1 = WorkflowStep(
+            job_id=job.id,
+            agent_id=a1.id,
+            step_order=1,
+            status="completed",
+            output_data='{"ok":1}',
+            input_data="{}",
+            depends_on_previous=True,
+        )
+        s2 = WorkflowStep(
+            job_id=job.id,
+            agent_id=a2.id,
+            step_order=2,
+            status="failed",
+            output_data='{"old":"x"}',
+            input_data="{}",
+            depends_on_previous=True,
+        )
+        s3 = WorkflowStep(
+            job_id=job.id,
+            agent_id=a3.id,
+            step_order=3,
+            status="pending",
+            output_data='{"stale":"y"}',
+            input_data="{}",
+            depends_on_previous=True,
+        )
+        db_session.add_all([s1, s2, s3])
+        job.status = JobStatus.FAILED
+        db_session.commit()
+
+        with patch("api.routes.jobs.queue_job_execution") as mock_queue:
+            resp = client.post(
+                f"/api/jobs/{job.id}/rerun",
+                headers=_auth_headers(user),
+            )
+
+        assert resp.status_code == 200
+        assert "resume" in resp.json()["message"].lower()
+        assert resp.json()["mode"] == "resume"
+        assert resp.json()["resume_start_step_order"] == 2
+        assert resp.json()["steps_reused_count"] == 1
+        assert resp.json()["steps_rerun_count"] == 2
+        mock_queue.assert_called_once()
+        db_session.refresh(s1)
+        db_session.refresh(s2)
+        db_session.refresh(s3)
+        assert s1.status == "completed"
+        assert s1.output_data == '{"ok":1}'
+        assert s2.status == "pending"
+        assert s2.output_data is None
+        assert s3.status == "pending"
+        assert s3.output_data is None
+
+    def test_rerun_default_mode_is_resume(self, schedule_client, db_session):
+        client, user, job = schedule_client
+        dev = _make_user(db_session, UserRole.DEVELOPER)
+        a1 = _make_agent(db_session, dev)
+        a2 = _make_agent(db_session, dev)
+        s1 = WorkflowStep(
+            job_id=job.id,
+            agent_id=a1.id,
+            step_order=1,
+            status="completed",
+            output_data='{"ok":1}',
+            input_data="{}",
+            depends_on_previous=True,
+        )
+        s2 = WorkflowStep(
+            job_id=job.id,
+            agent_id=a2.id,
+            step_order=2,
+            status="failed",
+            output_data='{"old":"x"}',
+            input_data="{}",
+            depends_on_previous=True,
+        )
+        db_session.add_all([s1, s2])
+        job.status = JobStatus.FAILED
+        db_session.commit()
+
+        with patch("api.routes.jobs.queue_job_execution"):
+            resp = client.post(
+                f"/api/jobs/{job.id}/rerun",
+                headers=_auth_headers(user),
+            )
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["mode"] == "resume"
+        assert data["steps_reused_count"] == 1
+        assert data["steps_rerun_count"] == 1
+
+    def test_rerun_default_reports_resume_metadata_counts(self, schedule_client, db_session):
+        client, user, job = schedule_client
+        dev = _make_user(db_session, UserRole.DEVELOPER)
+        a1 = _make_agent(db_session, dev)
+        a2 = _make_agent(db_session, dev)
+        s1 = WorkflowStep(
+            job_id=job.id,
+            agent_id=a1.id,
+            step_order=1,
+            status="completed",
+            output_data='{"ok":1}',
+            input_data="{}",
+            depends_on_previous=True,
+        )
+        s2 = WorkflowStep(
+            job_id=job.id,
+            agent_id=a2.id,
+            step_order=2,
+            status="failed",
+            output_data='{"old":"x"}',
+            input_data="{}",
+            depends_on_previous=True,
+        )
+        db_session.add_all([s1, s2])
+        job.status = JobStatus.FAILED
+        db_session.commit()
+
+        with patch("api.routes.jobs.queue_job_execution"):
+            resp = client.post(f"/api/jobs/{job.id}/rerun", headers=_auth_headers(user))
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["mode"] == "resume"
+        assert data["resume_start_step_order"] == 2
+        assert data["steps_reused_count"] == 1
+        assert data["steps_rerun_count"] == 1
+
+    def test_rerun_explicit_resume_rejects_when_all_steps_completed(self, schedule_client, db_session):
+        client, user, job = schedule_client
+        dev = _make_user(db_session, UserRole.DEVELOPER)
+        a1 = _make_agent(db_session, dev)
+        a2 = _make_agent(db_session, dev)
+        s1 = WorkflowStep(
+            job_id=job.id,
+            agent_id=a1.id,
+            step_order=1,
+            status="completed",
+            output_data='{"ok":1}',
+            input_data="{}",
+            depends_on_previous=True,
+        )
+        s2 = WorkflowStep(
+            job_id=job.id,
+            agent_id=a2.id,
+            step_order=2,
+            status="completed",
+            output_data='{"ok":2}',
+            input_data="{}",
+            depends_on_previous=True,
+        )
+        db_session.add_all([s1, s2])
+        job.status = JobStatus.FAILED
+        db_session.commit()
+
+        resp = client.post(
+            f"/api/jobs/{job.id}/rerun?mode=resume",
+            headers=_auth_headers(user),
+        )
+        assert resp.status_code == 400
+        assert "no incomplete workflow steps to resume" in resp.json()["detail"].lower()
+
+    def test_rerun_explicit_full_reruns_all_steps(self, schedule_client, db_session):
+        client, user, job = schedule_client
+        dev = _make_user(db_session, UserRole.DEVELOPER)
+        a1 = _make_agent(db_session, dev)
+        a2 = _make_agent(db_session, dev)
+        s1 = WorkflowStep(
+            job_id=job.id,
+            agent_id=a1.id,
+            step_order=1,
+            status="completed",
+            output_data='{"ok":1}',
+            input_data="{}",
+            depends_on_previous=True,
+        )
+        s2 = WorkflowStep(
+            job_id=job.id,
+            agent_id=a2.id,
+            step_order=2,
+            status="failed",
+            output_data='{"old":"x"}',
+            input_data="{}",
+            depends_on_previous=True,
+        )
+        db_session.add_all([s1, s2])
+        job.status = JobStatus.FAILED
+        db_session.commit()
+
+        with patch("api.routes.jobs.queue_job_execution"):
+            resp = client.post(
+                f"/api/jobs/{job.id}/rerun?mode=full",
+                headers=_auth_headers(user),
+            )
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["mode"] == "full"
+        assert data["resume_start_step_order"] == 1
+        assert data["steps_reused_count"] == 0
+        assert data["steps_rerun_count"] == 2

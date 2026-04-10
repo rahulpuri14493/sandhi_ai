@@ -5,7 +5,7 @@ Authentication:
 - View job: JWT token (from share link) in query ?token=xxx or header X-Job-Token
 - Create job: X-API-Key header (must match EXTERNAL_API_KEY)
 """
-from typing import Optional
+from typing import Any, Dict, List, Optional
 import json
 from fastapi import APIRouter, Depends, HTTPException, status, Header
 from fastapi.security import APIKeyHeader
@@ -112,6 +112,118 @@ def _build_job_response(job: Job, db: Session) -> dict:
         "files": files_data,
         "conversation": conversation_data,
         "failure_reason": job.failure_reason,
+        "kpis": _build_external_kpis(steps),
+    }
+
+
+def _parse_output_payload(raw: Optional[str]) -> Dict[str, Any]:
+    if not raw or not isinstance(raw, str):
+        return {}
+    try:
+        data = json.loads(raw)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _extract_completion_tokens(payload: Dict[str, Any]) -> int:
+    candidates: List[Any] = []
+    if isinstance(payload, dict):
+        candidates.extend(
+            [
+                payload.get("usage"),
+                payload.get("token_usage"),
+                payload.get("usage_metadata"),
+                payload.get("response_metadata", {}).get("token_usage") if isinstance(payload.get("response_metadata"), dict) else None,
+            ]
+        )
+        ao = payload.get("agent_output")
+        if isinstance(ao, dict):
+            candidates.extend(
+                [
+                    ao.get("usage"),
+                    ao.get("token_usage"),
+                    ao.get("response_metadata", {}).get("token_usage") if isinstance(ao.get("response_metadata"), dict) else None,
+                ]
+            )
+    for c in candidates:
+        if not isinstance(c, dict):
+            continue
+        try:
+            val = int(c.get("completion_tokens") or c.get("output_tokens") or 0)
+        except Exception:
+            val = 0
+        if val > 0:
+            return val
+    return 0
+
+
+def _build_external_kpis(steps: List[WorkflowStep]) -> Dict[str, Any]:
+    total_steps = len(steps)
+    completed_steps = 0
+    failed_steps = 0
+    in_progress_steps = 0
+    total_cost = 0.0
+    completion_tokens = 0
+    processed_records = 0
+    write_success = 0
+    tools_used: set[str] = set()
+
+    for step in steps:
+        st = (step.status or "").strip().lower()
+        if st == "completed":
+            completed_steps += 1
+        elif st == "failed":
+            failed_steps += 1
+        elif st == "in_progress":
+            in_progress_steps += 1
+        total_cost += float(step.cost or 0.0)
+
+        payload = _parse_output_payload(step.output_data)
+        completion_tokens += _extract_completion_tokens(payload)
+
+        records = payload.get("records")
+        if not isinstance(records, list):
+            ao = payload.get("agent_output")
+            if isinstance(ao, dict):
+                records = ao.get("records")
+        if isinstance(records, list):
+            processed_records += len(records)
+
+        wr = payload.get("write_results")
+        if isinstance(wr, list):
+            for row in wr:
+                if isinstance(row, dict) and str(row.get("status") or "").strip().lower() == "success":
+                    write_success += 1
+                if isinstance(row, dict):
+                    tn = row.get("tool_name")
+                    if isinstance(tn, str) and tn.strip():
+                        tools_used.add(tn.strip())
+
+        for candidate in (
+            payload.get("mcp_tools_used"),
+            payload.get("tools_used"),
+            payload.get("agent_output", {}).get("tools_used") if isinstance(payload.get("agent_output"), dict) else None,
+        ):
+            if isinstance(candidate, list):
+                for t in candidate:
+                    if isinstance(t, str) and t.strip():
+                        tools_used.add(t.strip())
+
+    success_rate = float(completed_steps) / float(max(1, total_steps))
+    return {
+        "steps_total": total_steps,
+        "steps_completed": completed_steps,
+        "steps_failed": failed_steps,
+        "steps_in_progress": in_progress_steps,
+        "success_rate": round(success_rate, 4),
+        "total_cost": round(float(total_cost), 6),
+        # Strict metric for published users: provider-reported completion/output tokens only.
+        "output_tokens_reported": int(completion_tokens),
+        "records_processed": int(processed_records),
+        "write_transactions_success": int(write_success),
+        "tools_used_count": len(tools_used),
+        "tools_used": sorted(tools_used),
     }
 
 
@@ -152,11 +264,18 @@ def get_job_status_external(
     job = db.query(Job).filter(Job.id == job_id).first()
     if not job:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Job not found")
+    steps = (
+        db.query(WorkflowStep)
+        .filter(WorkflowStep.job_id == job_id)
+        .order_by(WorkflowStep.step_order)
+        .all()
+    )
     return {
         "id": job.id,
         "title": job.title,
         "status": job.status.value if hasattr(job.status, "value") else job.status,
         "failure_reason": job.failure_reason,
+        "kpis": _build_external_kpis(steps),
         "workflow_steps": [
             {
                 "step_order": s.step_order,
@@ -164,10 +283,7 @@ def get_job_status_external(
                 "status": s.status,
                 "output_data": s.output_data,
             }
-            for s in db.query(WorkflowStep)
-            .filter(WorkflowStep.job_id == job_id)
-            .order_by(WorkflowStep.step_order)
-            .all()
+            for s in steps
         ],
     }
 

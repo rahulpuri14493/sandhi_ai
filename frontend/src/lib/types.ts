@@ -122,6 +122,16 @@ export interface Job {
   scheduled_at?: string | null;
 }
 
+export interface JobRerunResponse {
+  message: string
+  job_id: number
+  status: string
+  mode?: 'resume' | 'full' | string | null
+  resume_start_step_order?: number | null
+  steps_reused_count?: number | null
+  steps_rerun_count?: number | null
+}
+
 export interface WorkflowStep {
   id: number;
   job_id: number;
@@ -140,6 +150,16 @@ export interface WorkflowStep {
   allowed_connection_ids?: number[] | null;
   /** Override job tool_visibility for this step: full | names_only | none. */
   tool_visibility?: 'full' | 'names_only' | 'none' | null;
+  live_phase?: string | null;
+  live_phase_started_at?: string | null;
+  live_reason_code?: string | null;
+  live_reason_detail?: string | null;
+  live_trace_id?: string | null;
+  live_attempt?: number | null;
+  last_progress_at?: string | null;
+  last_activity_at?: string | null;
+  stuck_since?: string | null;
+  stuck_reason?: string | null;
 }
 
 export interface WorkflowPreview {

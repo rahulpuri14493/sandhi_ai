@@ -1,5 +1,8 @@
 import { useEffect, useState } from 'react'
 import { jobsAPI } from '../lib/api'
+import { formatRerunStartedMessage } from '../lib/rerunFeedback'
+import { FlashToast } from './FlashToast'
+import { RerunModeModal } from './RerunModeModal'
 import { getStepOutputDisplayText } from '../lib/formatStepOutput'
 import type { Job } from '../lib/types'
 
@@ -7,12 +10,16 @@ interface JobStatusTrackerProps {
   jobId: number
   job: Job
   onJobUpdate?: () => void
+  focusedStepId?: number
 }
 
-export function JobStatusTracker({ jobId, job: initialJob, onJobUpdate }: JobStatusTrackerProps) {
+export function JobStatusTracker({ jobId, job: initialJob, onJobUpdate, focusedStepId }: JobStatusTrackerProps) {
   const [job, setJob] = useState(initialJob)
   const [isPolling, setIsPolling] = useState(false)
   const [isRerunning, setIsRerunning] = useState(false)
+  const [showRerunModal, setShowRerunModal] = useState(false)
+  const [rerunToast, setRerunToast] = useState<string | null>(null)
+  const [highlightedStepId, setHighlightedStepId] = useState<number | null>(null)
 
   useEffect(() => {
     if (job.status === 'in_progress') {
@@ -35,6 +42,13 @@ export function JobStatusTracker({ jobId, job: initialJob, onJobUpdate }: JobSta
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [jobId, job.status])
+
+  useEffect(() => {
+    if (!focusedStepId) return
+    setHighlightedStepId(focusedStepId)
+    const timer = window.setTimeout(() => setHighlightedStepId(null), 3000)
+    return () => window.clearTimeout(timer)
+  }, [focusedStepId])
 
   const getStatusBadge = (status: string) => {
     const statusMap: Record<string, { bg: string; text: string; border: string; icon: string }> = {
@@ -161,7 +175,10 @@ export function JobStatusTracker({ jobId, job: initialJob, onJobUpdate }: JobSta
               return (
                 <div
                   key={step.id}
-                  className={`border-2 rounded-2xl p-6 bg-dark-200/30 backdrop-blur-sm hover:shadow-2xl transition-all duration-200 ${getStepBorderColor()}`}
+                  id={`workflow-step-${step.id}`}
+                  className={`border-2 rounded-2xl p-6 bg-dark-200/30 backdrop-blur-sm hover:shadow-2xl transition-all duration-200 ${getStepBorderColor()} ${
+                    highlightedStepId === step.id ? 'ring-2 ring-yellow-400/80 shadow-[0_0_30px_rgba(250,204,21,0.35)] animate-pulse' : ''
+                  }`}
                 >
                   <div className="flex items-center justify-between mb-5">
                     <div className="flex items-center gap-4">
@@ -296,21 +313,7 @@ export function JobStatusTracker({ jobId, job: initialJob, onJobUpdate }: JobSta
       {(job.status === 'failed' || job.status === 'cancelled') && (
         <div className="mt-8 pt-8 border-t border-dark-200/50">
           <button
-            onClick={async () => {
-              if (!window.confirm('Are you sure you want to rerun this job? This will reset the workflow and execute it again.')) {
-                return
-              }
-              setIsRerunning(true)
-              try {
-                await jobsAPI.rerun(jobId)
-                onJobUpdate?.()
-              } catch (error) {
-                console.error('Failed to rerun job:', error)
-                alert('Failed to rerun job. Only failed or cancelled jobs can be rerun.')
-              } finally {
-                setIsRerunning(false)
-              }
-            }}
+            onClick={() => setShowRerunModal(true)}
             disabled={isRerunning}
             className="bg-gradient-to-r from-primary-500 to-primary-700 text-white px-8 py-4 rounded-xl font-bold hover:shadow-2xl hover:shadow-primary-500/50 hover:scale-105 transition-all duration-200 disabled:opacity-50 disabled:cursor-not-allowed"
           >
@@ -318,6 +321,26 @@ export function JobStatusTracker({ jobId, job: initialJob, onJobUpdate }: JobSta
           </button>
         </div>
       )}
+      <RerunModeModal
+        isOpen={showRerunModal}
+        isSubmitting={isRerunning}
+        onClose={() => setShowRerunModal(false)}
+        onSelect={async (mode) => {
+          setIsRerunning(true)
+          try {
+            const resp = await jobsAPI.rerun(jobId, mode)
+            setShowRerunModal(false)
+            setRerunToast(formatRerunStartedMessage(resp))
+            onJobUpdate?.()
+          } catch (error) {
+            console.error('Failed to rerun job:', error)
+            setRerunToast('Failed to rerun job. Only failed or cancelled jobs can be rerun.')
+          } finally {
+            setIsRerunning(false)
+          }
+        }}
+      />
+      <FlashToast message={rerunToast} onDismiss={() => setRerunToast(null)} />
     </div>
   )
 }
