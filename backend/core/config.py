@@ -43,6 +43,21 @@ class Settings(BaseSettings):
     MCP_WRITE_OPERATION_RETRY_BASE_DELAY_SECONDS: float = 0.5
     MCP_WRITE_OPERATION_RETRY_MAX_DELAY_SECONDS: float = 5.0
     MCP_WRITE_OPERATION_RETRY_JITTER_SECONDS: float = 0.2
+    # MCP invocation guardrails (all MCP tool calls: platform + BYO)
+    MCP_INVOCATION_MAX_ATTEMPTS: int = 3
+    MCP_INVOCATION_RETRY_BASE_DELAY_SECONDS: float = 0.25
+    MCP_INVOCATION_RETRY_MAX_DELAY_SECONDS: float = 3.0
+    MCP_INVOCATION_RETRY_JITTER_SECONDS: float = 0.15
+    MCP_CIRCUIT_BREAKER_FAILURE_THRESHOLD: int = 5
+    MCP_CIRCUIT_BREAKER_OPEN_SECONDS: float = 30.0
+    MCP_CIRCUIT_BREAKER_HALF_OPEN_MAX_PROBES: int = 1
+    # Set to 0 to disable; recommended to tune in production per tenant scale.
+    # Concurrent admission controls. Keep >1 in production to allow expected parallel agent calls.
+    MCP_TENANT_MAX_CONCURRENT_CALLS: int = 32
+    MCP_TARGET_MAX_CONCURRENT_CALLS: int = 8
+    # Queue wait budget before returning mcp_quota_exceeded when concurrency slots are saturated.
+    MCP_CONCURRENCY_WAIT_SECONDS: float = 10.0
+    MCP_TENANT_RATE_LIMIT_PER_MINUTE: int = 0
     # Job execution backend: celery (Redis queue) or local_thread fallback.
     JOB_EXECUTION_BACKEND: str = "celery"
     JOB_EXECUTION_STRICT_QUEUE: bool = False  # True: no local fallback when enqueue fails

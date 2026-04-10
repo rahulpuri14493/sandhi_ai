@@ -18,6 +18,7 @@ from models.mcp_server import MCPToolConfig, MCPServerConnection
 from services.payment_processor import PaymentProcessor
 from services.a2a_client import execute_via_a2a
 from services.mcp_client import call_tool as mcp_call_tool, list_tools as mcp_list_tools
+from services.mcp_guardrails import MCPGuardrailError, get_mcp_guardrails
 from core.encryption import decrypt_json
 from services.db_schema_introspection import format_schema_for_prompt
 from services.job_file_storage import persist_file
@@ -707,13 +708,20 @@ class AgentExecutor:
         timeout = float(write_spec.get("timeout_seconds") or getattr(settings, "MCP_TOOL_DEFAULT_TIMEOUT_SECONDS", 60.0))
         extra_headers = {"X-MCP-Business-Id": str(business_id)}
         extra_headers.update(self._sandhi_mcp_correlation_headers())
-        return await mcp_call_tool(
-            base_url=settings.PLATFORM_MCP_SERVER_URL.rstrip("/"),
-            tool_name=tool_name,
-            arguments=arguments,
-            endpoint_path="/mcp",
-            extra_headers=extra_headers,
-            timeout=timeout,
+        guard = get_mcp_guardrails()
+        target_key = f"platform:{settings.PLATFORM_MCP_SERVER_URL.rstrip('/')}:/mcp:{tool_name}"
+        return await guard.call_tool_with_guardrails(
+            business_id=int(business_id),
+            target_key=target_key,
+            timeout_seconds=timeout,
+            execute_call=lambda bounded_timeout: mcp_call_tool(
+                base_url=settings.PLATFORM_MCP_SERVER_URL.rstrip("/"),
+                tool_name=tool_name,
+                arguments=arguments,
+                endpoint_path="/mcp",
+                extra_headers=extra_headers,
+                timeout=bounded_timeout,
+            ),
         )
 
     async def _execute_one_step_core(
@@ -2434,6 +2442,8 @@ END DOCUMENT {i+1}: {doc_name}
             creds = decrypt_json(conn.encrypted_credentials) if conn.encrypted_credentials else None
             timeout = float(getattr(settings, "MCP_TOOL_DEFAULT_TIMEOUT_SECONDS", 60.0))
             xh = self._sandhi_mcp_correlation_headers()
+            guard = get_mcp_guardrails()
+            target_key = f"external:{meta.get('connection_id')}:{conn.base_url.rstrip('/')}:{conn.endpoint_path or '/mcp'}:{ext_name}"
             try:
                 logger.info(
                     "byo_mcp_tools_call connection_id=%s tool=%s job_id=%s workflow_step_id=%s trace_id=%s",
@@ -2443,16 +2453,47 @@ END DOCUMENT {i+1}: {doc_name}
                     xh.get("X-Sandhi-Workflow-Step-Id", "-"),
                     xh.get("X-Sandhi-Trace-Id", "-"),
                 )
-                result = await mcp_call_tool(
-                    base_url=conn.base_url.rstrip("/"),
-                    tool_name=ext_name,
-                    arguments=arguments or {},
-                    endpoint_path=conn.endpoint_path or "/mcp",
-                    auth_type=conn.auth_type or "none",
-                    credentials=creds,
-                    timeout=timeout,
-                    extra_headers=xh if xh else None,
+                result = await guard.call_tool_with_guardrails(
+                    business_id=int(business_id),
+                    target_key=target_key,
+                    timeout_seconds=timeout,
+                    execute_call=lambda bounded_timeout: mcp_call_tool(
+                        base_url=conn.base_url.rstrip("/"),
+                        tool_name=ext_name,
+                        arguments=arguments or {},
+                        endpoint_path=conn.endpoint_path or "/mcp",
+                        auth_type=conn.auth_type or "none",
+                        credentials=creds,
+                        timeout=bounded_timeout,
+                        extra_headers=xh if xh else None,
+                    ),
                 )
+            except MCPGuardrailError as e:
+                elapsed_ms = int((time.perf_counter() - started) * 1000.0)
+                logger.warning(
+                    "BYO MCP guardrail blocked/failed connection_id=%s tool=%s code=%s job_id=%s step_id=%s",
+                    meta.get("connection_id"),
+                    ext_name,
+                    e.code,
+                    xh.get("X-Sandhi-Job-Id"),
+                    xh.get("X-Sandhi-Workflow-Step-Id"),
+                )
+                self._emit_current_step_heartbeat(
+                    phase="calling_tool",
+                    reason_code="tool_call_error",
+                    message=f"Tool {ext_name} failed: {e.code}",
+                    reason_detail={
+                        "kind": "tool_call",
+                        "tool_name": ext_name,
+                        "error_type": type(e).__name__,
+                        "error_code": e.code,
+                        "elapsed_ms": elapsed_ms,
+                        "tool_source": "external",
+                        "connection_id": meta.get("connection_id"),
+                    },
+                    commit_db=True,
+                )
+                return json.dumps({"error": e.code})
             except Exception as e:
                 elapsed_ms = int((time.perf_counter() - started) * 1000.0)
                 logger.exception(
@@ -2566,6 +2607,9 @@ END DOCUMENT {i+1}: {doc_name}
         extra_headers = {"X-MCP-Business-Id": str(business_id)}
         extra_headers.update(self._sandhi_mcp_correlation_headers())
         corr = self._sandhi_mcp_correlation_headers()
+        guard = get_mcp_guardrails()
+        timeout = float(getattr(settings, "MCP_TOOL_DEFAULT_TIMEOUT_SECONDS", 60.0))
+        target_key = f"platform:{base}:/mcp:{tool_name}"
         try:
             logger.info(
                 "platform_mcp_tools_call tool_name=%s business_id=%s job_id=%s workflow_step_id=%s trace_id=%s",
@@ -2575,14 +2619,29 @@ END DOCUMENT {i+1}: {doc_name}
                 corr.get("X-Sandhi-Workflow-Step-Id", "-"),
                 corr.get("X-Sandhi-Trace-Id", "-"),
             )
-            result = await mcp_call_tool(
-                base_url=base,
-                tool_name=tool_name,
-                arguments=arguments,
-                endpoint_path="/mcp",
-                timeout=60.0,
-                extra_headers=extra_headers,
+            result = await guard.call_tool_with_guardrails(
+                business_id=int(business_id),
+                target_key=target_key,
+                timeout_seconds=timeout,
+                execute_call=lambda bounded_timeout: mcp_call_tool(
+                    base_url=base,
+                    tool_name=tool_name,
+                    arguments=arguments,
+                    endpoint_path="/mcp",
+                    timeout=bounded_timeout,
+                    extra_headers=extra_headers,
+                ),
             )
+        except MCPGuardrailError as e:
+            logger.warning(
+                "Platform MCP guardrail blocked/failed tool_name=%s business_id=%s code=%s job_id=%s workflow_step_id=%s",
+                tool_name,
+                business_id,
+                e.code,
+                corr.get("X-Sandhi-Job-Id"),
+                corr.get("X-Sandhi-Workflow-Step-Id"),
+            )
+            return json.dumps({"error": e.code})
         except Exception as e:
             logger.exception(
                 "Platform MCP tools/call failed tool_name=%s business_id=%s job_id=%s workflow_step_id=%s",

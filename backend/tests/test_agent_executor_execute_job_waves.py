@@ -137,6 +137,27 @@ async def test_execute_job_no_workflow_steps_marks_failed(db_session):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("guardrail_code", ["mcp_circuit_open", "mcp_quota_exceeded", "mcp_rate_limited"])
+async def test_execute_job_multi_step_surfaces_mcp_guardrail_code_in_failure_reason(db_session, guardrail_code):
+    """User-visible failure reason should surface guardrail code when MCP path is blocked/fails."""
+    job, steps, _ = _create_job_with_steps(db_session, depends_on_previous_list=[True, True])
+
+    async def fake_core(self, job_id, step_id, prev):
+        if step_id == steps[0].id:
+            raise RuntimeError(guardrail_code)
+        return {"ok": True}
+
+    with patch.object(AgentExecutor, "_execute_one_step_core", new=fake_core):
+        executor = AgentExecutor(db_session)
+        with pytest.raises(RuntimeError):
+            await executor.execute_job(job.id)
+
+    db_session.refresh(job)
+    assert job.status == JobStatus.FAILED
+    assert guardrail_code in (job.failure_reason or "")
+
+
+@pytest.mark.asyncio
 async def test_execute_one_step_core_job_not_found(db_session):
     ex = AgentExecutor(db_session)
     with pytest.raises(ValueError, match="Job not found"):

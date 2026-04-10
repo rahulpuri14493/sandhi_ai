@@ -9,6 +9,7 @@ import httpx
 import pytest
 
 import services.agent_executor as ae
+from services.mcp_guardrails import MCPGuardrailError
 
 
 def test_load_step_input_json_empty():
@@ -97,6 +98,22 @@ def test_apply_tool_visibility():
     assert slim[0]["name"] == "n"
     assert len(slim[0]["description"]) <= 200
     assert ae._apply_tool_visibility(tools, "full") == tools
+
+
+@pytest.mark.asyncio
+async def test_call_platform_mcp_tool_returns_guardrail_code_json(monkeypatch):
+    ex = ae.AgentExecutor(MagicMock())
+    monkeypatch.setattr(ae.settings, "PLATFORM_MCP_SERVER_URL", "http://platform-mcp-server:8081", raising=False)
+
+    guard = MagicMock()
+    guard.call_tool_with_guardrails = AsyncMock(
+        side_effect=MCPGuardrailError("mcp_circuit_open", "circuit open", retryable=True)
+    )
+    monkeypatch.setattr(ae, "get_mcp_guardrails", lambda: guard)
+
+    out = await ex._call_platform_mcp_tool(7, "platform_1_query", {"query": "select 1"})
+    payload = json.loads(out)
+    assert payload["error"] == "mcp_circuit_open"
 
 
 def test_parse_output_contract():
