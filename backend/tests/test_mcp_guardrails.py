@@ -4,6 +4,7 @@ import pytest
 import httpx
 
 from services.mcp_guardrails import MCPGuardrailError, MCPInvocationGuardrails
+from services.mcp_client import MCPJSONRPCError
 
 
 @pytest.mark.asyncio
@@ -467,3 +468,63 @@ async def test_same_target_two_agents_one_waits_then_succeeds(monkeypatch):
     out2 = await t2
     assert out1["content"][0]["text"] == "ok"
     assert out2["content"][0]["text"] == "ok"
+
+
+@pytest.mark.asyncio
+async def test_guardrails_classifies_jsonrpc_structured_errors(monkeypatch):
+    monkeypatch.setattr("core.config.settings.MCP_INVOCATION_MAX_ATTEMPTS", 1, raising=False)
+    g = MCPInvocationGuardrails()
+
+    async def _invalid(_timeout: float):
+        raise MCPJSONRPCError("invalid params", rpc_code=-32602, rpc_data={"status": 400})
+
+    async def _throttled(_timeout: float):
+        raise MCPJSONRPCError("busy", rpc_code=-32002, rpc_data={"status": 429})
+
+    with pytest.raises(MCPGuardrailError) as invalid_exc:
+        await g.call_tool_with_guardrails(
+            business_id=115,
+            target_key="platform:test:/mcp:tool",
+            timeout_seconds=2.0,
+            execute_call=_invalid,
+        )
+    assert invalid_exc.value.code == "mcp_tool_validation_failed"
+    assert invalid_exc.value.retryable is False
+
+    with pytest.raises(MCPGuardrailError) as throttled_exc:
+        await g.call_tool_with_guardrails(
+            business_id=115,
+            target_key="platform:test:/mcp:tool",
+            timeout_seconds=2.0,
+            execute_call=_throttled,
+        )
+    assert throttled_exc.value.code == "mcp_rate_limited"
+    assert throttled_exc.value.retryable is True
+
+
+@pytest.mark.asyncio
+async def test_guardrails_write_retry_profile_override(monkeypatch):
+    monkeypatch.setattr("core.config.settings.MCP_INVOCATION_MAX_ATTEMPTS", 5, raising=False)
+    monkeypatch.setattr("core.config.settings.MCP_INVOCATION_RETRY_BASE_DELAY_SECONDS", 0.0, raising=False)
+    monkeypatch.setattr("core.config.settings.MCP_INVOCATION_RETRY_MAX_DELAY_SECONDS", 0.0, raising=False)
+    monkeypatch.setattr("core.config.settings.MCP_INVOCATION_RETRY_JITTER_SECONDS", 0.0, raising=False)
+    monkeypatch.setattr("core.config.settings.MCP_WRITE_INVOCATION_MAX_ATTEMPTS", 2, raising=False)
+    monkeypatch.setattr("core.config.settings.MCP_WRITE_INVOCATION_RETRY_BASE_DELAY_SECONDS", 0.0, raising=False)
+    monkeypatch.setattr("core.config.settings.MCP_WRITE_INVOCATION_RETRY_MAX_DELAY_SECONDS", 0.0, raising=False)
+    monkeypatch.setattr("core.config.settings.MCP_WRITE_INVOCATION_RETRY_JITTER_SECONDS", 0.0, raising=False)
+    g = MCPInvocationGuardrails()
+    calls = {"n": 0}
+
+    async def _always_retryable(_timeout: float):
+        calls["n"] += 1
+        raise httpx.ConnectError("down")
+
+    with pytest.raises(MCPGuardrailError):
+        await g.call_tool_with_guardrails(
+            business_id=116,
+            target_key="platform:test:/mcp:write_tool",
+            timeout_seconds=2.0,
+            operation_class="write_like",
+            execute_call=_always_retryable,
+        )
+    assert calls["n"] == 2

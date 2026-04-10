@@ -714,6 +714,7 @@ class AgentExecutor:
             business_id=int(business_id),
             target_key=target_key,
             timeout_seconds=timeout,
+            operation_class="write_like",
             execute_call=lambda bounded_timeout: mcp_call_tool(
                 base_url=settings.PLATFORM_MCP_SERVER_URL.rstrip("/"),
                 tool_name=tool_name,
@@ -2457,6 +2458,7 @@ END DOCUMENT {i+1}: {doc_name}
                     business_id=int(business_id),
                     target_key=target_key,
                     timeout_seconds=timeout,
+                    operation_class=self._infer_mcp_operation_class(ext_name, arguments or {}),
                     execute_call=lambda bounded_timeout: mcp_call_tool(
                         base_url=conn.base_url.rstrip("/"),
                         tool_name=ext_name,
@@ -2610,6 +2612,7 @@ END DOCUMENT {i+1}: {doc_name}
         guard = get_mcp_guardrails()
         timeout = float(getattr(settings, "MCP_TOOL_DEFAULT_TIMEOUT_SECONDS", 60.0))
         target_key = f"platform:{base}:/mcp:{tool_name}"
+        operation_class = self._infer_mcp_operation_class(tool_name, arguments)
         try:
             logger.info(
                 "platform_mcp_tools_call tool_name=%s business_id=%s job_id=%s workflow_step_id=%s trace_id=%s",
@@ -2623,6 +2626,7 @@ END DOCUMENT {i+1}: {doc_name}
                 business_id=int(business_id),
                 target_key=target_key,
                 timeout_seconds=timeout,
+                operation_class=operation_class,
                 execute_call=lambda bounded_timeout: mcp_call_tool(
                     base_url=base,
                     tool_name=tool_name,
@@ -2652,6 +2656,23 @@ END DOCUMENT {i+1}: {doc_name}
             )
             return json.dumps({"error": type(e).__name__})
         return self._mcp_tool_result_to_text(result)
+
+    @staticmethod
+    def _infer_mcp_operation_class(tool_name: str, arguments: Optional[Dict[str, Any]]) -> str:
+        name = (tool_name or "").strip().lower()
+        args = arguments or {}
+        operation_type = str(args.get("operation_type") or "").strip().lower()
+        write_mode = str(args.get("write_mode") or "").strip().lower()
+        if operation_type in {"write", "create", "update", "delete", "insert", "upsert", "merge"}:
+            return "write_like"
+        if write_mode in {"replace", "append", "merge", "upsert"}:
+            return "write_like"
+        if any(
+            token in name
+            for token in ("write", "create", "update", "delete", "insert", "upsert", "patch", "save", "merge", "sync")
+        ):
+            return "write_like"
+        return "read_like"
 
     def _log_action(self, entity_type: str, entity_id: int, action: str, details: Dict[str, Any]):
         """Log an action to the audit log"""

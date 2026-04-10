@@ -51,6 +51,14 @@ class Settings(BaseSettings):
     MCP_CIRCUIT_BREAKER_FAILURE_THRESHOLD: int = 5
     MCP_CIRCUIT_BREAKER_OPEN_SECONDS: float = 30.0
     MCP_CIRCUIT_BREAKER_HALF_OPEN_MAX_PROBES: int = 1
+    # Optional distributed state for MCP guardrails (recommended for multi-worker production).
+    MCP_GUARDRAILS_DISTRIBUTED_ENABLED: bool = False
+    MCP_GUARDRAILS_REDIS_URL: str = ""
+    MCP_GUARDRAILS_REDIS_PREFIX: str = "sandhi:mcp_guardrails:v1"
+    MCP_GUARDRAILS_REDIS_SOCKET_TIMEOUT_SECONDS: float = 2.0
+    MCP_GUARDRAILS_REDIS_CONNECT_TIMEOUT_SECONDS: float = 2.0
+    MCP_GUARDRAILS_COUNTER_TTL_SECONDS: int = 120
+    MCP_GUARDRAILS_BREAKER_TTL_SECONDS: int = 300
     # Set to 0 to disable; recommended to tune in production per tenant scale.
     # Concurrent admission controls. Keep >1 in production to allow expected parallel agent calls.
     MCP_TENANT_MAX_CONCURRENT_CALLS: int = 32
@@ -58,6 +66,15 @@ class Settings(BaseSettings):
     # Queue wait budget before returning mcp_quota_exceeded when concurrency slots are saturated.
     MCP_CONCURRENCY_WAIT_SECONDS: float = 10.0
     MCP_TENANT_RATE_LIMIT_PER_MINUTE: int = 0
+    # Retry profile split: stricter defaults for write-like operations.
+    MCP_READ_INVOCATION_MAX_ATTEMPTS: int = 0
+    MCP_READ_INVOCATION_RETRY_BASE_DELAY_SECONDS: float = 0.0
+    MCP_READ_INVOCATION_RETRY_MAX_DELAY_SECONDS: float = 0.0
+    MCP_READ_INVOCATION_RETRY_JITTER_SECONDS: float = 0.0
+    MCP_WRITE_INVOCATION_MAX_ATTEMPTS: int = 0
+    MCP_WRITE_INVOCATION_RETRY_BASE_DELAY_SECONDS: float = 0.0
+    MCP_WRITE_INVOCATION_RETRY_MAX_DELAY_SECONDS: float = 0.0
+    MCP_WRITE_INVOCATION_RETRY_JITTER_SECONDS: float = 0.0
     # Job execution backend: celery (Redis queue) or local_thread fallback.
     JOB_EXECUTION_BACKEND: str = "celery"
     JOB_EXECUTION_STRICT_QUEUE: bool = False  # True: no local fallback when enqueue fails
