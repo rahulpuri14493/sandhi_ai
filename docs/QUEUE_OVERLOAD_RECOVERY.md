@@ -28,7 +28,7 @@ redis-cli keys "*interactive*"
 Hit `/api/jobs/queue/stats`, or use the CLI to check whether the circuit breaker is open:
 
 ```bash
-# Check if breaker count >= CELERY_CIRCUIT_BREACH_THRESHOLD (default: 10)
+# Check if breaker count >= CELERY_CIRCUIT_BREACH_THRESHOLD (default: 30)
 redis-cli get circuit_breaker:interactive
 redis-cli get circuit_breaker:batch
 ```

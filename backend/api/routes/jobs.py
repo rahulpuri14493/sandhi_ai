@@ -2061,21 +2061,25 @@ def execute_job(
             execution_token=execution_token,
             strict=bool(getattr(settings, "JOB_EXECUTION_STRICT_QUEUE", False)),
         )
-    except QueueEnqueueError as e:
-        raise HTTPException(
-            status_code=503,
-            headers={"Retry-After": "30"},
-            detail={"error": "queue_overloaded"}
-        )
-    except Exception as exc:
-        job.status = JobStatus.PENDING_APPROVAL
+    except (QueueEnqueueError, Exception) as exc:
+        # 1. Handle one shared database updates
+        job.status = JobStatus.FAILED
         job.execution_token = None
         job.failure_reason = f"Failed to enqueue execution: {str(exc)[:200]}"
         db.commit()
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="Failed to enqueue job execution. Please try again.",
-        )
+
+        # 2. Raise the specific HTTPException based on the error type
+        if isinstance(exc, QueueEnqueueError):
+            raise HTTPException(
+                status_code=503,
+                headers={"Retry-After": "30"},
+                detail={"error": "queue_overloaded"}
+            ) from exc
+        else:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="Failed to enqueue job execution. Please try again.",
+            ) from exc
     
     # Parse files and conversation for response
     files_data = None
@@ -2628,27 +2632,32 @@ def rerun_job(
             execution_token=execution_token,
             strict=bool(getattr(settings, "JOB_EXECUTION_STRICT_QUEUE", False)),
         )
-    except QueueEnqueueError as e:
-        raise HTTPException(
-            status_code=503,
-            headers={"Retry-After": "30"},
-            detail={"error": "queue_overloaded"}
-        )
-    except Exception as exc:
+    except (QueueEnqueueError, Exception) as exc:
+        # 1. Shared cleanup logic (runs for BOTH exception types)
         logger.exception("Failed to enqueue execution for job %s", job.id)
         job.status = JobStatus.FAILED
         job.execution_token = None
         job.failure_reason = f"Failed to start execution: {str(exc)[:200]}"
+
         if history_id:
             hist = db.query(ScheduleExecutionHistory).filter(ScheduleExecutionHistory.id == history_id).first()
             if hist:
                 hist.status = "failed"
                 hist.failure_reason = job.failure_reason
         db.commit()
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail=f"Failed to enqueue job execution: {str(exc)[:200]}",
-        )
+
+        # 2. Specific HTTP Responses
+        if isinstance(exc, QueueEnqueueError):
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                headers={"Retry-After": "30"},
+                detail={"error": "queue_overloaded"},
+            )
+        else:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail=f"Failed to enqueue job execution: {str(exc)[:200]}",
+            )
 
     return RerunResponse(
         message="Job re-execution started",

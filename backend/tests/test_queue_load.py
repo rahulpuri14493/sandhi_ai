@@ -1,22 +1,12 @@
-"""
-Load simulation test: verify interactive queue remains responsive
-under batch queue pressure.
-
-Uses mocked Redis to simulate queue depth conditions without
-requiring a live Celery worker or Redis instance.
-"""
 import pytest
 from unittest.mock import patch, MagicMock
 from services.task_queue import enqueue_execute_platform_job, QueueEnqueueError
 
-
 class TestPriorityIsolationUnderLoad:
 
-    def _make_pipe_mock(self, cb_count: int, depth: int) -> MagicMock:
-        """Helper: build a pipeline mock returning given cb_count and depth."""
-        pipe = MagicMock()
-        pipe.execute.return_value = [cb_count, depth]
-        return pipe
+    def _mock_lua_result(self, mock_client, result_code: int):
+        """Helper: mock the Lua script evaluation result."""
+        mock_client.eval.return_value = result_code
 
     @patch("services.task_queue.execute_platform_job.apply_async")
     @patch("services.task_queue.redis.Redis.from_url")
@@ -29,9 +19,8 @@ class TestPriorityIsolationUnderLoad:
         mock_client = MagicMock()
         mock_redis.return_value = mock_client
 
-        # Interactive queue: healthy (depth=5, breaker=0)
-        healthy_pipe = self._make_pipe_mock(cb_count=0, depth=5)
-        mock_client.pipeline.return_value = healthy_pipe
+        # Mock Lua script returning 1 (OK)
+        self._mock_lua_result(mock_client, 1)
 
         result = enqueue_execute_platform_job(
             job_id=1,
@@ -39,6 +28,7 @@ class TestPriorityIsolationUnderLoad:
             queue_name="interactive",
         )
         assert result is True, "Interactive queue must accept jobs when healthy"
+
 
     @patch("services.task_queue.redis.Redis.from_url")
     def test_batch_rejects_when_overloaded(self, mock_redis):
@@ -49,9 +39,8 @@ class TestPriorityIsolationUnderLoad:
         mock_client = MagicMock()
         mock_redis.return_value = mock_client
 
-        # Batch queue: overloaded (depth=101, breaker=0)
-        overloaded_pipe = self._make_pipe_mock(cb_count=0, depth=101)
-        mock_client.pipeline.return_value = overloaded_pipe
+        # Mock Lua script returning -2 (Overloaded)
+        self._mock_lua_result(mock_client, -2)
 
         with pytest.raises(QueueEnqueueError, match="is overloaded"):
             enqueue_execute_platform_job(
@@ -59,6 +48,7 @@ class TestPriorityIsolationUnderLoad:
                 strict=True,
                 queue_name="batch",
             )
+
 
     @patch("services.task_queue.execute_platform_job.apply_async")
     @patch("services.task_queue.redis.Redis.from_url")
@@ -71,9 +61,8 @@ class TestPriorityIsolationUnderLoad:
         mock_client = MagicMock()
         mock_redis.return_value = mock_client
 
-        # Interactive: healthy
-        healthy_pipe = self._make_pipe_mock(cb_count=0, depth=5)
-        mock_client.pipeline.return_value = healthy_pipe
+        # Interactive: healthy (Lua returns 1)
+        self._mock_lua_result(mock_client, 1)
 
         result = enqueue_execute_platform_job(
             job_id=3,
@@ -91,9 +80,8 @@ class TestPriorityIsolationUnderLoad:
         mock_client = MagicMock()
         mock_redis.return_value = mock_client
 
-        # Interactive: breaker open (count=31, exceeds threshold of 30)
-        tripped_pipe = self._make_pipe_mock(cb_count=31, depth=0)
-        mock_client.pipeline.return_value = tripped_pipe
+        # Interactive: breaker open (Lua returns -1)
+        self._mock_lua_result(mock_client, -1)
 
         with pytest.raises(QueueEnqueueError, match="Circuit breaker OPEN"):
             enqueue_execute_platform_job(
@@ -112,8 +100,8 @@ class TestPriorityIsolationUnderLoad:
         mock_client = MagicMock()
         mock_redis.return_value = mock_client
 
-        healthy_pipe = self._make_pipe_mock(cb_count=0, depth=5)
-        mock_client.pipeline.return_value = healthy_pipe
+        # Healthy (Lua returns 1)
+        self._mock_lua_result(mock_client, 1)
 
         results = []
         for job_id in range(10):

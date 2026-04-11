@@ -56,6 +56,7 @@ if Celery is not None:
             # Scheduled/ETA tasks go to the background lane
             "trigger_scheduled_job": {"queue": "batch"},
             "check_stuck_jobs": {"queue": "batch"},
+            "check_stuck_workflow_steps": {"queue": "batch"},
         }
     )
 
@@ -134,63 +135,67 @@ def enqueue_execute_platform_job(
     breach_threshold = getattr(settings, "CELERY_CIRCUIT_BREACH_THRESHOLD", 30)
     max_depth = getattr(settings, "CELERY_MAX_QUEUE_DEPTH", 100)
 
+    # --- Lua script for atomic read-and-evaluate
+    ADMISSION_SCRIPT = """
+    local cb_key = KEYS[1]
+    local queue_key = KEYS[2]
+    local breach_threshold = tonumber(ARGV[1])
+    local max_depth = tonumber(ARGV[2])
+
+    -- Check Circuit Breaker
+    local cb_value = tonumber(redis.call('GET', cb_key) or '0')
+    if cb_value >= breach_threshold then
+        return -1 -- Circuit breaker OPEN
+    end
+
+    -- Check Queue Depth
+    local current_depth = tonumber(redis.call('LLEN', queue_key) or '0')
+    if current_depth >= max_depth then
+        redis.call('INCR', cb_key)
+        redis.call('EXPIRE', cb_key, 60)
+        return -2 -- Backpressure TRIPPED
+    end
+
+    return 1 -- OK to proceed
+    
+    """
+
     try:
         client = redis.Redis.from_url(
             settings.CELERY_BROKER_URL, socket_timeout=2, socket_connect_timeout=2
         )
     except redis.RedisError as e:
         logger.warning("Failed to connect to Redis for admission check: %s", e)
-        # Fail open: if we can't connect, try to enqueue anyway
         client = None
 
     if client is not None:
-        # Block 1: Read-only admission check — single round trip
         try:
-            pipe = client.pipeline()
-            pipe.get(cb_key)
-            pipe.llen(redis_key)
-            results = pipe.execute()
-            cb_value = int(results[0] or 0)
-            current_depth = int(results[1] or 0)
-        except redis.RedisError as e:
-            logger.warning("Failed to read queue state from Redis: %s", e)
-            # Fail open: skip admission control and attempt enqueue
-            cb_value = 0
-            current_depth = 0
-
-        # Block 2: Policy decisions — no Redis calls, no RedisError risk
-        if cb_value >= breach_threshold:
-            logger.warning(
-                "Circuit breaker OPEN for queue '%s' (count=%d, threshold=%d)",
-                queue_name, cb_value, breach_threshold,
+            # Execute atomic check: 2 KEYS, 2 ARGS
+            result = client.eval(
+                ADMISSION_SCRIPT, 2, cb_key, redis_key, breach_threshold, max_depth
             )
-            if strict:
-                raise QueueEnqueueError(
-                    f"Circuit breaker OPEN for queue '{queue_name}'. Traffic rejected."
-                )
-            return False
 
-        if current_depth >= max_depth:
-            logger.warning(
-                "BACKPRESSURE TRIPPED: Queue '%s' depth (%d) exceeds max (%d)",
-                queue_name, current_depth, max_depth,
-            )
-            # Block 3: Write breaker increment — separate, best-effort
-            try:
-                pipe = client.pipeline()
-                pipe.incr(cb_key)
-                pipe.expire(cb_key, 60)
-                pipe.execute()
-            except redis.RedisError as e:
+            if result == -1:
                 logger.warning(
-                    "Failed to increment circuit breaker for queue '%s': %s",
-                    queue_name, e,
+                    "Circuit breaker OPEN for queue '%s' (threshold=%d)",
+                    queue_name, breach_threshold,
                 )
-            if strict:
-                raise QueueEnqueueError(
-                    f"Queue '{queue_name}' is overloaded (depth={current_depth})"
+                if strict:
+                    raise QueueEnqueueError(f"Circuit breaker OPEN for queue '{queue_name}'. Traffic rejected.")
+                return False
+            
+            if result == -2:
+                logger.warning(
+                    "BACKPRESSURE TRIPPED: Queue '%s' exceeds max (%d)",
+                    queue_name, max_depth,
                 )
-            return False
+                if strict:
+                    raise QueueEnqueueError(f"Queue '{queue_name}' is overloaded.")
+                return False
+        
+        except redis.RedisError as e:
+            logger.warning("Failed to execute admission control script: %s", e)
+            # Fail open: skip admission control and attempt enqueue
 
     # --- Enqueue the task ---
     try:
@@ -241,11 +246,15 @@ def get_queue_stats() -> dict:
     """
     mode = (settings.JOB_EXECUTION_BACKEND or "celery").strip().lower()
     slo_max_age = getattr(settings, "CELERY_SLO_MAX_QUEUE_AGE_SECONDS", 1800)
+    slo_p95_threshold = getattr(settings, "CELERY_SLO_ENQUEUE_TO_START_P95_SECONDS", 300)
 
     out = {
         "execution_backend": mode,
         "queue_name": "celery",
         "queues": {},
+        "slo_targets": {
+            "p95_start_delay_seconds": slo_p95_threshold
+        },
         "pending_jobs": None,
         "workers": {"online": 0, "active": 0, "reserved": 0},
     }
@@ -285,6 +294,8 @@ def get_queue_stats() -> dict:
             out["queues"][q] = {
                 "pending_jobs": None,
                 "oldest_job_age_seconds": None,
+                "slo_max_age_seconds": slo_max_age, # Return the config default
+                "slo_age_breached": None,
                 "circuit_breaker_count": None,
                 "circuit_breaker_open": None,
             }
@@ -389,7 +400,7 @@ if celery_app is not None:
         try:
             # Reuses the core execution logic now triggered via distributed worker instead of in-process scheduler callback
             _execute_schedule(schedule_id)
-        except Exception as e:
+        except Exception:
             logger.exception("Scheduled ETA task failed for schedule_id=%s", schedule_id)
             raise
 
@@ -412,7 +423,6 @@ if celery_app is not None:
         from core.config import settings
         from datetime import datetime, timedelta
         from db.database import SessionLocal
-        from models.job import Job, JobStatus
         from models.job import (
             Job, JobSchedule, JobStatus, ScheduleStatus,
             WorkflowStep, ScheduleExecutionHistory,

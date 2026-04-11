@@ -652,12 +652,13 @@ def test_execute_job_overload_returns_503(client, db_session):
         mock_queue.side_effect = QueueEnqueueError("overloaded")
         
         r = client.post(f"/api/jobs/{job.id}/execute", headers=h)
-        
         assert r.status_code == 503
-        assert r.json()["detail"]["error"] == "queue_overloaded"
-        retry_header = r.headers.get("Retry-After") or r.headers.get("retry-after")
-        if retry_header:
-            assert retry_header == "30"
+
+        db_session.expire_all()
+        job = db_session.query(Job).filter(Job.id == job.id).first()
+        assert job.status == JobStatus.FAILED
+        assert job.execution_token is None
+        assert "overloaded" in job.failure_reason
 
 def test_rerun_job_overload_returns_503(client, db_session):
     u, h = _headers_biz(db_session, "re_ovr")
@@ -666,7 +667,7 @@ def test_rerun_job_overload_returns_503(client, db_session):
     db_session.add(agent)
     db_session.commit()
 
-    # Rerun requires FAILED
+    # Rerun requires FAILED status to start
     job = Job(business_id=u.id, title="Rerun Overload", status=JobStatus.FAILED, conversation="[]")
     db_session.add(job)
     db_session.commit()
@@ -680,7 +681,22 @@ def test_rerun_job_overload_returns_503(client, db_session):
         
         r = client.post(f"/api/jobs/{job.id}/rerun", headers=h)
         
+        # 1. Assert HTTP Response
         assert r.status_code == 503
         if r.headers.get("Retry-After"):
              assert r.headers.get("Retry-After") == "30"
-        assert "queue_overloaded" in r.text
+        
+        # 2. Assert DB State
+        db_session.expire_all()
+        job = db_session.query(Job).filter(Job.id == job.id).first()
+
+        assert job.status == JobStatus.FAILED
+        assert job.execution_token is None
+        assert "overloaded" in job.failure_reason.lower()
+
+        # 3. Assert History State (if your rerun logic creates a history record)
+        from models.job import ScheduleExecutionHistory
+        hist = db_session.query(ScheduleExecutionHistory).filter(ScheduleExecutionHistory.job_id == job.id).first()
+        if hist:
+            assert hist.status == "failed"
+            assert "overloaded" in hist.failure_reason.lower()

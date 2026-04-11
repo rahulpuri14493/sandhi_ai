@@ -792,7 +792,7 @@ def test_execute_forbidden_wrong_status_and_queue_failure(
     r = client.post(f"/api/jobs/{job3.id}/execute", headers=h)
     assert r.status_code == 503
     db_session.refresh(job3)
-    assert job3.status == JobStatus.PENDING_APPROVAL
+    assert job3.status == JobStatus.FAILED
 
 
 def test_execute_success_parses_files(monkeypatch, client: TestClient, db_session):

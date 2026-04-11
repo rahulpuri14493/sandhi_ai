@@ -10,7 +10,6 @@ from unittest.mock import patch, MagicMock
 
 from services.task_queue import enqueue_execute_platform_job, QueueEnqueueError
 from models.job import JobStatus
-from core.config import settings
 
 
 class TestCeleryTaskReliability:
@@ -151,58 +150,58 @@ class TestCeleryTaskReliability:
 
 class TestQueueAdmissionControl:
 
+    @patch("services.task_queue.execute_platform_job.apply_async")
     @patch("services.task_queue.redis.Redis.from_url")
-    def test_enqueue_rejects_when_overloaded(self, mock_redis_from_url):
+    def test_enqueue_rejects_when_overloaded(
+        self, mock_redis_from_url, mock_apply_async
+    ):
         """
         Verify that enqueue fails with a QueueEnqueueError when strict=True
         and the Redis queue depth exceeds the maximum threshold.
         """
         mock_client = MagicMock()
-        mock_pipe = MagicMock()
-        mock_client.pipeline.return_value = mock_pipe
-        # pipeline().execute() returns [cb_count, queue_depth]
-        mock_pipe.execute.return_value = [
-            b"0",
-            101,
-        ]  # breaker closed, queue over max of 100
         mock_redis_from_url.return_value = mock_client
+
+        # Mock Lua script returning -2 (Overloaded)
+        mock_client.eval.return_value = -2
 
         with pytest.raises(QueueEnqueueError, match="is overloaded"):
             enqueue_execute_platform_job(
                 job_id=42, strict=True, queue_name="interactive"
             )
+        mock_apply_async.assert_not_called()
 
+    @patch("services.task_queue.execute_platform_job.apply_async")
     @patch("services.task_queue.redis.Redis.from_url")
-    def test_circuit_breaker_trips(self, mock_redis_from_url):
+    def test_circuit_breaker_trips(self, mock_redis_from_url, mock_apply_async):
         """
         Verify that if the circuit breaker key in Redis exceeds the threshold,
         enqueue is rejected immediately.
         """
         mock_client = MagicMock()
-        mock_pipe = MagicMock()
-        mock_client.pipeline.return_value = mock_pipe
-        # pipeline().execute() returns [cb_count, queue_depth] — cb_count exceeds threshold of 30
-        mock_pipe.execute.return_value = [b"31", 0]
         mock_redis_from_url.return_value = mock_client
+
+        # Mock Lua script returning -1 (Circuit Breaker OPEN)
+        mock_client.eval.return_value = -1
 
         with pytest.raises(QueueEnqueueError, match="Circuit breaker OPEN"):
             enqueue_execute_platform_job(
                 job_id=42, strict=True, queue_name="interactive"
             )
+        mock_apply_async.assert_not_called()
 
-    @patch("services.task_queue.redis.Redis.from_url")
     @patch("services.task_queue.execute_platform_job.apply_async")
-    def test_enqueue_succeeds_when_healthy(self, mock_apply_async, mock_redis_from_url):
+    @patch("services.task_queue.redis.Redis.from_url")
+    def test_enqueue_succeeds_when_healthy(self, mock_redis_from_url, mock_apply_async):
         """
         Verify that a healthy queue depth and closed circuit breaker
         results in a successful Celery apply_async call.
         """
         mock_client = MagicMock()
-        mock_pipe = MagicMock()
-        mock_client.pipeline.return_value = mock_pipe
-        # pipeline().execute() returns [cb_count, queue_depth] — both healthy
-        mock_pipe.execute.return_value = [b"0", 5]
         mock_redis_from_url.return_value = mock_client
+
+        # Mock Lua script returning 1 (OK to proceed)
+        mock_client.eval.return_value = 1
 
         result = enqueue_execute_platform_job(
             job_id=42, strict=True, queue_name="interactive"
