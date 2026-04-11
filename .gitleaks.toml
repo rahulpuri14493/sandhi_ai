@@ -8,6 +8,7 @@ paths = [
   '''backend/tests/test_mcp\.py''',
   '''backend/tests/integration/test_vector_e2e\.py''',
   '''docs/HEARTBEAT_AND_KPI_GUIDE\.md''',
+  '''tools/platform_mcp_server/tests/test_integrations_object_storage_deep\.py''',
 ]
 regexTarget = "line"
 # docker-compose dev fallback (${MCP_INTERNAL_SECRET:-dev-mcp-internal-secret}); not a committed production secret.

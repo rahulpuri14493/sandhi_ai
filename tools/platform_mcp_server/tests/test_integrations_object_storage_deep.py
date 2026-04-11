@@ -88,7 +88,7 @@ class TestExecuteSlack:
 
     def test_send_missing_channel(self, monkeypatch):
         _ensure_fake_slack_sdk(monkeypatch)
-        out = execute_slack({"bot_token": "xoxb-fake"}, {"action": "send", "message": "hi"})
+        out = execute_slack({"bot_token": "mock-slack-bot-token-unit-test"}, {"action": "send", "message": "hi"})
         assert "channel" in out.lower()
 
     def test_list_channels(self, monkeypatch):
@@ -99,7 +99,7 @@ class TestExecuteSlack:
         import slack_sdk
 
         monkeypatch.setattr(slack_sdk, "WebClient", lambda token: inst)
-        out = execute_slack({"bot_token": "xoxb-fake"}, {"action": "list_channels"})
+        out = execute_slack({"bot_token": "mock-slack-bot-token-unit-test"}, {"action": "list_channels"})
         data = json.loads(out)
         assert "general" in data["channels"]
 
@@ -113,7 +113,7 @@ class TestExecuteSlack:
 
         monkeypatch.setattr(slack_sdk, "WebClient", lambda token: inst)
         out = execute_slack(
-            {"bot_token": "xoxb-fake"},
+            {"bot_token": "mock-slack-bot-token-unit-test"},
             {"action": "send", "channel": "#x", "message": "m"},
         )
         assert "channel_not_found" in out or "Error" in out
@@ -126,7 +126,7 @@ class TestExecuteGithub:
 
     def test_missing_repo(self, monkeypatch):
         _ensure_fake_github(monkeypatch)
-        assert "repo" in execute_github({"api_key": "ghp_x"}, {}).lower()
+        assert "repo" in execute_github({"api_key": "mock-github-api-key-unit-test"}, {}).lower()
 
     def test_get_file_mock(self, monkeypatch):
         _ensure_fake_github(monkeypatch)
@@ -190,7 +190,7 @@ class TestExecuteNotion:
         import notion_client
 
         monkeypatch.setattr(notion_client, "Client", lambda auth: client)
-        out = execute_notion({"api_key": "nsec"}, {"action": "search", "query": "x"})
+        out = execute_notion({"api_key": "mock-notion-api-key-unit-test"}, {"action": "search", "query": "x"})
         assert "p1" in out
 
     def test_get_page_missing_id(self, monkeypatch):
@@ -198,7 +198,7 @@ class TestExecuteNotion:
         import notion_client
 
         monkeypatch.setattr(notion_client, "Client", lambda auth: MagicMock())
-        out = execute_notion({"api_key": "nsec"}, {"action": "get_page", "query": ""})
+        out = execute_notion({"api_key": "mock-notion-api-key-unit-test"}, {"action": "get_page", "query": ""})
         assert "page id" in out.lower()
 
 

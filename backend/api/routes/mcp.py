@@ -145,7 +145,10 @@ async def _invoke_platform_tool_call(
     """
     from core.config import settings
     if not settings.PLATFORM_MCP_SERVER_URL or not settings.MCP_INTERNAL_SECRET:
-        raise HTTPException(status_code=503, detail="Platform MCP server not configured")
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Platform MCP server not configured",
+        )
     payload_bytes = _estimate_json_size_bytes(body.arguments or {})
     max_payload = max(1024, int(getattr(settings, "MCP_TOOL_MAX_ARGUMENT_BYTES", 5 * 1024 * 1024)))
     if payload_bytes > max_payload:
@@ -859,7 +862,10 @@ async def call_platform_write_async(
     """Submit write request as async operation and return operation_id for polling."""
     from core.config import settings
     if not settings.PLATFORM_MCP_SERVER_URL or not settings.MCP_INTERNAL_SECRET:
-        raise HTTPException(status_code=503, detail="Platform MCP server not configured")
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Platform MCP server not configured",
+        )
     _require_platform_tool_for_user(db, current_user.id, body.tool_name)
     if body.operation_type in ("upsert", "merge") and not body.merge_keys:
         raise HTTPException(status_code=422, detail="merge_keys are required when operation_type is upsert or merge")
