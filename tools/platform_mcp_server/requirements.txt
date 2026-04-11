@@ -22,3 +22,4 @@ slack-sdk>=3.27.0
 PyGithub>=2.2.0
 notion-client>=2.2.0
 azure-storage-blob>=12.19.0
+azure-identity>=1.15.0

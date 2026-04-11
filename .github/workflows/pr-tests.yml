@@ -208,6 +208,7 @@ jobs:
           pip install pytest pytest-cov
 
       # tools/platform_mcp_server/tests: unit + integration + optional e2e; .coveragerc omits tests/* only (execution_artifact.py stays in the coverage denominator).
+      # Optional live tests skip without env (e.g. PLATFORM_MCP_E2E_BASE_URL, MYSQL_E2E_*, AZURE_BLOB_E2E_*).
       - name: Run platform MCP pytest suite with coverage (min 80%)
         run: |
           python -m pytest tests -c pytest.ini --rootdir . -v --tb=short \

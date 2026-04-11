@@ -1,6 +1,6 @@
 import logging
 import hashlib
-from typing import Dict, Optional
+from typing import Any, Dict, Optional
 
 from core.config import settings
 
@@ -9,6 +9,7 @@ logger = logging.getLogger(__name__)
 _PROM_REGISTRY = None
 _PROM_COUNTER = None
 _PROM_HIST = None
+_PROM_TOOL_FAMILY: Any = None
 _OTEL_METER = None
 _OTEL_COUNTER = None
 _OTEL_HIST = None
@@ -36,28 +37,34 @@ def _normalize_target_key(target_key: str) -> str:
 
 
 def _ensure_prom():
-    global _PROM_REGISTRY, _PROM_COUNTER, _PROM_HIST
-    if _PROM_COUNTER is not None and _PROM_HIST is not None:
-        return
+    global _PROM_REGISTRY, _PROM_COUNTER, _PROM_HIST, _PROM_TOOL_FAMILY
     try:
         from prometheus_client import CollectorRegistry, Counter, Histogram
     except Exception:
         return
     if _PROM_REGISTRY is None:
         _PROM_REGISTRY = CollectorRegistry()
-    _PROM_COUNTER = Counter(
-        "mcp_guardrail_events_total",
-        "MCP guardrail events",
-        ["event", "code", "operation_class", "target_key"],
-        registry=_PROM_REGISTRY,
-    )
-    _PROM_HIST = Histogram(
-        "mcp_guardrail_call_duration_seconds",
-        "MCP guardrail call duration seconds",
-        ["operation_class", "target_key", "outcome"],
-        registry=_PROM_REGISTRY,
-        buckets=(0.01, 0.05, 0.1, 0.2, 0.5, 1, 2, 5, 10, 30, 60),
-    )
+    if _PROM_COUNTER is None:
+        _PROM_COUNTER = Counter(
+            "mcp_guardrail_events_total",
+            "MCP guardrail events",
+            ["event", "code", "operation_class", "target_key"],
+            registry=_PROM_REGISTRY,
+        )
+        _PROM_HIST = Histogram(
+            "mcp_guardrail_call_duration_seconds",
+            "MCP guardrail call duration seconds",
+            ["operation_class", "target_key", "outcome"],
+            registry=_PROM_REGISTRY,
+            buckets=(0.01, 0.05, 0.1, 0.2, 0.5, 1, 2, 5, 10, 30, 60),
+        )
+    if _PROM_TOOL_FAMILY is None:
+        _PROM_TOOL_FAMILY = Counter(
+            "mcp_platform_tool_calls_total",
+            "Platform MCP tool calls by inferred family (low-cardinality)",
+            ["tool_family", "operation_class", "outcome"],
+            registry=_PROM_REGISTRY,
+        )
 
 
 def _ensure_otlp():
@@ -86,18 +93,77 @@ def _ensure_otlp():
     _OTEL_HIST = _OTEL_METER.create_histogram("mcp_guardrail_call_duration_seconds", unit="s")
 
 
+def infer_mcp_tool_family(tool_name: Optional[str]) -> str:
+    """Collapse platform_N_foo_bar into a small label set for Prometheus."""
+    if not tool_name:
+        return "unknown"
+    t = str(tool_name).lower()
+    for tag in (
+        "minio",
+        "ceph",
+        "azure_blob",
+        "gcs",
+        "snowflake",
+        "postgres",
+        "mysql",
+        "sqlserver",
+        "databricks",
+        "bigquery",
+        "pinecone",
+        "chroma",
+        "weaviate",
+        "qdrant",
+        "elasticsearch",
+        "pageindex",
+        "slack",
+        "github",
+        "notion",
+        "rest_api",
+        "filesystem",
+        "vector_db",
+    ):
+        if tag in t:
+            return tag
+    if "s3" in t and "minio" not in t:
+        return "s3"
+    return "other"
+
+
+def increment_mcp_tool_family_metric(
+    *,
+    tool_name: Optional[str],
+    operation_class: str,
+    outcome: str,
+) -> None:
+    """Outcome: success | guardrail_error | call_error (per attempt, matches histogram outcomes)."""
+    if not bool(getattr(settings, "MCP_TOOL_FAMILY_METRICS_ENABLED", True)):
+        return
+    _ensure_prom()
+    if _PROM_TOOL_FAMILY is None:
+        return
+    fam = infer_mcp_tool_family(tool_name)
+    oc = str(operation_class or "read_like").strip().lower() or "read_like"
+    oc = oc if oc in ("read_like", "write_like") else "read_like"
+    out = str(outcome or "unknown").strip().lower() or "unknown"
+    if out not in ("success", "guardrail_error", "call_error"):
+        out = "unknown"
+    _PROM_TOOL_FAMILY.labels(tool_family=fam, operation_class=oc, outcome=out).inc()
+
+
 def increment_event(event: str, *, code: str = "none", operation_class: str = "read_like", target_key: str = "unknown") -> None:
     label_target = _normalize_target_key(target_key)
+    ev = str(event or "unknown")[:64]
+    cd = str(code or "none")[:128]
     _ensure_prom()
     _ensure_otlp()
     if _PROM_COUNTER is not None:
-        _PROM_COUNTER.labels(event=event, code=code, operation_class=operation_class, target_key=label_target).inc()
+        _PROM_COUNTER.labels(event=ev, code=cd, operation_class=operation_class, target_key=label_target).inc()
     if _OTEL_COUNTER is not None:
         _OTEL_COUNTER.add(
             1,
             {
-                "event": event,
-                "code": code,
+                "event": ev,
+                "code": cd,
                 "operation_class": operation_class,
                 "target_key": label_target,
             },
@@ -106,14 +172,19 @@ def increment_event(event: str, *, code: str = "none", operation_class: str = "r
 
 def observe_duration(seconds: float, *, operation_class: str, target_key: str, outcome: str) -> None:
     label_target = _normalize_target_key(target_key)
+    oc = str(operation_class or "read_like").strip().lower() or "read_like"
+    oc = oc if oc in ("read_like", "write_like") else "read_like"
+    out = str(outcome or "unknown").strip().lower() or "unknown"
+    if out not in ("success", "guardrail_error", "call_error"):
+        out = "unknown"
     _ensure_prom()
     _ensure_otlp()
     if _PROM_HIST is not None:
-        _PROM_HIST.labels(operation_class=operation_class, target_key=label_target, outcome=outcome).observe(max(0.0, float(seconds)))
+        _PROM_HIST.labels(operation_class=oc, target_key=label_target, outcome=out).observe(max(0.0, float(seconds)))
     if _OTEL_HIST is not None:
         _OTEL_HIST.record(
             max(0.0, float(seconds)),
-            {"operation_class": operation_class, "target_key": label_target, "outcome": outcome},
+            {"operation_class": oc, "target_key": label_target, "outcome": out},
         )
 
 

@@ -239,6 +239,9 @@ class Settings(BaseSettings):
     WORKFLOW_MAX_PARALLEL_STEPS: int = 8
     # Step execution guardrails (sequential + async): hard timeout + bounded retries.
     AGENT_STEP_TIMEOUT_SECONDS: float = 180.0
+    # Clamp optional per-job override from output_contract.agent_step_timeout_seconds.
+    AGENT_STEP_TIMEOUT_MIN_SECONDS: float = 30.0
+    AGENT_STEP_TIMEOUT_MAX_SECONDS: float = 900.0
     AGENT_STEP_MAX_RETRIES: int = 2
     AGENT_STEP_RETRY_BACKOFF_SECONDS: float = 2.0
     # Output quality gates before passing step output downstream.

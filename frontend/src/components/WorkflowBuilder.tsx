@@ -65,7 +65,8 @@ const DEFAULT_OUTPUT_CONTRACT = {
   write_policy: {
     _description: 'How multi-target writes behave when one or more targets fail.',
     _fields_help: {
-      on_write_error: "Use 'continue' to attempt all targets, or 'stop' to halt on first failure.",
+      on_write_error:
+        "Use 'continue' to attempt all targets after a failure, or 'fail_job' to stop the job when a target errors (Platform mode).",
       min_successful_targets: 'Minimum number of successful write targets required for overall success.',
     },
     on_write_error: 'continue',
@@ -917,7 +918,48 @@ export function WorkflowBuilder({ jobId, onWorkflowCreated, initialSelectedAgent
             <div className="mb-6 p-5 bg-indigo-500/10 border-2 border-indigo-500/30 rounded-xl">
               <h4 className="font-bold text-indigo-300 mb-2">Output contract and write mode</h4>
               <p className="text-sm text-white/70 mb-3">
-                Default is Sandhi AI universal JSON contract. You can customize this when your job uses MCP write tools.
+                The JSON below is your <strong className="text-white/90">delivery contract</strong> (where copies of step output may go).
+                Choose <strong className="text-white/90">who</strong> performs those writes: the platform (automatic after each step) or the AI agent (by calling tools during the step).
+              </p>
+              <div className="mb-4 grid grid-cols-1 lg:grid-cols-2 gap-3 text-sm">
+                <div className="rounded-xl border border-indigo-400/35 bg-dark-200/50 p-4">
+                  <p className="font-bold text-indigo-200 mb-2">Platform — automatic</p>
+                  <ul className="list-disc list-inside text-white/70 space-y-1.5">
+                    <li>
+                      After a step finishes, Sandhi builds <strong className="text-white/85">one structured artifact</strong> from the
+                      model output (e.g. JSON/JSONL with a <code className="text-primary-300">records</code> array) and{' '}
+                      <strong className="text-white/85">calls each write target</strong> in the contract for you.
+                    </li>
+                    <li>
+                      Best for: loading that step result into a table, warehouse, or cloud storage as{' '}
+                      <strong className="text-white/85">a single file or batch load per completed step</strong> — repeatable and operator-controlled.
+                    </li>
+                    <li>
+                      <strong className="text-white/85">Not</strong> a full bucket-to-bucket sync: it does not crawl every object in MinIO/S3 by itself.
+                    </li>
+                  </ul>
+                </div>
+                <div className="rounded-xl border border-teal-400/35 bg-dark-200/50 p-4">
+                  <p className="font-bold text-teal-200 mb-2">AI agent — tool calls</p>
+                  <ul className="list-disc list-inside text-white/70 space-y-1.5">
+                    <li>
+                      The model must <strong className="text-white/85">invoke MCP tools</strong> (e.g. list/get from MinIO, put to Azure Blob, SQL) during the step.
+                    </li>
+                    <li>
+                      Best for: <strong className="text-white/85">many objects</strong>, custom paths, or logic that needs a loop (copy each key, transform, then write).
+                    </li>
+                    <li>
+                      Requires the right tools (MinIO, Azure, etc.) in the job/step tool list; the agent only does what it can call.
+                    </li>
+                    <li>
+                      Large bucket listings are paginated: use <code className="text-primary-300">continuation_token</code> /{' '}
+                      <code className="text-primary-300">page_token</code> from tool responses when <code className="text-primary-300">is_truncated</code> is true.
+                    </li>
+                  </ul>
+                </div>
+              </div>
+              <p className="text-xs text-white/55 mb-4 border-l-2 border-amber-500/50 pl-3 py-0.5">
+                <strong className="text-amber-100/90">UI only</strong> skips automatic artifact files and contract-driven writes — results stay in the app unless you use tools another way.
               </p>
               <div className="grid grid-cols-1 md:grid-cols-2 gap-4 mb-3">
                 <div>
@@ -929,10 +971,27 @@ export function WorkflowBuilder({ jobId, onWorkflowCreated, initialSelectedAgent
                     }
                     className="px-4 py-2.5 bg-dark-200/80 border-2 border-dark-300 rounded-xl text-white font-medium focus:ring-2 focus:ring-primary-500 focus:border-primary-500 w-full"
                   >
-                    <option value="platform">Platform triggers write tools from artifact reference</option>
-                    <option value="agent">AI agent triggers write tools from artifact reference</option>
-                    <option value="ui_only">UI only — show results in app; no artifact file or contract writes</option>
+                    <option value="platform">Platform — auto-write step artifact to write targets</option>
+                    <option value="agent">AI agent — model calls write/list tools during the step</option>
+                    <option value="ui_only">UI only — in-app results; no contract-driven writes</option>
                   </select>
+                  {writeExecutionMode === 'platform' && (
+                    <p className="mt-2 text-xs text-indigo-200/95 leading-relaxed" role="note">
+                      <span className="font-semibold text-indigo-100">Current mode:</span> Each successful step produces one artifact; the platform pushes it to every
+                      configured destination. Use for structured loads, not &quot;mirror entire bucket&quot; unless a separate sync tool handles that.
+                    </p>
+                  )}
+                  {writeExecutionMode === 'agent' && (
+                    <p className="mt-2 text-xs text-teal-200/95 leading-relaxed" role="note">
+                      <span className="font-semibold text-teal-100">Current mode:</span> The agent must use tools to read and write data. Prefer this when you need many
+                      files copied or per-object behavior. Keep <code className="text-primary-300">write_targets</code> aligned with how your tools are used.
+                    </p>
+                  )}
+                  {writeExecutionMode === 'ui_only' && (
+                    <p className="mt-2 text-xs text-white/60 leading-relaxed" role="note">
+                      <span className="font-semibold text-white/75">Current mode:</span> No automatic upload from the output contract. Use when you only need answers in the UI.
+                    </p>
+                  )}
                 </div>
                 <div>
                   <label className="block text-white/80 text-sm font-semibold mb-1">Output artifact format</label>
@@ -944,14 +1003,27 @@ export function WorkflowBuilder({ jobId, onWorkflowCreated, initialSelectedAgent
                     <option value="jsonl">JSONL (best for bulk and high volume)</option>
                     <option value="json">JSON (single structured payload)</option>
                   </select>
+                  <p className="mt-2 text-xs text-white/55">
+                    Artifact format applies when the platform persists step output (not UI only). Platform mode expects the model to return JSON with a top-level{' '}
+                    <code className="text-primary-300">records</code> array for reliable writes.
+                  </p>
                 </div>
               </div>
+              <label className="block text-white/80 text-sm font-semibold mb-1">Output contract (JSON)</label>
+              <p className="text-xs text-white/55 mb-2">
+                <code className="text-primary-300">write_targets</code> are used by <strong className="text-white/75">Platform</strong> mode for automatic delivery. In{' '}
+                <strong className="text-white/75">Agent</strong> mode, the platform does not run those writes for you — the model must call MinIO/Azure/SQL tools. If saving fails with a contract error, check{' '}
+                <code className="text-primary-300">write_policy.on_write_error</code> is <code className="text-primary-300">fail_job</code> or{' '}
+                <code className="text-primary-300">continue</code> (not &quot;stop&quot;). Optional per-job step timeout override:{' '}
+                <code className="text-primary-300">agent_step_timeout_seconds</code> (or <code className="text-primary-300">step_timeout_seconds</code>) — clamped by server min/max.
+              </p>
               <textarea
                 value={outputContractText}
                 onChange={(e) => setOutputContractText(e.target.value)}
                 rows={10}
                 className="w-full px-4 py-3 bg-dark-200/80 border-2 border-dark-300 rounded-xl text-white font-mono text-sm focus:ring-2 focus:ring-primary-500 focus:border-primary-500"
                 placeholder="Paste output contract JSON"
+                aria-label="Output contract JSON"
               />
             </div>
           )}

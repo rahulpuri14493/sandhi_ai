@@ -9,7 +9,11 @@ import pytest
 pytestmark = pytest.mark.unit
 
 from execution_integrations import _github_host_is_api_github_com, execute_github, execute_notion, execute_rest_api, execute_slack
-from execution_object_storage import _s3_key_allowed_for_write, execute_s3_family
+from execution_object_storage import (
+    _normalize_s3_object_key,
+    _s3_key_allowed_for_write,
+    execute_s3_family,
+)
 
 
 def _ensure_fake_slack_sdk(monkeypatch):
@@ -240,6 +244,16 @@ class TestExecuteRestApi:
         assert body["body"]["ok"] is True
 
 
+def test_normalize_s3_object_key():
+    assert _normalize_s3_object_key("", "buck") == ""
+    assert _normalize_s3_object_key("reports/a", "buck") == "reports/a"
+    assert _normalize_s3_object_key("/reports/a", "buck") == "reports/a"
+    assert _normalize_s3_object_key("buck/reports/a", "buck") == "reports/a"
+    assert _normalize_s3_object_key("s3://buck/reports/a", "buck") == "reports/a"
+    assert _normalize_s3_object_key("buck", "buck") == ""
+    assert _normalize_s3_object_key("s3://other/x", "buck") == "s3://other/x"
+
+
 class TestS3FamilyMocked:
     def test_list_objects(self, monkeypatch):
         s3 = MagicMock()
@@ -253,10 +267,35 @@ class TestS3FamilyMocked:
         keys = json.loads(out)["keys"]
         assert "a/1" in keys
 
+    def test_list_bucket_root_empty_key_uses_empty_prefix(self, monkeypatch):
+        s3 = MagicMock()
+        s3.list_objects_v2.return_value = {"Contents": [{"Key": "root.txt"}]}
+        monkeypatch.setattr("boto3.client", lambda name, **kw: s3)
+        execute_s3_family(
+            "minio",
+            {"bucket": "sandhi-brd-docs", "access_key": "a", "secret_key": "s"},
+            {"action": "list", "key": ""},
+        )
+        s3.list_objects_v2.assert_called_once()
+        call_kw = s3.list_objects_v2.call_args.kwargs
+        assert call_kw["Prefix"] == ""
+
+    def test_list_slash_only_key_uses_empty_prefix(self, monkeypatch):
+        s3 = MagicMock()
+        s3.list_objects_v2.return_value = {"Contents": []}
+        monkeypatch.setattr("boto3.client", lambda name, **kw: s3)
+        execute_s3_family(
+            "s3",
+            {"bucket": "b", "access_key": "a", "secret_key": "s"},
+            {"action": "list", "key": "/"},
+        )
+        assert s3.list_objects_v2.call_args.kwargs["Prefix"] == ""
+
     def test_get_object_text(self, monkeypatch):
         body = MagicMock()
         body.read.return_value = b"payload"
         s3 = MagicMock()
+        s3.head_object.return_value = {"ContentLength": 7}
         s3.get_object.return_value = {"Body": body}
         monkeypatch.setattr("boto3.client", lambda name, **kw: s3)
         out = execute_s3_family(
@@ -265,3 +304,47 @@ class TestS3FamilyMocked:
             {"action": "get", "key": "f.txt"},
         )
         assert out == "payload"
+
+    def test_list_includes_truncation_and_continuation(self, monkeypatch):
+        s3 = MagicMock()
+        s3.list_objects_v2.return_value = {
+            "Contents": [{"Key": "a"}],
+            "IsTruncated": True,
+            "NextContinuationToken": "tok123",
+        }
+        monkeypatch.setattr("boto3.client", lambda name, **kw: s3)
+        out = json.loads(
+            execute_s3_family(
+                "s3",
+                {"bucket": "b", "access_key": "a", "secret_key": "s"},
+                {"action": "list", "key": ""},
+            )
+        )
+        assert out["keys"] == ["a"]
+        assert out["is_truncated"] is True
+        assert out["next_continuation_token"] == "tok123"
+
+    def test_list_passes_continuation_token(self, monkeypatch):
+        s3 = MagicMock()
+        s3.list_objects_v2.return_value = {"Contents": []}
+        monkeypatch.setattr("boto3.client", lambda name, **kw: s3)
+        execute_s3_family(
+            "ceph",
+            {"bucket": "buck", "access_key": "a", "secret_key": "s"},
+            {"action": "list", "key": "p", "continuation_token": "abc"},
+        )
+        assert s3.list_objects_v2.call_args.kwargs["ContinuationToken"] == "abc"
+
+    def test_get_strips_bucket_prefix_and_leading_slash(self, monkeypatch):
+        body = MagicMock()
+        body.read.return_value = b"payload"
+        s3 = MagicMock()
+        s3.head_object.return_value = {"ContentLength": 7}
+        s3.get_object.return_value = {"Body": body}
+        monkeypatch.setattr("boto3.client", lambda name, **kw: s3)
+        execute_s3_family(
+            "s3",
+            {"bucket": "myb", "access_key": "a", "secret_key": "s"},
+            {"action": "get", "key": "/myb/path/file.txt"},
+        )
+        assert s3.get_object.call_args.kwargs["Key"] == "path/file.txt"

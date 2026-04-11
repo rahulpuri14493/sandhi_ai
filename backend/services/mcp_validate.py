@@ -548,7 +548,15 @@ def _validate_azure_blob(config: dict) -> Tuple[bool, str]:
     except ImportError:
         return False, "Azure Blob validation requires azure-storage-blob (not installed in backend)"
     try:
-        svc = BlobServiceClient.from_connection_string(conn) if conn else BlobServiceClient(account_url=account_url)
+        if conn:
+            svc = BlobServiceClient.from_connection_string(conn)
+        else:
+            try:
+                from azure.identity import DefaultAzureCredential
+
+                svc = BlobServiceClient(account_url, credential=DefaultAzureCredential())
+            except ImportError:
+                svc = BlobServiceClient(account_url=account_url)
         cc = svc.get_container_client(container)
         cc.exists()
         return True, "Azure Blob connection successful"
