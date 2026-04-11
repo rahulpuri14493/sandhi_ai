@@ -38,6 +38,30 @@ def test_load_step_input_json_not_object():
         ae._load_step_input_json("[1]", job_id=1, step_id=2, step_order=1)
 
 
+def test_format_workflow_step_error_message_timeout_is_readable():
+    assert str(asyncio.TimeoutError()) == ""
+    msg = ae._format_workflow_step_error_message(asyncio.TimeoutError(), timeout_seconds=180.0)
+    assert "timed out" in msg.lower() and "180" in msg
+
+
+def test_resolve_agent_step_timeout_min_only_applies_to_contract_override(monkeypatch):
+    """Default AGENT_STEP_TIMEOUT_SECONDS is not raised to MIN; contract values are clamped."""
+    monkeypatch.setattr(ae.settings, "AGENT_STEP_TIMEOUT_SECONDS", 2.0)
+    monkeypatch.setattr(ae.settings, "AGENT_STEP_TIMEOUT_MIN_SECONDS", 30.0)
+    monkeypatch.setattr(ae.settings, "AGENT_STEP_TIMEOUT_MAX_SECONDS", 900.0)
+    assert ae._resolve_agent_step_timeout_seconds({}) == 2.0
+    assert ae._resolve_agent_step_timeout_seconds({"agent_step_timeout_seconds": 5}) == 30.0
+
+
+def test_format_workflow_step_error_message_empty_str_uses_type():
+    class QuietError(Exception):
+        def __str__(self):
+            return ""
+
+    msg = ae._format_workflow_step_error_message(QuietError())
+    assert "QuietError" in msg
+
+
 def test_sign_trusted_bootstrap_payload_no_secret(monkeypatch):
     monkeypatch.setattr(ae.settings, "MCP_INTERNAL_SECRET", "")
     assert ae._sign_trusted_bootstrap_payload(

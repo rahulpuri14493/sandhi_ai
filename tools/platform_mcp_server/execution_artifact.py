@@ -1180,10 +1180,14 @@ def _artifact_write_azure_blob(
     operation_type: str,
 ) -> str:
     try:
-        from azure.storage.blob import BlobServiceClient
+        import azure.storage.blob  # noqa: F401
     except ImportError:
         return "Error: azure-storage-blob is not installed"
-    container = (target.get("bucket") or config.get("container") or "").strip()
+    from azure_blob_client import blob_service_client_from_config
+
+    container = (
+        target.get("bucket") or target.get("container") or config.get("container") or ""
+    ).strip()
     prefix = (target.get("prefix") or "").strip().strip("/")
     if not container:
         return "Error: target.bucket/container required"
@@ -1192,10 +1196,9 @@ def _artifact_write_azure_blob(
     conn = (config.get("connection_string") or "").strip()
     account_url = (config.get("account_url") or "").strip()
     try:
-        if conn:
-            svc = BlobServiceClient.from_connection_string(conn)
-        else:
-            svc = BlobServiceClient(account_url=account_url)
+        if not conn and not account_url:
+            return "Error: account_url or connection_string required"
+        svc = blob_service_client_from_config(config)
         bc = svc.get_container_client(container).get_blob_client(blob_name)
         bc.upload_blob(raw, overwrite=True)
         return json.dumps({"status": "ok", "container": container, "blob": blob_name})

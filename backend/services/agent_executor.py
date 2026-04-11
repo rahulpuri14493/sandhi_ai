@@ -341,6 +341,31 @@ def _parse_output_contract(raw: Optional[str]) -> Dict[str, Any]:
     return data if isinstance(data, dict) else {}
 
 
+def _resolve_agent_step_timeout_seconds(contract: Dict[str, Any]) -> float:
+    """Optional job-level step timeout from output_contract (clamped for platform safety)."""
+    default_t = float(getattr(settings, "AGENT_STEP_TIMEOUT_SECONDS", 180.0) or 180.0)
+    max_t = float(getattr(settings, "AGENT_STEP_TIMEOUT_MAX_SECONDS", 900.0) or 900.0)
+    min_t = float(getattr(settings, "AGENT_STEP_TIMEOUT_MIN_SECONDS", 30.0) or 30.0)
+
+    def _from_settings_default() -> float:
+        # Operator / env default: honor AGENT_STEP_TIMEOUT_SECONDS as-is (capped at max only).
+        # Min clamp applies only to explicit output_contract overrides below.
+        return min(max_t, max(0.0, default_t))
+
+    if not isinstance(contract, dict):
+        return _from_settings_default()
+    raw = contract.get("agent_step_timeout_seconds")
+    if raw is None:
+        raw = contract.get("step_timeout_seconds")
+    if raw is None:
+        return _from_settings_default()
+    try:
+        t = float(raw)
+    except (TypeError, ValueError):
+        return _from_settings_default()
+    return max(min_t, min(max_t, t))
+
+
 def _parse_write_policy(contract: Dict[str, Any], write_targets_count: int) -> Dict[str, Any]:
     policy = contract.get("write_policy") if isinstance(contract, dict) else {}
     if not isinstance(policy, dict):
@@ -359,6 +384,42 @@ def _parse_write_policy(contract: Dict[str, Any], write_targets_count: int) -> D
         "on_write_error": on_write_error,
         "min_successful_targets": min_successful_targets,
     }
+
+
+def _format_workflow_step_error_message(exc: BaseException, *, timeout_seconds: Optional[float] = None) -> str:
+    """
+    asyncio.wait_for raises TimeoutError whose str() is empty on Python 3.11+, which produced
+    opaque 'Workflow step N failed: ' messages in logs and job output.
+    """
+    if isinstance(exc, asyncio.TimeoutError):
+        if isinstance(timeout_seconds, (int, float)) and timeout_seconds > 0:
+            ts_txt = f"{float(timeout_seconds):g}s"
+        else:
+            ts_txt = "the configured limit"
+        return (
+            f"Agent step timed out after {ts_txt} (see AGENT_STEP_TIMEOUT_SECONDS). "
+            "The LLM or upstream API did not finish in time — increase the timeout, reduce tool calls, or use a faster model."
+        )
+    msg = str(exc).strip()
+    if msg:
+        return msg
+    return f"{type(exc).__name__} (no error message)"
+
+
+def _mcp_tool_result_summary(write_result: Dict[str, Any], *, max_len: int = 2000) -> str:
+    """Extract text from MCP tools/call result for exception messages and step metadata."""
+    if not isinstance(write_result, dict):
+        return ""
+    parts: List[str] = []
+    for block in write_result.get("content") or []:
+        if isinstance(block, dict) and block.get("type") == "text":
+            t = str(block.get("text", "")).strip()
+            if t:
+                parts.append(t)
+    joined = " | ".join(parts)
+    if len(joined) > max_len:
+        return joined[: max_len - 3] + "..."
+    return joined
 
 
 def _input_schema_for_tool_type(tool_type: str) -> dict:
@@ -997,13 +1058,13 @@ class AgentExecutor:
             token_usage_source: Optional[str] = None
             mcp_tools_used: List[str] = []
             artifact_ref = None
+            contract = _parse_output_contract(getattr(job, "output_contract", None))
             guardrail_meta: Dict[str, Any] = {
-                "timeout_seconds": float(getattr(settings, "AGENT_STEP_TIMEOUT_SECONDS", 180.0) or 180.0),
+                "timeout_seconds": _resolve_agent_step_timeout_seconds(contract),
                 "max_retries": max(1, int(getattr(settings, "AGENT_STEP_MAX_RETRIES", 2) or 2)),
                 "attempts_used": 0,
                 "retryable_failures": 0,
             }
-            contract = _parse_output_contract(getattr(job, "output_contract", None))
             write_mode = (getattr(job, "write_execution_mode", None) or "platform").strip().lower()
             write_targets: List[Dict[str, Any]] = contract.get("write_targets") if isinstance(contract, dict) else []
             write_policy = _parse_write_policy(contract, len(write_targets) if isinstance(write_targets, list) else 0)
@@ -1200,10 +1261,12 @@ class AgentExecutor:
                                 )
                             )
                             if is_error_result:
+                                mcp_detail = _mcp_tool_result_summary(write_result)
+                                err_label = mcp_detail or "platform write target returned isError=true"
                                 write_results.append({
                                     "tool_name": tool_name,
                                     "status": "failed",
-                                    "error": "platform write target returned isError=true",
+                                    "error": err_label,
                                     "result": write_result,
                                 })
                                 self._emit_step_heartbeat(
@@ -1211,13 +1274,18 @@ class AgentExecutor:
                                     phase="writing_artifact",
                                     reason_code="platform_write_target_error",
                                     message=f"Write target failed via {tool_name or 'unknown_tool'}",
-                                    reason_detail={"tool_name": tool_name, "error_type": "platform_write_error"},
+                                    reason_detail={
+                                        "tool_name": tool_name,
+                                        "error_type": "platform_write_error",
+                                        "mcp_detail": mcp_detail[:500] if mcp_detail else None,
+                                    },
                                     commit_db=True,
                                 )
                                 if write_policy.get("on_write_error") == "fail_job":
-                                    raise ValueError(
-                                        f"Write target {tool_name or 'unknown_tool'} returned error response"
-                                    )
+                                    msg = f"Write target {tool_name or 'unknown_tool'} returned error response"
+                                    if mcp_detail:
+                                        msg = f"{msg}: {mcp_detail}"
+                                    raise ValueError(msg)
                             else:
                                 write_results.append({
                                     "tool_name": tool_name,
@@ -1274,7 +1342,10 @@ class AgentExecutor:
             except Exception as step_error:
                 step.status = "failed"
                 step.completed_at = datetime.utcnow()
-                error_msg = str(step_error)
+                error_msg = _format_workflow_step_error_message(
+                    step_error,
+                    timeout_seconds=float(guardrail_meta.get("timeout_seconds") or 0) or None,
+                )
                 if len(error_msg) > 500:
                     error_msg = error_msg[:500] + "..."
                 step.output_data = json.dumps({
@@ -1289,12 +1360,22 @@ class AgentExecutor:
                     "write_results": write_results,
                     "guardrail_meta": guardrail_meta,
                 })
+                hb_detail = {
+                    "error_type": type(step_error).__name__,
+                    "timeout_seconds": guardrail_meta.get("timeout_seconds"),
+                }
+                hb_msg = _format_workflow_step_error_message(
+                    step_error,
+                    timeout_seconds=float(guardrail_meta.get("timeout_seconds") or 0) or None,
+                )
+                if len(hb_msg) > 280:
+                    hb_msg = hb_msg[:277] + "..."
                 self._emit_step_heartbeat(
                     step,
                     phase="failed",
                     reason_code="step_failed",
-                    message=f"Workflow step failed: {type(step_error).__name__}",
-                    reason_detail={"error_type": type(step_error).__name__},
+                    message=f"Workflow step failed: {hb_msg}",
+                    reason_detail=hb_detail,
                     commit_db=False,
                 )
                 self.db.commit()

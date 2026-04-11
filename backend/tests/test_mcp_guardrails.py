@@ -53,6 +53,37 @@ async def test_guardrails_retry_transient_then_success(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_guardrails_tool_family_metric_on_success(monkeypatch):
+    monkeypatch.setattr("core.config.settings.MCP_INVOCATION_MAX_ATTEMPTS", 1, raising=False)
+    recorded: list[dict] = []
+
+    def _cap(**kw):
+        recorded.append(kw)
+
+    monkeypatch.setattr("services.mcp_guardrails.increment_mcp_tool_family_metric", _cap)
+    g = MCPInvocationGuardrails()
+
+    async def _ok(_timeout: float):
+        return {"content": [{"type": "text", "text": "ok"}]}
+
+    await g.call_tool_with_guardrails(
+        business_id=101,
+        target_key="platform:test:/mcp:query",
+        timeout_seconds=5.0,
+        execute_call=_ok,
+        tool_name="platform_9_minio_bucket",
+        operation_class="read_like",
+    )
+    assert recorded == [
+        {
+            "tool_name": "platform_9_minio_bucket",
+            "operation_class": "read_like",
+            "outcome": "success",
+        }
+    ]
+
+
+@pytest.mark.asyncio
 async def test_guardrails_no_retry_non_retryable_error(monkeypatch):
     monkeypatch.setattr("core.config.settings.MCP_INVOCATION_MAX_ATTEMPTS", 5, raising=False)
     monkeypatch.setattr("core.config.settings.MCP_INVOCATION_RETRY_BASE_DELAY_SECONDS", 0.0, raising=False)

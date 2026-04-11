@@ -10,7 +10,7 @@ import httpx
 
 from core.config import settings
 from services.mcp_client import MCPJSONRPCError
-from services.mcp_metrics import increment_event, observe_duration
+from services.mcp_metrics import increment_event, increment_mcp_tool_family_metric, observe_duration
 
 import logging
 
@@ -759,6 +759,11 @@ return 0
                     target_key=target_key,
                     outcome="success",
                 )
+                increment_mcp_tool_family_metric(
+                    tool_name=tool_name,
+                    operation_class=operation_class,
+                    outcome="success",
+                )
                 increment_event("success", code="none", operation_class=operation_class, target_key=target_key)
                 logger.info(
                     "mcp_guardrail_event event=success business_id=%s target=%s op=%s attempt=%s/%s",
@@ -788,6 +793,11 @@ return 0
                     time.perf_counter() - started,
                     operation_class=operation_class,
                     target_key=target_key,
+                    outcome="guardrail_error",
+                )
+                increment_mcp_tool_family_metric(
+                    tool_name=tool_name,
+                    operation_class=operation_class,
                     outcome="guardrail_error",
                 )
                 increment_event("rejected", code=ge.code, operation_class=operation_class, target_key=target_key)
@@ -824,6 +834,11 @@ return 0
                     time.perf_counter() - started,
                     operation_class=operation_class,
                     target_key=target_key,
+                    outcome="call_error",
+                )
+                increment_mcp_tool_family_metric(
+                    tool_name=tool_name,
+                    operation_class=operation_class,
                     outcome="call_error",
                 )
                 increment_event("error", code=cls.code, operation_class=operation_class, target_key=target_key)

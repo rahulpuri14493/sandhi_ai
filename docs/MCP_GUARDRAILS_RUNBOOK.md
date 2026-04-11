@@ -14,6 +14,7 @@ This runbook covers production operations for MCP invocation guardrails under he
 - Endpoint: `GET /metrics`
 - Counter: `mcp_guardrail_events_total{event,code,operation_class,target_key}`
 - Histogram: `mcp_guardrail_call_duration_seconds{operation_class,target_key,outcome}`
+- Counter: `mcp_platform_tool_calls_total{tool_family,operation_class,outcome}` — low-cardinality tool family (e.g. `minio`, `azure_blob`, `s3`) aligned with guardrail histogram outcomes: `success`, `guardrail_error`, `call_error`. Disable with `MCP_TOOL_FAMILY_METRICS_ENABLED=false` if needed.
 - Logs: `mcp_guardrail_event ...`
 
 ## Playbook: Quota Saturation

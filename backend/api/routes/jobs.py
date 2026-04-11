@@ -502,12 +502,19 @@ def _validate_output_contract_policy(contract: Optional[dict]) -> Optional[dict]
         return contract
     if not isinstance(policy, dict):
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="output_contract.write_policy must be an object")
+    policy = dict(policy)
     on_write_error = policy.get("on_write_error")
-    if on_write_error is not None and str(on_write_error).strip().lower() not in ("fail_job", "continue"):
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="output_contract.write_policy.on_write_error must be 'fail_job' or 'continue'",
-        )
+    if on_write_error is not None:
+        raw = str(on_write_error).strip().lower()
+        # UX template historically said "stop"; map common synonyms to canonical values.
+        aliases = {"stop": "fail_job", "halt": "fail_job", "abort": "fail_job", "fail": "fail_job"}
+        normalized = aliases.get(raw, raw)
+        if normalized not in ("fail_job", "continue"):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="output_contract.write_policy.on_write_error must be 'fail_job' or 'continue'",
+            )
+        policy["on_write_error"] = normalized
     min_successful_targets = policy.get("min_successful_targets")
     if min_successful_targets is not None:
         try:
@@ -522,7 +529,9 @@ def _validate_output_contract_policy(contract: Optional[dict]) -> Optional[dict]
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail="output_contract.write_policy.min_successful_targets must be an integer >= 0",
             )
-    return contract
+    out = dict(contract)
+    out["write_policy"] = policy
+    return out
 
 
 def _parse_contract_json(raw: Optional[str]) -> Optional[dict]:

@@ -83,6 +83,8 @@ def test_validate_output_contract_policy():
         {"write_policy": {"on_write_error": "continue", "min_successful_targets": 0}}
     )
     assert ok["write_policy"]["on_write_error"] == "continue"
+    stop_norm = jm._validate_output_contract_policy({"write_policy": {"on_write_error": "stop"}})
+    assert stop_norm["write_policy"]["on_write_error"] == "fail_job"
     with pytest.raises(HTTPException):
         jm._validate_output_contract_policy(
             {"write_policy": {"min_successful_targets": "x"}}
