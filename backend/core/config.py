@@ -43,6 +43,62 @@ class Settings(BaseSettings):
     MCP_WRITE_OPERATION_RETRY_BASE_DELAY_SECONDS: float = 0.5
     MCP_WRITE_OPERATION_RETRY_MAX_DELAY_SECONDS: float = 5.0
     MCP_WRITE_OPERATION_RETRY_JITTER_SECONDS: float = 0.2
+    # MCP invocation guardrails (all MCP tool calls: platform + BYO)
+    MCP_INVOCATION_MAX_ATTEMPTS: int = 3
+    MCP_INVOCATION_RETRY_BASE_DELAY_SECONDS: float = 0.25
+    MCP_INVOCATION_RETRY_MAX_DELAY_SECONDS: float = 3.0
+    MCP_INVOCATION_RETRY_JITTER_SECONDS: float = 0.15
+    MCP_CIRCUIT_BREAKER_FAILURE_THRESHOLD: int = 5
+    MCP_CIRCUIT_BREAKER_OPEN_SECONDS: float = 30.0
+    MCP_CIRCUIT_BREAKER_HALF_OPEN_MAX_PROBES: int = 1
+    # Optional distributed state for MCP guardrails (recommended for multi-worker production).
+    MCP_GUARDRAILS_DISTRIBUTED_ENABLED: bool = False
+    MCP_GUARDRAILS_REDIS_URL: str = ""
+    MCP_GUARDRAILS_REDIS_PREFIX: str = "sandhi:mcp_guardrails:v1"
+    MCP_GUARDRAILS_REDIS_SOCKET_TIMEOUT_SECONDS: float = 2.0
+    MCP_GUARDRAILS_REDIS_CONNECT_TIMEOUT_SECONDS: float = 2.0
+    MCP_GUARDRAILS_REDIS_RETRY_SECONDS: float = 30.0
+    MCP_GUARDRAILS_COUNTER_TTL_SECONDS: int = 120
+    MCP_GUARDRAILS_BREAKER_TTL_SECONDS: int = 300
+    MCP_GUARDRAILS_FAIR_QUEUE_ENABLED: bool = False
+    MCP_GUARDRAILS_FAIR_QUEUE_STALE_SECONDS: float = 30.0
+    # Set to 0 to disable; recommended to tune in production per tenant scale.
+    # Concurrent admission controls. Keep >1 in production to allow expected parallel agent calls.
+    MCP_TENANT_MAX_CONCURRENT_CALLS: int = 32
+    MCP_TARGET_MAX_CONCURRENT_CALLS: int = 8
+    # Queue wait budget before returning mcp_quota_exceeded when concurrency slots are saturated.
+    MCP_CONCURRENCY_WAIT_SECONDS: float = 10.0
+    MCP_TENANT_RATE_LIMIT_PER_MINUTE: int = 0
+    # Retry profile split: stricter defaults for write-like operations.
+    MCP_READ_INVOCATION_MAX_ATTEMPTS: int = 0
+    MCP_READ_INVOCATION_RETRY_BASE_DELAY_SECONDS: float = 0.0
+    MCP_READ_INVOCATION_RETRY_MAX_DELAY_SECONDS: float = 0.0
+    MCP_READ_INVOCATION_RETRY_JITTER_SECONDS: float = 0.0
+    MCP_WRITE_INVOCATION_MAX_ATTEMPTS: int = 0
+    MCP_WRITE_INVOCATION_RETRY_BASE_DELAY_SECONDS: float = 0.0
+    MCP_WRITE_INVOCATION_RETRY_MAX_DELAY_SECONDS: float = 0.0
+    MCP_WRITE_INVOCATION_RETRY_JITTER_SECONDS: float = 0.0
+    # Rolling-window breaker tuning (additional to existing breaker knobs).
+    MCP_CIRCUIT_BREAKER_WINDOW_SECONDS: float = 60.0
+    MCP_CIRCUIT_BREAKER_MIN_SAMPLES: int = 10
+    MCP_CIRCUIT_BREAKER_ERROR_RATE_THRESHOLD: float = 0.5
+    # Policy maps as JSON strings (global defaults remain fallback).
+    # MCP_TENANT_TIER_POLICY_JSON example:
+    # {"bronze":{"tenant_max_concurrent_calls":64},"silver":{"tenant_max_concurrent_calls":128},"gold":{"tenant_max_concurrent_calls":256}}
+    MCP_TENANT_TIER_POLICY_JSON: str = "{}"
+    # Optional per-business tier mapping (business user id -> bronze/silver/gold).
+    # Example: {"12":"gold","31":"silver"}
+    MCP_BUSINESS_TIER_BY_ID_JSON: str = "{}"
+    # MCP_TOOL_POLICY_JSON example:
+    # {"databricks_write":{"operation_class":"write_like","write_retry_safe":false,"target_max_concurrent_calls":6}}
+    MCP_TOOL_POLICY_JSON: str = "{}"
+    MCP_DEFAULT_BUSINESS_TIER: str = "bronze"
+    # Optional OTLP metrics export for MCP guardrails.
+    MCP_GUARDRAILS_OTLP_ENABLED: bool = False
+    MCP_GUARDRAILS_OTLP_ENDPOINT: str = ""
+    MCP_GUARDRAILS_OTLP_INSECURE: bool = True
+    MCP_GUARDRAILS_METRICS_TARGET_KEY_MODE: str = "raw"  # raw | normalized | hash
+    MCP_GUARDRAILS_METRICS_TARGET_KEY_MAX_LEN: int = 120
     # Job execution backend: celery (Redis queue) or local_thread fallback.
     JOB_EXECUTION_BACKEND: str = "celery"
     JOB_EXECUTION_STRICT_QUEUE: bool = False  # True: no local fallback when enqueue fails

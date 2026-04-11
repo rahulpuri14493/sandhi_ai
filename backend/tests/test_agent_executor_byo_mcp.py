@@ -84,7 +84,6 @@ async def test_invoke_mcp_tool_unknown_name_returns_error():
 
 @pytest.mark.asyncio
 async def test_get_available_mcp_tools_async_expands_byo_tools():
-    from services import agent_executor as ae
     from models.mcp_server import MCPServerConnection, MCPToolConfig
 
     conn_row = MCPServerConnection(
@@ -119,7 +118,7 @@ async def test_get_available_mcp_tools_async_expands_byo_tools():
             ]
         }
     )
-    with patch.object(ae, "mcp_list_tools", fake_list):
+    with patch("services.agent_executor.guarded_mcp_list_tools", fake_list):
         tools = await ex._get_available_mcp_tools_async(42, platform_tool_ids=[], connection_ids=[5])
     names = [t["name"] for t in tools]
     assert any(n.startswith("byo_5_") for n in names)
@@ -160,7 +159,6 @@ async def test_get_available_mcp_tools_async_empty_platform_ids_means_no_platfor
 
 @pytest.mark.asyncio
 async def test_get_available_mcp_tools_async_empty_connection_ids_means_no_byo_tools():
-    from services import agent_executor as ae
     from models.mcp_server import MCPToolConfig, MCPServerConnection
 
     def _query_side_effect(model):
@@ -175,7 +173,7 @@ async def test_get_available_mcp_tools_async_empty_connection_ids_means_no_byo_t
     mock_session.query.side_effect = _query_side_effect
     ex = AgentExecutor(mock_session)
     fake_list = AsyncMock()
-    with patch.object(ae, "mcp_list_tools", fake_list):
+    with patch("services.agent_executor.guarded_mcp_list_tools", fake_list):
         tools = await ex._get_available_mcp_tools_async(42, platform_tool_ids=None, connection_ids=[])
     assert tools == []
     fake_list.assert_not_called()

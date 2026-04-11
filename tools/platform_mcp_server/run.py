@@ -12,7 +12,7 @@ def _env_bool(name: str, default: bool = False) -> bool:
     return str(raw).strip().lower() in ("1", "true", "yes", "on")
 
 
-if __name__ == "__main__":
+def main() -> None:
     uvicorn.run(
         "app:app",
         host="0.0.0.0",
@@ -21,3 +21,7 @@ if __name__ == "__main__":
         log_level="info",
         access_log=True,
     )
+
+
+if __name__ == "__main__":
+    main()

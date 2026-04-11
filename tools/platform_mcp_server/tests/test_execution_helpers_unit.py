@@ -417,3 +417,55 @@ class TestSqlserverValidateMergeSql:
     def test_rejects_wrong_shape(self):
         with pytest.raises(ValueError, match="shape"):
             execution_common._sqlserver_validate_merge_sql("SELECT 1")
+
+
+class TestPymssqlConnectKwargs:
+    """Cover Azure SQL / pymssql kw branches (often missed on Linux CI vs local)."""
+
+    def test_azure_host_default_encryption_require(self, monkeypatch):
+        monkeypatch.delenv("MCP_SQLSERVER_AZURE_ENCRYPTION_DEFAULT", raising=False)
+        kw = execution_common._pymssql_connect_kwargs(
+            {"host": "x.database.windows.net", "user": "u", "password": "p"},
+        )
+        assert kw["encryption"] == "require"
+        assert kw["login_timeout"] == 90
+
+    def test_azure_encryption_from_env(self, monkeypatch):
+        monkeypatch.setenv("MCP_SQLSERVER_AZURE_ENCRYPTION_DEFAULT", "request")
+        kw = execution_common._pymssql_connect_kwargs({"host": "x.database.windows.net"})
+        assert kw["encryption"] == "request"
+
+    def test_azure_encryption_env_invalid_falls_back_require(self, monkeypatch):
+        monkeypatch.setenv("MCP_SQLSERVER_AZURE_ENCRYPTION_DEFAULT", "invalid")
+        kw = execution_common._pymssql_connect_kwargs({"host": "y.database.windows.net"})
+        assert kw["encryption"] == "require"
+
+    def test_explicit_encrypt_off(self):
+        kw = execution_common._pymssql_connect_kwargs(
+            {"host": "localhost", "encrypt": "off"},
+        )
+        assert kw["encryption"] == "off"
+
+    def test_login_timeout_parsed(self):
+        kw = execution_common._pymssql_connect_kwargs(
+            {"host": "localhost", "login_timeout": "44"},
+        )
+        assert kw["login_timeout"] == 44
+
+    def test_login_timeout_bad_ignored(self):
+        kw = execution_common._pymssql_connect_kwargs(
+            {"host": "localhost", "login_timeout": "nope"},
+        )
+        assert "login_timeout" not in kw
+
+    def test_timeout_parsed(self):
+        kw = execution_common._pymssql_connect_kwargs(
+            {"host": "localhost", "timeout": "12"},
+        )
+        assert kw["timeout"] == 12
+
+    def test_timeout_bad_ignored(self):
+        kw = execution_common._pymssql_connect_kwargs(
+            {"host": "localhost", "timeout": "bad"},
+        )
+        assert "timeout" not in kw

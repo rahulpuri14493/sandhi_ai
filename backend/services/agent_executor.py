@@ -17,7 +17,14 @@ from models.audit_log import AuditLog
 from models.mcp_server import MCPToolConfig, MCPServerConnection
 from services.payment_processor import PaymentProcessor
 from services.a2a_client import execute_via_a2a
-from services.mcp_client import call_tool as mcp_call_tool, list_tools as mcp_list_tools
+from services.mcp_client import call_tool as mcp_call_tool
+from services.mcp_guardrails import (
+    MCPGuardrailError,
+    get_mcp_guardrails,
+    guarded_mcp_list_tools,
+    infer_mcp_tool_operation_class,
+    resolve_mcp_tenant_tier,
+)
 from core.encryption import decrypt_json
 from services.db_schema_introspection import format_schema_for_prompt
 from services.job_file_storage import persist_file
@@ -707,13 +714,25 @@ class AgentExecutor:
         timeout = float(write_spec.get("timeout_seconds") or getattr(settings, "MCP_TOOL_DEFAULT_TIMEOUT_SECONDS", 60.0))
         extra_headers = {"X-MCP-Business-Id": str(business_id)}
         extra_headers.update(self._sandhi_mcp_correlation_headers())
-        return await mcp_call_tool(
-            base_url=settings.PLATFORM_MCP_SERVER_URL.rstrip("/"),
+        guard = get_mcp_guardrails()
+        target_key = f"platform:{settings.PLATFORM_MCP_SERVER_URL.rstrip('/')}:/mcp:{tool_name}"
+        tenant_tier = self._resolve_business_tier(int(business_id))
+        return await guard.call_tool_with_guardrails(
+            business_id=int(business_id),
+            target_key=target_key,
+            timeout_seconds=timeout,
+            operation_class="write_like",
             tool_name=tool_name,
-            arguments=arguments,
-            endpoint_path="/mcp",
-            extra_headers=extra_headers,
-            timeout=timeout,
+            tenant_tier=tenant_tier,
+            idempotency_key=str(arguments.get("idempotency_key") or ""),
+            execute_call=lambda bounded_timeout: mcp_call_tool(
+                base_url=settings.PLATFORM_MCP_SERVER_URL.rstrip("/"),
+                tool_name=tool_name,
+                arguments=arguments,
+                endpoint_path="/mcp",
+                extra_headers=extra_headers,
+                timeout=bounded_timeout,
+            ),
         )
 
     async def _execute_one_step_core(
@@ -2338,15 +2357,26 @@ END DOCUMENT {i+1}: {doc_name}
             remote_tools: list = []
             try:
                 xh = self._sandhi_mcp_correlation_headers()
-                res = await mcp_list_tools(
+                res = await guarded_mcp_list_tools(
+                    business_id=int(business_id),
+                    connection_id=int(c.id),
                     base_url=base_url,
                     endpoint_path=endpoint_path,
                     auth_type=c.auth_type or "none",
                     credentials=creds,
-                    timeout=20.0,
+                    timeout_seconds=20.0,
                     extra_headers=xh if xh else None,
                 )
                 remote_tools = res.get("tools") or []
+            except MCPGuardrailError as ge:
+                logger.warning(
+                    "BYO MCP tools/list guardrail connection id=%s name=%s url=%s code=%s",
+                    c.id,
+                    c.name,
+                    base_url,
+                    ge.code,
+                )
+                continue
             except Exception as e:
                 logger.warning(
                     "BYO MCP tools/list failed for connection id=%s name=%s url=%s: %s",
@@ -2434,6 +2464,9 @@ END DOCUMENT {i+1}: {doc_name}
             creds = decrypt_json(conn.encrypted_credentials) if conn.encrypted_credentials else None
             timeout = float(getattr(settings, "MCP_TOOL_DEFAULT_TIMEOUT_SECONDS", 60.0))
             xh = self._sandhi_mcp_correlation_headers()
+            guard = get_mcp_guardrails()
+            target_key = f"external:{meta.get('connection_id')}:{conn.base_url.rstrip('/')}:{conn.endpoint_path or '/mcp'}:{ext_name}"
+            tenant_tier = self._resolve_business_tier(int(business_id))
             try:
                 logger.info(
                     "byo_mcp_tools_call connection_id=%s tool=%s job_id=%s workflow_step_id=%s trace_id=%s",
@@ -2443,16 +2476,51 @@ END DOCUMENT {i+1}: {doc_name}
                     xh.get("X-Sandhi-Workflow-Step-Id", "-"),
                     xh.get("X-Sandhi-Trace-Id", "-"),
                 )
-                result = await mcp_call_tool(
-                    base_url=conn.base_url.rstrip("/"),
+                result = await guard.call_tool_with_guardrails(
+                    business_id=int(business_id),
+                    target_key=target_key,
+                    timeout_seconds=timeout,
+                    operation_class=self._infer_mcp_operation_class(ext_name, arguments or {}),
                     tool_name=ext_name,
-                    arguments=arguments or {},
-                    endpoint_path=conn.endpoint_path or "/mcp",
-                    auth_type=conn.auth_type or "none",
-                    credentials=creds,
-                    timeout=timeout,
-                    extra_headers=xh if xh else None,
+                    tenant_tier=tenant_tier,
+                    idempotency_key=str((arguments or {}).get("idempotency_key") or ""),
+                    execute_call=lambda bounded_timeout: mcp_call_tool(
+                        base_url=conn.base_url.rstrip("/"),
+                        tool_name=ext_name,
+                        arguments=arguments or {},
+                        endpoint_path=conn.endpoint_path or "/mcp",
+                        auth_type=conn.auth_type or "none",
+                        credentials=creds,
+                        timeout=bounded_timeout,
+                        extra_headers=xh if xh else None,
+                    ),
                 )
+            except MCPGuardrailError as e:
+                elapsed_ms = int((time.perf_counter() - started) * 1000.0)
+                logger.warning(
+                    "BYO MCP guardrail blocked/failed connection_id=%s tool=%s code=%s job_id=%s step_id=%s",
+                    meta.get("connection_id"),
+                    ext_name,
+                    e.code,
+                    xh.get("X-Sandhi-Job-Id"),
+                    xh.get("X-Sandhi-Workflow-Step-Id"),
+                )
+                self._emit_current_step_heartbeat(
+                    phase="calling_tool",
+                    reason_code="tool_call_error",
+                    message=f"Tool {ext_name} failed: {e.code}",
+                    reason_detail={
+                        "kind": "tool_call",
+                        "tool_name": ext_name,
+                        "error_type": type(e).__name__,
+                        "error_code": e.code,
+                        "elapsed_ms": elapsed_ms,
+                        "tool_source": "external",
+                        "connection_id": meta.get("connection_id"),
+                    },
+                    commit_db=True,
+                )
+                return json.dumps({"error": e.code})
             except Exception as e:
                 elapsed_ms = int((time.perf_counter() - started) * 1000.0)
                 logger.exception(
@@ -2566,6 +2634,11 @@ END DOCUMENT {i+1}: {doc_name}
         extra_headers = {"X-MCP-Business-Id": str(business_id)}
         extra_headers.update(self._sandhi_mcp_correlation_headers())
         corr = self._sandhi_mcp_correlation_headers()
+        guard = get_mcp_guardrails()
+        timeout = float(getattr(settings, "MCP_TOOL_DEFAULT_TIMEOUT_SECONDS", 60.0))
+        target_key = f"platform:{base}:/mcp:{tool_name}"
+        operation_class = self._infer_mcp_operation_class(tool_name, arguments)
+        tenant_tier = self._resolve_business_tier(int(business_id))
         try:
             logger.info(
                 "platform_mcp_tools_call tool_name=%s business_id=%s job_id=%s workflow_step_id=%s trace_id=%s",
@@ -2575,14 +2648,33 @@ END DOCUMENT {i+1}: {doc_name}
                 corr.get("X-Sandhi-Workflow-Step-Id", "-"),
                 corr.get("X-Sandhi-Trace-Id", "-"),
             )
-            result = await mcp_call_tool(
-                base_url=base,
+            result = await guard.call_tool_with_guardrails(
+                business_id=int(business_id),
+                target_key=target_key,
+                timeout_seconds=timeout,
+                operation_class=operation_class,
                 tool_name=tool_name,
-                arguments=arguments,
-                endpoint_path="/mcp",
-                timeout=60.0,
-                extra_headers=extra_headers,
+                tenant_tier=tenant_tier,
+                idempotency_key=str((arguments or {}).get("idempotency_key") or ""),
+                execute_call=lambda bounded_timeout: mcp_call_tool(
+                    base_url=base,
+                    tool_name=tool_name,
+                    arguments=arguments,
+                    endpoint_path="/mcp",
+                    timeout=bounded_timeout,
+                    extra_headers=extra_headers,
+                ),
             )
+        except MCPGuardrailError as e:
+            logger.warning(
+                "Platform MCP guardrail blocked/failed tool_name=%s business_id=%s code=%s job_id=%s workflow_step_id=%s",
+                tool_name,
+                business_id,
+                e.code,
+                corr.get("X-Sandhi-Job-Id"),
+                corr.get("X-Sandhi-Workflow-Step-Id"),
+            )
+            return json.dumps({"error": e.code})
         except Exception as e:
             logger.exception(
                 "Platform MCP tools/call failed tool_name=%s business_id=%s job_id=%s workflow_step_id=%s",
@@ -2593,6 +2685,13 @@ END DOCUMENT {i+1}: {doc_name}
             )
             return json.dumps({"error": type(e).__name__})
         return self._mcp_tool_result_to_text(result)
+
+    @staticmethod
+    def _infer_mcp_operation_class(tool_name: str, arguments: Optional[Dict[str, Any]]) -> str:
+        return infer_mcp_tool_operation_class(tool_name, arguments)
+
+    def _resolve_business_tier(self, business_id: int) -> str:
+        return resolve_mcp_tenant_tier(int(business_id))
 
     def _log_action(self, entity_type: str, entity_id: int, action: str, details: Dict[str, Any]):
         """Log an action to the audit log"""

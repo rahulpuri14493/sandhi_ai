@@ -36,6 +36,8 @@ from services.task_queue import get_queue_health
 from core.config import settings
 from services.job_scheduler import JobSchedulerService
 from core.security import get_current_user
+from core.startup_sanity import warn_mcp_guardrail_sanity
+from services.mcp_metrics import render_prometheus
 
 configure_logging()
 logger = logging.getLogger(__name__)
@@ -72,6 +74,7 @@ def _log_s3_startup_status() -> None:
 _run_alembic_startup_with_retries()
 ensure_encryption_key_for_production()
 _log_s3_startup_status()
+warn_mcp_guardrail_sanity()
 _scheduler_service = JobSchedulerService()
 
 
@@ -200,3 +203,11 @@ def health_check(current_user=Depends(get_current_user)):
 def healthz():
     """Minimal unauthenticated liveness endpoint."""
     return {"status": "ok"}
+
+
+@app.get("/metrics")
+def metrics():
+    payload = render_prometheus()
+    if payload is None:
+        return Response(content="# prometheus metrics unavailable\n", media_type="text/plain; version=0.0.4")
+    return Response(content=payload, media_type="text/plain; version=0.0.4")

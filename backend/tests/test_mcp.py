@@ -380,6 +380,33 @@ class TestMCPConnectionValidate:
         assert data["valid"] is False
         assert data["message"]
 
+    def test_validate_connection_uses_per_tenant_ephemeral_guard_target(
+        self, client_mcp: TestClient, business_user
+    ):
+        """Unsaved validate must not use connection_id=0 (one global breaker for all tenants)."""
+        captured: dict = {}
+
+        async def _fake(**kwargs):
+            captured.update(kwargs)
+            return {"jsonrpc": "2.0", "result": {}}
+
+        with patch("api.routes.mcp.guarded_mcp_jsonrpc", new_callable=AsyncMock, side_effect=_fake):
+            r = client_mcp.post(
+                "/api/mcp/connections/validate",
+                headers=business_user["headers"],
+                json={
+                    "name": "Test",
+                    "base_url": "https://mcp.example.com",
+                    "endpoint_path": "/mcp",
+                    "auth_type": "none",
+                },
+            )
+        assert r.status_code == 200
+        assert r.json()["valid"] is True
+        uid = int(business_user["user"].id)
+        assert captured.get("business_id") == uid
+        assert captured.get("connection_id") == -(uid + 1)
+
 
 class TestMCPValidate:
     """POST /api/mcp/tools/validate."""
@@ -556,6 +583,44 @@ class TestMCPProxy:
         )
         assert r.status_code == 404
 
+    @pytest.mark.parametrize(
+        "code,message",
+        [
+            ("mcp_circuit_open", "circuit open for target"),
+            ("mcp_upstream_unavailable", "MCP transport failure"),
+        ],
+    )
+    def test_proxy_guardrail_error_maps_to_http(
+        self, client_mcp: TestClient, business_user, db_session, code, message
+    ):
+        from models.mcp_server import MCPServerConnection
+        from services.mcp_guardrails import MCPGuardrailError
+
+        conn = MCPServerConnection(
+            user_id=business_user["user"].id,
+            name="ProxyGuard",
+            base_url="https://mcp.example.com",
+            endpoint_path="/mcp",
+            auth_type="none",
+            is_active=True,
+        )
+        db_session.add(conn)
+        db_session.commit()
+        db_session.refresh(conn)
+
+        with patch(
+            "api.routes.mcp.guarded_mcp_jsonrpc",
+            new_callable=AsyncMock,
+            side_effect=MCPGuardrailError(code, message, retryable=True),
+        ):
+            r = client_mcp.post(
+                "/api/mcp/proxy",
+                headers=business_user["headers"],
+                json={"connection_id": conn.id, "method": "initialize", "params": {}},
+            )
+        assert r.status_code == 503
+        assert r.json()["detail"]["error"] == code
+
 
 class TestMCPCallPlatformTool:
     """POST /api/mcp/call-platform-tool - invoke platform MCP tool by name."""
@@ -590,6 +655,38 @@ class TestMCPCallPlatformTool:
                 json={"tool_name": "platform_1_t", "arguments": {"payload": "x" * 1024}},
             )
             assert r.status_code == 413
+
+    @pytest.mark.parametrize(
+        "code,message",
+        [
+            ("mcp_circuit_open", "circuit open for target"),
+            ("mcp_upstream_unavailable", "MCP transport failure"),
+        ],
+    )
+    def test_call_platform_tool_guardrail_error_maps_to_http(
+        self, client_mcp: TestClient, business_user, mcp_snowflake_platform_tool, code, message
+    ):
+        """Platform HTTP route uses call_tool_with_guardrails; map MCPGuardrailError to HTTP."""
+        from services.mcp_guardrails import MCPGuardrailError
+
+        pn = f"platform_{mcp_snowflake_platform_tool.id}_snowflake"
+        with patch.object(app_settings, "PLATFORM_MCP_SERVER_URL", "http://platform-mcp-server:8081"), patch.object(
+            app_settings, "MCP_INTERNAL_SECRET", "x"
+        ):
+            guard = AsyncMock(
+                call_tool_with_guardrails=AsyncMock(
+                    side_effect=MCPGuardrailError(code, message, retryable=True)
+                )
+            )
+            with patch("api.routes.mcp.get_mcp_guardrails", return_value=guard):
+                r = client_mcp.post(
+                    "/api/mcp/call-platform-tool",
+                    headers=business_user["headers"],
+                    json={"tool_name": pn, "arguments": {"query": "SELECT 1"}},
+                )
+                assert r.status_code == 503
+                detail = r.json()["detail"]
+                assert detail["error"] == code
 
     def test_call_platform_write_requires_merge_keys_for_upsert(self, client_mcp: TestClient, business_user):
         r = client_mcp.post(

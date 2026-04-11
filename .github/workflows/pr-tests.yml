@@ -18,6 +18,12 @@ env:
 permissions:
   contents: read
 
+# Coverage gates (fail CI if below threshold):
+# - Backend: single pytest run (unit + integration + redis_integration) with --cov-fail-under=80 on backend/.
+# - Frontend: vitest.config.ts coverage.thresholds at 80%.
+# - Backend e2e modules: run separately without full-tree coverage (subset would not fairly hit 80% on backend/).
+# - Platform MCP server: pytest-cov with --cov-fail-under=80 (see tools/platform_mcp_server/.coveragerc).
+
 jobs:
   docker-compose-stack:
     name: Docker Compose stack
@@ -70,12 +76,24 @@ jobs:
         if: always()
         run: docker compose down -v || true
 
-  backend-tests:
-    name: Backend tests
+  backend-tests-with-coverage:
+    name: Backend tests with coverage (min 80%)
     runs-on: ubuntu-latest
     env:
       SECRET_KEY: ci-secret-key
       OBJECT_STORAGE_BACKEND: local
+      MCP_GUARDRAILS_DISTRIBUTED_ENABLED: "true"
+      MCP_GUARDRAILS_REDIS_URL: redis://localhost:6379/15
+    services:
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 20
     defaults:
       run:
         working-directory: backend
@@ -108,9 +126,57 @@ jobs:
           rm -rf .pytest_cache || true
           find . -type d -name "__pycache__" -prune -exec rm -rf {} +
 
-      - name: Run pytest with coverage gate (>=80%)
+      # pytest-cov: exit non-zero when line coverage is below --cov-fail-under (entire backend tree under tests/).
+      - name: Run backend pytest (unit + integration, excluding e2e modules) with coverage >=80%
         run: |
-          pytest --cov=. --cov-report=term-missing --cov-fail-under=76 -v
+          # Single run under tests/ so the 80% gate applies to the real backend corpus (integration-only ~37%).
+          # Do not use --ignore=tests/integration (drops integration from coverage). Do not use -k "not e2e".
+          # When adding a new e2e-only module, ignore it here and list it in backend-e2e-tests.
+          # Redis-backed guardrail tests run here (same job as the 80% gate).
+          pytest tests \
+            --ignore=tests/integration/test_e2e_flows.py \
+            --ignore=tests/integration/test_mcp_job_ai_data_output_e2e.py \
+            --ignore=tests/integration/test_sql_e2e.py \
+            --ignore=tests/integration/test_vector_e2e.py \
+            --ignore=tests/integration/test_vector_e2e_deployed.py \
+            --cov=. \
+            --cov-report=term-missing \
+            --cov-fail-under=80 \
+            -v
+
+  backend-e2e-tests:
+    name: Backend e2e tests
+    runs-on: ubuntu-latest
+    env:
+      SECRET_KEY: ci-secret-key
+      OBJECT_STORAGE_BACKEND: local
+    defaults:
+      run:
+        working-directory: backend
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      # No --cov-fail-under: these modules are a slow/heavy slice; full-backend 80% gate is backend-tests-with-coverage.
+      - name: Run backend e2e pytest
+        run: |
+          pytest \
+            tests/integration/test_e2e_flows.py \
+            tests/integration/test_mcp_job_ai_data_output_e2e.py \
+            tests/integration/test_sql_e2e.py \
+            tests/integration/test_vector_e2e.py \
+            tests/integration/test_vector_e2e_deployed.py \
+            -v --tb=short
 
   platform-mcp-tests:
     name: Platform MCP server tests (unit + integration + e2e)
@@ -131,7 +197,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/.cache/pip
-          key: ${{ runner.os }}-pip-mcp-${{ hashFiles('tools/platform_mcp_server/requirements.txt', 'tools/platform_mcp_server/pytest.ini') }}
+          key: ${{ runner.os }}-pip-mcp-${{ hashFiles('tools/platform_mcp_server/requirements.txt', 'tools/platform_mcp_server/pytest.ini', 'tools/platform_mcp_server/.coveragerc') }}
           restore-keys: |
             ${{ runner.os }}-pip-mcp-
 
@@ -139,12 +205,16 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
-          pip install pytest
+          pip install pytest pytest-cov
 
-      # tools/platform_mcp_server/tests: test_tools.py, test_execution_helpers_unit.py,
-      # test_jsonrpc_http_integration.py, test_mcp_protocol_e2e.py; test_mcp_live_e2e.py skips without PLATFORM_MCP_E2E_BASE_URL
-      - name: Run platform MCP pytest suite
-        run: python -m pytest tests -c pytest.ini --rootdir . -v --tb=short
+      # tools/platform_mcp_server/tests: unit + integration + optional e2e; .coveragerc omits tests/* only (execution_artifact.py stays in the coverage denominator).
+      - name: Run platform MCP pytest suite with coverage (min 80%)
+        run: |
+          python -m pytest tests -c pytest.ini --rootdir . -v --tb=short \
+            --cov=. \
+            --cov-config=.coveragerc \
+            --cov-report=term-missing \
+            --cov-fail-under=80
 
   frontend-tests:
     name: Frontend tests
@@ -166,7 +236,8 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
-      - name: Run tests with coverage (fail if <80%)
-        run: npm run test -- --run --coverage
+      # vitest.config.ts sets coverage.thresholds to 80% (lines/functions/branches/statements); Vitest fails the job if any threshold is not met.
+      - name: Run frontend tests with coverage (pass if all thresholds >=80%)
+        run: npm run test -- --coverage
         env:
           CI: true

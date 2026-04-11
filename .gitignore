@@ -242,3 +242,7 @@ Thumbs.db
 # Database
 *.db
 *.sqlite
+
+# Redis: local snapshot or bind-mount data (e.g. MCP guardrails / docker dev)
+dump.rdb
+redis-data/

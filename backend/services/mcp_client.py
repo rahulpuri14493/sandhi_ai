@@ -17,6 +17,15 @@ from typing import Optional, Dict, Any
 JSONRPC_VERSION = "2.0"
 
 
+class MCPJSONRPCError(RuntimeError):
+    """Structured JSON-RPC error from MCP server."""
+
+    def __init__(self, message: str, *, rpc_code: Optional[int] = None, rpc_data: Optional[dict] = None):
+        super().__init__(message)
+        self.rpc_code = rpc_code
+        self.rpc_data = rpc_data or {}
+
+
 def _parse_sse_to_json(raw: str) -> dict:
     """
     Parse SSE body: extract first event's data and parse as JSON.
@@ -128,7 +137,17 @@ async def call_mcp_server(
                 f"Response body starts with: {raw[:200]!r}"
             ) from e
         if "error" in data:
-            raise RuntimeError(data["error"].get("message", str(data["error"])))
+            err = data.get("error") if isinstance(data, dict) else None
+            if isinstance(err, dict):
+                msg = str(err.get("message") or "MCP JSON-RPC error")
+                code = err.get("code")
+                try:
+                    code_int = int(code) if code is not None else None
+                except (TypeError, ValueError):
+                    code_int = None
+                rpc_data = err.get("data") if isinstance(err.get("data"), dict) else {}
+                raise MCPJSONRPCError(msg, rpc_code=code_int, rpc_data=rpc_data)
+            raise RuntimeError(str(err))
         return data
 
 
