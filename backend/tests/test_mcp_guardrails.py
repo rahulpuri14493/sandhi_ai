@@ -1,4 +1,5 @@
 import asyncio
+import uuid
 
 import pytest
 import httpx
@@ -209,11 +210,15 @@ async def test_guardrails_tenant_rate_limit_per_minute(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_guardrails_circuit_half_open_success_closes(monkeypatch):
+    # Process-local circuit only: CI enables distributed Redis guardrails globally; a shared Redis
+    # breaker key for a fixed target_key causes flaky open/half-open with other tests.
+    monkeypatch.setattr("core.config.settings.MCP_GUARDRAILS_DISTRIBUTED_ENABLED", False, raising=False)
     monkeypatch.setattr("core.config.settings.MCP_INVOCATION_MAX_ATTEMPTS", 1, raising=False)
     monkeypatch.setattr("core.config.settings.MCP_CIRCUIT_BREAKER_FAILURE_THRESHOLD", 1, raising=False)
     monkeypatch.setattr("core.config.settings.MCP_CIRCUIT_BREAKER_OPEN_SECONDS", 0.01, raising=False)
     monkeypatch.setattr("core.config.settings.MCP_CIRCUIT_BREAKER_HALF_OPEN_MAX_PROBES", 1, raising=False)
     g = MCPInvocationGuardrails()
+    tk = f"platform:test:/mcp:insert:{uuid.uuid4().hex[:12]}"
 
     async def _fail(_timeout: float):
         raise httpx.ConnectError("down")
@@ -224,14 +229,14 @@ async def test_guardrails_circuit_half_open_success_closes(monkeypatch):
     with pytest.raises(MCPGuardrailError):
         await g.call_tool_with_guardrails(
             business_id=108,
-            target_key="platform:test:/mcp:insert",
+            target_key=tk,
             timeout_seconds=2.0,
             execute_call=_fail,
         )
     await asyncio.sleep(0.02)
     out = await g.call_tool_with_guardrails(
         business_id=108,
-        target_key="platform:test:/mcp:insert",
+        target_key=tk,
         timeout_seconds=2.0,
         execute_call=_ok,
     )
@@ -239,7 +244,7 @@ async def test_guardrails_circuit_half_open_success_closes(monkeypatch):
     # Closed again: immediate follow-up succeeds.
     out2 = await g.call_tool_with_guardrails(
         business_id=108,
-        target_key="platform:test:/mcp:insert",
+        target_key=tk,
         timeout_seconds=2.0,
         execute_call=_ok,
     )

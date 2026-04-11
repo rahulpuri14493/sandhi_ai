@@ -49,6 +49,30 @@ class TestParsePlatformToolId:
         assert app_module._parse_platform_tool_id("platform_42_postgres") == 42
 
 
+class TestSandhiCorrelationLogSuffix:
+    def test_empty_when_no_headers(self):
+        req = MagicMock()
+        req.headers.get = MagicMock(return_value=None)
+        assert app_module._sandhi_correlation_log_suffix(req) == ""
+
+    def test_includes_job_and_trace_when_present(self):
+        hdrs = {
+            "X-Sandhi-Job-Id": "99",
+            "x-sandhi-trace-id": "trace-xyz",
+        }
+
+        def _get(name, default=None):
+            if not name:
+                return default
+            return hdrs.get(name) or hdrs.get(name.lower(), default)
+
+        req = MagicMock()
+        req.headers.get = _get
+        out = app_module._sandhi_correlation_log_suffix(req)
+        assert "job_id=99" in out
+        assert "trace_id=trace-xyz" in out
+
+
 class TestParseUrlAndHost:
     def test_parse_url_default(self):
         h, p, sec = app_module._parse_url("")
