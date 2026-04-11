@@ -510,6 +510,9 @@ class TestAzureGcsArtifactWrite:
         cc.get_blob_client.return_value = bc
         svc = MagicMock()
         svc.get_container_client.return_value = cc
+        # Parent packages must exist or ``import azure.storage.blob`` fails before stubs apply.
+        monkeypatch.setitem(sys.modules, "azure", types.ModuleType("azure"))
+        monkeypatch.setitem(sys.modules, "azure.storage", types.ModuleType("azure.storage"))
         fake = types.ModuleType("azure.storage.blob")
         fake.BlobServiceClient = MagicMock(from_connection_string=MagicMock(return_value=svc))
         monkeypatch.setitem(sys.modules, "azure.storage.blob", fake)
