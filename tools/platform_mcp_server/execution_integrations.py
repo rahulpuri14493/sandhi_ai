@@ -65,9 +65,19 @@ def execute_github(config: Dict[str, Any], arguments: Dict[str, Any]) -> str:
         return "Error: repo (owner/name) is required"
     try:
         if _github_host_is_api_github_com(base):
-            g = Github(login_or_token=token)
+            try:
+                from github import Auth
+
+                g = Github(auth=Auth.Token(token))
+            except (ImportError, AttributeError, TypeError):
+                g = Github(login_or_token=token)
         else:
-            g = Github(base_url=base + "/", login_or_token=token)
+            try:
+                from github import Auth
+
+                g = Github(base_url=base + "/", auth=Auth.Token(token))
+            except (ImportError, AttributeError, TypeError):
+                g = Github(base_url=base + "/", login_or_token=token)
         repo = g.get_repo(repo_s)
         if action == "get_file":
             path = (arguments.get("path") or "").strip()
