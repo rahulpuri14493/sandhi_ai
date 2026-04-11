@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timedelta
+import redis
+import json
+from datetime import datetime, timedelta, timezone
 from typing import Optional
+from kombu import Queue
 
 from core.config import settings
 from services.business_job_alerts import send_business_job_alert
@@ -89,7 +92,6 @@ class QueueEnqueueError(RuntimeError):
     """Raised when strict queue mode is enabled and enqueue fails."""
 
 
-
 try:
     from celery import Celery
 except Exception:  # pragma: no cover - optional dependency at runtime
@@ -115,6 +117,21 @@ if Celery is not None:
         # --- Reliability settings ---
         task_acks_late=True,
         task_reject_on_worker_lost=True, # Requeues job if worker processing it is lost (e.g crash, OOM)
+
+        # --- Priority Isolation ---
+        task_default_queue=getattr(settings, "CELERY_TASK_DEFAULT_QUEUE", "interactive"),
+        task_queues=(
+            Queue("interactive", routing_key="interactive"),
+            Queue("batch", routing_key="batch"),
+        ),
+        task_routes={
+            # Direct API executions go to the fast lane
+            "execute_platform_job": {"queue": "interactive"},
+            # Scheduled/ETA tasks go to the background lane
+            "trigger_scheduled_job": {"queue": "batch"},
+            "check_stuck_jobs": {"queue": "batch"},
+            "check_stuck_workflow_steps": {"queue": "batch"},
+        }
     )
 
     # Configure Celery Beat
@@ -132,6 +149,47 @@ if Celery is not None:
             "schedule": 86400.0,
         },
     }
+
+# ---------------------------------------------------------------------------
+# Helpers for enqueueing with admission control and backpressure
+# ---------------------------------------------------------------------------
+
+def _get_queue_oldest_age_seconds(client: redis.Redis, redis_key: str) -> Optional[float]:
+    """
+    Peek at the oldest task in the queue and return its age in seconds.
+    Celery stores tasks as JSON. The 'eta' field or 'headers.enqueued_at' 
+    gives us the enqueue timestamp.
+    Returns None if the queue is empty or the timestamp can't be parsed.
+    """
+    try:
+        # Celery/Kombu uses Redis lists as FIFO; index -1 (tail) represents the oldest enqueued task.
+        raw = client.lindex(redis_key, -1)  # oldest item is at the tail
+        if not raw:
+            return None
+        task = json.loads(raw)
+
+        # Try headers.enqueued_at first (Celery 4+)
+        timestamp_str = (task.get("headers") or {}).get("enqueued_at")
+
+        # Fall back to eta if present
+        if not timestamp_str:
+            timestamp_str = task.get("eta")
+
+        if not timestamp_str:
+            return None
+
+        # Parse ISO 8601 timestamp
+        enqueued_at = datetime.fromisoformat(timestamp_str.replace("Z", "+00:00"))
+        now = datetime.now(timezone.utc)
+        return (now - enqueued_at).total_seconds()
+
+    except Exception as e:
+        logger.warning("Failed to parse oldest task age for key '%s': %s", redis_key, e)
+        return None
+    
+# ---------------------------------------------------------------------------
+# Main enqueue function with admission control and backpressure
+# ---------------------------------------------------------------------------
 
 
 # Fallback symbol for imports when Celery is unavailable in the environment.
@@ -203,10 +261,10 @@ def enqueue_execute_platform_job(
     execution_token: Optional[str] = None,
     *,
     strict: bool = False,
+    queue_name: str = "interactive",  # Default queue to the fast lane for direct API executions
 ) -> bool:
     """
-    Enqueue execution in Celery when configured.
-    Returns True when enqueued, False when caller should fallback.
+    Enqueue execution with admission control and backpressure.
     """
     if (settings.JOB_EXECUTION_BACKEND or "").strip().lower() != "celery":
         return False
@@ -216,14 +274,91 @@ def enqueue_execute_platform_job(
             raise QueueEnqueueError(msg)
         logger.warning("%s; falling back to local thread", msg)
         return False
+
+    # --- Admission Control: Check if the target queue is healthy before enqueuing ---
+    cb_key = f"circuit_breaker:{queue_name}"
+    redis_key = f"{settings.CELERY_QUEUE_PREFIX}{queue_name}"
+    breach_threshold = getattr(settings, "CELERY_CIRCUIT_BREACH_THRESHOLD", 30)
+    max_depth = getattr(settings, "CELERY_MAX_QUEUE_DEPTH", 100)
+
+    # --- Lua script for atomic read-and-evaluate
+    ADMISSION_SCRIPT = """
+    local cb_key = KEYS[1]
+    local queue_key = KEYS[2]
+    local breach_threshold = tonumber(ARGV[1])
+    local max_depth = tonumber(ARGV[2])
+
+    -- Check Circuit Breaker
+    local cb_value = tonumber(redis.call('GET', cb_key) or '0')
+    if cb_value >= breach_threshold then
+        return -1 -- Circuit breaker OPEN
+    end
+
+    -- Check Queue Depth
+    local current_depth = tonumber(redis.call('LLEN', queue_key) or '0')
+    if current_depth >= max_depth then
+        redis.call('INCR', cb_key)
+        redis.call('EXPIRE', cb_key, 60)
+        return -2 -- Backpressure TRIPPED
+    end
+
+    return 1 -- OK to proceed
+    
+    """
+
     try:
-        execute_platform_job.delay(job_id=job_id, history_id=history_id, execution_token=execution_token)
+        client = redis.Redis.from_url(
+            settings.CELERY_BROKER_URL, socket_timeout=2, socket_connect_timeout=2
+        )
+    except redis.RedisError as e:
+        logger.warning("Failed to connect to Redis for admission check: %s", e)
+        client = None
+
+    if client is not None:
+        try:
+            # Execute atomic check: 2 KEYS, 2 ARGS
+            result = client.eval(
+                ADMISSION_SCRIPT, 2, cb_key, redis_key, breach_threshold, max_depth
+            )
+
+            if result == -1:
+                logger.warning(
+                    "Circuit breaker OPEN for queue '%s' (threshold=%d)",
+                    queue_name, breach_threshold,
+                )
+                if strict:
+                    raise QueueEnqueueError(f"Circuit breaker OPEN for queue '{queue_name}'. Traffic rejected.")
+                return False
+            
+            if result == -2:
+                logger.warning(
+                    "BACKPRESSURE TRIPPED: Queue '%s' exceeds max (%d)",
+                    queue_name, max_depth,
+                )
+                if strict:
+                    raise QueueEnqueueError(f"Queue '{queue_name}' is overloaded.")
+                return False
+        
+        except redis.RedisError as e:
+            logger.warning("Failed to execute admission control script: %s", e)
+            # Fail open: skip admission control and attempt enqueue
+
+    # --- Enqueue the task ---
+    try:
+        execute_platform_job.apply_async(
+            kwargs={"job_id": job_id, "history_id": history_id, "execution_token": execution_token},
+            queue=queue_name,
+        )
         return True
     except Exception as e:
         if strict:
             raise QueueEnqueueError(f"Failed to enqueue job_id={job_id} to Celery: {e}") from e
-        logger.warning("Failed to enqueue job_id=%s to Celery: %s; falling back to local thread", job_id, e)
+        logger.warning(
+            "Failed to enqueue job_id=%s to Celery: %s; falling back to local thread",
+            job_id, e,
+        )
         return False
+
 
 
 def get_queue_health() -> dict:
@@ -236,7 +371,6 @@ def get_queue_health() -> dict:
         return {"ok": True, "detail": f"execution_backend={mode}"}
     strict_queue = bool(getattr(settings, "JOB_EXECUTION_STRICT_QUEUE", False))
     try:
-        import redis  # lazy import for environments without redis extra
 
         client = redis.Redis.from_url(settings.CELERY_BROKER_URL, socket_timeout=2, socket_connect_timeout=2)
         pong = client.ping()
@@ -254,26 +388,63 @@ def get_queue_health() -> dict:
 def get_queue_stats() -> dict:
     """
     Queue runtime stats for ops dashboards/troubleshooting.
-    Returns pending queue depth and worker active/reserved counts when available.
+    Returns pending queue depth, circuit breaker state, and worker active/reserved counts.
     """
     mode = (settings.JOB_EXECUTION_BACKEND or "celery").strip().lower()
+    slo_max_age = getattr(settings, "CELERY_SLO_MAX_QUEUE_AGE_SECONDS", 1800)
+    slo_p95_threshold = getattr(settings, "CELERY_SLO_ENQUEUE_TO_START_P95_SECONDS", 300)
+
     out = {
         "execution_backend": mode,
         "queue_name": "celery",
+        "queues": {},
+        "slo_targets": {
+            "p95_start_delay_seconds": slo_p95_threshold
+        },
         "pending_jobs": None,
         "workers": {"online": 0, "active": 0, "reserved": 0},
     }
     if mode != "celery":
         return out
 
-    # Redis queue depth (default Celery queue key = "celery")
-    try:
-        import redis
+    target_queues = ["interactive", "batch"]
+    breach_threshold = getattr(settings, "CELERY_CIRCUIT_BREACH_THRESHOLD", 30)
 
-        client = redis.Redis.from_url(settings.CELERY_BROKER_URL, socket_timeout=2, socket_connect_timeout=2)
-        out["pending_jobs"] = int(client.llen("celery"))
+    try:
+        client = redis.Redis.from_url(
+            settings.CELERY_BROKER_URL, socket_timeout=2, socket_connect_timeout=2
+        )
+        for q in target_queues:
+            redis_key = f"{settings.CELERY_QUEUE_PREFIX}{q}"
+            cb_key = f"circuit_breaker:{q}"
+
+            pipe = client.pipeline()
+            pipe.llen(redis_key)
+            pipe.get(cb_key)
+            results = pipe.execute()
+
+            depth = int(results[0] or 0)
+            cb_value = int(results[1] or 0)
+            oldest_age = _get_queue_oldest_age_seconds(client, redis_key)
+
+            out["queues"][q] = {
+                "pending_jobs": depth,
+                "oldest_job_age_seconds": oldest_age,
+                "slo_max_age_seconds": slo_max_age,
+                "slo_age_breached": oldest_age is not None and oldest_age > slo_max_age,
+                "circuit_breaker_count": cb_value,
+                "circuit_breaker_open": cb_value >= breach_threshold,
+            }
     except Exception:
-        out["pending_jobs"] = None
+        for q in target_queues:
+            out["queues"][q] = {
+                "pending_jobs": None,
+                "oldest_job_age_seconds": None,
+                "slo_max_age_seconds": slo_max_age, # Return the config default
+                "slo_age_breached": None,
+                "circuit_breaker_count": None,
+                "circuit_breaker_open": None,
+            }
 
     # Celery worker runtime stats (best effort)
     if celery_app is not None:
@@ -287,6 +458,7 @@ def get_queue_stats() -> dict:
             out["workers"]["reserved"] = sum(len(v or []) for v in reserved.values())
         except Exception:
             pass
+
     return out
 
 
@@ -306,7 +478,7 @@ if celery_app is not None:
 
             db = SessionLocal()
             try:
-                # 1. Upate Job Status
+                # 1. Update Job Status
                 job = db.query(Job).filter(Job.id == job_id).first()
                 if job and job.status == JobStatus.IN_PROGRESS:
                     job.status = JobStatus.FAILED
@@ -369,7 +541,7 @@ if celery_app is not None:
         try:
             # Reuses the core execution logic now triggered via distributed worker instead of in-process scheduler callback
             _execute_schedule(schedule_id)
-        except Exception as e:
+        except Exception:
             logger.exception("Scheduled ETA task failed for schedule_id=%s", schedule_id)
             raise
 
@@ -392,7 +564,6 @@ if celery_app is not None:
         from core.config import settings
         from datetime import datetime, timedelta
         from db.database import SessionLocal
-        from models.job import Job, JobStatus
         from models.job import (
             Job, JobSchedule, JobStatus, ScheduleStatus,
             WorkflowStep, ScheduleExecutionHistory,

@@ -8,6 +8,7 @@ Tests cover:
 import pytest
 from unittest.mock import patch, MagicMock
 
+from services.task_queue import enqueue_execute_platform_job, QueueEnqueueError
 from models.job import JobStatus
 
 
@@ -17,13 +18,13 @@ class TestCeleryTaskReliability:
     def test_execute_platform_job_passes_reraise_flag(self, mock_run_job):
         """
         Verify that the Celery task calls the core execution logic with reraise_exceptions=True.
-        This is critical because it allows exceptions to bubble up to Celery, 
+        This is critical because it allows exceptions to bubble up to Celery,
         which triggers the autoretry_for and retry_backoff policies.
         """
         from services.task_queue import execute_platform_job
 
         # Call the underlying function directly (simulating a worker executing it)
-        execute_platform_job(job_id=42, history_id=101, execution_token="token-abc")
+        execute_platform_job.run(job_id=42, history_id=101, execution_token="token-abc")
 
         # Verify the flag is strictly set to True
         mock_run_job.assert_called_once_with(
@@ -66,7 +67,7 @@ class TestCeleryTaskReliability:
 
         # 2. Instantiate our custom Celery Task class
         task = ExecutePlatformJobTask()
-        
+
         # 3. Manually trigger the on_failure hook (simulating max_retries exceeded)
         exception_instance = RuntimeError("API rate limit exceeded permanently")
         task.on_failure(
@@ -142,3 +143,70 @@ class TestCeleryTaskReliability:
         assert mock_hist.status == "failed"
         assert mock_hist.completed_at is not None
         mock_db.commit.assert_called_once()
+
+
+class TestQueueAdmissionControl:
+
+    @patch("services.task_queue.execute_platform_job.apply_async")
+    @patch("services.task_queue.redis.Redis.from_url")
+    def test_enqueue_rejects_when_overloaded(
+        self, mock_redis_from_url, mock_apply_async
+    ):
+        """
+        Verify that enqueue fails with a QueueEnqueueError when strict=True
+        and the Redis queue depth exceeds the maximum threshold.
+        """
+        mock_client = MagicMock()
+        mock_redis_from_url.return_value = mock_client
+
+        # Mock Lua script returning -2 (Overloaded)
+        mock_client.eval.return_value = -2
+
+        with pytest.raises(QueueEnqueueError, match="is overloaded"):
+            enqueue_execute_platform_job(
+                job_id=42, strict=True, queue_name="interactive"
+            )
+        mock_apply_async.assert_not_called()
+
+    @patch("services.task_queue.execute_platform_job.apply_async")
+    @patch("services.task_queue.redis.Redis.from_url")
+    def test_circuit_breaker_trips(self, mock_redis_from_url, mock_apply_async):
+        """
+        Verify that if the circuit breaker key in Redis exceeds the threshold,
+        enqueue is rejected immediately.
+        """
+        mock_client = MagicMock()
+        mock_redis_from_url.return_value = mock_client
+
+        # Mock Lua script returning -1 (Circuit Breaker OPEN)
+        mock_client.eval.return_value = -1
+
+        with pytest.raises(QueueEnqueueError, match="Circuit breaker OPEN"):
+            enqueue_execute_platform_job(
+                job_id=42, strict=True, queue_name="interactive"
+            )
+        mock_apply_async.assert_not_called()
+
+    @patch("services.task_queue.execute_platform_job.apply_async")
+    @patch("services.task_queue.redis.Redis.from_url")
+    def test_enqueue_succeeds_when_healthy(self, mock_redis_from_url, mock_apply_async):
+        """
+        Verify that a healthy queue depth and closed circuit breaker
+        results in a successful Celery apply_async call.
+        """
+        mock_client = MagicMock()
+        mock_redis_from_url.return_value = mock_client
+
+        # Mock Lua script returning 1 (OK to proceed)
+        mock_client.eval.return_value = 1
+
+        result = enqueue_execute_platform_job(
+            job_id=42, strict=True, queue_name="interactive"
+        )
+
+        assert result is True
+        mock_apply_async.assert_called_once_with(
+            kwargs={"job_id": 42, "history_id": None, "execution_token": None},
+            queue="interactive",
+        )
+
