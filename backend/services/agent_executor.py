@@ -346,17 +346,23 @@ def _resolve_agent_step_timeout_seconds(contract: Dict[str, Any]) -> float:
     default_t = float(getattr(settings, "AGENT_STEP_TIMEOUT_SECONDS", 180.0) or 180.0)
     max_t = float(getattr(settings, "AGENT_STEP_TIMEOUT_MAX_SECONDS", 900.0) or 900.0)
     min_t = float(getattr(settings, "AGENT_STEP_TIMEOUT_MIN_SECONDS", 30.0) or 30.0)
+
+    def _from_settings_default() -> float:
+        # Operator / env default: honor AGENT_STEP_TIMEOUT_SECONDS as-is (capped at max only).
+        # Min clamp applies only to explicit output_contract overrides below.
+        return min(max_t, max(0.0, default_t))
+
     if not isinstance(contract, dict):
-        return max(min_t, min(max_t, default_t))
+        return _from_settings_default()
     raw = contract.get("agent_step_timeout_seconds")
     if raw is None:
         raw = contract.get("step_timeout_seconds")
     if raw is None:
-        return max(min_t, min(max_t, default_t))
+        return _from_settings_default()
     try:
         t = float(raw)
     except (TypeError, ValueError):
-        return max(min_t, min(max_t, default_t))
+        return _from_settings_default()
     return max(min_t, min(max_t, t))
 
 

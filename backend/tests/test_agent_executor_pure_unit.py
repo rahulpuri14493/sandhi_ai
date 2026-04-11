@@ -44,6 +44,15 @@ def test_format_workflow_step_error_message_timeout_is_readable():
     assert "timed out" in msg.lower() and "180" in msg
 
 
+def test_resolve_agent_step_timeout_min_only_applies_to_contract_override(monkeypatch):
+    """Default AGENT_STEP_TIMEOUT_SECONDS is not raised to MIN; contract values are clamped."""
+    monkeypatch.setattr(ae.settings, "AGENT_STEP_TIMEOUT_SECONDS", 2.0)
+    monkeypatch.setattr(ae.settings, "AGENT_STEP_TIMEOUT_MIN_SECONDS", 30.0)
+    monkeypatch.setattr(ae.settings, "AGENT_STEP_TIMEOUT_MAX_SECONDS", 900.0)
+    assert ae._resolve_agent_step_timeout_seconds({}) == 2.0
+    assert ae._resolve_agent_step_timeout_seconds({"agent_step_timeout_seconds": 5}) == 30.0
+
+
 def test_format_workflow_step_error_message_empty_str_uses_type():
     class QuietError(Exception):
         def __str__(self):

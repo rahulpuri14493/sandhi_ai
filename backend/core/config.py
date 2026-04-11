@@ -99,6 +99,7 @@ class Settings(BaseSettings):
     MCP_GUARDRAILS_OTLP_INSECURE: bool = True
     MCP_GUARDRAILS_METRICS_TARGET_KEY_MODE: str = "raw"  # raw | normalized | hash
     MCP_GUARDRAILS_METRICS_TARGET_KEY_MAX_LEN: int = 120
+    MCP_TOOL_FAMILY_METRICS_ENABLED: bool = True
     # Job execution backend: celery (Redis queue) or local_thread fallback.
     JOB_EXECUTION_BACKEND: str = "celery"
     JOB_EXECUTION_STRICT_QUEUE: bool = False  # True: no local fallback when enqueue fails
