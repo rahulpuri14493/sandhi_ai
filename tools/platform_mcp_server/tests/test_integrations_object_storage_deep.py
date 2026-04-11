@@ -1,4 +1,5 @@
 """Mock-heavy tests for execution_integrations and execution_object_storage."""
+import builtins
 import json
 import sys
 import types
@@ -122,6 +123,31 @@ class TestExecuteSlack:
         )
         assert "channel_not_found" in out or "Error" in out
 
+    def test_slack_import_error_surfaces_not_installed(self, monkeypatch):
+        real = builtins.__import__
+
+        def _guard(name, globals=None, locals=None, fromlist=(), level=0):
+            if name == "slack_sdk" or name.startswith("slack_sdk."):
+                raise ImportError("simulated missing slack_sdk")
+            return real(name, globals, locals, fromlist, level)
+
+        monkeypatch.setattr(builtins, "__import__", _guard)
+        out = execute_slack({}, {})
+        assert "not installed" in out.lower()
+
+    def test_slack_generic_exception_maps_safe_error(self, monkeypatch):
+        _ensure_fake_slack_sdk(monkeypatch)
+        inst = MagicMock()
+        inst.chat_postMessage.side_effect = RuntimeError("boom")
+        import slack_sdk
+
+        monkeypatch.setattr(slack_sdk, "WebClient", lambda token: inst)
+        out = execute_slack(
+            {"bot_token": "mock-slack-bot-token-unit-test"},
+            {"action": "send", "channel": "#x", "message": "m"},
+        )
+        assert "Error" in out
+
 
 class TestExecuteGithub:
     def test_missing_token(self, monkeypatch):
@@ -181,6 +207,109 @@ class TestExecuteGithub:
         )
         assert "unknown action" in out.lower()
 
+    def test_pygithub_import_error(self, monkeypatch):
+        real = builtins.__import__
+
+        def _guard(name, globals=None, locals=None, fromlist=(), level=0):
+            if name == "github":
+                raise ImportError("simulated missing PyGithub")
+            return real(name, globals, locals, fromlist, level)
+
+        monkeypatch.setattr(builtins, "__import__", _guard)
+        out = execute_github({}, {"repo": "o/r"})
+        assert "not installed" in out.lower()
+
+    def test_get_file_requires_path(self, monkeypatch):
+        _ensure_fake_github(monkeypatch)
+        repo = MagicMock()
+        gh = MagicMock()
+        gh.get_repo.return_value = repo
+        import github as gh_mod
+
+        monkeypatch.setattr(gh_mod, "Github", lambda *a, **k: gh)
+        out = execute_github(
+            {"api_key": "tok"},
+            {"action": "get_file", "repo": "o/r", "path": ""},
+        )
+        assert "path" in out.lower()
+
+    def test_list_issues_action(self, monkeypatch):
+        _ensure_fake_github(monkeypatch)
+        issue = MagicMock()
+        issue.number = 1
+        issue.title = "t"
+        repo = MagicMock()
+        repo.get_issues.return_value = [issue]
+        gh = MagicMock()
+        gh.get_repo.return_value = repo
+        import github as gh_mod
+
+        monkeypatch.setattr(gh_mod, "Github", lambda *a, **k: gh)
+        out = execute_github(
+            {"api_key": "tok"},
+            {"action": "list_issues", "repo": "o/r"},
+        )
+        data = json.loads(out)
+        assert data[0]["number"] == 1
+
+    def test_search_repositories_action(self, monkeypatch):
+        _ensure_fake_github(monkeypatch)
+        r = MagicMock()
+        r.full_name = "a/b"
+        gh = MagicMock()
+        gh.search_repositories.return_value = [r]
+        gh.get_repo.return_value = MagicMock()
+        import github as gh_mod
+
+        monkeypatch.setattr(gh_mod, "Github", lambda *a, **k: gh)
+        out = execute_github(
+            {"api_key": "tok"},
+            {"action": "search", "repo": "o/r", "query": "q"},
+        )
+        data = json.loads(out)
+        assert data[0]["full_name"] == "a/b"
+
+    def test_github_enterprise_legacy_login_when_auth_subimport_fails(self, monkeypatch):
+        """Non-github.com host + ``from github import Auth`` fails → login_or_token path (lines 75–80)."""
+        import base64
+
+        saved = sys.modules.pop("github", None)
+        try:
+            gh_mod = types.ModuleType("github")
+
+            class FakeGithub:
+                def __init__(self, *a, **kw):
+                    self.init_kw = kw
+
+                def get_repo(self, _name):
+                    r = MagicMock()
+                    c = MagicMock()
+                    c.content = base64.b64encode(b"z").decode("ascii")
+                    r.get_contents.return_value = c
+                    return r
+
+            gh_mod.Github = FakeGithub
+            sys.modules["github"] = gh_mod
+
+            real_import = builtins.__import__
+
+            def guarded(name, globals=None, locals=None, fromlist=(), level=0):
+                if name == "github" and fromlist and "Auth" in fromlist:
+                    raise ImportError("no Auth")
+                return real_import(name, globals, locals, fromlist, level)
+
+            monkeypatch.setattr(builtins, "__import__", guarded)
+            out = execute_github(
+                {"api_key": "tok", "base_url": "https://git.example.com/api/v3"},
+                {"action": "get_file", "repo": "o/r", "path": "README"},
+            )
+            assert out == "z"
+        finally:
+            if saved is not None:
+                sys.modules["github"] = saved
+            elif "github" in sys.modules:
+                del sys.modules["github"]
+
 
 class TestExecuteNotion:
     def test_missing_key(self, monkeypatch):
@@ -204,6 +333,37 @@ class TestExecuteNotion:
         monkeypatch.setattr(notion_client, "Client", lambda auth: MagicMock())
         out = execute_notion({"api_key": "mock-notion-api-key-unit-test"}, {"action": "get_page", "query": ""})
         assert "page id" in out.lower()
+
+    def test_notion_import_error(self, monkeypatch):
+        real = builtins.__import__
+
+        def _guard(name, globals=None, locals=None, fromlist=(), level=0):
+            if name == "notion_client":
+                raise ImportError("simulated missing notion_client")
+            return real(name, globals, locals, fromlist, level)
+
+        monkeypatch.setattr(builtins, "__import__", _guard)
+        assert "not installed" in execute_notion({}, {}).lower()
+
+    def test_get_page_retrieve(self, monkeypatch):
+        _ensure_fake_notion(monkeypatch)
+        client = MagicMock()
+        client.pages.retrieve.return_value = {"id": "page-1"}
+        import notion_client
+
+        monkeypatch.setattr(notion_client, "Client", lambda auth: client)
+        out = execute_notion({"api_key": "k"}, {"action": "get_page", "query": "abc"})
+        assert "page-1" in out
+
+    def test_get_database_retrieve(self, monkeypatch):
+        _ensure_fake_notion(monkeypatch)
+        client = MagicMock()
+        client.databases.retrieve.return_value = {"id": "db-1"}
+        import notion_client
+
+        monkeypatch.setattr(notion_client, "Client", lambda auth: client)
+        out = execute_notion({"api_key": "k"}, {"action": "get_database", "query": "did"})
+        assert "db-1" in out
 
 
 class TestExecuteRestApi:
@@ -242,6 +402,44 @@ class TestExecuteRestApi:
         body = json.loads(out)
         assert body["status"] == 200
         assert body["body"]["ok"] is True
+
+    def test_sends_bearer_when_api_key_configured(self):
+        captured: dict = {}
+
+        class Resp:
+            status_code = 204
+            headers = {"content-type": "text/plain"}
+            text = "ok"
+
+        class Ctx:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+            def request(self, method, url, json=None, headers=None):
+                captured["headers"] = dict(headers or {})
+                return Resp()
+
+        with patch("httpx.Client", return_value=Ctx()):
+            execute_rest_api({"base_url": "https://h.com", "api_key": "tok"}, {"path": "v1/x"})
+        assert "Bearer" in captured.get("headers", {}).get("Authorization", "")
+
+    def test_request_exception_maps_safe_error(self):
+        class Ctx:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+            def request(self, *a, **k):
+                raise RuntimeError("network down")
+
+        with patch("httpx.Client", return_value=Ctx()):
+            out = execute_rest_api({"base_url": "https://h.com"}, {"path": "v1/x"})
+        assert "Error" in out
 
 
 def test_normalize_s3_object_key():
