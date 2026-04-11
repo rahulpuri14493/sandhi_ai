@@ -2213,23 +2213,34 @@ def execute_job(
             strict=bool(getattr(settings, "JOB_EXECUTION_STRICT_QUEUE", False)),
         )
     except (QueueEnqueueError, Exception) as exc:
-        # 1. Handle one shared database updates
-        job.status = JobStatus.FAILED
-        job.execution_token = None
-        job.failure_reason = f"Failed to enqueue execution: {str(exc)[:200]}"
-        db.commit()
-
-        # 2. Raise the specific HTTPException based on the error type
         if isinstance(exc, QueueEnqueueError):
+            # 1. System is full - move to FAILED so user can see why in the history/status
+            job.status = JobStatus.FAILED
+            job.execution_token = None
+            job.failure_reason = f"Failed to enqueue execution: {str(exc)[:200]}"
+            db.commit()
+
             raise HTTPException(
                 status_code=503,
                 headers={"Retry-After": "30"},
-                detail={"error": "queue_overloaded"}
+                detail={
+                    "error": "queue_overloaded", 
+                    "message": "The system is currently at capacity. Please try again later.",
+                },
             ) from exc
         else:
+            # 2. Transient/Unexpected error - roll back to PENDING_APPROVAL per main branch behavior
+            job.status = JobStatus.PENDING_APPROVAL
+            job.execution_token = None
+            job.failure_reason = f"Failed to enqueue execution: {str(exc)[:200]}"
+            db.commit()
+
             raise HTTPException(
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                detail="Failed to enqueue job execution. Please try again.",
+                detail={
+                    "error": "enqueue_failed",
+                    "message": "Failed to enqueue job execution. Please try again.",
+                },
             ) from exc
     
     # Parse files and conversation for response

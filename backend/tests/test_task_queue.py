@@ -209,3 +209,4 @@ class TestQueueAdmissionControl:
             kwargs={"job_id": 42, "history_id": None, "execution_token": None},
             queue="interactive",
         )
+

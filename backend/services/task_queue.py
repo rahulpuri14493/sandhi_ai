@@ -162,6 +162,7 @@ def _get_queue_oldest_age_seconds(client: redis.Redis, redis_key: str) -> Option
     Returns None if the queue is empty or the timestamp can't be parsed.
     """
     try:
+        # Celery/Kombu uses Redis lists as FIFO; index -1 (tail) represents the oldest enqueued task.
         raw = client.lindex(redis_key, -1)  # oldest item is at the tail
         if not raw:
             return None

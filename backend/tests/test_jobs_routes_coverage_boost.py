@@ -653,6 +653,8 @@ def test_execute_job_overload_returns_503(client, db_session):
         
         r = client.post(f"/api/jobs/{job.id}/execute", headers=h)
         assert r.status_code == 503
+        if r.headers.get("Retry-After"):
+            assert r.headers.get("Retry-After") == "30"
 
         db_session.expire_all()
         job = db_session.query(Job).filter(Job.id == job.id).first()
@@ -700,3 +702,5 @@ def test_rerun_job_overload_returns_503(client, db_session):
         if hist:
             assert hist.status == "failed"
             assert "overloaded" in hist.failure_reason.lower()
+
+    

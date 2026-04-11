@@ -114,3 +114,4 @@ class TestPriorityIsolationUnderLoad:
 
         assert all(results), "All 10 interactive jobs must succeed regardless of batch state"
         assert mock_apply_async.call_count == 10
+
