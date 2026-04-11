@@ -2,6 +2,8 @@ import { useCallback, useEffect, useState } from 'react'
 import { useParams, useSearchParams, useNavigate, useLocation } from 'react-router-dom'
 import { jobsAPI, mcpAPI } from '../lib/api'
 import type { Job, WorkflowPreview, WorkflowStep, JobSchedule, PlannerPipelineBundle } from '../lib/types'
+import { FlashToast } from '../components/FlashToast'
+import { RerunModeModal } from '../components/RerunModeModal'
 import SchedulePicker, { humanReadableSchedule } from '../components/SchedulePicker'
 import { WorkflowBuilder } from '../components/WorkflowBuilder'
 import { CostCalculator } from '../components/CostCalculator'
@@ -9,6 +11,13 @@ import { JobStatusTracker } from '../components/JobStatusTracker'
 import { DocumentConversation } from '../components/DocumentConversation'
 import { buildJobDetailSharedToolWarning } from '../lib/independentWorkflowSharedTools'
 import { filterByJobAllowedIds, jobHasExplicitMcpScope } from '../lib/jobMcpScope'
+import {
+  buildPlatformToolIdToNameMap,
+  enrichPlannerArtifactJsonForDisplay,
+  formatPlannerAgentLabel,
+  orderedWorkflowSteps,
+} from '../lib/plannerArtifactDisplay'
+import { formatRerunStartedMessage } from '../lib/rerunFeedback'
 
 function ppStr(v: unknown): string {
   if (v == null) return ''
@@ -92,8 +101,23 @@ export default function JobDetailPage() {
     if (searchParams.get('qa') === 'true') {
       setMode('qa')
     }
+    const requestedMode = searchParams.get('mode')
+    if (requestedMode === 'status' || requestedMode === 'workflow' || requestedMode === 'preview' || requestedMode === 'qa') {
+      setMode(requestedMode)
+    }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [jobId, searchParams])
+
+  useEffect(() => {
+    const focusStep = searchParams.get('focus_step')
+    if (!focusStep || !job?.workflow_steps?.length) return
+    const sid = parseInt(focusStep, 10)
+    if (!Number.isFinite(sid)) return
+    const target = document.getElementById(`workflow-step-${sid}`)
+    if (target) {
+      target.scrollIntoView({ behavior: 'smooth', block: 'center' })
+    }
+  }, [job, searchParams])
 
   useEffect(() => {
     if (job && mode === 'preview') {
@@ -160,6 +184,9 @@ export default function JobDetailPage() {
   }
 
   const [showExecuteConfirm, setShowExecuteConfirm] = useState(false)
+  const [showRerunModal, setShowRerunModal] = useState(false)
+  const [isRerunning, setIsRerunning] = useState(false)
+  const [rerunToast, setRerunToast] = useState<string | null>(null)
 
   const handleExecute = async () => {
     if (!job) return
@@ -279,17 +306,7 @@ export default function JobDetailPage() {
 
   const handleRerun = async () => {
     if (!job) return
-    if (!window.confirm('Are you sure you want to rerun this job? This will reset the workflow and execute it again.')) {
-      return
-    }
-    try {
-      await jobsAPI.rerun(jobId)
-      await loadJob()
-      setMode('status')
-    } catch (error) {
-      console.error('Failed to rerun job:', error)
-      alert('Failed to rerun job. Only failed or cancelled jobs can be rerun.')
-    }
+    setShowRerunModal(true)
   }
 
   const handleCancel = async () => {
@@ -375,42 +392,15 @@ export default function JobDetailPage() {
         const names = explicit.map(ppStr).filter(Boolean)
         if (names.length > 0) return names
       }
-      const byId = new Map(platformToolsList.map((t) => [String(t.id), t.name]))
+      const byId = buildPlatformToolIdToNameMap(platformToolsList)
       const ids = Array.isArray(row.platform_tool_ids) ? (row.platform_tool_ids as unknown[]) : []
-      return ids.map((id) => byId.get(ppStr(id)) || ppStr(id)).filter(Boolean)
-    },
-    [platformToolsList],
-  )
-
-  const enrichToolSuggestionForDisplay = useCallback(
-    (payload: unknown): unknown => {
-      if (!payload || typeof payload !== 'object') return payload
-      const byId = new Map(platformToolsList.map((t) => [String(t.id), t.name]))
-      const out = JSON.parse(JSON.stringify(payload)) as Record<string, unknown>
-      const enrichRows = (rows: unknown) => {
-        if (!Array.isArray(rows)) return
-        for (const row of rows) {
-          if (!row || typeof row !== 'object') continue
-          const r = row as Record<string, unknown>
-          if (Array.isArray(r.platform_tool_names) && r.platform_tool_names.length > 0) {
-            delete r.platform_tool_ids
-            continue
-          }
-          if (!Array.isArray(r.platform_tool_ids)) continue
-          const names = (r.platform_tool_ids as unknown[])
-            .map((id) => byId.get(ppStr(id)) || ppStr(id))
-            .filter(Boolean)
-          if (names.length > 0) {
-            r.platform_tool_names = names
-            delete r.platform_tool_ids
-          }
-        }
-      }
-      enrichRows(out.step_suggestions)
-      if (out.parsed_result && typeof out.parsed_result === 'object') {
-        enrichRows((out.parsed_result as Record<string, unknown>).step_suggestions)
-      }
-      return out
+      return ids
+        .map((id) => {
+          const key = ppStr(id)
+          if (!key) return ''
+          return byId.get(key) || `Tool #${key}`
+        })
+        .filter(Boolean)
     },
     [platformToolsList],
   )
@@ -769,7 +759,11 @@ export default function JobDetailPage() {
                                   return (
                                     <li key={idx} className="pl-1">
                                       <span className="font-semibold text-white">
-                                        Agent index {ppStr(row.agent_index) || String(idx)}
+                                        {formatPlannerAgentLabel(
+                                          row.agent_name,
+                                          row.agent_index,
+                                          orderedWorkflowSteps(job.workflow_steps),
+                                        )}
                                       </span>
                                       {ppStr(row.task) ? (
                                         <p className="mt-1 text-white/80 whitespace-pre-wrap">{ppStr(row.task)}</p>
@@ -818,11 +812,11 @@ export default function JobDetailPage() {
                                     <p className="font-semibold text-white">
                                       Step {idx + 1}
                                       {' · '}
-                                      agent index{' '}
-                                      {typeof s.agent_index === 'number' ||
-                                      (typeof s.agent_index === 'string' && s.agent_index !== '')
-                                        ? ppStr(s.agent_index)
-                                        : '—'}
+                                      {formatPlannerAgentLabel(
+                                        s.agent_name,
+                                        s.agent_index,
+                                        orderedWorkflowSteps(job.workflow_steps),
+                                      )}
                                     </p>
                                     {ppStr(s.rationale) ? (
                                       <p className="mt-1 text-white/75 text-xs whitespace-pre-wrap">
@@ -882,9 +876,14 @@ export default function JobDetailPage() {
                                     onClick={async () => {
                                       try {
                                         const data = await jobsAPI.getPlannerArtifactRaw(jobId, row.id)
+                                        const toolMap = buildPlatformToolIdToNameMap(platformToolsList)
                                         const displayData =
-                                          row.artifact_type === 'tool_suggestion'
-                                            ? enrichToolSuggestionForDisplay(data)
+                                          row.artifact_type === 'tool_suggestion' ||
+                                          row.artifact_type === 'task_split'
+                                            ? enrichPlannerArtifactJsonForDisplay(row.artifact_type, data, {
+                                                workflowSteps: job.workflow_steps || [],
+                                                platformToolIdToName: toolMap,
+                                              })
                                             : data
                                         setPlannerRawModal({
                                           title: `${row.artifact_type} (#${row.id})`,
@@ -1223,7 +1222,12 @@ export default function JobDetailPage() {
         )}
 
         {mode === 'status' && (
-          <JobStatusTracker jobId={jobId} job={job} onJobUpdate={loadJob} />
+          <JobStatusTracker
+            jobId={jobId}
+            job={job}
+            onJobUpdate={loadJob}
+            focusedStepId={Number(searchParams.get('focus_step') || 0) || undefined}
+          />
         )}
 
         {mode === 'status' && job.status !== 'draft' && job.workflow_steps && job.workflow_steps.length > 0 && (
@@ -1502,12 +1506,13 @@ export default function JobDetailPage() {
             <div className="flex flex-wrap gap-3">
               <button
                 onClick={handleRerun}
+                disabled={isRerunning}
                 className="px-8 py-4 bg-gradient-to-r from-primary-500 to-primary-700 text-white rounded-xl font-bold hover:shadow-2xl hover:shadow-primary-500/50 hover:scale-105 transition-all duration-200 flex items-center gap-2"
               >
                 <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                   <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
                 </svg>
-                Rerun Now
+                {isRerunning ? 'Rerunning...' : 'Rerun Now'}
               </button>
               <button
                 onClick={() => {
@@ -1540,6 +1545,27 @@ export default function JobDetailPage() {
             )}
           </div>
         )}
+        <RerunModeModal
+          isOpen={showRerunModal}
+          isSubmitting={isRerunning}
+          onClose={() => setShowRerunModal(false)}
+          onSelect={async (mode) => {
+            setIsRerunning(true)
+            try {
+              const resp = await jobsAPI.rerun(jobId, mode)
+              setShowRerunModal(false)
+              setRerunToast(formatRerunStartedMessage(resp))
+              await loadJob()
+              setMode('status')
+            } catch (error) {
+              console.error('Failed to rerun job:', error)
+              setRerunToast('Failed to rerun job. Only failed or cancelled jobs can be rerun.')
+            } finally {
+              setIsRerunning(false)
+            }
+          }}
+        />
+        <FlashToast message={rerunToast} onDismiss={() => setRerunToast(null)} />
       </div>
     </div>
   )

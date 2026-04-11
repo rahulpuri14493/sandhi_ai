@@ -375,6 +375,13 @@ class WorkflowBuilder:
                         if tt is not None and str(tt).strip():
                             step_task_type = str(tt).strip().lower()
                         break
+            step_visibility = step_tool_visibility if step_tool_visibility is not None else (tool_visibility or getattr(job, "tool_visibility", None))
+            # tool_visibility='none' means no MCP tools for this step — never inherit job allowlists (would contradict "none").
+            step_vis_norm = str(step_visibility or "").strip().lower()
+            if step_vis_norm == "none":
+                step_platform = []
+                step_conn = []
+            elif step_tools:
                 if step_platform is None and job_platform_ids is not None:
                     step_platform = job_platform_ids
                 if step_conn is None and job_conn_ids is not None:
@@ -384,7 +391,6 @@ class WorkflowBuilder:
                     step_platform = job_platform_ids
                 if job_conn_ids is not None:
                     step_conn = job_conn_ids
-            step_visibility = step_tool_visibility if step_tool_visibility is not None else (tool_visibility or getattr(job, "tool_visibility", None))
             if step_task_type:
                 step_input_data["task_type"] = step_task_type
             step = WorkflowStep(
@@ -394,8 +400,8 @@ class WorkflowBuilder:
                 input_data=json.dumps(step_input_data),
                 status="pending",
                 depends_on_previous=depends_on_previous,
-                allowed_platform_tool_ids=json.dumps(step_platform) if step_platform is not None else None,
-                allowed_connection_ids=json.dumps(step_conn) if step_conn is not None else None,
+                allowed_platform_tool_ids=json.dumps(step_platform) if (step_platform is not None and len(step_platform) > 0) else None,
+                allowed_connection_ids=json.dumps(step_conn) if (step_conn is not None and len(step_conn) > 0) else None,
                 tool_visibility=step_visibility,
             )
             self.db.add(step)

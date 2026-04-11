@@ -10,7 +10,7 @@ from typing import Any, Dict, List, Optional
 from fastapi import APIRouter, Depends, HTTPException, status, UploadFile, File, Form, Query
 from fastapi.responses import FileResponse, Response, StreamingResponse
 from sqlalchemy.orm import Session
-from pydantic import BaseModel
+from pydantic import BaseModel, model_validator
 from db.database import get_db
 from models.job import Job, JobStatus, WorkflowStep, JobSchedule, ScheduleStatus, ScheduleExecutionHistory, JobPlannerArtifact
 from models.agent import Agent
@@ -121,6 +121,45 @@ def _platform_tool_name_map_for_business(db: Session, business_id: int) -> Dict[
     return out
 
 
+def _agent_name_map_for_job_by_step_index(db: Session, job_id: int) -> Dict[int, str]:
+    rows = (
+        db.query(WorkflowStep.step_order, Agent.name)
+        .join(Agent, Agent.id == WorkflowStep.agent_id)
+        .filter(WorkflowStep.job_id == job_id)
+        .order_by(WorkflowStep.step_order.asc())
+        .all()
+    )
+    out: Dict[int, str] = {}
+    for step_order, agent_name in rows:
+        try:
+            idx = max(0, int(step_order) - 1)
+        except (TypeError, ValueError):
+            continue
+        nm = (str(agent_name or "") or "").strip()
+        if nm:
+            out[idx] = nm
+    return out
+
+
+def _attach_agent_names_by_index(rows: Any, agent_name_by_index: Dict[int, str]) -> None:
+    if not isinstance(rows, list):
+        return
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        name = row.get("agent_name")
+        if isinstance(name, str) and name.strip():
+            continue
+        raw_idx = row.get("agent_index")
+        try:
+            idx = int(raw_idx)
+        except (TypeError, ValueError):
+            continue
+        mapped = agent_name_by_index.get(idx)
+        if mapped:
+            row["agent_name"] = mapped
+
+
 def _attach_tool_names_to_step_suggestions(
     tool_suggestion: Optional[Dict[str, Any]], tool_name_by_id: Dict[int, str]
 ) -> Optional[Dict[str, Any]]:
@@ -188,6 +227,15 @@ def _enrich_tool_suggestion_json_bytes(
         return json.dumps(enriched, ensure_ascii=False).encode("utf-8")
     except Exception:
         return data
+
+
+def _attach_agent_names_to_task_split(
+    task_split: Optional[Dict[str, Any]], agent_name_by_index: Dict[int, str]
+) -> Optional[Dict[str, Any]]:
+    if not isinstance(task_split, dict):
+        return task_split
+    _attach_agent_names_by_index(task_split.get("parsed_assignments"), agent_name_by_index)
+    return task_split
 
 
 # Allowed file extensions (including .zip; zip contents are extracted and only allowed types kept)
@@ -377,6 +425,30 @@ def _parse_int_list_form(value: Optional[str]) -> Optional[List[int]]:
         return [int(x) for x in out] if isinstance(out, list) else None
     except (json.JSONDecodeError, TypeError, ValueError):
         return None
+
+
+def _parse_int_list(value: Any) -> Optional[List[int]]:
+    """Parse list[int] from JSON string or iterable; None on invalid."""
+    if value is None:
+        return None
+    raw = value
+    if isinstance(raw, str):
+        txt = raw.strip()
+        if not txt:
+            return None
+        try:
+            raw = json.loads(txt)
+        except Exception:
+            return None
+    if isinstance(raw, (list, tuple, set)):
+        out: List[int] = []
+        for item in raw:
+            try:
+                out.append(int(item))
+            except (TypeError, ValueError):
+                return None
+        return out
+    return None
 
 
 def _validate_tool_visibility(v: Optional[str]) -> Optional[str]:
@@ -1065,12 +1137,23 @@ async def download_job_planner_artifact_raw(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Artifact not found")
     cached = await asyncio.to_thread(get_cached_planner_raw, job_id, artifact_id)
     if cached is not None:
-        if (row.artifact_type or "").strip().lower() == "tool_suggestion":
+        artifact_type = (row.artifact_type or "").strip().lower()
+        if artifact_type == "tool_suggestion":
             cached = _enrich_tool_suggestion_json_bytes(
                 cached,
                 db=db,
                 business_id=int(job.business_id),
             )
+        elif artifact_type == "task_split":
+            try:
+                payload = json.loads(cached.decode("utf-8"))
+                if isinstance(payload, dict):
+                    agent_name_by_index = _agent_name_map_for_job_by_step_index(db, job_id)
+                    payload = _attach_agent_names_to_task_split(payload, agent_name_by_index)
+                    if isinstance(payload, dict):
+                        cached = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+            except Exception:
+                pass
         return Response(content=cached, media_type="application/json")
     try:
         data = await asyncio.to_thread(read_planner_artifact_bytes, row)
@@ -1080,12 +1163,23 @@ async def download_job_planner_artifact_raw(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="Could not read artifact from storage",
         )
-    if (row.artifact_type or "").strip().lower() == "tool_suggestion":
+    artifact_type = (row.artifact_type or "").strip().lower()
+    if artifact_type == "tool_suggestion":
         data = _enrich_tool_suggestion_json_bytes(
             data,
             db=db,
             business_id=int(job.business_id),
         )
+    elif artifact_type == "task_split":
+        try:
+            payload = json.loads(data.decode("utf-8"))
+            if isinstance(payload, dict):
+                agent_name_by_index = _agent_name_map_for_job_by_step_index(db, job_id)
+                payload = _attach_agent_names_to_task_split(payload, agent_name_by_index)
+                if isinstance(payload, dict):
+                    data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        except Exception:
+            pass
     await asyncio.to_thread(set_cached_planner_raw, job_id, artifact_id, data)
     return Response(content=data, media_type="application/json")
 
@@ -1106,14 +1200,22 @@ def get_job_planner_pipeline(
     if not _user_can_access_job(job, current_user, db):
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Not authorized")
     payloads, row_ids = load_latest_planner_pipeline_payloads(db, job_id)
+    agent_name_by_index = _agent_name_map_for_job_by_step_index(db, job_id)
+    task_split = payloads.get("task_split")
+    if isinstance(task_split, dict):
+        task_split = _attach_agent_names_to_task_split(task_split, agent_name_by_index)
     tool_suggestion = payloads.get("tool_suggestion")
     if isinstance(tool_suggestion, dict):
+        _attach_agent_names_by_index(tool_suggestion.get("step_suggestions"), agent_name_by_index)
+        parsed_result = tool_suggestion.get("parsed_result")
+        if isinstance(parsed_result, dict):
+            _attach_agent_names_by_index(parsed_result.get("step_suggestions"), agent_name_by_index)
         tool_name_by_id = _platform_tool_name_map_for_business(db, int(job.business_id))
         tool_suggestion = _attach_tool_names_to_step_suggestions(tool_suggestion, tool_name_by_id)
     return PlannerPipelineBundleResponse(
         job_id=job_id,
         brd_analysis=payloads.get("brd_analysis"),
-        task_split=payloads.get("task_split"),
+        task_split=task_split,
         tool_suggestion=tool_suggestion,
         artifact_ids={
             "brd_analysis": row_ids.get("brd_analysis"),
@@ -1726,8 +1828,25 @@ async def auto_split_workflow(
 
 
 class SuggestWorkflowToolsBody(BaseModel):
-    """Agents in workflow order (same as auto-split). Tool suggestions use platform planner or a deterministic fallback."""
+    """Agents in workflow order (same as auto-split). Optional step_tool_visibility matches agent_ids; else job.tool_visibility applies."""
+
     agent_ids: List[int]
+    # Use Optional elements so JSON null per step inherits job.tool_visibility (not rejected before validator).
+    step_tool_visibility: Optional[List[Optional[str]]] = None
+
+    @model_validator(mode="after")
+    def _step_vis_len_matches_agents(self) -> "SuggestWorkflowToolsBody":
+        if self.step_tool_visibility is not None and len(self.step_tool_visibility) != len(self.agent_ids):
+            raise ValueError("step_tool_visibility must have the same length as agent_ids")
+        for v in self.step_tool_visibility or []:
+            if v is None:
+                continue
+            if not str(v).strip():
+                continue
+            sv = str(v).strip().lower()
+            if sv not in ("full", "names_only", "none"):
+                raise ValueError("step_tool_visibility values must be full, names_only, or none")
+        return self
 
 
 @router.get("/{job_id}/suggest-workflow-tools", include_in_schema=True)
@@ -1821,24 +1940,36 @@ async def suggest_workflow_tools(
             agents=agents_ordered,
             platform_tools=platform_tools,
             llm_audit=llm_audit,
+            step_tool_visibility=body.step_tool_visibility,
+            job_tool_visibility=getattr(job, "tool_visibility", None),
         )
+    persist_payload: Optional[Dict[str, Any]] = None
     if llm_audit.get("raw_llm_response"):
-        aid = await persist_json_planner_artifact(
-            db,
-            job_id,
-            "tool_suggestion",
-            {
-                "raw_llm_response": llm_audit["raw_llm_response"],
-                "source": llm_audit.get("source"),
-                "job_title": job.title or "",
-                "job_description": job.description or "",
-                "parsed_result": {
-                    "step_suggestions": result.get("step_suggestions"),
-                    "output_contract_stub": result.get("output_contract_stub"),
-                    "fallback_used": result.get("fallback_used"),
-                },
+        persist_payload = {
+            "raw_llm_response": llm_audit["raw_llm_response"],
+            "source": llm_audit.get("source"),
+            "job_title": job.title or "",
+            "job_description": job.description or "",
+            "parsed_result": {
+                "step_suggestions": result.get("step_suggestions"),
+                "output_contract_stub": result.get("output_contract_stub"),
+                "fallback_used": result.get("fallback_used"),
             },
-        )
+        }
+    elif llm_audit.get("persist_tool_suggestion_without_llm"):
+        persist_payload = {
+            "source": llm_audit.get("source"),
+            "detail": "No platform tool suggestions: all workflow steps have tool_visibility=none.",
+            "job_title": job.title or "",
+            "job_description": job.description or "",
+            "parsed_result": {
+                "step_suggestions": result.get("step_suggestions"),
+                "output_contract_stub": result.get("output_contract_stub"),
+                "fallback_used": result.get("fallback_used"),
+            },
+        }
+    if persist_payload is not None:
+        aid = await persist_json_planner_artifact(db, job_id, "tool_suggestion", persist_payload)
         if aid is not None:
             db.commit()
     return result
@@ -1896,10 +2027,30 @@ def update_workflow_step_tools(
         pids, cids = body.allowed_platform_tool_ids, body.allowed_connection_ids
         if (pids and len(pids)) or (cids and len(cids)):
             pids, cids = _validate_allowed_tools(db, current_user.id, pids, cids)
-        step.allowed_platform_tool_ids = json.dumps(pids) if pids is not None else None
-        step.allowed_connection_ids = json.dumps(cids) if cids is not None else None
+        # Empty lists on step mean "inherit from job scope".
+        step.allowed_platform_tool_ids = json.dumps(pids) if (pids is not None and len(pids) > 0) else None
+        step.allowed_connection_ids = json.dumps(cids) if (cids is not None and len(cids) > 0) else None
     if body.tool_visibility is not None:
         step.tool_visibility = _validate_tool_visibility(body.tool_visibility)
+        # If a step is explicitly hidden, clear step-level allowlists so this update remains valid.
+        # This preserves backwards compatibility for PATCH tool_visibility-only requests.
+        if step.tool_visibility == "none" and (
+            body.allowed_platform_tool_ids is None and body.allowed_connection_ids is None
+        ):
+            step.allowed_platform_tool_ids = None
+            step.allowed_connection_ids = None
+    eff_tv = getattr(step, "tool_visibility", None) or getattr(job, "tool_visibility", None) or "full"
+    step_platform_ids = _parse_int_list(getattr(step, "allowed_platform_tool_ids", None))
+    step_conn_ids = _parse_int_list(getattr(step, "allowed_connection_ids", None))
+    has_scope = bool(
+        (step_platform_ids is not None and len(step_platform_ids) > 0)
+        or (step_conn_ids is not None and len(step_conn_ids) > 0)
+    )
+    if eff_tv == "none" and has_scope:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid step configuration: tool_visibility='none' cannot be used when step tools are assigned. Use 'names_only' or 'full'.",
+        )
     db.commit()
     db.refresh(step)
     agent = db.query(Agent).filter(Agent.id == step.agent_id).first()
@@ -2564,14 +2715,20 @@ def update_job_schedule(
 @router.post("/{job_id}/rerun", response_model=RerunResponse)
 def rerun_job(
     job_id: int,
+    mode: Optional[str] = Query(
+        default=None,
+        description="Optional rerun mode override: full (reset all steps) or resume (rerun only non-completed steps).",
+        pattern="^(full|resume)$",
+    ),
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
     """Immediately re-execute a failed or cancelled job ("Run Now" button).
 
-    Only available when job status is FAILED or CANCELLED. Resets all workflow
-    steps, transitions to IN_PROGRESS, and triggers execution in a background thread.
-    For "Schedule Again", the frontend uses PUT /schedule with a new scheduled_at.
+    Only available when job status is FAILED or CANCELLED.
+    Rerun behavior supports both:
+    - Automatic mode (no query param): resume when possible, full fallback if all steps completed.
+    - Explicit mode override: mode=resume or mode=full.
     """
     job = db.query(Job).filter(Job.id == job_id, Job.business_id == current_user.id).first()
     if not job:
@@ -2603,7 +2760,44 @@ def rerun_job(
         db.flush()
         history_id = history.id
 
-    # Acquire execution claim atomically, then reset steps for a clean run.
+    steps = (
+        db.query(WorkflowStep)
+        .filter(WorkflowStep.job_id == job.id)
+        .order_by(WorkflowStep.step_order)
+        .all()
+    )
+    completed_steps = [s for s in steps if s.status == "completed"]
+    rerun_steps = [s for s in steps if s.status != "completed"]
+    requested_mode = (mode or "").strip().lower() or None
+    if requested_mode == "full":
+        mode_effective = "full"
+        resume_start_step_order = 1
+        steps_reused_count = 0
+        steps_rerun_count = len(steps)
+    elif requested_mode == "resume":
+        if not rerun_steps:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="No incomplete workflow steps to resume; use full rerun if needed.",
+            )
+        mode_effective = "resume"
+        resume_start_step_order = min(s.step_order for s in rerun_steps)
+        steps_reused_count = len(completed_steps)
+        steps_rerun_count = len(rerun_steps)
+    else:
+        # Automatic default mode (no query): resume if possible, otherwise full fallback.
+        mode_effective = "resume"
+        if not rerun_steps:
+            mode_effective = "full"
+            resume_start_step_order = 1
+            steps_reused_count = 0
+            steps_rerun_count = len(steps)
+        else:
+            resume_start_step_order = min(s.step_order for s in rerun_steps)
+            steps_reused_count = len(completed_steps)
+            steps_rerun_count = len(rerun_steps)
+
+    # Acquire execution claim atomically, then reset steps for re-execution.
     execution_token = uuid.uuid4().hex
     transitioned = _transition_job_status_if_current(
         db,
@@ -2621,7 +2815,7 @@ def rerun_job(
         )
 
     db.refresh(job)
-    reset_job_for_execution(db, job)
+    reset_job_for_execution(db, job, mode=mode_effective)
     db.commit()
 
     # Spawn execution thread — job is already IN_PROGRESS
@@ -2660,9 +2854,13 @@ def rerun_job(
             )
 
     return RerunResponse(
-        message="Job re-execution started",
+        message=f"Job re-execution started ({mode_effective})",
         job_id=job.id,
         status=job.status.value,
+        mode=mode_effective,
+        resume_start_step_order=resume_start_step_order,
+        steps_reused_count=steps_reused_count,
+        steps_rerun_count=steps_rerun_count,
     )
 
 

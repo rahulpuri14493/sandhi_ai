@@ -65,6 +65,25 @@ class Settings(BaseSettings):
     CELERY_SLO_ENQUEUE_TO_START_P95_SECONDS: int = 300   # 5 minutes
     CELERY_SLO_MAX_QUEUE_AGE_SECONDS: int = 1800          # 30 minutes, flag if oldest job older than this
 
+    # Execution heartbeat runtime visibility.
+    # Redis live-state defaults to CELERY_BROKER_URL when HEARTBEAT_REDIS_URL is empty.
+    HEARTBEAT_ENABLE_REDIS: bool = True
+    HEARTBEAT_REDIS_URL: str = ""
+    HEARTBEAT_REDIS_TTL_SECONDS: int = 180
+    HEARTBEAT_ENABLE_DB_SNAPSHOT: bool = True
+    HEARTBEAT_DB_MIN_UPDATE_SECONDS: int = 45
+    # Signed heartbeat ingestion contract (worker -> internal API).
+    HEARTBEAT_SIGNED_API_ENABLED: bool = True
+    HEARTBEAT_SIGNED_API_VERSION: str = "sandhi.heartbeat.v1"
+    HEARTBEAT_SIGNED_API_SKEW_SECONDS: int = 120
+    HEARTBEAT_NONCE_TTL_SECONDS: int = 300
+    HEARTBEAT_RETENTION_DAYS: int = 30
+    # Step-level stuck watchdog thresholds (durable DB fallback; independent from Redis liveness).
+    STEP_STUCK_THRESHOLD_SECONDS: int = 600
+    STEP_STUCK_BLOCKED_THRESHOLD_SECONDS: int = 900
+    # Loop detection for stuck diagnosis (adapter/tool loops under heavy load).
+    STEP_LOOP_ROUND_THRESHOLD: int = 10
+    STEP_REPEAT_TOOLCALL_THRESHOLD: int = 6
     # When True, allow agent endpoints that resolve to private/loopback IPs (dev, Docker, same host). Default False in production.
     ALLOW_PRIVATE_AGENT_ENDPOINTS: bool = False
     # Job document storage backend: S3-compatible object storage (default) or local filesystem
@@ -169,6 +188,24 @@ class Settings(BaseSettings):
     # Output quality gates before passing step output downstream.
     AGENT_OUTPUT_REQUIRE_NONEMPTY: bool = True
     AGENT_OUTPUT_MIN_CONFIDENCE: float = 0.0
+    # Use a fixed seed for tool-calling agent rounds to reduce SQL/output drift across identical prompts.
+    AGENT_TOOLCALL_OPENAI_SEED: int = 42
+    # Developer (publish-user) KPI/SLA thresholds.
+    DEVELOPER_KPI_SLA_SUCCESS_RATE_MIN: float = 0.95
+    DEVELOPER_KPI_SLA_P95_LATENCY_SECONDS_MAX: float = 30.0
+    # Optional webhook alerts for developer KPI SLA changes.
+    DEVELOPER_KPI_ALERTS_ENABLED: bool = False
+    DEVELOPER_KPI_ALERT_WEBHOOK_URL: str = ""
+    DEVELOPER_KPI_ALERT_COOLDOWN_SECONDS: int = 900
+    # Optional business/end-user job lifecycle webhook alerts.
+    BUSINESS_JOB_ALERTS_ENABLED: bool = False
+    BUSINESS_JOB_ALERT_WEBHOOK_URL: str = ""
+    BUSINESS_JOB_ALERT_COOLDOWN_SECONDS: int = 180
+    BUSINESS_KPI_ALERTS_ENABLED: bool = False
+    BUSINESS_KPI_ALERT_WEBHOOK_URL: str = ""
+    BUSINESS_KPI_ALERT_COOLDOWN_SECONDS: int = 900
+    BUSINESS_KPI_SLA_SUCCESS_RATE_MIN: float = 0.95
+    BUSINESS_KPI_SLA_P95_LATENCY_SECONDS_MAX: float = 45.0
     # --- Tool assignment registry + A2A task envelope ---
     # Absolute path to JSON registry; empty = packaged backend/resources/config/tool_assignment_registry.default.json
     TOOL_ASSIGNMENT_REGISTRY_PATH: str = ""

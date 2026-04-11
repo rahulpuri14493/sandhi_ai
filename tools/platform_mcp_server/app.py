@@ -5,25 +5,53 @@ Exposes MCP protocol (JSON-RPC 2.0): initialize, tools/list, tools/call.
 Tools are resolved per business (tenant) via the Sandhi AI backend internal API.
 Implements Vector DB, PostgreSQL, and File system tools using tenant-stored config.
 """
-from execution_common import safe_tool_error
-from execution import (
-    execute_artifact_write,
-    execute_azure_blob,
-    execute_bigquery_sql,
-    execute_databricks_sql,
-    execute_elasticsearch,
-    execute_gcs,
-    execute_github,
-    execute_mysql,
-    execute_notion,
-    execute_postgres,
-    execute_rest_api,
-    execute_s3_family,
-    execute_slack,
-    execute_sqlserver_sql,
-    execute_snowflake_sql,
-    is_artifact_platform_write,
-)
+try:
+    from execution_common import safe_tool_error
+    from execution import (
+        execute_artifact_write,
+        execute_azure_blob,
+        execute_bigquery_sql,
+        execute_databricks_sql,
+        execute_elasticsearch,
+        execute_gcs,
+        execute_github,
+        execute_mysql,
+        execute_notion,
+        execute_postgres,
+        execute_rest_api,
+        execute_s3_family,
+        execute_slack,
+        execute_sqlserver_sql,
+        execute_snowflake_sql,
+        is_artifact_platform_write,
+    )
+except ModuleNotFoundError:
+    # Support direct module loading in tests where package path differs.
+    import os as _os
+    import sys as _sys
+
+    _here = _os.path.dirname(_os.path.abspath(__file__))
+    if _here not in _sys.path:
+        _sys.path.insert(0, _here)
+    from execution_common import safe_tool_error
+    from execution import (
+        execute_artifact_write,
+        execute_azure_blob,
+        execute_bigquery_sql,
+        execute_databricks_sql,
+        execute_elasticsearch,
+        execute_gcs,
+        execute_github,
+        execute_mysql,
+        execute_notion,
+        execute_postgres,
+        execute_rest_api,
+        execute_s3_family,
+        execute_slack,
+        execute_sqlserver_sql,
+        execute_snowflake_sql,
+        is_artifact_platform_write,
+    )
 import json
 import logging
 import os

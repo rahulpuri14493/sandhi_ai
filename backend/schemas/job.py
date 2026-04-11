@@ -155,6 +155,10 @@ class RerunResponse(BaseModel):
     message: str
     job_id: int
     status: str
+    mode: Optional[str] = None
+    resume_start_step_order: Optional[int] = None
+    steps_reused_count: Optional[int] = None
+    steps_rerun_count: Optional[int] = None
 
 
 def _parse_int_list(v):
@@ -328,6 +332,17 @@ class WorkflowStepResponse(BaseModel):
     allowed_platform_tool_ids: Optional[List[int]] = None
     allowed_connection_ids: Optional[List[int]] = None
     tool_visibility: Optional[str] = None  # full | names_only | none
+    # Runtime telemetry snapshot (Redis-first in internal APIs; durable DB fallback here).
+    live_phase: Optional[str] = None
+    live_phase_started_at: Optional[datetime] = None
+    live_reason_code: Optional[str] = None
+    live_reason_detail: Optional[str] = None
+    live_trace_id: Optional[str] = None
+    live_attempt: Optional[int] = None
+    last_progress_at: Optional[datetime] = None
+    last_activity_at: Optional[datetime] = None
+    stuck_since: Optional[datetime] = None
+    stuck_reason: Optional[str] = None
 
     class Config:
         from_attributes = True

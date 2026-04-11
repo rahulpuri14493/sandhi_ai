@@ -205,7 +205,8 @@ cython_debug/
 #  refer to https://docs.cursor.com/context/ignore-files
 .cursorignore
 .cursorindexingignore
-.cursor/rules/codeql-platform-mcp-security.mdc
+# Local Cursor project rules and editor state (not shared via repo)
+.cursor/
 
 # Marimo
 marimo/_static/

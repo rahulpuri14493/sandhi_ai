@@ -1,8 +1,13 @@
+# Fork PRs: runs on the PR head with read-only token; comment-summary needs pull-requests: write (works for fork PRs into this repo).
 name: Dependency Review
 
 on:
   pull_request:
-    branches: ["main"]
+    branches: ["**"]
+
+concurrency:
+  group: dependency-review-${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: true
 
 permissions:
   contents: read

@@ -44,6 +44,7 @@ from models.job import (
     WorkflowStep, ScheduleExecutionHistory,
 )
 from services.agent_executor import AgentExecutor
+from services.business_job_alerts import send_business_job_alert
 from services.task_queue import enqueue_execute_platform_job
 
 from services.task_queue import celery_app, trigger_scheduled_job
@@ -63,21 +64,50 @@ def get_scheduler() -> Optional["JobSchedulerService"]:
 # Job execution helpers (public API — used by routes for rerun)
 # ---------------------------------------------------------------------------
 
-def reset_job_for_execution(db: Session, job: Job):
-    """Reset a job's workflow steps so it can be executed again.
-
-    Clears step output/status/cost and resets job metadata.
-    Does NOT commit — the caller is responsible for setting the final
-    job status (e.g. IN_QUEUE) and committing in a single transaction
-    to avoid a window where the job is in an intermediate state.
-    """
-    steps = db.query(WorkflowStep).filter(WorkflowStep.job_id == job.id).all()
-    for step in steps:
+def _reset_step_runtime_fields(step: WorkflowStep, *, clear_output: bool) -> None:
+    """Reset transient runtime fields for a workflow step."""
+    if clear_output:
         step.output_data = None
-        step.status = "pending"
-        step.started_at = None
-        step.completed_at = None
-        step.cost = 0.0
+    step.status = "pending"
+    step.started_at = None
+    step.completed_at = None
+    step.cost = 0.0
+    step.last_progress_at = None
+    step.last_activity_at = None
+    step.live_phase = None
+    step.live_phase_started_at = None
+    step.live_reason_code = None
+    step.live_reason_detail = None
+    step.live_trace_id = None
+    step.live_attempt = None
+    step.stuck_since = None
+    step.stuck_reason = None
+
+
+def reset_job_for_execution(db: Session, job: Job, *, mode: str = "full"):
+    """Reset workflow steps for re-execution.
+
+    Modes:
+      - full: reset every step and clear all outputs (legacy behavior).
+      - resume: keep completed steps and outputs; reset non-completed steps only.
+
+    Does NOT commit — callers should commit atomically with status updates.
+    """
+    normalized_mode = (mode or "full").strip().lower()
+    if normalized_mode not in {"full", "resume"}:
+        raise ValueError("mode must be 'full' or 'resume'")
+
+    steps = (
+        db.query(WorkflowStep)
+        .filter(WorkflowStep.job_id == job.id)
+        .order_by(WorkflowStep.step_order)
+        .all()
+    )
+    for step in steps:
+        if normalized_mode == "resume" and step.status == "completed":
+            # Preserve completed outputs for resume-from-failure semantics.
+            continue
+        _reset_step_runtime_fields(step, clear_output=True)
 
     job.completed_at = None
     job.failure_reason = None
@@ -322,6 +352,17 @@ def _execute_schedule(schedule_id: int):
         schedule.status = ScheduleStatus.INACTIVE
         schedule.next_run_time = None
         db.commit()
+        try:
+            send_business_job_alert(
+                event_type="job_started",
+                job_id=int(job.id),
+                business_id=int(job.business_id),
+                title=str(job.title or f"Job {job.id}"),
+                status="in_progress",
+                stage="execution_started",
+            )
+        except Exception:
+            pass
 
         # Internal cleanup of the scheduler singleton state (task has already fired)
         svc = get_scheduler()
@@ -346,6 +387,17 @@ def _execute_schedule(schedule_id: int):
             history.failure_reason = job.failure_reason
             history.completed_at = datetime.utcnow()
             db.commit()
+            try:
+                send_business_job_alert(
+                    event_type="job_failed",
+                    job_id=int(job.id),
+                    business_id=int(job.business_id),
+                    title=str(job.title or f"Job {job.id}"),
+                    status="failed",
+                    reason=str(job.failure_reason or ""),
+                )
+            except Exception:
+                pass
     except Exception:
         logger.exception("Error executing schedule %s", schedule_id)
         db.rollback()

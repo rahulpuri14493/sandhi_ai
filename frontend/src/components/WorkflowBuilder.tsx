@@ -176,9 +176,15 @@ export function WorkflowBuilder({ jobId, onWorkflowCreated, initialSelectedAgent
     // Steps are ordered by step_order; index i = step_order - 1
     const next: StepToolSelection = {}
     steps.forEach((step, i) => {
-      const platformIds = step.allowed_platform_tool_ids ?? []
-      const connectionIds = step.allowed_connection_ids ?? []
-      const toolVisibility = step.tool_visibility as ToolVisibility | undefined
+      const rawVis = step.tool_visibility as ToolVisibility | undefined
+      const toolVisibility =
+        rawVis === 'full' || rawVis === 'names_only' || rawVis === 'none' ? rawVis : undefined
+      let platformIds = step.allowed_platform_tool_ids ?? []
+      let connectionIds = step.allowed_connection_ids ?? []
+      if (toolVisibility === 'none') {
+        platformIds = []
+        connectionIds = []
+      }
       next[i] = { platformIds, connectionIds, toolVisibility }
     })
     setStepToolSelections((prev) => {
@@ -273,7 +279,13 @@ export function WorkflowBuilder({ jobId, onWorkflowCreated, initialSelectedAgent
     })
   }
 
+  const stepEffectiveToolVisibility = (agentIndex: number): ToolVisibility => {
+    const cur = stepToolSelections[agentIndex]
+    return cur?.toolVisibility ?? jobToolVisibility
+  }
+
   const toggleStepPlatformTool = (agentIndex: number, toolId: number) => {
+    if (stepEffectiveToolVisibility(agentIndex) === 'none') return
     const cur = stepToolSelections[agentIndex] ?? { platformIds: [], connectionIds: [] }
     const platformIds = cur.platformIds.includes(toolId)
       ? cur.platformIds.filter((id) => id !== toolId)
@@ -282,6 +294,7 @@ export function WorkflowBuilder({ jobId, onWorkflowCreated, initialSelectedAgent
   }
 
   const toggleStepConnection = (agentIndex: number, connId: number) => {
+    if (stepEffectiveToolVisibility(agentIndex) === 'none') return
     const cur = stepToolSelections[agentIndex] ?? { platformIds: [], connectionIds: [] }
     const connectionIds = cur.connectionIds.includes(connId)
       ? cur.connectionIds.filter((id) => id !== connId)
@@ -290,12 +303,14 @@ export function WorkflowBuilder({ jobId, onWorkflowCreated, initialSelectedAgent
   }
 
   const addStepPlatformTool = (agentIndex: number, toolId: number) => {
+    if (stepEffectiveToolVisibility(agentIndex) === 'none') return
     const cur = stepToolSelections[agentIndex] ?? { platformIds: [], connectionIds: [] }
     if (cur.platformIds.includes(toolId)) return
     setStepTools(agentIndex, [...cur.platformIds, toolId], cur.connectionIds, cur.toolVisibility)
   }
 
   const addStepConnection = (agentIndex: number, connId: number) => {
+    if (stepEffectiveToolVisibility(agentIndex) === 'none') return
     const cur = stepToolSelections[agentIndex] ?? { platformIds: [], connectionIds: [] }
     if (cur.connectionIds.includes(connId)) return
     setStepTools(agentIndex, cur.platformIds, [...cur.connectionIds, connId], cur.toolVisibility)
@@ -355,7 +370,11 @@ export function WorkflowBuilder({ jobId, onWorkflowCreated, initialSelectedAgent
     setIsLoading(true)
     setError('')
     try {
-      const data = await jobsAPI.suggestWorkflowTools(jobId, selectedAgents)
+      const step_tool_visibility = selectedAgents.map((_, idx) => {
+        const s = stepToolSelections[idx]
+        return (s?.toolVisibility ?? jobToolVisibility) as ToolVisibility
+      })
+      const data = await jobsAPI.suggestWorkflowTools(jobId, selectedAgents, step_tool_visibility)
       if (data.detail && !(data.step_suggestions && data.step_suggestions.length)) {
         setError(data.detail)
         return
@@ -365,6 +384,16 @@ export function WorkflowBuilder({ jobId, onWorkflowCreated, initialSelectedAgent
       for (const s of data.step_suggestions || []) {
         const idx = s.agent_index
         const prev = base[idx] ?? { platformIds: [], connectionIds: [] }
+        const effVis = prev.toolVisibility ?? jobToolVisibility
+        if (effVis === 'none') {
+          next[idx] = {
+            platformIds: [],
+            connectionIds: [],
+            toolVisibility: 'none',
+            ...(prev.taskType ? { taskType: prev.taskType } : {}),
+          }
+          continue
+        }
         next[idx] = {
           platformIds: s.platform_tool_ids ?? [],
           connectionIds: prev.connectionIds,
@@ -416,18 +445,28 @@ export function WorkflowBuilder({ jobId, onWorkflowCreated, initialSelectedAgent
       const current = stepToolSelectionsRef.current
       const stepTools = selectedAgents.map((_, idx) => {
         const sel = current[idx]
+        const effVis = sel?.toolVisibility ?? jobToolVisibility
+        const slug = (sel?.taskType ?? '').trim().toLowerCase()
+        const task_type = /^[a-z][a-z0-9_]{0,63}$/i.test(slug) ? slug : undefined
+        if (effVis === 'none') {
+          return {
+            agent_index: idx,
+            allowed_platform_tool_ids: [] as number[],
+            allowed_connection_ids: [] as number[],
+            tool_visibility: 'none' as const,
+            ...(task_type ? { task_type } : {}),
+          }
+        }
         const hasPlatform = (sel?.platformIds?.length ?? 0) > 0
         const hasConn = (sel?.connectionIds?.length ?? 0) > 0
         // When only connections are selected, send empty platform list so backend does not inherit job-level platform tools
         const platformIds = hasPlatform ? sel!.platformIds : (hasConn ? [] : undefined)
         const connectionIds = hasConn ? sel!.connectionIds : (hasPlatform ? [] : undefined)
-        const slug = (sel?.taskType ?? '').trim().toLowerCase()
-        const task_type = /^[a-z][a-z0-9_]{0,63}$/i.test(slug) ? slug : undefined
         return {
           agent_index: idx,
           allowed_platform_tool_ids: platformIds,
           allowed_connection_ids: connectionIds,
-          tool_visibility: sel?.toolVisibility ?? jobToolVisibility,
+          tool_visibility: effVis,
           ...(task_type ? { task_type } : {}),
         }
       })
@@ -700,19 +739,29 @@ export function WorkflowBuilder({ jobId, onWorkflowCreated, initialSelectedAgent
                 {selectedAgents.map((agentId, idx) => {
                   const agent = availableAgents.find((a) => a.id === agentId)
                   const sel = stepToolSelections[idx] ?? { platformIds: [], connectionIds: [] }
+                  const effVis = sel.toolVisibility ?? jobToolVisibility
                   const selectedPlatformTools = platformTools.filter((t) => sel.platformIds.includes(t.id))
                   const selectedConns = connections.filter((c) => sel.connectionIds.includes(c.id))
                   const availableToAddPlatform = platformTools.filter((t) => !sel.platformIds.includes(t.id))
                   const availableToAddConn = connections.filter((c) => !sel.connectionIds.includes(c.id))
-                  const hasAnySelected = selectedPlatformTools.length > 0 || selectedConns.length > 0
+                  const showToolAssignment = effVis !== 'none'
+                  const hasAnySelected =
+                    showToolAssignment && (selectedPlatformTools.length > 0 || selectedConns.length > 0)
                   return (
                     <div key={agentId} className="border border-dark-300 rounded-lg p-4 bg-dark-200/30">
                       <div className="font-bold text-white mb-2">Step {idx + 1}: {agent?.name ?? `Agent ${agentId}`}</div>
                       <div className="mb-3">
                         <label className="text-xs text-white/70 mr-2">Step tool visibility:</label>
                         <select
-                          value={sel.toolVisibility ?? jobToolVisibility}
-                          onChange={(e) => setStepTools(idx, sel.platformIds, sel.connectionIds, e.target.value as ToolVisibility)}
+                          value={effVis}
+                          onChange={(e) => {
+                            const v = e.target.value as ToolVisibility
+                            if (v === 'none') {
+                              setStepTools(idx, [], [], v)
+                            } else {
+                              setStepTools(idx, sel.platformIds, sel.connectionIds, v)
+                            }
+                          }}
                           className="px-2 py-1 bg-dark-200/80 border border-dark-300 rounded text-white text-sm min-w-[200px]"
                           title="Full = names, descriptions, schema. Names only = names + short description. None = no tools."
                         >
@@ -729,9 +778,13 @@ export function WorkflowBuilder({ jobId, onWorkflowCreated, initialSelectedAgent
                           type="text"
                           value={sel.taskType ?? ''}
                           onChange={(e) =>
-                            setStepTools(idx, sel.platformIds, sel.connectionIds, sel.toolVisibility, {
-                              taskType: e.target.value,
-                            })
+                            setStepTools(
+                              idx,
+                              effVis === 'none' ? [] : sel.platformIds,
+                              effVis === 'none' ? [] : sel.connectionIds,
+                              sel.toolVisibility,
+                              { taskType: e.target.value }
+                            )
                           }
                           placeholder="e.g. search, persist"
                           className="w-full max-w-md px-3 py-2 bg-dark-200/80 border border-dark-300 rounded-lg text-white text-sm placeholder:text-white/35 focus:ring-2 focus:ring-primary-500 focus:border-primary-500"
@@ -740,7 +793,11 @@ export function WorkflowBuilder({ jobId, onWorkflowCreated, initialSelectedAgent
                       </div>
                       <div className="space-y-2">
                         <div className="text-sm font-semibold text-white/90">Selected for this step:</div>
-                        {!hasAnySelected ? (
+                        {!showToolAssignment ? (
+                          <p className="text-xs text-white/60">
+                            No tools for this step — visibility is set to None (no MCP tools).
+                          </p>
+                        ) : !hasAnySelected ? (
                           jobHasExplicitMcpScope(job) ? (
                             <p className="text-xs text-white/50 italic">
                               No tools selected for this step — uses the job&rsquo;s tool list.
@@ -809,7 +866,8 @@ export function WorkflowBuilder({ jobId, onWorkflowCreated, initialSelectedAgent
                             ))}
                           </div>
                         )}
-                        {(availableToAddPlatform.length > 0 || availableToAddConn.length > 0) && (
+                        {showToolAssignment &&
+                          (availableToAddPlatform.length > 0 || availableToAddConn.length > 0) && (
                           <div className="flex flex-wrap items-center gap-2 pt-1">
                             <span className="text-xs text-white/70">Add tool:</span>
                             {availableToAddPlatform.length > 0 && (
