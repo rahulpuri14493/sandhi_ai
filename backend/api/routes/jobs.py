@@ -28,7 +28,7 @@ from schemas.job import (
 from core.security import get_current_user, get_current_business_user
 from core.config import settings
 from services.job_scheduler import get_scheduler, reset_job_for_execution, queue_job_execution
-from services.task_queue import get_queue_stats
+from services.task_queue import get_queue_stats, QueueEnqueueError
 from services.task_splitter import PlannerSplitError
 from services.workflow_builder import WorkflowBuilder
 from services.tool_splitter import suggest_tool_assignments_for_agents
@@ -2212,15 +2212,36 @@ def execute_job(
             execution_token=execution_token,
             strict=bool(getattr(settings, "JOB_EXECUTION_STRICT_QUEUE", False)),
         )
-    except Exception as exc:
-        job.status = JobStatus.PENDING_APPROVAL
-        job.execution_token = None
-        job.failure_reason = f"Failed to enqueue execution: {str(exc)[:200]}"
-        db.commit()
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="Failed to enqueue job execution. Please try again.",
-        )
+    except (QueueEnqueueError, Exception) as exc:
+        if isinstance(exc, QueueEnqueueError):
+            # 1. System is full - move to FAILED so user can see why in the history/status
+            job.status = JobStatus.FAILED
+            job.execution_token = None
+            job.failure_reason = f"Failed to enqueue execution: {str(exc)[:200]}"
+            db.commit()
+
+            raise HTTPException(
+                status_code=503,
+                headers={"Retry-After": "30"},
+                detail={
+                    "error": "queue_overloaded", 
+                    "message": "The system is currently at capacity. Please try again later.",
+                },
+            ) from exc
+        else:
+            # 2. Transient/Unexpected error - roll back to PENDING_APPROVAL per main branch behavior
+            job.status = JobStatus.PENDING_APPROVAL
+            job.execution_token = None
+            job.failure_reason = f"Failed to enqueue execution: {str(exc)[:200]}"
+            db.commit()
+
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail={
+                    "error": "enqueue_failed",
+                    "message": "Failed to enqueue job execution. Please try again.",
+                },
+            ) from exc
     
     # Parse files and conversation for response
     files_data = None
@@ -2816,21 +2837,32 @@ def rerun_job(
             execution_token=execution_token,
             strict=bool(getattr(settings, "JOB_EXECUTION_STRICT_QUEUE", False)),
         )
-    except Exception as exc:
+    except (QueueEnqueueError, Exception) as exc:
+        # 1. Shared cleanup logic (runs for BOTH exception types)
         logger.exception("Failed to enqueue execution for job %s", job.id)
         job.status = JobStatus.FAILED
         job.execution_token = None
         job.failure_reason = f"Failed to start execution: {str(exc)[:200]}"
+
         if history_id:
             hist = db.query(ScheduleExecutionHistory).filter(ScheduleExecutionHistory.id == history_id).first()
             if hist:
                 hist.status = "failed"
                 hist.failure_reason = job.failure_reason
         db.commit()
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail=f"Failed to enqueue job execution: {str(exc)[:200]}",
-        )
+
+        # 2. Specific HTTP Responses
+        if isinstance(exc, QueueEnqueueError):
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                headers={"Retry-After": "30"},
+                detail={"error": "queue_overloaded"},
+            )
+        else:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail=f"Failed to enqueue job execution: {str(exc)[:200]}",
+            )
 
     return RerunResponse(
         message=f"Job re-execution started ({mode_effective})",

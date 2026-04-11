@@ -4,7 +4,7 @@ import io
 import json
 import uuid
 from datetime import datetime, timedelta, timezone
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 from fastapi.testclient import TestClient
 
@@ -14,6 +14,7 @@ from models.agent import Agent, AgentStatus
 from models.job import Job, JobStatus, WorkflowStep
 from models.mcp_server import MCPToolConfig, MCPToolType
 from models.user import User, UserRole
+from services.task_queue import QueueEnqueueError
 
 
 def _headers_biz(db_session, suffix: str | None = None):
@@ -629,3 +630,77 @@ def test_suggest_workflow_tools_post_no_platform_tools_returns_fallback(client: 
     data = r.json()
     assert data.get("fallback_used") is True
     assert data.get("step_suggestions") == []
+
+
+def test_execute_job_overload_returns_503(client, db_session):
+    u, h = _headers_biz(db_session, "ex_ovr")
+    
+    agent = Agent(name="TestAgent", developer_id=u.id, status=AgentStatus.ACTIVE, price_per_task=0, api_endpoint="http://ex.com")
+    db_session.add(agent)
+    db_session.commit()
+
+    job = Job(business_id=u.id, title="Execute Overload", status=JobStatus.PENDING_APPROVAL, conversation="[]")
+    db_session.add(job)
+    db_session.commit()
+
+    step = WorkflowStep(job_id=job.id, agent_id=agent.id, step_order=1, input_data="{}")
+    db_session.add(step)
+    db_session.commit()
+    db_session.refresh(job)
+
+    with patch("api.routes.jobs.queue_job_execution") as mock_queue:
+        mock_queue.side_effect = QueueEnqueueError("overloaded")
+        
+        r = client.post(f"/api/jobs/{job.id}/execute", headers=h)
+        assert r.status_code == 503
+        if r.headers.get("Retry-After"):
+            assert r.headers.get("Retry-After") == "30"
+
+        db_session.expire_all()
+        job = db_session.query(Job).filter(Job.id == job.id).first()
+        assert job.status == JobStatus.FAILED
+        assert job.execution_token is None
+        assert "overloaded" in job.failure_reason
+
+def test_rerun_job_overload_returns_503(client, db_session):
+    u, h = _headers_biz(db_session, "re_ovr")
+    
+    agent = Agent(name="TestAgent2", developer_id=u.id, status=AgentStatus.ACTIVE, price_per_task=0, api_endpoint="http://ex.com")
+    db_session.add(agent)
+    db_session.commit()
+
+    # Rerun requires FAILED status to start
+    job = Job(business_id=u.id, title="Rerun Overload", status=JobStatus.FAILED, conversation="[]")
+    db_session.add(job)
+    db_session.commit()
+
+    step = WorkflowStep(job_id=job.id, agent_id=agent.id, step_order=1, input_data="{}")
+    db_session.add(step)
+    db_session.commit()
+
+    with patch("api.routes.jobs.queue_job_execution") as mock_queue:
+        mock_queue.side_effect = QueueEnqueueError("overloaded")
+        
+        r = client.post(f"/api/jobs/{job.id}/rerun", headers=h)
+        
+        # 1. Assert HTTP Response
+        assert r.status_code == 503
+        if r.headers.get("Retry-After"):
+             assert r.headers.get("Retry-After") == "30"
+        
+        # 2. Assert DB State
+        db_session.expire_all()
+        job = db_session.query(Job).filter(Job.id == job.id).first()
+
+        assert job.status == JobStatus.FAILED
+        assert job.execution_token is None
+        assert "overloaded" in job.failure_reason.lower()
+
+        # 3. Assert History State (if your rerun logic creates a history record)
+        from models.job import ScheduleExecutionHistory
+        hist = db_session.query(ScheduleExecutionHistory).filter(ScheduleExecutionHistory.job_id == job.id).first()
+        if hist:
+            assert hist.status == "failed"
+            assert "overloaded" in hist.failure_reason.lower()
+
+    

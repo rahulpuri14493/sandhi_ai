@@ -1224,3 +1224,4 @@ def test_patch_workflow_step_malformed_json_in_db(client: TestClient, db_session
     )
     assert r.status_code == 200
     assert r.json().get("allowed_platform_tool_ids") is None
+
