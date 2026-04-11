@@ -634,6 +634,35 @@ async def test_write_like_with_idempotency_allows_retries(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_quota_release_matches_policy_when_global_limits_zero(monkeypatch):
+    """Acquire uses tool/tier policy limits; release must use the same (Codex: inflight leak)."""
+    monkeypatch.setattr("core.config.settings.MCP_GUARDRAILS_DISTRIBUTED_ENABLED", False, raising=False)
+    monkeypatch.setattr("core.config.settings.MCP_TENANT_MAX_CONCURRENT_CALLS", 0, raising=False)
+    monkeypatch.setattr("core.config.settings.MCP_TARGET_MAX_CONCURRENT_CALLS", 0, raising=False)
+    monkeypatch.setattr("core.config.settings.MCP_TENANT_RATE_LIMIT_PER_MINUTE", 0, raising=False)
+    monkeypatch.setattr("core.config.settings.MCP_CONCURRENCY_WAIT_SECONDS", 0.0, raising=False)
+    monkeypatch.setattr(
+        "core.config.settings.MCP_TOOL_POLICY_JSON",
+        '{"toolA":{"tenant_max_concurrent_calls":1}}',
+        raising=False,
+    )
+    g = MCPInvocationGuardrails()
+
+    async def _ok(_timeout: float):
+        return {"content": [{"type": "text", "text": "ok"}]}
+
+    await g.call_tool_with_guardrails(
+        business_id=1,
+        target_key="t",
+        timeout_seconds=1.0,
+        execute_call=_ok,
+        tool_name="toolA",
+    )
+    assert g._tenant_inflight == {}
+    assert g._target_inflight == {}
+
+
+@pytest.mark.asyncio
 async def test_tier_and_tool_policy_override(monkeypatch):
     monkeypatch.setattr(
         "core.config.settings.MCP_TENANT_TIER_POLICY_JSON",

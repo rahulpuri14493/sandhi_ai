@@ -448,11 +448,12 @@ return 0
                 )
             await asyncio.sleep(min(0.05, max(0.005, deadline - now)))
 
-    async def _release_quota(self, business_id: int, target_key: str) -> None:
+    async def _release_quota(self, business_id: int, target_key: str, policy: Dict[str, Any]) -> None:
+        # Must mirror _acquire_quota / _acquire_quota_distributed limit resolution (tier/tool overrides).
+        tenant_limit = int(policy.get("tenant_max_concurrent_calls") or getattr(settings, "MCP_TENANT_MAX_CONCURRENT_CALLS", 0) or 0)
+        target_limit = int(policy.get("target_max_concurrent_calls") or getattr(settings, "MCP_TARGET_MAX_CONCURRENT_CALLS", 0) or 0)
         r = self._get_redis_client()
         if r is not None:
-            tenant_limit = int(getattr(settings, "MCP_TENANT_MAX_CONCURRENT_CALLS", 0) or 0)
-            target_limit = int(getattr(settings, "MCP_TARGET_MAX_CONCURRENT_CALLS", 0) or 0)
             if tenant_limit > 0:
                 try:
                     r.decr(self._redis_counter_key("tenant", business_id, target_key))
@@ -464,8 +465,6 @@ return 0
                 except Exception:
                     pass
             return
-        tenant_limit = int(getattr(settings, "MCP_TENANT_MAX_CONCURRENT_CALLS", 0) or 0)
-        target_limit = int(getattr(settings, "MCP_TARGET_MAX_CONCURRENT_CALLS", 0) or 0)
         if tenant_limit <= 0 and target_limit <= 0:
             return
         async with self._lock:
@@ -844,7 +843,7 @@ return 0
                 raise MCPGuardrailError(cls.code, cls.detail, retryable=cls.retryable, cause=exc) from exc
             finally:
                 if acquired_quota:
-                    await self._release_quota(business_id, target_key)
+                    await self._release_quota(business_id, target_key, policy)
 
         if isinstance(last_exc, MCPGuardrailError):
             raise last_exc
