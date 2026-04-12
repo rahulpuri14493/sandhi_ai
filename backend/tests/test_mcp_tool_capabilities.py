@@ -13,6 +13,16 @@ def test_tool_access_sql():
     assert s["supports_artifact_platform_write"] is True
 
 
+def test_tool_access_messaging_read_and_write():
+    for tt in ("slack", "teams", "smtp"):
+        s = tool_access_summary(tt)
+        assert s["tier"] == "messaging"
+        assert s["interactive_read_primary"] is True
+        assert s["supports_interactive_write"] is True
+        assert s["supports_artifact_platform_write"] is False
+        assert "read" in s["label"].lower() and "write" in s["label"].lower()
+
+
 def test_partition_multi_agent():
     tools = [
         {"id": 1, "tool_type": "pinecone", "name": "P"},

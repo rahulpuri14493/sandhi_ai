@@ -84,6 +84,12 @@ async def lifespan(app: FastAPI):
         _scheduler_service.start()
     yield
     _scheduler_service.stop()
+    try:
+        from services.mcp_client import shutdown_shared_mcp_http_clients
+
+        await shutdown_shared_mcp_http_clients()
+    except Exception:
+        pass
 
 
 app = FastAPI(

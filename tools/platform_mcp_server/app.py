@@ -6,6 +6,7 @@ Tools are resolved per business (tenant) via the Sandhi AI backend internal API.
 Implements Vector DB, PostgreSQL, and File system tools using tenant-stored config.
 """
 try:
+    from execution_contract import CONTRACT_ERROR_CODES
     from execution_common import safe_tool_error
     from execution import (
         execute_artifact_write,
@@ -21,7 +22,9 @@ try:
         execute_rest_api,
         execute_s3_family,
         execute_slack,
+        execute_smtp,
         execute_sqlserver_sql,
+        execute_teams,
         execute_snowflake_sql,
         is_artifact_platform_write,
     )
@@ -33,6 +36,7 @@ except ModuleNotFoundError:
     _here = _os.path.dirname(_os.path.abspath(__file__))
     if _here not in _sys.path:
         _sys.path.insert(0, _here)
+    from execution_contract import CONTRACT_ERROR_CODES
     from execution_common import safe_tool_error
     from execution import (
         execute_artifact_write,
@@ -48,7 +52,9 @@ except ModuleNotFoundError:
         execute_rest_api,
         execute_s3_family,
         execute_slack,
+        execute_smtp,
         execute_sqlserver_sql,
+        execute_teams,
         execute_snowflake_sql,
         is_artifact_platform_write,
     )
@@ -61,6 +67,8 @@ from contextlib import asynccontextmanager
 from typing import Any, Dict, List, Optional
 
 import httpx
+
+from execution_http import get_sync_http_client
 from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import JSONResponse
 
@@ -161,20 +169,40 @@ def _get_business_id(request: Request) -> int:
 def _fetch_platform_tools(business_id: int) -> List[Dict[str, Any]]:
     """Fetch tool list from backend internal API."""
     url = f"{BACKEND_BASE}/api/internal/mcp/tools?business_id={business_id}"
-    with httpx.Client(timeout=15.0) as client:
-        r = client.get(url, headers=INTERNAL_HEADERS)
-        r.raise_for_status()
-        data = r.json()
+    r = get_sync_http_client().get(url, headers=INTERNAL_HEADERS, timeout=15.0)
+    r.raise_for_status()
+    data = r.json()
     return data.get("tools", [])
 
 
 def _fetch_tool_config(business_id: int, tool_id: int) -> Dict[str, Any]:
     """Fetch decrypted tool config from backend."""
     url = f"{BACKEND_BASE}/api/internal/mcp/tools/{tool_id}/config"
-    with httpx.Client(timeout=15.0) as client:
-        r = client.post(url, json={"business_id": business_id}, headers=INTERNAL_HEADERS)
-        r.raise_for_status()
-        return r.json()
+    r = get_sync_http_client().post(
+        url, json={"business_id": business_id}, headers=INTERNAL_HEADERS, timeout=15.0
+    )
+    r.raise_for_status()
+    return r.json()
+
+
+def _tool_result_is_error(result_text: Optional[str]) -> bool:
+    """True when tool output should surface as MCP isError (plain errors or contract/provider failures)."""
+    if not result_text:
+        return False
+    s = str(result_text).strip()
+    if s.startswith("Error:"):
+        return True
+    try:
+        obj = json.loads(s)
+        if isinstance(obj, dict):
+            err = obj.get("error")
+            if err in CONTRACT_ERROR_CODES:
+                return True
+            if err and isinstance(err, str) and err != "ok":
+                return True
+    except (json.JSONDecodeError, TypeError):
+        pass
+    return False
 
 
 def _tool_result_for_log(text: str, max_len: int = 12000) -> str:
@@ -185,7 +213,7 @@ def _tool_result_for_log(text: str, max_len: int = 12000) -> str:
         is_err = False
     else:
         length = len(text)
-        is_err = str(text).startswith("Error:")
+        is_err = _tool_result_is_error(text)
     return f"[redacted tool output] len={length} is_error={is_err}"
 
 
@@ -967,19 +995,19 @@ def _execute_qdrant(config: Dict[str, Any], arguments: Dict[str, Any]) -> str:
 
 def _chroma_cloud_http_embed_query_vector(api_key: str, text: str, model: str) -> List[float]:
     """Embed query text via Chroma Cloud's embed service (same contract as chromadb ChromaCloudQwenEmbeddingFunction with task=None)."""
-    with httpx.Client(timeout=60.0) as client:
-        r = client.post(
-            "https://embed.trychroma.com",
-            json={"instructions": "", "texts": [text]},
-            headers={
-                "x-chroma-token": api_key.strip(),
-                "x-chroma-embedding-model": model.strip(),
-                "Content-Type": "application/json",
-            },
-        )
-        if r.status_code >= 400:
-            raise RuntimeError(f"embed.trychroma.com HTTP {r.status_code}: {r.text[:600]}")
-        data = r.json()
+    r = get_sync_http_client().post(
+        "https://embed.trychroma.com",
+        json={"instructions": "", "texts": [text]},
+        headers={
+            "x-chroma-token": api_key.strip(),
+            "x-chroma-embedding-model": model.strip(),
+            "Content-Type": "application/json",
+        },
+        timeout=60.0,
+    )
+    if r.status_code >= 400:
+        raise RuntimeError(f"embed.trychroma.com HTTP {r.status_code}: {r.text[:600]}")
+    data = r.json()
     if isinstance(data, dict) and data.get("error"):
         raise RuntimeError(str(data.get("error"))[:600])
     embeddings = data.get("embeddings") if isinstance(data, dict) else None
@@ -1214,14 +1242,14 @@ def _execute_vector_db(config: Dict[str, Any], arguments: Dict[str, Any]) -> str
         return "Error: query is required"
     if url and api_key:
         try:
-            with httpx.Client(timeout=10.0) as client:
-                r = client.post(
-                    url.rstrip("/") + "/query",
-                    json={"query": query, "top_k": top_k},
-                    headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
-                )
-                if r.status_code == 200:
-                    return json.dumps(r.json(), indent=2)
+            r = get_sync_http_client().post(
+                url.rstrip("/") + "/query",
+                json={"query": query, "top_k": top_k},
+                headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+                timeout=10.0,
+            )
+            if r.status_code == 200:
+                return json.dumps(r.json(), indent=2)
         except Exception as e:
             logger.error("Vector DB query error (%s)", type(e).__name__)
             return "Vector query error"
@@ -1250,23 +1278,23 @@ def _execute_pageindex(config: Dict[str, Any], arguments: Dict[str, Any]) -> str
     thinking = arguments.get("thinking", False)
     headers = {"api_key": api_key, "Content-Type": "application/json"}
     try:
-        with httpx.Client(timeout=30.0) as client:
-            r = client.post(
-                f"{base}/retrieval/",
-                headers=headers,
-                json={"doc_id": doc_id, "query": query, "thinking": thinking},
-            )
-            if r.status_code != 200:
-                return f"PageIndex retrieval start error: {r.status_code} {r.text[:500]}"
-            data = r.json()
-            retrieval_id = data.get("retrieval_id")
-            if not retrieval_id:
-                return f"PageIndex unexpected response: {data}"
+        http = get_sync_http_client()
+        r = http.post(
+            f"{base}/retrieval/",
+            headers=headers,
+            json={"doc_id": doc_id, "query": query, "thinking": thinking},
+            timeout=30.0,
+        )
+        if r.status_code != 200:
+            return f"PageIndex retrieval start error: {r.status_code} {r.text[:500]}"
+        data = r.json()
+        retrieval_id = data.get("retrieval_id")
+        if not retrieval_id:
+            return f"PageIndex unexpected response: {data}"
         # Poll for completion (max ~60s)
         for _ in range(24):
             time.sleep(2.5)
-            with httpx.Client(timeout=15.0) as client:
-                r = client.get(f"{base}/retrieval/{retrieval_id}/", headers={"api_key": api_key})
+            r = http.get(f"{base}/retrieval/{retrieval_id}/", headers={"api_key": api_key}, timeout=15.0)
             if r.status_code != 200:
                 return f"PageIndex status error: {r.status_code} {r.text[:300]}"
             data = r.json()
@@ -1335,6 +1363,10 @@ def execute_platform_tool(tool_type: str, config: Dict[str, Any], arguments: Dic
         return execute_gcs(config, arguments)
     if tool_type == "slack":
         return execute_slack(config, arguments)
+    if tool_type == "smtp":
+        return execute_smtp(config, arguments)
+    if tool_type == "teams":
+        return execute_teams(config, arguments)
     if tool_type == "github":
         return execute_github(config, arguments)
     if tool_type == "notion":
@@ -1426,7 +1458,7 @@ async def jsonrpc(request: Request, x_mcp_business_id: Optional[str] = Header(No
             config = data.get("config") or {}
             tool_type = data.get("tool_type") or "vector_db"
             result_text = execute_platform_tool(tool_type, config, arguments)
-            is_err = result_text.startswith("Error:")
+            is_err = _tool_result_is_error(result_text)
             logger.info(
                 "MCP tools/call business_id=%s tool=%s tool_type=%s is_error=%s result_chars=%s result_output=%s%s",
                 business_id,

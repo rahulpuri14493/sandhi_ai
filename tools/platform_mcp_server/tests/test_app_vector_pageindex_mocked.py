@@ -210,10 +210,7 @@ class TestChromaCloudHttpEmbed:
         mock_resp.json.return_value = {"embeddings": [[0.1, 0.2, 0.3]]}
         mock_http = MagicMock()
         mock_http.post.return_value = mock_resp
-        cm = MagicMock()
-        cm.__enter__.return_value = mock_http
-        cm.__exit__.return_value = None
-        with patch("httpx.Client", return_value=cm):
+        with patch.object(app_module, "get_sync_http_client", return_value=mock_http):
             vec = app_module._chroma_cloud_http_embed_query_vector("tok", "hello", "Qwen/Qwen3-Embedding-0.6B")
         assert vec == [0.1, 0.2, 0.3]
 
@@ -223,10 +220,7 @@ class TestChromaCloudHttpEmbed:
         mock_resp.text = "bad"
         mock_http = MagicMock()
         mock_http.post.return_value = mock_resp
-        cm = MagicMock()
-        cm.__enter__.return_value = mock_http
-        cm.__exit__.return_value = None
-        with patch("httpx.Client", return_value=cm):
+        with patch.object(app_module, "get_sync_http_client", return_value=mock_http):
             with pytest.raises(RuntimeError, match="embed.trychroma.com"):
                 app_module._chroma_cloud_http_embed_query_vector("t", "x", "Qwen/Qwen3-Embedding-0.6B")
 
@@ -284,12 +278,9 @@ class TestVectorDbAndPageIndex:
         mock_resp = MagicMock()
         mock_resp.status_code = 200
         mock_resp.json.return_value = {"ok": True}
-        mock_client = MagicMock()
-        mock_client.post.return_value = mock_resp
-        cm = MagicMock()
-        cm.__enter__.return_value = mock_client
-        cm.__exit__.return_value = None
-        with patch("httpx.Client", return_value=cm):
+        mock_http = MagicMock()
+        mock_http.post.return_value = mock_resp
+        with patch.object(app_module, "get_sync_http_client", return_value=mock_http):
             out = app_module._execute_vector_db(
                 {"url": "https://api.example.com", "api_key": "tok"},
                 {"query": "hi", "top_k": 2},
@@ -301,9 +292,9 @@ class TestVectorDbAndPageIndex:
         assert "configured" in out.lower()
 
     def test_vector_db_httpx_client_failure(self):
-        cm = MagicMock()
-        cm.__enter__.side_effect = RuntimeError("network")
-        with patch("httpx.Client", return_value=cm):
+        mock_http = MagicMock()
+        mock_http.post.side_effect = RuntimeError("network")
+        with patch.object(app_module, "get_sync_http_client", return_value=mock_http):
             out = app_module._execute_vector_db(
                 {"url": "http://api.example", "api_key": "k"},
                 {"query": "q"},
@@ -327,10 +318,7 @@ class TestVectorDbAndPageIndex:
         mock_http = MagicMock()
         mock_http.post.return_value = post_resp
         mock_http.get.return_value = get_resp
-        cm = MagicMock()
-        cm.__enter__.return_value = mock_http
-        cm.__exit__.return_value = None
-        with patch("httpx.Client", return_value=cm):
+        with patch.object(app_module, "get_sync_http_client", return_value=mock_http):
             with patch("time.sleep", lambda s: None):
                 out = app_module._execute_pageindex(
                     {"api_key": "k", "base_url": "https://api.pageindex.ai"},

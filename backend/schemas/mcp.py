@@ -1,5 +1,5 @@
 from pydantic import BaseModel, Field
-from typing import Optional, Literal
+from typing import Optional, Literal, Dict
 from datetime import datetime
 
 
@@ -11,6 +11,12 @@ class MCPServerConnectionCreate(BaseModel):
     endpoint_path: str = "/mcp"  # JSON-RPC endpoint path, e.g. /mcp, /message, /
     auth_type: str = "none"  # none, bearer, api_key, basic
     credentials: Optional[dict] = None  # { "token": "..." } or { "api_key": "..." } or { "username": "...", "password": "..." }
+
+
+class MCPServerConnectionValidate(MCPServerConnectionCreate):
+    """Validate payload; optional connection_id merges credentials over stored secrets when fields are left blank."""
+
+    connection_id: Optional[int] = None
 
 
 class MCPServerConnectionUpdate(BaseModel):
@@ -57,6 +63,8 @@ class MCPToolConfigUpdate(BaseModel):
 class ValidateToolConfigRequest(BaseModel):
     tool_type: str
     config: dict
+    # When set, merge `config` over the stored encrypted config so secret fields left blank in the UI still validate.
+    tool_id: Optional[int] = None
 
 
 class MCPToolConfigResponse(BaseModel):
@@ -73,6 +81,8 @@ class MCPToolConfigResponse(BaseModel):
     # Non-secret: Weaviate WCD display name + class name for edit form (no API keys).
     weaviate_cluster_preview: Optional[str] = None
     weaviate_class_preview: Optional[str] = None
+    # GET /tools/{id} only — safe scalar fields to repopulate the edit form (no tokens/passwords).
+    config_preview: Optional[Dict[str, str]] = None
     created_at: datetime
     updated_at: datetime
 

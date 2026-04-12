@@ -201,10 +201,7 @@ class TestElasticsearch:
         mock_resp.json.return_value = {"hits": []}
         mock_http = MagicMock()
         mock_http.post.return_value = mock_resp
-        cm = MagicMock()
-        cm.__enter__.return_value = mock_http
-        cm.__exit__.return_value = None
-        with patch("httpx.Client", return_value=cm):
+        with patch("execution_http.get_sync_http_client", return_value=mock_http):
             out = execute_elasticsearch(
                 {"url": "http://localhost:9200"},
                 {"query": "text", "index": "idx", "size": 5},
@@ -216,20 +213,14 @@ class TestElasticsearch:
         mock_resp.text = "unavailable"
         mock_http = MagicMock()
         mock_http.post.return_value = mock_resp
-        cm = MagicMock()
-        cm.__enter__.return_value = mock_http
-        cm.__exit__.return_value = None
-        with patch("httpx.Client", return_value=cm):
+        with patch("execution_http.get_sync_http_client", return_value=mock_http):
             out = execute_elasticsearch({"url": "http://h:9200"}, {"query": "q"})
         assert "503" in out
 
     def test_network_error_safe_message(self):
         mock_http = MagicMock()
         mock_http.post.side_effect = RuntimeError("down")
-        cm = MagicMock()
-        cm.__enter__.return_value = mock_http
-        cm.__exit__.return_value = None
-        with patch("httpx.Client", return_value=cm):
+        with patch("execution_http.get_sync_http_client", return_value=mock_http):
             out = execute_elasticsearch({"url": "http://h:9200"}, {"query": "q"})
         assert "Elasticsearch error" in out
 

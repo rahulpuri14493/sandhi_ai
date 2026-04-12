@@ -89,24 +89,82 @@ class TestExecuteSlack:
     def test_missing_token(self, monkeypatch):
         _ensure_fake_slack_sdk(monkeypatch)
         out = execute_slack({}, {"action": "send", "channel": "c", "message": "m"})
-        assert "bot_token" in out.lower()
+        data = json.loads(out)
+        assert data.get("error") == "validation_failed"
+        assert "bot_token" in (data.get("message") or "").lower()
 
     def test_send_missing_channel(self, monkeypatch):
         _ensure_fake_slack_sdk(monkeypatch)
-        out = execute_slack({"bot_token": "mock-slack-bot-token-unit-test"}, {"action": "send", "message": "hi"})
-        assert "channel" in out.lower()
+        out = execute_slack(
+            {"bot_token": "mock-slack-bot-token-unit-test"},
+            {"action": "send", "message": "hi", "idempotency_key": "unit-slack-missing-channel"},
+        )
+        data = json.loads(out)
+        assert data.get("error") == "validation_failed"
+        assert "channel" in (data.get("message") or "").lower()
 
     def test_list_channels(self, monkeypatch):
         _ensure_fake_slack_sdk(monkeypatch)
         inst = MagicMock()
-        inst.conversations_list.return_value = {"channels": [{"name": "general"}, {"name": "random"}]}
+        inst.conversations_list.return_value = {
+            "channels": [
+                {"id": "C111", "name": "general", "is_private": False},
+                {"id": "C222", "name": "random", "is_private": False},
+            ]
+        }
 
         import slack_sdk
 
         monkeypatch.setattr(slack_sdk, "WebClient", lambda token: inst)
         out = execute_slack({"bot_token": "mock-slack-bot-token-unit-test"}, {"action": "list_channels"})
         data = json.loads(out)
-        assert "general" in data["channels"]
+        names = [c.get("name") for c in data.get("channels") or []]
+        assert "general" in names
+        assert data["channels"][0].get("id") == "C111"
+        inst.conversations_list.assert_called_once()
+        call_kw = inst.conversations_list.call_args[1]
+        assert "private_channel" in (call_kw.get("types") or "")
+
+    def test_list_messages_requires_channel(self, monkeypatch):
+        _ensure_fake_slack_sdk(monkeypatch)
+        out = execute_slack({"bot_token": "mock-slack-bot-token-unit-test"}, {"action": "list_messages"})
+        assert "channel" in out.lower()
+
+    def test_list_messages_ok(self, monkeypatch):
+        _ensure_fake_slack_sdk(monkeypatch)
+        inst = MagicMock()
+        inst.conversations_history.return_value = {
+            "messages": [{"ts": "1", "user": "U1", "text": "hi"}],
+            "response_metadata": {},
+        }
+        import slack_sdk
+
+        monkeypatch.setattr(slack_sdk, "WebClient", lambda token: inst)
+        out = execute_slack(
+            {"bot_token": "mock-slack-bot-token-unit-test"},
+            {"action": "list_messages", "channel": "C123"},
+        )
+        data = json.loads(out)
+        assert data["messages"][0]["text"] == "hi"
+        inst.conversations_history.assert_called_once()
+
+    def test_send_idempotency_single_post(self, monkeypatch):
+        _ensure_fake_slack_sdk(monkeypatch)
+        inst = MagicMock()
+        import slack_sdk
+
+        monkeypatch.setattr(slack_sdk, "WebClient", lambda token: inst)
+        args = {
+            "action": "send",
+            "channel": "#x",
+            "message": "m",
+            "idempotency_key": "idem-slack-unit-1",
+        }
+        cfg = {"bot_token": "mock-slack-bot-token-unit-test"}
+        out1 = execute_slack(cfg, args)
+        out2 = execute_slack(cfg, args)
+        assert out1 == out2
+        assert inst.chat_postMessage.call_count == 1
 
     def test_slack_api_error(self, monkeypatch):
         _ensure_fake_slack_sdk(monkeypatch)
@@ -119,9 +177,16 @@ class TestExecuteSlack:
         monkeypatch.setattr(slack_sdk, "WebClient", lambda token: inst)
         out = execute_slack(
             {"bot_token": "mock-slack-bot-token-unit-test"},
-            {"action": "send", "channel": "#x", "message": "m"},
+            {
+                "action": "send",
+                "channel": "#x",
+                "message": "m",
+                "idempotency_key": "unit-slack-api-err-1",
+            },
         )
-        assert "channel_not_found" in out or "Error" in out
+        data = json.loads(out)
+        assert data.get("error") == "upstream_error"
+        assert data.get("upstream_code") == "channel_not_found"
 
     def test_slack_import_error_surfaces_not_installed(self, monkeypatch):
         real = builtins.__import__
@@ -133,7 +198,8 @@ class TestExecuteSlack:
 
         monkeypatch.setattr(builtins, "__import__", _guard)
         out = execute_slack({}, {})
-        assert "not installed" in out.lower()
+        data = json.loads(out)
+        assert data.get("error") == "configuration_error"
 
     def test_slack_generic_exception_maps_safe_error(self, monkeypatch):
         _ensure_fake_slack_sdk(monkeypatch)
@@ -144,9 +210,29 @@ class TestExecuteSlack:
         monkeypatch.setattr(slack_sdk, "WebClient", lambda token: inst)
         out = execute_slack(
             {"bot_token": "mock-slack-bot-token-unit-test"},
-            {"action": "send", "channel": "#x", "message": "m"},
+            {
+                "action": "send",
+                "channel": "#x",
+                "message": "m",
+                "idempotency_key": "unit-slack-runtime-err",
+            },
         )
         assert "Error" in out
+
+    def test_send_requires_idempotency_key_by_default(self, monkeypatch):
+        _ensure_fake_slack_sdk(monkeypatch)
+        monkeypatch.delenv("PLATFORM_MCP_ALLOW_WRITES_WITHOUT_IDEMPOTENCY_KEY", raising=False)
+        inst = MagicMock()
+        import slack_sdk
+
+        monkeypatch.setattr(slack_sdk, "WebClient", lambda token: inst)
+        out = execute_slack(
+            {"bot_token": "mock-slack-bot-token-unit-test"},
+            {"action": "send", "channel": "#x", "message": "m"},
+        )
+        data = json.loads(out)
+        assert data.get("error") == "idempotency_required"
+        inst.chat_postMessage.assert_not_called()
 
 
 class TestExecuteGithub:
@@ -367,6 +453,136 @@ class TestExecuteNotion:
 
 
 class TestExecuteRestApi:
+    def test_blocks_private_base_url(self, monkeypatch):
+        monkeypatch.delenv("MCP_HTTP_ALLOW_PRIVATE_URLS", raising=False)
+        out = execute_rest_api({"base_url": "http://127.0.0.1:8080"}, {"path": "v1", "method": "GET"})
+        data = json.loads(out)
+        assert data.get("error") == "base_url_blocked"
+
+    def test_follow_redirects_false_by_default(self, monkeypatch):
+        monkeypatch.delenv("MCP_REST_API_FOLLOW_REDIRECTS", raising=False)
+        req_kw: dict = {}
+
+        class Resp:
+            status_code = 200
+            headers = {"content-type": "application/json"}
+            text = "{}"
+
+            def json(self):
+                return {}
+
+        class Http:
+            def request(self, method, url, json=None, headers=None, **kwargs):
+                req_kw.update(kwargs)
+                return Resp()
+
+        with patch("execution_integrations.check_url_safe_for_server_fetch", return_value=(True, "")):
+            with patch("execution_integrations.get_sync_http_client", return_value=Http()):
+                execute_rest_api({"base_url": "https://h.com"}, {"path": "x", "method": "GET"})
+        assert req_kw.get("follow_redirects") is False
+
+    def test_follow_redirects_true_when_env_set(self, monkeypatch):
+        monkeypatch.setenv("MCP_REST_API_FOLLOW_REDIRECTS", "true")
+        req_kw: dict = {}
+
+        class Resp:
+            status_code = 200
+            headers = {"content-type": "application/json"}
+            text = "{}"
+
+            def json(self):
+                return {}
+
+        class Http:
+            def request(self, method, url, json=None, headers=None, **kwargs):
+                req_kw.update(kwargs)
+                return Resp()
+
+        with patch("execution_integrations.check_url_safe_for_server_fetch", return_value=(True, "")):
+            with patch("execution_integrations.get_sync_http_client", return_value=Http()):
+                execute_rest_api({"base_url": "https://h.com"}, {"path": "x", "method": "GET"})
+        assert req_kw.get("follow_redirects") is False
+
+    def test_same_host_redirect_chain_when_env_set(self, monkeypatch):
+        monkeypatch.setenv("MCP_REST_API_FOLLOW_REDIRECTS", "true")
+        calls: list = []
+
+        class Resp302:
+            status_code = 302
+            headers = {"location": "/final"}
+            text = ""
+
+        class Resp200:
+            status_code = 200
+            headers = {"content-type": "application/json"}
+            text = "{}"
+
+            def json(self):
+                return {"ok": True}
+
+        class Http:
+            def request(self, method, url, json=None, headers=None, **kwargs):
+                calls.append(kwargs.get("follow_redirects"))
+                if len(calls) == 1:
+                    return Resp302()
+                return Resp200()
+
+        with patch("execution_integrations.check_url_safe_for_server_fetch", return_value=(True, "")):
+            with patch("execution_integrations.get_sync_http_client", return_value=Http()):
+                out = execute_rest_api({"base_url": "https://h.com"}, {"path": "start", "method": "GET"})
+        assert calls == [False, False]
+        body = json.loads(out)
+        assert body.get("status") == 200
+
+    def test_cross_host_redirect_returns_error(self, monkeypatch):
+        monkeypatch.setenv("MCP_REST_API_FOLLOW_REDIRECTS", "true")
+
+        class Resp302:
+            status_code = 302
+            headers = {"location": "https://evil.example/path"}
+            text = ""
+
+        class Http:
+            def request(self, method, url, json=None, headers=None, **kwargs):
+                return Resp302()
+
+        with patch("execution_integrations.check_url_safe_for_server_fetch", return_value=(True, "")):
+            with patch("execution_integrations.get_sync_http_client", return_value=Http()):
+                out = execute_rest_api({"base_url": "https://h.com"}, {"path": "x", "method": "GET"})
+        data = json.loads(out)
+        assert data.get("error") == "redirect_host_mismatch"
+
+    def test_subdomain_redirect_succeeds_same_registrable_domain(self, monkeypatch):
+        monkeypatch.setenv("MCP_REST_API_FOLLOW_REDIRECTS", "true")
+        calls: list = []
+
+        class Resp302:
+            status_code = 302
+            headers = {"location": "https://cdn.h.com/final"}
+            text = ""
+
+        class Resp200:
+            status_code = 200
+            headers = {"content-type": "application/json"}
+            text = "{}"
+
+            def json(self):
+                return {"ok": True}
+
+        class Http:
+            def request(self, method, url, json=None, headers=None, **kwargs):
+                calls.append(url)
+                if len(calls) == 1:
+                    return Resp302()
+                return Resp200()
+
+        with patch("execution_integrations.check_url_safe_for_server_fetch", return_value=(True, "")):
+            with patch("execution_integrations.get_sync_http_client", return_value=Http()):
+                out = execute_rest_api({"base_url": "https://api.h.com"}, {"path": "start", "method": "GET"})
+        body = json.loads(out)
+        assert body.get("status") == 200
+        assert "cdn.h.com" in calls[1]
+
     def test_missing_path(self):
         assert "path" in execute_rest_api({"base_url": "https://api.example.com"}, {}).lower()
 
@@ -388,17 +604,12 @@ class TestExecuteRestApi:
                 return {"ok": True}
 
         class Ctx:
-            def __enter__(self):
-                return self
-
-            def __exit__(self, *a):
-                return False
-
-            def request(self, method, url, json=None, headers=None):
+            def request(self, method, url, json=None, headers=None, **kwargs):
                 return Resp()
 
-        with patch("httpx.Client", return_value=Ctx()):
-            out = execute_rest_api({"base_url": "https://h.com"}, {"path": "api", "method": "get"})
+        with patch("execution_integrations.check_url_safe_for_server_fetch", return_value=(True, "")):
+            with patch("execution_integrations.get_sync_http_client", return_value=Ctx()):
+                out = execute_rest_api({"base_url": "https://h.com"}, {"path": "api", "method": "get"})
         body = json.loads(out)
         assert body["status"] == 200
         assert body["body"]["ok"] is True
@@ -412,33 +623,23 @@ class TestExecuteRestApi:
             text = "ok"
 
         class Ctx:
-            def __enter__(self):
-                return self
-
-            def __exit__(self, *a):
-                return False
-
-            def request(self, method, url, json=None, headers=None):
+            def request(self, method, url, json=None, headers=None, **kwargs):
                 captured["headers"] = dict(headers or {})
                 return Resp()
 
-        with patch("httpx.Client", return_value=Ctx()):
-            execute_rest_api({"base_url": "https://h.com", "api_key": "tok"}, {"path": "v1/x"})
+        with patch("execution_integrations.check_url_safe_for_server_fetch", return_value=(True, "")):
+            with patch("execution_integrations.get_sync_http_client", return_value=Ctx()):
+                execute_rest_api({"base_url": "https://h.com", "api_key": "tok"}, {"path": "v1/x"})
         assert "Bearer" in captured.get("headers", {}).get("Authorization", "")
 
     def test_request_exception_maps_safe_error(self):
         class Ctx:
-            def __enter__(self):
-                return self
-
-            def __exit__(self, *a):
-                return False
-
             def request(self, *a, **k):
                 raise RuntimeError("network down")
 
-        with patch("httpx.Client", return_value=Ctx()):
-            out = execute_rest_api({"base_url": "https://h.com"}, {"path": "v1/x"})
+        with patch("execution_integrations.check_url_safe_for_server_fetch", return_value=(True, "")):
+            with patch("execution_integrations.get_sync_http_client", return_value=Ctx()):
+                out = execute_rest_api({"base_url": "https://h.com"}, {"path": "v1/x"})
         assert "Error" in out
 
 

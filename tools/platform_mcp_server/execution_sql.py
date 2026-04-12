@@ -403,7 +403,7 @@ def execute_databricks_sql(config: Dict[str, Any], arguments: Dict[str, Any]) ->
 
 
 def execute_elasticsearch(config: Dict[str, Any], arguments: Dict[str, Any]) -> str:
-    import httpx
+    from execution_http import get_sync_http_client
 
     url = (config.get("url") or config.get("host") or "").strip() or "http://localhost:9200"
     query = (arguments.get("query") or "").strip()
@@ -418,10 +418,9 @@ def execute_elasticsearch(config: Dict[str, Any], arguments: Dict[str, Any]) -> 
     path = f"{url.rstrip('/')}/{index}/_search" if index else f"{url.rstrip('/')}/_search"
     body = {"query": {"query_string": {"query": query}}, "size": size}
     try:
-        with httpx.Client(timeout=15.0) as client:
-            r = client.post(path, json=body, headers=headers)
-            if r.status_code == 200:
-                return json.dumps(r.json(), indent=2)
-            return f"Elasticsearch error: HTTP {r.status_code}"
+        r = get_sync_http_client().post(path, json=body, headers=headers, timeout=15.0)
+        if r.status_code == 200:
+            return json.dumps(r.json(), indent=2)
+        return f"Elasticsearch error: HTTP {r.status_code}"
     except Exception as e:
         return safe_tool_error("Elasticsearch error", e)

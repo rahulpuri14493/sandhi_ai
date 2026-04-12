@@ -60,6 +60,8 @@ class MCPToolType(str, enum.Enum):
     GCS = "gcs"
     # Integrations
     SLACK = "slack"
+    TEAMS = "teams"
+    SMTP = "smtp"
     GITHUB = "github"
     NOTION = "notion"
     REST_API = "rest_api"

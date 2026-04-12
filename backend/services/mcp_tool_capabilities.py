@@ -39,8 +39,8 @@ _OBJECT_TYPES = frozenset({"s3", "minio", "ceph", "azure_blob", "gcs", "filesyst
 # Typically read-biased integrations for interactive use.
 _API_READ_BIAS = frozenset({"github", "notion"})
 
-# Can send messages / side effects.
-_MESSAGING = frozenset({"slack"})
+# List/discover (read-like) and send/post (write-like): Slack, Teams, SMTP validate + send.
+_MESSAGING = frozenset({"slack", "teams", "smtp"})
 
 # Generic HTTP — read/write depends on usage.
 _REST = frozenset({"rest_api"})
@@ -119,11 +119,14 @@ def tool_access_summary(tool_type: str) -> Dict[str, Any]:
         summary.update(
             {
                 "tier": "messaging",
-                "interactive_read_primary": False,
+                "interactive_read_primary": True,
                 "supports_interactive_write": True,
                 "supports_artifact_platform_write": False,
-                "label": "Messaging",
-                "hint": "Side-effect tools (e.g. send); assign only where needed.",
+                "label": "Messaging (read + write)",
+                "hint": (
+                    "Read-like: list channels/teams, SMTP validate. "
+                    "Write-like: send messages or email. Guardrails classify by action; scope per step."
+                ),
             }
         )
         return summary

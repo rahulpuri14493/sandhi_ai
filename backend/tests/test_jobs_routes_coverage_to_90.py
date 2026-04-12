@@ -536,6 +536,38 @@ def test_update_job_tool_scope_and_contract(client: TestClient, db_session):
     assert body.get("output_contract") is not None
 
 
+def test_update_job_drops_stale_platform_tool_ids(client: TestClient, db_session):
+    """Recreate MCP tool → new id; job still had old id — update should succeed and keep valid ids only."""
+    u, h = _headers_biz(db_session, "stalept")
+    good = MCPToolConfig(
+        user_id=u.id,
+        tool_type=MCPToolType.TEAMS,
+        name="teams",
+        encrypted_config="{}",
+        is_active=True,
+    )
+    db_session.add(good)
+    db_session.commit()
+    db_session.refresh(good)
+    job = Job(
+        business_id=u.id,
+        title="team2",
+        status=JobStatus.DRAFT,
+        conversation=json.dumps([]),
+        allowed_platform_tool_ids=json.dumps([999991, good.id]),
+    )
+    db_session.add(job)
+    db_session.commit()
+    db_session.refresh(job)
+    r = client.put(
+        f"/api/jobs/{job.id}",
+        data={"allowed_platform_tool_ids": json.dumps([999991, good.id])},
+        headers=h,
+    )
+    assert r.status_code == 200, r.text
+    assert r.json().get("allowed_platform_tool_ids") == [good.id]
+
+
 def test_update_job_upload_resets_workflow_and_auto_analyze(
     monkeypatch, client: TestClient, db_session, tmp_path
 ):

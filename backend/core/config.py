@@ -98,6 +98,24 @@ class Settings(BaseSettings):
     MCP_GUARDRAILS_OTLP_ENDPOINT: str = ""
     MCP_GUARDRAILS_OTLP_INSECURE: bool = True
     MCP_GUARDRAILS_METRICS_TARGET_KEY_MODE: str = "raw"  # raw | normalized | hash
+    # Cache successful platform/BYO MCP HTTP tool results when write_like + idempotency_key (requires Redis).
+    MCP_HTTP_IDEMPOTENCY_CACHE_ENABLED: bool = True
+    MCP_HTTP_IDEMPOTENCY_REDIS_URL: str = ""  # fallback: MCP_GUARDRAILS_REDIS_URL
+    MCP_HTTP_IDEMPOTENCY_TTL_SECONDS: int = 3600
+    MCP_HTTP_IDEMPOTENCY_REDIS_PREFIX: str = "sandhi:mcp_http_idemp:v1:"
+    # MCP tool OAuth (Microsoft / Google) — requires Redis for CSRF state and MCP_OAUTH_* credentials.
+    MCP_OAUTH_ENABLED: bool = False
+    MCP_OAUTH_BACKEND_PUBLIC_URL: str = "http://localhost:8000"
+    # Match frontend/vite `base` (see frontend/vite.config.ts) so OAuth callbacks land on the MCP page.
+    MCP_OAUTH_FRONTEND_REDIRECT_URL: str = "http://localhost:3000/sandhi_ai/mcp"
+    MCP_OAUTH_MICROSOFT_CLIENT_ID: str = ""
+    MCP_OAUTH_MICROSOFT_CLIENT_SECRET: str = ""
+    MCP_OAUTH_MICROSOFT_TENANT: str = "common"
+    # Space-separated v2 scopes for Outlook SMTP OAuth. Default: outlook.office.com/SMTP.Send (correct aud for smtp.office365.com).
+    # Override to "offline_access openid https://graph.microsoft.com/SMTP.Send" only if authorize rejects outlook.office.com (SMTP may then 535).
+    MCP_OAUTH_MICROSOFT_SMTP_SCOPES: str = ""
+    MCP_OAUTH_GOOGLE_CLIENT_ID: str = ""
+    MCP_OAUTH_GOOGLE_CLIENT_SECRET: str = ""
     MCP_GUARDRAILS_METRICS_TARGET_KEY_MAX_LEN: int = 120
     MCP_TOOL_FAMILY_METRICS_ENABLED: bool = True
     # Job execution backend: celery (Redis queue) or local_thread fallback.
@@ -261,6 +279,18 @@ class Settings(BaseSettings):
     BUSINESS_JOB_ALERTS_ENABLED: bool = False
     BUSINESS_JOB_ALERT_WEBHOOK_URL: str = ""
     BUSINESS_JOB_ALERT_COOLDOWN_SECONDS: int = 180
+    # Optional: email the business user (User.email) when a job completes (platform SMTP, not MCP).
+    JOB_COMPLETION_EMAIL_ENABLED: bool = False
+    JOB_COMPLETION_SMTP_HOST: str = ""
+    JOB_COMPLETION_SMTP_PORT: int = 587
+    JOB_COMPLETION_SMTP_USER: str = ""
+    JOB_COMPLETION_SMTP_PASSWORD: str = ""
+    JOB_COMPLETION_SMTP_USE_TLS: bool = True
+    JOB_COMPLETION_SMTP_USE_SSL: bool = False
+    JOB_COMPLETION_EMAIL_FROM: str = ""
+    JOB_COMPLETION_EMAIL_SUBJECT_PREFIX: str = "[Sandhi AI]"
+    # SPA base for "Open the job" link (e.g. http://localhost:3000/sandhi_ai). Empty = no link in email.
+    JOB_COMPLETION_EMAIL_LINK_BASE_URL: str = ""
     BUSINESS_KPI_ALERTS_ENABLED: bool = False
     BUSINESS_KPI_ALERT_WEBHOOK_URL: str = ""
     BUSINESS_KPI_ALERT_COOLDOWN_SECONDS: int = 900

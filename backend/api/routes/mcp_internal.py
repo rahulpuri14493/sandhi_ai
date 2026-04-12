@@ -98,10 +98,12 @@ def _description_for_type(tool_type: MCPToolType, name: str) -> str:
         MCPToolType.CEPH: "Read, list, and write objects in Ceph object storage",
         MCPToolType.AZURE_BLOB: "Read, list, and write objects in Azure Blob storage",
         MCPToolType.GCS: "Read, list, and write objects in Google Cloud Storage",
-        MCPToolType.SLACK: "List channels and send messages (Slack)",
+        MCPToolType.SLACK: "Slack: list channels (id+name), list_messages, send (write)",
+        MCPToolType.TEAMS: "Microsoft Teams (Graph): teams/channels/messages and Outlook mail (read), post and reply (write)",
+        MCPToolType.SMTP: "SMTP: validate (read-like), send (write); Gmail OAuth also list/read mail via Gmail API",
         MCPToolType.GITHUB: "Read GitHub repos, issues, and files (read-only in platform MCP)",
         MCPToolType.NOTION: "Search and retrieve Notion pages and databases (read-only in platform MCP)",
-        MCPToolType.REST_API: "Call external REST API (reads and writes)",
+        MCPToolType.REST_API: "REST API: relative paths; SSRF guard on base_url; redirects off by default; MCP_REST_API_FOLLOW_REDIRECTS=true allows same-registrable-domain redirects only",
     }
     return f"{d.get(tool_type, tool_type.value)}: {name}"
 

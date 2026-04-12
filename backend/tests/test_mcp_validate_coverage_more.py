@@ -1,7 +1,11 @@
 """Additional branch coverage for services.mcp_validate (no real external I/O)."""
 
+import smtplib
+import socket
+import ssl
 import sys
 import types
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -11,6 +15,14 @@ from services.mcp_validate import validate_tool_config
 
 def test_normalize_http_url_rstrip_empties():
     assert mv._normalize_http_url(")))") == ""
+
+
+def test_host_is_domain_or_subdomain_smtp_refresh_matching():
+    assert mv._host_is_domain_or_subdomain("smtp.office365.com", "office365.com")
+    assert mv._host_is_domain_or_subdomain("office365.com", "office365.com")
+    assert not mv._host_is_domain_or_subdomain("notoffice365.com", "office365.com")
+    assert mv._host_is_domain_or_subdomain("smtp.gmail.com", "gmail.com")
+    assert not mv._host_is_domain_or_subdomain("notgmail.com", "gmail.com")
 
 
 def test_validate_snowflake_missing_user():
@@ -144,7 +156,11 @@ def test_validate_notion_import_error(monkeypatch):
 
 
 def test_validate_rest_api_ok(monkeypatch):
-    monkeypatch.setattr(mv, "_http_reachable", lambda url, headers=None: (True, "ok"))
+    monkeypatch.setattr(mv, "_http_reachable", lambda url, headers=None, **kwargs: (True, "ok"))
+    monkeypatch.setattr(
+        "services.http_url_guard.socket.getaddrinfo",
+        lambda *a, **k: [(socket.AF_INET, socket.SOCK_STREAM, 0, "", ("8.8.8.8", 0))],
+    )
     ok, _ = validate_tool_config("rest_api", {"url": "https://api.example.com"})
     assert ok is True
 
@@ -243,11 +259,15 @@ def test_github_host_helper_api_github_com():
 def test_validate_elasticsearch_uses_trailing_slash(monkeypatch):
     seen = {}
 
-    def capture(url, headers=None):
+    def capture(url, headers=None, **kwargs):
         seen["url"] = url
         return True, "ok"
 
     monkeypatch.setattr(mv, "_http_reachable", capture)
+    monkeypatch.setattr(
+        "services.http_url_guard.socket.getaddrinfo",
+        lambda *a, **k: [(socket.AF_INET, socket.SOCK_STREAM, 0, "", ("8.8.8.8", 0))],
+    )
     validate_tool_config("elasticsearch", {"url": "https://es.test:9200"})
     assert seen["url"].endswith("/")
 
@@ -340,3 +360,96 @@ def test_validate_postgres_connection_refused_localhost_message(monkeypatch):
     )
     assert ok is False
     assert "host.docker.internal" in msg or "docker" in msg.lower()
+
+
+def test_validate_smtp_gmail_oauth_probes_gmail_rest(monkeypatch):
+    """After SMTP 235, Gmail REST is probed so users see whether inbox read will work."""
+    calls = {"n": 0}
+
+    class _FakeSMTP:
+        def __init__(self, *a, **k):
+            pass
+
+        def ehlo(self):
+            pass
+
+        def starttls(self, context=None):
+            pass
+
+        def docmd(self, *a, **k):
+            return (235, b"OK")
+
+        def quit(self):
+            pass
+
+    def fake_httpx_get(url, **kwargs):
+        calls["n"] += 1
+        r = MagicMock()
+        r.status_code = 200
+        return r
+
+    monkeypatch.setattr(smtplib, "SMTP", _FakeSMTP)
+    monkeypatch.setattr(ssl, "create_default_context", lambda *a, **k: MagicMock())
+    monkeypatch.setattr("httpx.get", fake_httpx_get)
+
+    ok, msg = validate_tool_config(
+        "smtp",
+        {
+            "provider": "gmail",
+            "username": "a@gmail.com",
+            "access_token": "ya29.unit-test",
+            "auth_mode": "oauth2",
+        },
+    )
+    assert ok is True
+    assert "Gmail REST" in msg
+    assert calls["n"] == 1
+
+
+def test_validate_smtp_outlook_oauth_refresh_after_535(monkeypatch):
+    doc_calls: list = []
+
+    class _FakeSMTP:
+        def __init__(self, *a, **k):
+            pass
+
+        def ehlo(self):
+            pass
+
+        def starttls(self, context=None):
+            pass
+
+        def docmd(self, *a, **k):
+            doc_calls.append(a)
+            if len(doc_calls) == 1:
+                return (535, b"expired")
+            return (235, b"OK")
+
+        def quit(self):
+            pass
+
+    def fake_post(url, **kwargs):
+        r = MagicMock()
+        r.status_code = 200
+        r.json = lambda: {"access_token": "fresh-token"}
+        return r
+
+    monkeypatch.setattr(smtplib, "SMTP", _FakeSMTP)
+    monkeypatch.setattr(ssl, "create_default_context", lambda *a, **k: MagicMock())
+    monkeypatch.setattr("httpx.post", fake_post)
+    from core.config import settings
+
+    monkeypatch.setattr(settings, "MCP_OAUTH_MICROSOFT_CLIENT_ID", "cid", raising=False)
+    monkeypatch.setattr(settings, "MCP_OAUTH_MICROSOFT_CLIENT_SECRET", "sec", raising=False)
+
+    cfg = {
+        "provider": "outlook",
+        "username": "u@outlook.com",
+        "access_token": "stale",
+        "oauth_refresh_token": "rt",
+        "auth_mode": "oauth2",
+    }
+    ok, msg = validate_tool_config("smtp", cfg)
+    assert ok is True
+    assert len(doc_calls) == 2
+    assert cfg["access_token"] == "fresh-token"

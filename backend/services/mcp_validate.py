@@ -4,9 +4,14 @@ Does not store any data; only checks connectivity where possible.
 """
 import logging
 import json
-from urllib.parse import urlparse
+from urllib.parse import urljoin, urlparse
 from typing import Tuple
 
+from services.http_url_guard import (
+    check_url_safe_for_server_fetch,
+    http_hosts_allow_redirect,
+    safe_url_host_for_logs,
+)
 from services.sql_server_host import sql_server_host_is_azure_sql
 
 logger = logging.getLogger(__name__)
@@ -52,6 +57,10 @@ def validate_tool_config(tool_type: str, config: dict) -> Tuple[bool, str]:
         return _validate_gcs(config)
     if tool_type == "slack":
         return _validate_slack(config)
+    if tool_type == "teams":
+        return _validate_teams(config)
+    if tool_type == "smtp":
+        return _validate_smtp(config)
     if tool_type == "github":
         return _validate_github(config)
     if tool_type == "notion":
@@ -80,16 +89,71 @@ def _http_url_has_host(url: str) -> bool:
         return False
 
 
-def _http_reachable(url: str, *, headers: dict | None = None, timeout: float = 6.0) -> Tuple[bool, str]:
+_HTTP_REDIRECT_STATUSES = frozenset((301, 302, 303, 307, 308))
+_MAX_VALIDATE_HTTP_REDIRECTS = 10
+
+
+def _http_url_hostname_lower(url: str) -> str:
+    try:
+        return (urlparse(url).hostname or "").lower()
+    except Exception:
+        return ""
+
+
+def _http_reachable(
+    url: str,
+    *,
+    headers: dict | None = None,
+    timeout: float = 6.0,
+    restrict_same_host_redirects: bool = False,
+) -> Tuple[bool, str]:
     import httpx
 
+    if not restrict_same_host_redirects:
+        try:
+            r = httpx.get(url, headers=headers or {}, timeout=timeout)
+            if r.status_code < 500:
+                return True, f"Endpoint reachable (HTTP {r.status_code})"
+            return False, f"Endpoint returned HTTP {r.status_code}"
+        except Exception:
+            logger.exception("HTTP reachability check failed host=%s", safe_url_host_for_logs(url))
+            return False, "Unable to reach endpoint; verify URL, network, and credentials."
+
+    anchor = _http_url_hostname_lower(url)
+    if not anchor:
+        return False, "URL is invalid"
+    current = url
+    n_redirects = 0
     try:
-        r = httpx.get(url, headers=headers or {}, timeout=timeout)
-        if r.status_code < 500:
-            return True, f"Endpoint reachable (HTTP {r.status_code})"
-        return False, f"Endpoint returned HTTP {r.status_code}"
+        while True:
+            r = httpx.get(current, headers=headers or {}, timeout=timeout, follow_redirects=False)
+            if r.status_code not in _HTTP_REDIRECT_STATUSES:
+                if r.status_code < 500:
+                    return True, f"Endpoint reachable (HTTP {r.status_code})"
+                return False, f"Endpoint returned HTTP {r.status_code}"
+            if n_redirects >= _MAX_VALIDATE_HTTP_REDIRECTS:
+                return False, "Too many HTTP redirects while validating (limit exceeded)."
+            n_redirects += 1
+            loc = r.headers.get("location")
+            if not loc or not str(loc).strip():
+                return (
+                    False,
+                    f"Endpoint returned HTTP {r.status_code} without a Location header (redirect cannot be validated).",
+                )
+            next_url = urljoin(current, str(loc).strip())
+            safe, reason = check_url_safe_for_server_fetch(next_url, purpose="validate_http_redirect")
+            if not safe:
+                return False, f"Redirect blocked (SSRF policy): {reason}"
+            if not http_hosts_allow_redirect(anchor, _http_url_hostname_lower(next_url)):
+                return (
+                    False,
+                    "Redirect blocked: target host is not the same hostname or registrable domain "
+                    "as the configured URL (e.g. api.example.com → cdn.example.com is allowed; "
+                    "another.example.org is not).",
+                )
+            current = next_url
     except Exception:
-        logger.exception("HTTP reachability check failed for %s", url)
+        logger.exception("HTTP reachability check failed host=%s", safe_url_host_for_logs(url))
         return False, "Unable to reach endpoint; verify URL, network, and credentials."
 
 
@@ -503,8 +567,11 @@ def _validate_http(config: dict, tool_type: str) -> Tuple[bool, str]:
         return False, "URL is required"
     if not _http_url_has_host(url):
         return False, "URL is invalid"
+    safe, reason = check_url_safe_for_server_fetch(url, purpose=f"validate_{tool_type}")
+    if not safe:
+        return False, reason
     target = url.rstrip("/") + "/" if tool_type == "elasticsearch" else url
-    return _http_reachable(target)
+    return _http_reachable(target, restrict_same_host_redirects=True)
 
 
 def _validate_s3_family(config: dict, tool_type: str) -> Tuple[bool, str]:
@@ -590,6 +657,229 @@ def _validate_gcs(config: dict) -> Tuple[bool, str]:
     except Exception:
         logger.exception("GCS validation failed")
         return False, "Unable to access GCS bucket; verify project, bucket, credentials, and IAM permissions."
+
+
+def _gmail_read_api_probe(access_token: str) -> str:
+    """Non-blocking check after Gmail SMTP OAuth succeeds; confirms inbox read scopes work."""
+    try:
+        import httpx
+    except ImportError:
+        return ""
+    try:
+        r = httpx.get(
+            "https://gmail.googleapis.com/gmail/v1/users/me/profile",
+            headers={"Authorization": f"Bearer {access_token}"},
+            timeout=10.0,
+        )
+        if r.status_code == 200:
+            return " Gmail REST API (read) OK."
+        return (
+            f" Warning: Gmail REST returned HTTP {r.status_code}; "
+            "list_mail_messages may fail until you reconnect Google with gmail.readonly."
+        )
+    except Exception:
+        return " Warning: could not reach Gmail REST API; check network if you need inbox read."
+
+
+def _host_is_domain_or_subdomain(host: str, domain: str) -> bool:
+    """True if host is exactly domain or a direct subdomain (avoids naive substring URL matching)."""
+    h = (host or "").strip().lower().rstrip(".")
+    d = (domain or "").strip().lower().rstrip(".")
+    return bool(h) and bool(d) and (h == d or h.endswith("." + d))
+
+
+def _smtp_validate_oauth_provider_for_refresh(config: dict) -> str:
+    prov = str(config.get("provider") or "custom").strip().lower()
+    if prov in ("outlook", "gmail"):
+        return prov
+    host = str(config.get("smtp_host") or "").strip().lower()
+    if _host_is_domain_or_subdomain(host, "office365.com") or host == "smtp-mail.outlook.com":
+        return "outlook"
+    if _host_is_domain_or_subdomain(host, "gmail.com"):
+        return "gmail"
+    return ""
+
+
+def _smtp_validate_refresh_access_token(config: dict) -> bool:
+    """
+    Refresh OAuth access_token using stored refresh token and MCP_OAUTH_* settings.
+    Mutates config in place. Used so validation matches platform MCP after access tokens expire.
+    """
+    refresh = str(config.get("oauth_refresh_token") or config.get("refresh_token") or "").strip()
+    if not refresh:
+        return False
+    prov = _smtp_validate_oauth_provider_for_refresh(config)
+    try:
+        from core.config import settings
+        import httpx
+    except Exception:
+        return False
+    try:
+        if prov == "outlook":
+            cid = (getattr(settings, "MCP_OAUTH_MICROSOFT_CLIENT_ID", "") or "").strip()
+            secret = (getattr(settings, "MCP_OAUTH_MICROSOFT_CLIENT_SECRET", "") or "").strip()
+            tenant = (getattr(settings, "MCP_OAUTH_MICROSOFT_TENANT", "") or "common").strip() or "common"
+            if not cid or not secret:
+                return False
+            token_url = f"https://login.microsoftonline.com/{tenant}/oauth2/v2.0/token"
+            data = {
+                "client_id": cid,
+                "client_secret": secret,
+                "grant_type": "refresh_token",
+                "refresh_token": refresh,
+            }
+            r = httpx.post(token_url, data=data, timeout=30.0)
+        elif prov == "gmail":
+            cid = (getattr(settings, "MCP_OAUTH_GOOGLE_CLIENT_ID", "") or "").strip()
+            secret = (getattr(settings, "MCP_OAUTH_GOOGLE_CLIENT_SECRET", "") or "").strip()
+            if not cid or not secret:
+                return False
+            r = httpx.post(
+                "https://oauth2.googleapis.com/token",
+                data={
+                    "client_id": cid,
+                    "client_secret": secret,
+                    "grant_type": "refresh_token",
+                    "refresh_token": refresh,
+                },
+                timeout=30.0,
+            )
+        else:
+            return False
+    except Exception:
+        logger.exception("SMTP OAuth token refresh failed during validation")
+        return False
+    if r.status_code != 200:
+        return False
+    try:
+        body = r.json()
+    except Exception:
+        return False
+    if not isinstance(body, dict):
+        return False
+    at = str(body.get("access_token") or "").strip()
+    if not at:
+        return False
+    config["access_token"] = at
+    new_rt = str(body.get("refresh_token") or "").strip()
+    if new_rt:
+        config["oauth_refresh_token"] = new_rt
+    return True
+
+
+def _validate_teams(config: dict) -> Tuple[bool, str]:
+    token = (config.get("access_token") or config.get("oauth2_access_token") or "").strip()
+    if not token:
+        return False, "Microsoft Graph access_token is required for Teams"
+    try:
+        import httpx
+    except ImportError:
+        return False, "Teams validation requires httpx (not installed in backend)"
+    try:
+        r = httpx.get(
+            "https://graph.microsoft.com/v1.0/me",
+            headers={"Authorization": f"Bearer {token}"},
+            timeout=10.0,
+        )
+        if r.status_code == 200:
+            return True, "Microsoft Graph / Teams token validated"
+        return False, f"Graph API returned HTTP {r.status_code}; verify token and Teams permissions."
+    except Exception:
+        logger.exception("Teams / Graph validation failed")
+        return False, "Unable to reach Microsoft Graph; verify token, scopes, and network."
+
+
+def _validate_smtp(config: dict) -> Tuple[bool, str]:
+    import smtplib
+    import ssl
+
+    provider = str(config.get("provider") or "custom").strip().lower()
+    presets = {
+        "gmail": ("smtp.gmail.com", 587, False),
+        "outlook": ("smtp.office365.com", 587, False),
+        "yahoo": ("smtp.mail.yahoo.com", 587, False),
+    }
+    if provider in presets:
+        host, port, use_ssl = presets[provider]
+        use_starttls = not use_ssl
+    else:
+        host = (config.get("smtp_host") or "").strip()
+        try:
+            port = int(config.get("smtp_port") or 587)
+        except (TypeError, ValueError):
+            port = 587
+        use_ssl = bool(config.get("use_ssl"))
+        use_starttls = bool(config.get("use_tls", True))
+    if not host:
+        return False, "SMTP host is required (or choose provider gmail/outlook/yahoo)"
+    auth_mode = str(config.get("auth_mode") or "").strip().lower()
+    username = str(config.get("username") or config.get("from_address") or "").strip()
+    password = str(config.get("password") or "").strip()
+    access_token = str(config.get("access_token") or config.get("oauth2_access_token") or "").strip()
+    refresh_tok = str(config.get("oauth_refresh_token") or config.get("refresh_token") or "").strip()
+    if not auth_mode:
+        auth_mode = "oauth2" if (access_token or refresh_tok) else "password"
+    ctx = ssl.create_default_context()
+    timeout = 25.0
+    try:
+        if use_ssl or port == 465:
+            client = smtplib.SMTP_SSL(host, port, context=ctx, timeout=timeout)
+        else:
+            client = smtplib.SMTP(host, port, timeout=timeout)
+            client.ehlo()
+            if use_starttls:
+                client.starttls(context=ctx)
+                client.ehlo()
+        try:
+            if auth_mode == "oauth2":
+                if not username:
+                    return False, "username (mailbox) is required for OAuth2 SMTP"
+                if not access_token and refresh_tok:
+                    _smtp_validate_refresh_access_token(config)
+                    access_token = str(config.get("access_token") or config.get("oauth2_access_token") or "").strip()
+                if not access_token:
+                    return False, (
+                        "username and access_token are required for OAuth2 SMTP, or oauth_refresh_token plus "
+                        "MCP_OAUTH_MICROSOFT_* / MCP_OAUTH_GOOGLE_* in backend settings to refresh expired tokens."
+                    )
+                import base64
+
+                auth_string = f"user={username}\x01auth=Bearer {access_token}\x01\x01"
+                b64 = base64.b64encode(auth_string.encode("utf-8")).decode("ascii")
+                code, resp = client.docmd("AUTH", "XOAUTH2 " + b64)
+                if code != 235 and refresh_tok:
+                    if _smtp_validate_refresh_access_token(config):
+                        access_token = str(config.get("access_token") or config.get("oauth2_access_token") or "").strip()
+                        auth_string = f"user={username}\x01auth=Bearer {access_token}\x01\x01"
+                        b64 = base64.b64encode(auth_string.encode("utf-8")).decode("ascii")
+                        code, resp = client.docmd("AUTH", "XOAUTH2 " + b64)
+                if code != 235:
+                    detail = resp.decode(errors="replace") if isinstance(resp, bytes) else str(resp)
+                    msg = f"SMTP OAuth2 rejected ({code}): {detail.strip()[:400]}"
+                    if code == 535:
+                        msg += (
+                            " Hint: use OAuth scope https://outlook.office.com/SMTP.Send (not Graph-only) for "
+                            "smtp.office365.com; enable Authenticated SMTP on the mailbox. "
+                            "If this worked earlier, the access token may have expired — save oauth_refresh_token and "
+                            "ensure backend has the same OAuth app credentials used for Connect Microsoft."
+                        )
+                    return False, msg
+            else:
+                if not username or not password:
+                    return False, "username and password are required for SMTP password auth"
+                client.login(username, password)
+            msg_ok = "SMTP connection and authentication successful"
+            if auth_mode == "oauth2" and provider == "gmail" and access_token:
+                msg_ok += _gmail_read_api_probe(access_token)
+            return True, msg_ok
+        finally:
+            try:
+                client.quit()
+            except Exception:
+                pass
+    except Exception:
+        logger.exception("SMTP validation failed")
+        return False, "SMTP validation failed; verify host, port, credentials, and TLS settings."
 
 
 def _validate_slack(config: dict) -> Tuple[bool, str]:

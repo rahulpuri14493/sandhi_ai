@@ -62,6 +62,32 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/jobs", tags=["jobs"])
 
 
+def _filter_allowed_platform_tool_ids(db: Session, business_id: int, platform_ids: List[int]) -> List[int]:
+    """Keep only platform tool ids that exist, belong to the business, and are active (order preserved)."""
+    if not platform_ids:
+        return []
+    valid = db.query(MCPToolConfig.id).filter(
+        MCPToolConfig.user_id == business_id,
+        MCPToolConfig.id.in_(platform_ids),
+        MCPToolConfig.is_active == True,
+    ).all()
+    valid_set = {r[0] for r in valid}
+    return [x for x in platform_ids if x in valid_set]
+
+
+def _filter_allowed_connection_ids(db: Session, business_id: int, connection_ids: List[int]) -> List[int]:
+    """Keep only MCP connection ids that exist, belong to the business, and are active (order preserved)."""
+    if not connection_ids:
+        return []
+    valid = db.query(MCPServerConnection.id).filter(
+        MCPServerConnection.user_id == business_id,
+        MCPServerConnection.id.in_(connection_ids),
+        MCPServerConnection.is_active == True,
+    ).all()
+    valid_set = {r[0] for r in valid}
+    return [x for x in connection_ids if x in valid_set]
+
+
 def _validate_allowed_tools(db: Session, business_id: int, platform_ids: Optional[List[int]], connection_ids: Optional[List[int]]):
     """Validate that platform_tool_ids and connection_ids belong to business_id. Returns (platform_ids, connection_ids) as JSON-serializable lists or None."""
     out_platform = [] if platform_ids is not None and len(platform_ids) == 0 else None
@@ -1494,16 +1520,17 @@ async def update_job(
                 detail="Can only update title and description for draft jobs. Use status update for other jobs."
             )
 
-    # Update allowed tools if provided (each key updates only that field)
+    # Update allowed tools if provided (each key updates only that field).
+    # Sanitize ids: deleted/recreated MCP tools get new ids — drop stale ids instead of 400.
     if allowed_platform_tool_ids is not None:
         pids = _parse_int_list_form(allowed_platform_tool_ids)
-        if pids:
-            pids, _ = _validate_allowed_tools(db, current_user.id, pids, None)
+        if pids is not None:
+            pids = _filter_allowed_platform_tool_ids(db, current_user.id, pids)
         job.allowed_platform_tool_ids = json.dumps(pids) if pids is not None else None
     if allowed_connection_ids is not None:
         cids = _parse_int_list_form(allowed_connection_ids)
-        if cids:
-            _, cids = _validate_allowed_tools(db, current_user.id, None, cids)
+        if cids is not None:
+            cids = _filter_allowed_connection_ids(db, current_user.id, cids)
         job.allowed_connection_ids = json.dumps(cids) if cids is not None else None
     if tool_visibility is not None:
         job.tool_visibility = _validate_tool_visibility(tool_visibility)
@@ -2034,8 +2061,10 @@ def update_workflow_step_tools(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Step not found")
     if body.allowed_platform_tool_ids is not None or body.allowed_connection_ids is not None:
         pids, cids = body.allowed_platform_tool_ids, body.allowed_connection_ids
-        if (pids and len(pids)) or (cids and len(cids)):
-            pids, cids = _validate_allowed_tools(db, current_user.id, pids, cids)
+        if pids is not None and len(pids) > 0:
+            pids = _filter_allowed_platform_tool_ids(db, current_user.id, pids)
+        if cids is not None and len(cids) > 0:
+            cids = _filter_allowed_connection_ids(db, current_user.id, cids)
         # Empty lists on step mean "inherit from job scope".
         step.allowed_platform_tool_ids = json.dumps(pids) if (pids is not None and len(pids) > 0) else None
         step.allowed_connection_ids = json.dumps(cids) if (cids is not None and len(cids) > 0) else None

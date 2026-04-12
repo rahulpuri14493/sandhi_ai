@@ -10,6 +10,10 @@ import httpx
 
 from core.config import settings
 from services.mcp_client import MCPJSONRPCError
+from services.mcp_http_idempotency import (
+    store_cached_tool_result as store_http_idempotency_result,
+    try_get_cached_tool_result as try_get_http_idempotency_result,
+)
 from services.mcp_metrics import increment_event, increment_mcp_tool_family_metric, observe_duration
 
 import logging
@@ -733,6 +737,29 @@ return 0
         attempts = max(1, attempts)
         bounded_timeout = self._bounded_timeout(timeout_seconds)
         last_exc: Optional[BaseException] = None
+        idem = str(idempotency_key or "").strip()
+        if operation_class == "write_like" and idem:
+            cached = try_get_http_idempotency_result(business_id, target_key, idem)
+            if cached is not None:
+                increment_event("idempotency_replay", code="hit", operation_class=operation_class, target_key=target_key)
+                increment_mcp_tool_family_metric(
+                    tool_name=tool_name,
+                    operation_class=operation_class,
+                    outcome="success",
+                )
+                observe_duration(
+                    0.0,
+                    operation_class=operation_class,
+                    target_key=target_key,
+                    outcome="success",
+                )
+                logger.info(
+                    "mcp_guardrail_event event=idempotency_replay business_id=%s target=%s tool=%s",
+                    business_id,
+                    target_key,
+                    tool_name,
+                )
+                return cached
 
         for attempt in range(1, attempts + 1):
             started = time.perf_counter()
@@ -773,6 +800,8 @@ return 0
                     attempt,
                     attempts,
                 )
+                if operation_class == "write_like" and idem:
+                    store_http_idempotency_result(business_id, target_key, idem, out)
                 return out
             except MCPGuardrailError as ge:
                 # Quota/circuit preflight style errors can bubble directly.
@@ -929,6 +958,65 @@ def infer_mcp_tool_operation_class(
         return "write_like"
     if write_mode in {"replace", "append", "merge", "upsert"}:
         return "write_like"
+    action = str(args.get("action") or "").strip().lower()
+    _write_actions = frozenset(
+        {
+            "send",
+            "send_message",
+            "reply_message",
+            "reply",
+            "put",
+            "write",
+        }
+    )
+    _read_actions = frozenset(
+        {
+            "list_channels",
+            "list_joined_teams",
+            "list_messages",
+            "list_channel_messages",
+            "get_channel_message",
+            "list_mail_messages",
+            "get_mail_message",
+            "get_mail_attachment",
+            "validate",
+            "get",
+            "list",
+            "read",
+            "get_file",
+            "list_issues",
+            "search",
+            "get_page",
+            "get_database",
+        }
+    )
+    if action in _write_actions:
+        return "write_like"
+    if action in _read_actions:
+        return "read_like"
+    if "method" in args:
+        m = str(args.get("method") or "GET").strip().upper()
+        if m != "GET":
+            return "write_like"
+        return "read_like"
+    msg = args.get("message")
+    ch = args.get("channel")
+    if isinstance(msg, str) and msg.strip() and isinstance(ch, str) and ch.strip():
+        return "write_like"
+    if args.get("to") and str(args.get("subject") or "").strip():
+        body_s = args.get("body")
+        html_s = args.get("html_body")
+        if (isinstance(body_s, str) and body_s.strip()) or (isinstance(html_s, str) and html_s.strip()):
+            return "write_like"
+    if (
+        isinstance(args.get("team_id"), str)
+        and args["team_id"].strip()
+        and isinstance(args.get("channel_id"), str)
+        and args["channel_id"].strip()
+    ):
+        blob = args.get("body") or args.get("text") or args.get("message")
+        if isinstance(blob, str) and blob.strip():
+            return "write_like"
     if any(
         token in name
         for token in ("write", "create", "update", "delete", "insert", "upsert", "patch", "save", "merge", "sync")

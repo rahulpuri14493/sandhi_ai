@@ -237,3 +237,18 @@ class TestDatabricksHttpPathNormalization:
         )
         assert valid is True
         assert captured["http_path"] == full
+
+
+class TestTeamsSmtpValidate:
+    def test_teams_missing_token(self):
+        valid, msg = validate_tool_config("teams", {})
+        assert valid is False
+        assert "token" in msg.lower()
+
+    def test_smtp_custom_missing_host(self):
+        valid, msg = validate_tool_config(
+            "smtp",
+            {"provider": "custom", "username": "a@b.com", "password": "p"},
+        )
+        assert valid is False
+        assert "host" in msg.lower()

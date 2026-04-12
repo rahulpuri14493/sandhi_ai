@@ -415,7 +415,161 @@ def input_schema_for_platform_tool_type(tool_type: str) -> Dict[str, Any]:
             "properties": {
                 "channel": {"type": "string", "description": "Channel ID or name"},
                 "message": {"type": "string", "description": "Message text"},
-                "action": {"type": "string", "enum": ["list_channels", "send"], "default": "send"},
+                "action": {
+                    "type": "string",
+                    "enum": ["list_channels", "list_messages", "send"],
+                    "default": "send",
+                },
+                "limit": {
+                    "type": "integer",
+                    "description": "For list_messages: max messages (1–200, default 50).",
+                },
+                "cursor": {
+                    "type": "string",
+                    "description": "For list_messages: pagination cursor from previous next_cursor.",
+                },
+                "idempotency_key": {
+                    "type": "string",
+                    "description": (
+                        "Required for action send unless PLATFORM_MCP_ALLOW_WRITES_WITHOUT_IDEMPOTENCY_KEY=true. "
+                        "Stable unique key per logical post; identical key+payload returns cached success within TTL (Redis when configured)."
+                    ),
+                },
+            },
+        },
+        "smtp": {
+            "type": "object",
+            "properties": {
+                "action": {
+                    "type": "string",
+                    "enum": ["validate", "send", "list_mail_messages", "get_mail_message", "get_mail_attachment"],
+                    "default": "send",
+                },
+                "query": {
+                    "type": "string",
+                    "description": "Gmail list_mail_messages: optional Gmail search query (same syntax as Gmail UI).",
+                },
+                "q": {"type": "string", "description": "Alias for query on list_mail_messages."},
+                "max_results": {
+                    "type": "integer",
+                    "description": "Gmail list_mail_messages: max IDs to return (1–50, default 20).",
+                },
+                "message_id": {
+                    "type": "string",
+                    "description": "Gmail get_mail_message / get_mail_attachment: message id from list_mail_messages.",
+                },
+                "id": {"type": "string", "description": "Alias for message_id (Gmail)."},
+                "attachment_id": {
+                    "type": "string",
+                    "description": "Gmail get_mail_attachment: attachment_id from get_mail_message attachments list.",
+                },
+                "to": {
+                    "description": "Recipient(s): comma/semicolon-separated or array of addresses.",
+                    "oneOf": [
+                        {"type": "string"},
+                        {"type": "array", "items": {"type": "string"}},
+                    ],
+                },
+                "cc": {
+                    "description": "Optional CC addresses (string or array).",
+                    "oneOf": [
+                        {"type": "string"},
+                        {"type": "array", "items": {"type": "string"}},
+                    ],
+                },
+                "bcc": {
+                    "description": "Optional BCC addresses (string or array).",
+                    "oneOf": [
+                        {"type": "string"},
+                        {"type": "array", "items": {"type": "string"}},
+                    ],
+                },
+                "subject": {"type": "string"},
+                "body": {"type": "string", "description": "Plain-text body"},
+                "html_body": {"type": "string", "description": "Optional HTML body (multipart/alternative if body+html_body)."},
+                "from_address": {"type": "string", "description": "Override From; defaults to tool config."},
+                "from_name": {"type": "string"},
+                "attachments": {
+                    "type": "array",
+                    "description": "Optional file attachments (base64). Max 10 files, 5 MiB each, 12 MiB total decoded.",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "filename": {"type": "string"},
+                            "content_base64": {"type": "string"},
+                            "content_type": {"type": "string", "description": "MIME type, default application/octet-stream"},
+                        },
+                        "required": ["content_base64"],
+                    },
+                },
+                "idempotency_key": {
+                    "type": "string",
+                    "description": (
+                        "Required for action send unless PLATFORM_MCP_ALLOW_WRITES_WITHOUT_IDEMPOTENCY_KEY=true. "
+                        "Dedupes successful sends within TTL (Redis when configured, else in-process on MCP server)."
+                    ),
+                },
+            },
+        },
+        "teams": {
+            "type": "object",
+            "properties": {
+                "action": {
+                    "type": "string",
+                    "enum": [
+                        "list_joined_teams",
+                        "list_channels",
+                        "list_channel_messages",
+                        "get_channel_message",
+                        "list_mail_messages",
+                        "get_mail_message",
+                        "get_mail_attachment",
+                        "send_message",
+                        "reply_message",
+                    ],
+                    "default": "list_joined_teams",
+                },
+                "team_id": {
+                    "type": "string",
+                    "description": "Required for list_channels, channel message actions, send_message, reply_message.",
+                },
+                "channel_id": {
+                    "type": "string",
+                    "description": "Required for channel messages, send_message, reply_message.",
+                },
+                "message_id": {
+                    "type": "string",
+                    "description": "reply_message / get_channel_message: Graph message id. get_mail_message / get_mail_attachment: Graph mail message id.",
+                },
+                "top": {
+                    "type": "integer",
+                    "description": "list_channel_messages / list_mail_messages: page size (Teams mail default 15, channel default 25; max 50).",
+                },
+                "mail_folder": {
+                    "type": "string",
+                    "description": "list_mail_messages: mail folder id or well-known name (default inbox).",
+                },
+                "folder": {"type": "string", "description": "Alias for mail_folder."},
+                "include_full_body": {
+                    "type": "boolean",
+                    "description": "get_mail_message: if true, include full MIME body (truncated); else bodyPreview-style excerpt.",
+                },
+                "full_body": {"type": "boolean", "description": "Alias for include_full_body."},
+                "attachment_id": {
+                    "type": "string",
+                    "description": "get_mail_attachment: Graph attachment id from the message.",
+                },
+                "body": {"type": "string", "description": "Message text (or use text / message alias)."},
+                "text": {"type": "string"},
+                "message": {"type": "string"},
+                "content_type": {"type": "string", "enum": ["text", "html"], "default": "text"},
+                "idempotency_key": {
+                    "type": "string",
+                    "description": (
+                        "Required for send_message and reply_message unless PLATFORM_MCP_ALLOW_WRITES_WITHOUT_IDEMPOTENCY_KEY=true. "
+                        "Dedupes successful Graph posts within TTL."
+                    ),
+                },
             },
         },
         "github": {
@@ -437,7 +591,10 @@ def input_schema_for_platform_tool_type(tool_type: str) -> Dict[str, Any]:
             "type": "object",
             "properties": {
                 "method": {"type": "string", "enum": ["GET", "POST", "PUT", "PATCH", "DELETE"], "default": "GET"},
-                "path": {"type": "string", "description": "Path or full URL"},
+                "path": {
+                    "type": "string",
+                    "description": "Relative path only (no scheme, no leading slash); combined with base_url from tool config.",
+                },
                 "body": {"type": "object", "description": "JSON body for POST/PUT/PATCH"},
             },
             "required": ["path"],

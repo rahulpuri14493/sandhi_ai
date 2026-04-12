@@ -1,14 +1,62 @@
 """Slack, GitHub, Notion, REST integrations."""
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
-from typing import Any, Dict
-from urllib.parse import urlparse
+import os
+from typing import Any, Dict, Tuple
+from urllib.parse import urljoin, urlparse
 
 from execution_common import safe_tool_error
+from execution_contract import (
+    ERROR_AUTH_FAILED,
+    ERROR_CONFIGURATION_ERROR,
+    ERROR_UPSTREAM_ERROR,
+    ERROR_VALIDATION_FAILED,
+    maybe_validate_messaging_output,
+    tool_error_json,
+    write_blocked_without_idempotency,
+)
+from execution_http import get_sync_http_client
+from execution_idempotency import cached_tool_json
+from execution_read_cache import get_cached_or_run
+from http_url_guard import check_url_safe_for_server_fetch, http_hosts_allow_redirect
 
 logger = logging.getLogger(__name__)
+
+
+def _rest_api_follow_redirects() -> bool:
+    """Opt-in: follow redirects only on the same host as the first request, re-checking each Location URL."""
+    return os.environ.get("MCP_REST_API_FOLLOW_REDIRECTS", "").strip().lower() in ("1", "true", "yes")
+
+
+_REST_API_REDIRECT_STATUSES = frozenset((301, 302, 303, 307, 308))
+_REST_API_MAX_REDIRECTS = 10
+
+
+def _rest_api_hostname(url: str) -> str:
+    try:
+        return (urlparse(url).hostname or "").lower()
+    except Exception:
+        return ""
+
+
+def _rest_api_json_for_method(method: str, body: Any) -> Any:
+    if body is None:
+        return None
+    if method in ("POST", "PUT", "PATCH"):
+        return body
+    return None
+
+
+def _rest_api_redirect_next_method_body(method: str, status_code: int, json_body: Any) -> Tuple[str, Any]:
+    """Align with common client behavior (303 GET; 301/302 strip POST body)."""
+    if status_code == 303:
+        return "GET", None
+    if status_code in (301, 302) and method == "POST":
+        return "GET", None
+    return method, json_body
 
 
 def _github_host_is_api_github_com(base: str) -> bool:
@@ -26,26 +74,121 @@ def execute_slack(config: Dict[str, Any], arguments: Dict[str, Any]) -> str:
         from slack_sdk import WebClient
         from slack_sdk.errors import SlackApiError
     except ImportError:
-        return "Error: slack_sdk is not installed"
+        return tool_error_json(ERROR_CONFIGURATION_ERROR, "slack_sdk is not installed")
     token = (config.get("bot_token") or config.get("token") or "").strip()
     if not token:
-        return "Error: bot_token not configured"
+        return tool_error_json(ERROR_VALIDATION_FAILED, "bot_token not configured")
     action = (arguments.get("action") or "send").strip().lower()
     client = WebClient(token=token)
     try:
         if action == "list_channels":
-            r = client.conversations_list(limit=200)
-            ch = [c.get("name") for c in r.get("channels") or []]
-            return json.dumps({"channels": ch}, indent=2)
+            def _produce_channels() -> str:
+                r = client.conversations_list(
+                    limit=200,
+                    types="public_channel,private_channel",
+                    exclude_archived=True,
+                )
+                detailed = []
+                for c in r.get("channels") or []:
+                    if not isinstance(c, dict):
+                        continue
+                    cid = c.get("id")
+                    name = c.get("name")
+                    if not cid:
+                        continue
+                    detailed.append(
+                        {
+                            "id": cid,
+                            "name": name,
+                            "is_private": bool(c.get("is_private")),
+                        }
+                    )
+                raw = json.dumps(
+                    {
+                        "channels": detailed,
+                        "note": (
+                            "Use id for list_messages when possible; Slack accepts some names with # prefix for send."
+                        ),
+                    },
+                    indent=2,
+                )
+                return maybe_validate_messaging_output("slack", "list_channels", raw)
+
+            ck = "slack:list_channels:" + hashlib.sha256(token.encode()).hexdigest()[:40]
+            return get_cached_or_run(ck, _produce_channels)
+        if action == "list_messages":
+            channel = (arguments.get("channel") or config.get("default_channel") or "").strip()
+            if not channel:
+                return tool_error_json(ERROR_VALIDATION_FAILED, "channel is required for list_messages")
+            try:
+                lim = int(arguments.get("limit") or 50)
+            except (TypeError, ValueError):
+                lim = 50
+            lim = max(1, min(lim, 200))
+            cursor = (arguments.get("cursor") or arguments.get("oldest") or "").strip() or None
+            kwargs: Dict[str, Any] = {"channel": channel, "limit": lim}
+            if cursor:
+                kwargs["cursor"] = cursor
+            hist = client.conversations_history(**kwargs)
+            msgs = hist.get("messages") or []
+            slim = []
+            for m in msgs:
+                if not isinstance(m, dict):
+                    continue
+                text = str(m.get("text") or "")
+                if len(text) > 4000:
+                    text = text[:4000] + "…"
+                slim.append(
+                    {
+                        "ts": m.get("ts"),
+                        "user": m.get("user"),
+                        "text": text,
+                        "thread_ts": m.get("thread_ts"),
+                        "subtype": m.get("subtype"),
+                    }
+                )
+            meta = hist.get("response_metadata") or {}
+            out: Dict[str, Any] = {"messages": slim, "has_more": bool(meta.get("next_cursor"))}
+            if meta.get("next_cursor"):
+                out["next_cursor"] = meta.get("next_cursor")
+            raw = json.dumps(out, indent=2)
+            return maybe_validate_messaging_output("slack", "list_messages", raw)
         channel = (arguments.get("channel") or config.get("default_channel") or "").strip()
         message = (arguments.get("message") or "").strip()
         if not channel or not message:
-            return "Error: channel and message are required for send"
-        client.chat_postMessage(channel=channel, text=message)
-        return json.dumps({"status": "ok"})
+            return tool_error_json(ERROR_VALIDATION_FAILED, "channel and message are required for send")
+        blocked = write_blocked_without_idempotency(arguments, operation="slack send")
+        if blocked:
+            return blocked
+        idem = str(arguments.get("idempotency_key") or "").strip()
+
+        def _post() -> str:
+            client.chat_postMessage(channel=channel, text=message)
+            return json.dumps({"status": "ok"})
+
+        return cached_tool_json("slack_send", idem, _post, cache_success_only=True)
     except SlackApiError as e:
-        code = (e.response or {}).get("error") or "slack_api_error"
-        return f"Error: Slack API ({code})"
+        resp = e.response or {}
+        slack_err = str(resp.get("error") or "slack_api_error")
+        if slack_err in (
+            "not_authed",
+            "invalid_auth",
+            "token_revoked",
+            "account_inactive",
+            "invalid_token",
+        ):
+            return tool_error_json(
+                ERROR_AUTH_FAILED,
+                f"Slack rejected credentials ({slack_err})",
+                provider="slack",
+                upstream_code=slack_err,
+            )
+        return tool_error_json(
+            ERROR_UPSTREAM_ERROR,
+            f"Slack API error: {slack_err}",
+            provider="slack",
+            upstream_code=slack_err,
+        )
     except Exception as e:
         return safe_tool_error("Slack error", e)
 
@@ -135,8 +278,6 @@ def execute_notion(config: Dict[str, Any], arguments: Dict[str, Any]) -> str:
 
 
 def execute_rest_api(config: Dict[str, Any], arguments: Dict[str, Any]) -> str:
-    import httpx
-
     base = (config.get("base_url") or "").strip()
     path = (arguments.get("path") or "").strip()
     method = (arguments.get("method") or "GET").upper()
@@ -146,16 +287,83 @@ def execute_rest_api(config: Dict[str, Any], arguments: Dict[str, Any]) -> str:
         return "Error: path must be a relative path (no full URLs or leading slash)"
     if not base:
         return "Error: base_url not configured for REST API tool"
+    safe, reason = check_url_safe_for_server_fetch(base, purpose="rest_api_tool")
+    if not safe:
+        code = "dns_error" if "resolve" in reason.lower() else "base_url_blocked"
+        return json.dumps({"error": code, "message": reason}, indent=2)
     url = base.rstrip("/") + "/" + path.lstrip("/")
     headers = {}
     if config.get("api_key"):
         headers["Authorization"] = f"Bearer {config.get('api_key')}"
+    client = get_sync_http_client()
+    json_body = arguments.get("body")
     try:
-        with httpx.Client(timeout=15.0) as client:
-            r = client.request(method, url, json=arguments.get("body"), headers=headers)
-            ct = r.headers.get("content-type", "")
-            body = r.json() if ct.startswith("application/json") else r.text
-            return json.dumps({"status": r.status_code, "body": body})
+        if not _rest_api_follow_redirects():
+            r = client.request(
+                method,
+                url,
+                json=_rest_api_json_for_method(method, json_body),
+                headers=headers,
+                timeout=15.0,
+                follow_redirects=False,
+            )
+        else:
+            anchor_host = _rest_api_hostname(url)
+            if not anchor_host:
+                return json.dumps({"error": "base_url_blocked", "message": "Invalid base URL host"}, indent=2)
+            current_method = method
+            current_url = url
+            current_json = json_body
+            n_redir = 0
+            while True:
+                r = client.request(
+                    current_method,
+                    current_url,
+                    json=_rest_api_json_for_method(current_method, current_json),
+                    headers=headers,
+                    timeout=15.0,
+                    follow_redirects=False,
+                )
+                if r.status_code not in _REST_API_REDIRECT_STATUSES:
+                    break
+                if n_redir >= _REST_API_MAX_REDIRECTS:
+                    return json.dumps(
+                        {"error": "redirect_limit", "message": "Too many HTTP redirects."},
+                        indent=2,
+                    )
+                n_redir += 1
+                loc = r.headers.get("location") or r.headers.get("Location")
+                if not loc or not str(loc).strip():
+                    return json.dumps(
+                        {
+                            "error": "redirect_no_location",
+                            "message": f"HTTP {r.status_code} redirect without Location header.",
+                        },
+                        indent=2,
+                    )
+                next_url = urljoin(current_url, str(loc).strip())
+                safe, reason = check_url_safe_for_server_fetch(next_url, purpose="rest_api_tool_redirect")
+                if not safe:
+                    code = "dns_error" if "resolve" in reason.lower() else "redirect_blocked"
+                    return json.dumps({"error": code, "message": reason}, indent=2)
+                if not http_hosts_allow_redirect(anchor_host, _rest_api_hostname(next_url)):
+                    return json.dumps(
+                        {
+                            "error": "redirect_host_mismatch",
+                            "message": (
+                                "Redirect target is not the same hostname or registrable domain as base_url "
+                                "(e.g. api.example.com → cdn.example.com is allowed)."
+                            ),
+                        },
+                        indent=2,
+                    )
+                current_method, current_json = _rest_api_redirect_next_method_body(
+                    current_method, r.status_code, current_json
+                )
+                current_url = next_url
+        ct = r.headers.get("content-type", "")
+        body = r.json() if ct.startswith("application/json") else r.text
+        return json.dumps({"status": r.status_code, "body": body})
     except Exception as e:
         return safe_tool_error("REST API error", e)
 

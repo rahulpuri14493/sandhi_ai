@@ -192,6 +192,57 @@ class TestMCPTools:
         )
         assert r.status_code == 400
 
+    def test_create_tool_rejects_duplicate_name_case_insensitive(self, client_mcp: TestClient, business_user):
+        r1 = client_mcp.post(
+            "/api/mcp/tools",
+            headers=business_user["headers"],
+            json={"tool_type": "filesystem", "name": "smtp", "config": {"base_path": "/tmp"}},
+        )
+        assert r1.status_code == 201
+        r2 = client_mcp.post(
+            "/api/mcp/tools",
+            headers=business_user["headers"],
+            json={"tool_type": "smtp", "name": "  SMTP  ", "config": {"provider": "gmail", "username": "a@b.com", "password": "x"}},
+        )
+        assert r2.status_code == 400
+        assert "already exists" in (r2.json().get("detail") or "").lower()
+
+    def test_update_tool_rejects_rename_to_existing_name(self, client_mcp: TestClient, business_user):
+        client_mcp.post(
+            "/api/mcp/tools",
+            headers=business_user["headers"],
+            json={"tool_type": "filesystem", "name": "alpha", "config": {"base_path": "/tmp"}},
+        )
+        cr = client_mcp.post(
+            "/api/mcp/tools",
+            headers=business_user["headers"],
+            json={"tool_type": "filesystem", "name": "beta", "config": {"base_path": "/tmp"}},
+        )
+        assert cr.status_code == 201
+        tid = cr.json()["id"]
+        r = client_mcp.patch(
+            f"/api/mcp/tools/{tid}",
+            headers=business_user["headers"],
+            json={"name": "ALPHA"},
+        )
+        assert r.status_code == 400
+        assert "already exists" in (r.json().get("detail") or "").lower()
+
+    def test_update_tool_same_name_allowed(self, client_mcp: TestClient, business_user):
+        cr = client_mcp.post(
+            "/api/mcp/tools",
+            headers=business_user["headers"],
+            json={"tool_type": "filesystem", "name": "gamma", "config": {"base_path": "/tmp"}},
+        )
+        tid = cr.json()["id"]
+        r = client_mcp.patch(
+            f"/api/mcp/tools/{tid}",
+            headers=business_user["headers"],
+            json={"name": "gamma"},
+        )
+        assert r.status_code == 200
+        assert r.json()["name"] == "gamma"
+
     def test_list_tools_after_create(self, client_mcp: TestClient, business_user):
         client_mcp.post(
             "/api/mcp/tools",
@@ -267,6 +318,8 @@ class TestMCPSchemaRefresh:
         types_and_configs = [
             ("s3", {"bucket": "b", "region": "us-east-1"}),
             ("slack", {"token": "xoxb-x"}),
+            ("teams", {"access_token": "fake-graph-token"}),
+            ("smtp", {"provider": "gmail", "username": "a@b.com", "password": "x"}),
             ("github", {"token": "ghp-x"}),
             ("notion", {"api_key": "secret-x"}),
             ("elasticsearch", {"url": "http://localhost:9200"}),
@@ -330,6 +383,29 @@ class TestMCPSchemaRefresh:
         assert cfg["schema"] == "analytics"
         assert cfg["query"] == "SELECT now();"
         assert cfg["connection_string"] == "postgresql://u:p@localhost/db"
+
+    def test_update_tool_fails_when_decrypt_raises(self, client_mcp: TestClient, business_user, monkeypatch):
+        import api.routes.mcp as mcp_routes
+
+        cr = client_mcp.post(
+            "/api/mcp/tools",
+            headers=business_user["headers"],
+            json={"tool_type": "slack", "name": "S1", "config": {"bot_token": "x"}},
+        )
+        assert cr.status_code == 201
+        tid = cr.json()["id"]
+
+        def _boom(_blob):
+            raise ValueError("bad cipher")
+
+        monkeypatch.setattr(mcp_routes, "decrypt_json", _boom)
+        r = client_mcp.patch(
+            f"/api/mcp/tools/{tid}",
+            headers=business_user["headers"],
+            json={"config": {"bot_token": "new"}},
+        )
+        assert r.status_code == 500
+        assert "decrypt" in str(r.json().get("detail", "")).lower()
 
     def test_delete_tool(self, client_mcp: TestClient, business_user):
         cr = client_mcp.post(
@@ -406,6 +482,45 @@ class TestMCPConnectionValidate:
         uid = int(business_user["user"].id)
         assert captured.get("business_id") == uid
         assert captured.get("connection_id") == -(uid + 1)
+
+    def test_validate_connection_merges_stored_credentials(
+        self, client_mcp: TestClient, business_user, db_session
+    ):
+        from models.mcp_server import MCPServerConnection
+
+        conn = MCPServerConnection(
+            user_id=business_user["user"].id,
+            name="Secured",
+            base_url="https://mcp.example.com",
+            endpoint_path="/mcp",
+            auth_type="bearer",
+            encrypted_credentials=encrypt_json({"token": "secret-bearer"}),
+        )
+        db_session.add(conn)
+        db_session.commit()
+        db_session.refresh(conn)
+
+        captured: dict = {}
+
+        async def _fake(**kwargs):
+            captured.update(kwargs)
+            return {"jsonrpc": "2.0", "result": {}}
+
+        with patch("api.routes.mcp.guarded_mcp_jsonrpc", new_callable=AsyncMock, side_effect=_fake):
+            r = client_mcp.post(
+                "/api/mcp/connections/validate",
+                headers=business_user["headers"],
+                json={
+                    "name": "Secured",
+                    "base_url": "https://mcp.example.com",
+                    "endpoint_path": "/mcp",
+                    "auth_type": "bearer",
+                    "connection_id": conn.id,
+                },
+            )
+        assert r.status_code == 200
+        assert r.json()["valid"] is True
+        assert captured.get("credentials", {}).get("token") == "secret-bearer"
 
 
 class TestMCPValidate:
@@ -500,6 +615,84 @@ class TestMCPValidate:
         assert r.status_code == 200
         assert r.json()["valid"] is False
         assert "user is required" in r.json()["message"].lower()
+
+    def test_validate_teams_blank_token_in_payload_keeps_stored(
+        self, client_mcp: TestClient, business_user, monkeypatch
+    ):
+        captured: dict = {}
+
+        def fake_validate(tool_type: str, config: dict):
+            captured["config"] = config
+            return True, "ok"
+
+        monkeypatch.setattr("services.mcp_validate.validate_tool_config", fake_validate)
+
+        cr = client_mcp.post(
+            "/api/mcp/tools",
+            headers=business_user["headers"],
+            json={
+                "tool_type": "teams",
+                "name": "Teams V",
+                "config": {
+                    "access_token": "stored-secret",
+                    "graph_base_url": "https://graph.microsoft.com/v1.0",
+                },
+            },
+        )
+        assert cr.status_code == 201
+        tid = cr.json()["id"]
+
+        r = client_mcp.post(
+            "/api/mcp/tools/validate",
+            headers=business_user["headers"],
+            json={
+                "tool_type": "teams",
+                "tool_id": tid,
+                "config": {
+                    "access_token": "",
+                    "oauth_refresh_token": "",
+                    "graph_base_url": "https://graph.microsoft.com/v1.0",
+                },
+            },
+        )
+        assert r.status_code == 200
+        assert r.json()["valid"] is True
+        assert captured["config"].get("access_token") == "stored-secret"
+
+    def test_validate_postgres_empty_connection_string_keeps_stored(
+        self, client_mcp: TestClient, business_user, monkeypatch
+    ):
+        captured: dict = {}
+
+        def fake_validate(tool_type: str, config: dict):
+            captured["config"] = config
+            return True, "ok"
+
+        monkeypatch.setattr("services.mcp_validate.validate_tool_config", fake_validate)
+
+        cr = client_mcp.post(
+            "/api/mcp/tools",
+            headers=business_user["headers"],
+            json={
+                "tool_type": "postgres",
+                "name": "PG merge",
+                "config": {"connection_string": "postgresql://u:p@localhost/db", "schema": "public"},
+            },
+        )
+        assert cr.status_code == 201
+        tid = cr.json()["id"]
+        r = client_mcp.post(
+            "/api/mcp/tools/validate",
+            headers=business_user["headers"],
+            json={
+                "tool_type": "postgres",
+                "tool_id": tid,
+                "config": {"schema": "analytics", "connection_string": ""},
+            },
+        )
+        assert r.status_code == 200
+        assert captured["config"]["connection_string"] == "postgresql://u:p@localhost/db"
+        assert captured["config"]["schema"] == "analytics"
 
 
 class TestMCPRegistry:
@@ -978,6 +1171,34 @@ class TestMCPPositive:
         r = client_mcp.get(f"/api/mcp/tools/{tid}", headers=business_user["headers"])
         assert r.status_code == 200
         assert r.json()["name"] == "GetMeTool"
+
+    def test_positive_get_tool_smtp_config_preview_safe(self, client_mcp: TestClient, business_user):
+        cr = client_mcp.post(
+            "/api/mcp/tools",
+            headers=business_user["headers"],
+            json={
+                "tool_type": "smtp",
+                "name": "smtp",
+                "config": {
+                    "provider": "gmail",
+                    "username": "a@b.com",
+                    "password": "secret-pw",
+                    "access_token": "tok",
+                    "from_name": "Support",
+                },
+            },
+        )
+        assert cr.status_code == 201
+        tid = cr.json()["id"]
+        r = client_mcp.get(f"/api/mcp/tools/{tid}", headers=business_user["headers"])
+        assert r.status_code == 200
+        body = r.json()
+        preview = body.get("config_preview") or {}
+        assert preview.get("provider") == "gmail"
+        assert preview.get("username") == "a@b.com"
+        assert preview.get("from_name") == "Support"
+        assert "password" not in preview
+        assert "access_token" not in preview
 
     def test_positive_validate_tool_filesystem_success(self, client_mcp: TestClient, business_user, tmp_path):
         r = client_mcp.post(

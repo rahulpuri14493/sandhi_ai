@@ -71,6 +71,12 @@ def test_validate_tool_config_http(monkeypatch):
             self.status_code = code
             self.text = text
 
+    import socket
+
+    monkeypatch.setattr(
+        "services.http_url_guard.socket.getaddrinfo",
+        lambda *a, **k: [(socket.AF_INET, socket.SOCK_STREAM, 0, "", ("8.8.8.8", 0))],
+    )
     monkeypatch.setattr(httpx, "get", lambda *a, **k: R(200, "ok"))
     ok, msg = mcp_validate.validate_tool_config("rest_api", {"url": "example.com"})
     assert ok is True

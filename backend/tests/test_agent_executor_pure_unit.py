@@ -438,6 +438,14 @@ async def test_trigger_platform_write_calls_mcp_with_headers(monkeypatch):
     step.step_order = 3
     mcp = AsyncMock(return_value={"written": True})
     monkeypatch.setattr(ae, "mcp_call_tool", mcp)
+    monkeypatch.setattr(
+        "services.mcp_guardrails.try_get_http_idempotency_result",
+        lambda *_a, **_k: None,
+    )
+    monkeypatch.setattr(
+        "services.mcp_guardrails.store_http_idempotency_result",
+        lambda *_a, **_k: None,
+    )
     monkeypatch.setattr(ae.settings, "PLATFORM_MCP_SERVER_URL", "http://platform-mcp:9999")
     monkeypatch.setattr(ae.settings, "MCP_TOOL_DEFAULT_TIMEOUT_SECONDS", 45.0)
     out = await ex._trigger_platform_write(
@@ -473,6 +481,14 @@ async def test_trigger_platform_write_adds_trusted_bootstrap_when_signed(monkeyp
     step.step_order = 1
     mcp = AsyncMock(return_value={})
     monkeypatch.setattr(ae, "mcp_call_tool", mcp)
+    monkeypatch.setattr(
+        "services.mcp_guardrails.try_get_http_idempotency_result",
+        lambda *_a, **_k: None,
+    )
+    monkeypatch.setattr(
+        "services.mcp_guardrails.store_http_idempotency_result",
+        lambda *_a, **_k: None,
+    )
     monkeypatch.setattr(ae.settings, "PLATFORM_MCP_SERVER_URL", "http://mcp/")
     monkeypatch.setattr(ae.settings, "MCP_TOOL_DEFAULT_TIMEOUT_SECONDS", 60.0)
     monkeypatch.setattr(ae, "_sign_trusted_bootstrap_payload", lambda **kwargs: "sighex")
@@ -503,6 +519,14 @@ async def test_trigger_platform_write_omits_bootstrap_when_signature_none(monkey
     step.step_order = 1
     mcp = AsyncMock(return_value={})
     monkeypatch.setattr(ae, "mcp_call_tool", mcp)
+    monkeypatch.setattr(
+        "services.mcp_guardrails.try_get_http_idempotency_result",
+        lambda *_a, **_k: None,
+    )
+    monkeypatch.setattr(
+        "services.mcp_guardrails.store_http_idempotency_result",
+        lambda *_a, **_k: None,
+    )
     monkeypatch.setattr(ae.settings, "PLATFORM_MCP_SERVER_URL", "http://mcp/")
     monkeypatch.setattr(ae.settings, "MCP_TOOL_DEFAULT_TIMEOUT_SECONDS", 60.0)
     monkeypatch.setattr(ae, "_sign_trusted_bootstrap_payload", lambda **kwargs: None)

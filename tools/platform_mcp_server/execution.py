@@ -40,6 +40,8 @@ from execution_integrations import (
     execute_rest_api,
     execute_slack,
 )
+from execution_smtp import execute_smtp
+from execution_teams import execute_teams
 from execution_object_storage import execute_azure_blob, execute_gcs, execute_s3_family
 from execution_sql import (
     execute_bigquery_sql,
@@ -84,6 +86,8 @@ __all__ = [
     "execute_rest_api",
     "execute_s3_family",
     "execute_slack",
+    "execute_smtp",
+    "execute_teams",
     "execute_snowflake_sql",
     "execute_sqlserver_sql",
     "is_artifact_platform_write",

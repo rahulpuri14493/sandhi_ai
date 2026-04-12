@@ -7,9 +7,10 @@ import logging
 import uuid
 from datetime import datetime
 from fastapi import APIRouter, Depends, HTTPException, status, BackgroundTasks
+from sqlalchemy import func
 from sqlalchemy.orm import Session
 from sqlalchemy.exc import IntegrityError
-from typing import List
+from typing import List, Optional
 
 from db.database import get_db
 from models.user import User
@@ -17,6 +18,7 @@ from models.audit_log import AuditLog
 from models.mcp_server import MCPServerConnection, MCPToolConfig, MCPToolType, MCPWriteOperation
 from schemas.mcp import (
     MCPServerConnectionCreate,
+    MCPServerConnectionValidate,
     MCPServerConnectionUpdate,
     MCPServerConnectionResponse,
     MCPToolConfigCreate,
@@ -31,7 +33,9 @@ from schemas.mcp import (
 from core.security import get_current_business_user
 from core.encryption import encrypt_json, decrypt_json
 from db.database import SessionLocal
+from services.http_url_guard import safe_url_host_for_logs
 from services.mcp_platform_naming import platform_tool_id_from_mcp_function_name
+from services.mcp_config_merge import merge_shallow_config, public_config_preview
 from services.mcp_guardrails import (
     MCPGuardrailError,
     get_mcp_guardrails,
@@ -40,9 +44,31 @@ from services.mcp_guardrails import (
     infer_mcp_tool_operation_class,
     resolve_mcp_tenant_tier,
 )
+from api.routes import mcp_oauth as _mcp_oauth
 
 router = APIRouter(prefix="/api/mcp", tags=["mcp"])
+router.include_router(_mcp_oauth.router)
 logger = logging.getLogger(__name__)
+
+
+def _platform_tool_name_taken(
+    db: Session,
+    user_id: int,
+    name: str,
+    *,
+    exclude_tool_id: Optional[int] = None,
+) -> bool:
+    """True if this business user already has a platform tool with the same name (trimmed, case-insensitive)."""
+    norm = (name or "").strip()
+    if not norm:
+        return False
+    q = db.query(MCPToolConfig.id).filter(
+        MCPToolConfig.user_id == user_id,
+        func.lower(MCPToolConfig.name) == norm.lower(),
+    )
+    if exclude_tool_id is not None:
+        q = q.filter(MCPToolConfig.id != exclude_tool_id)
+    return q.first() is not None
 
 
 def _require_platform_tool_for_user(db: Session, user_id: int, tool_name: str) -> None:
@@ -201,7 +227,11 @@ async def _invoke_platform_tool_call(
     except MCPGuardrailError as ge:
         raise _http_exception_from_mcp_guardrail_error(ge) from ge
     except Exception as e:
-        logger.exception("call_platform_tool failed tool_name=%s", body.tool_name)
+        logger.error(
+            "call_platform_tool failed tool_name=%s err_type=%s",
+            body.tool_name,
+            type(e).__name__,
+        )
         raise HTTPException(
             status_code=502,
             detail=f"Platform tool call failed ({type(e).__name__})",
@@ -276,7 +306,11 @@ def _run_platform_write_operation(operation_id: str, user_id: int) -> None:
         op.completed_at = datetime.utcnow()
         db.commit()
     except Exception as e:
-        logger.exception("Async platform write operation failed operation_id=%s", operation_id)
+        logger.error(
+            "Async platform write operation failed operation_id=%s err_type=%s",
+            operation_id,
+            type(e).__name__,
+        )
         try:
             op = db.query(MCPWriteOperation).filter(
                 MCPWriteOperation.operation_id == operation_id,
@@ -339,8 +373,9 @@ def _tool_to_response(t: MCPToolConfig) -> MCPToolConfigResponse:
 
 @router.post("/connections/validate")
 async def validate_connection(
-    body: MCPServerConnectionCreate,
+    body: MCPServerConnectionValidate,
     current_user: User = Depends(get_current_business_user),
+    db: Session = Depends(get_db),
 ):
     """
     Test MCP server connectivity (JSON-RPC initialize) without saving.
@@ -354,6 +389,22 @@ async def validate_connection(
         endpoint_path = "/" + endpoint_path
     auth_type = body.auth_type or "none"
     credentials = body.credentials
+    if body.connection_id is not None:
+        conn = db.query(MCPServerConnection).filter(
+            MCPServerConnection.id == int(body.connection_id),
+            MCPServerConnection.user_id == current_user.id,
+        ).first()
+        if not conn:
+            return {"valid": False, "message": "Connection not found"}
+        stored_cred: dict = {}
+        if conn.encrypted_credentials:
+            try:
+                raw = decrypt_json(conn.encrypted_credentials)
+                if isinstance(raw, dict):
+                    stored_cred = raw
+            except Exception:
+                pass
+        credentials = merge_shallow_config(stored_cred, body.credentials or {})
     try:
         await guarded_mcp_jsonrpc(
             business_id=int(current_user.id),
@@ -436,7 +487,11 @@ async def certify_connection_for_production(
         checks.append({"name": "initialize", "passed": False, "error": ge.code})
         return {"certified": False, "checks": checks, "recommended_policy": "fix_connection"}
     except Exception as e:
-        logger.exception("MCP certify: initialize failed")
+        logger.error(
+            "MCP certify: initialize failed connection_id=%s err_type=%s",
+            conn.id,
+            type(e).__name__,
+        )
         checks.append({"name": "initialize", "passed": False, "error": type(e).__name__})
         return {"certified": False, "checks": checks, "recommended_policy": "fix_connection"}
 
@@ -457,7 +512,11 @@ async def certify_connection_for_production(
         checks.append({"name": "tools_list", "passed": False, "error": ge.code})
         return {"certified": False, "checks": checks, "recommended_policy": "fix_tools_list"}
     except Exception as e:
-        logger.exception("MCP certify: tools/list failed")
+        logger.error(
+            "MCP certify: tools/list failed connection_id=%s err_type=%s",
+            conn.id,
+            type(e).__name__,
+        )
         checks.append({"name": "tools_list", "passed": False, "error": type(e).__name__})
         return {"certified": False, "checks": checks, "recommended_policy": "fix_tools_list"}
 
@@ -549,7 +608,15 @@ def update_connection(
     if body.auth_type is not None:
         conn.auth_type = body.auth_type
     if body.credentials is not None:
-        conn.encrypted_credentials = encrypt_json(body.credentials)
+        prev: dict = {}
+        if conn.encrypted_credentials:
+            try:
+                d = decrypt_json(conn.encrypted_credentials)
+                if isinstance(d, dict):
+                    prev = d
+            except Exception:
+                pass
+        conn.encrypted_credentials = encrypt_json(merge_shallow_config(prev, body.credentials))
     if body.is_active is not None:
         conn.is_active = body.is_active
     db.commit()
@@ -592,15 +659,36 @@ def list_tools(
 def validate_tool_config(
     body: ValidateToolConfigRequest,
     current_user: User = Depends(get_current_business_user),
+    db: Session = Depends(get_db),
 ):
     """Validate tool config (test connection) before save. Does not store anything."""
     from services.mcp_validate import validate_tool_config as do_validate
     tool_type_str = (body.tool_type or "").strip().lower()
     try:
-        MCPToolType(tool_type_str)
+        expected_type = MCPToolType(tool_type_str)
     except ValueError:
         raise HTTPException(status_code=400, detail="Invalid tool_type")
-    valid, message = do_validate(tool_type_str, body.config)
+    cfg_in = body.config if isinstance(body.config, dict) else {}
+    merged: dict = dict(cfg_in)
+    if body.tool_id is not None:
+        t = db.query(MCPToolConfig).filter(
+            MCPToolConfig.id == int(body.tool_id),
+            MCPToolConfig.user_id == current_user.id,
+        ).first()
+        if not t:
+            raise HTTPException(status_code=404, detail="Tool config not found")
+        if t.tool_type != expected_type:
+            raise HTTPException(status_code=400, detail="tool_type does not match this tool_id")
+        stored: dict = {}
+        if t.encrypted_config:
+            try:
+                raw = decrypt_json(t.encrypted_config)
+                if isinstance(raw, dict):
+                    stored = raw
+            except Exception:
+                pass
+        merged = merge_shallow_config(stored, cfg_in)
+    valid, message = do_validate(tool_type_str, merged)
     return {"valid": valid, "message": message}
 
 
@@ -619,17 +707,25 @@ def create_tool(
             detail=(
                 "tool_type must be one of: vector_db, pinecone, weaviate, qdrant, chroma, "
                 "postgres, mysql, sqlserver, snowflake, databricks, bigquery, elasticsearch, pageindex, "
-                "filesystem, s3, minio, ceph, azure_blob, gcs, slack, github, notion, rest_api"
+                "filesystem, s3, minio, ceph, azure_blob, gcs, slack, teams, smtp, github, notion, rest_api"
             ),
         )
     encrypted = encrypt_json(body.config)
     business_description = (body.business_description or "").strip() or None
     if business_description and len(business_description) > 2000:
         business_description = business_description[:2000]
+    display_name = (body.name or "").strip()
+    if not display_name:
+        raise HTTPException(status_code=400, detail="Tool name is required")
+    if _platform_tool_name_taken(db, int(current_user.id), display_name):
+        raise HTTPException(
+            status_code=400,
+            detail="A platform tool with this name already exists. Choose a different name.",
+        )
     tool = MCPToolConfig(
         user_id=current_user.id,
         tool_type=tool_type,
-        name=body.name,
+        name=display_name,
         encrypted_config=encrypted,
         business_description=business_description,
     )
@@ -661,6 +757,9 @@ def get_tool(
     if not isinstance(cfg, dict):
         return base
     updates: dict = {}
+    preview = public_config_preview(cfg)
+    if preview:
+        updates["config_preview"] = preview
     if t.tool_type == MCPToolType.CHROMA:
         url = cfg.get("url")
         if isinstance(url, str) and url.strip():
@@ -691,14 +790,37 @@ def update_tool(
     if not t:
         raise HTTPException(status_code=404, detail="Tool config not found")
     if body.name is not None:
-        t.name = body.name
+        display_name = (body.name or "").strip()
+        if not display_name:
+            raise HTTPException(status_code=400, detail="Tool name cannot be empty")
+        if _platform_tool_name_taken(db, int(current_user.id), display_name, exclude_tool_id=tool_id):
+            raise HTTPException(
+                status_code=400,
+                detail="A platform tool with this name already exists. Choose a different name.",
+            )
+        t.name = display_name
     if body.config is not None:
         # Merge partial updates so omitted keys (e.g. secret fields left blank in UI)
         # are preserved instead of being dropped.
-        current_cfg = decrypt_json(t.encrypted_config) if t.encrypted_config else {}
-        if not isinstance(current_cfg, dict):
-            current_cfg = {}
-        merged_cfg = {**current_cfg, **body.config}
+        current_cfg: dict = {}
+        if t.encrypted_config:
+            try:
+                raw = decrypt_json(t.encrypted_config)
+            except Exception:
+                raise HTTPException(
+                    status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                    detail=(
+                        "Stored tool configuration could not be decrypted. "
+                        "Check MCP_ENCRYPTION_KEY matches the key used when the tool was created, or re-create the tool."
+                    ),
+                )
+            if not isinstance(raw, dict):
+                raise HTTPException(
+                    status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                    detail="Stored tool configuration is invalid. Re-create the tool.",
+                )
+            current_cfg = raw
+        merged_cfg = merge_shallow_config(current_cfg, body.config)
         t.encrypted_config = encrypt_json(merged_cfg)
     if body.business_description is not None:
         bd = (body.business_description or "").strip() or None
@@ -1001,7 +1123,13 @@ async def get_registry(
             )
             error_msg = f"Failed to list tools ({ge.code})."
         except Exception as e:
-            logging.getLogger(__name__).warning("Failed to list tools for connection %s (%s): %s", c.name, base_url, e)
+            logger.warning(
+                "Failed to list tools for connection id=%s name=%s host=%s (%s)",
+                c.id,
+                c.name,
+                safe_url_host_for_logs(base_url),
+                type(e).__name__,
+            )
             error_msg = "Failed to list tools for this connection."
         connection_tools.append({
             "connection_id": c.id,
@@ -1085,7 +1213,9 @@ def _registry_description(tool_type: str, name: str) -> str:
         "ceph": "Ceph",
         "azure_blob": "Azure Blob",
         "gcs": "Google Cloud Storage",
-        "slack": "Slack",
+        "slack": "Slack (read + write)",
+        "teams": "Microsoft Teams / Graph (read + write)",
+        "smtp": "SMTP email (read + write)",
         "github": "GitHub",
         "notion": "Notion",
         "rest_api": "REST API",
