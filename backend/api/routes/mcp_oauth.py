@@ -94,7 +94,7 @@ _MS_GRAPH_SCOPES = (
     "https://graph.microsoft.com/Mail.Read"
 )
 # Use Exchange resource in the authorize URL so access_token "aud" matches smtp.office365.com (XOAUTH2).
-# Graph-only scope (https://graph.microsoft.com/SMTP.Send) often authorizes but SMTP returns 535.7.3 — wrong audience.
+# Graph-only scope (https://graph.microsoft.com/SMTP.Send) often authorizes but SMTP returns 535.7.3 - wrong audience.
 # Entra still lists SMTP.Send under "Microsoft Graph"; that permission backs this scope for many tenants.
 # https://learn.microsoft.com/en-us/exchange/client-developer/legacy-protocols/how-to-authenticate-an-imap-pop-smtp-application-by-using-oauth
 _DEFAULT_MS_SMTP_SCOPES = "offline_access openid https://outlook.office.com/SMTP.Send"

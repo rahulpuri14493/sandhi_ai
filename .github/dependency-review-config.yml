@@ -1,0 +1,4 @@
+# Settings for actions/dependency-review-action (see dependency-review.yml).
+# OpenSSF Scorecard: transitive PyPI deps often score "0" for maintenance/pinning and flood PR comments without
+# being actionable for this repo. Vulnerability + license checks stay enabled via the workflow.
+show-openssf-scorecard: false

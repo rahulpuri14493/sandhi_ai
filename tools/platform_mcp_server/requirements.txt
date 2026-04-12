@@ -24,4 +24,5 @@ PyGithub>=2.2.0
 notion-client>=2.2.0
 azure-storage-blob>=12.19.0
 azure-identity>=1.15.0
-redis>=5.0.0
+# Pin to backend's redis to avoid floating resolves (e.g. 7.x / pre-releases) and stabilize dependency-review / SBOM.
+redis==5.1.1

@@ -13,6 +13,16 @@ const MCP_OAUTH_RETURN_KEY = 'sandhi_mcp_oauth_return'
 /** If `?oauth_nonce=` is gone before `user` is loaded (navigation, router timing), we still claim using this. */
 const MCP_PENDING_OAUTH_NONCE_KEY = 'sandhi_mcp_oauth_nonce_pending'
 
+/** Nonces come from `secrets.token_urlsafe` on the backend; reject anything else before sessionStorage. */
+const OAUTH_NONCE_SAFE_RE = /^[A-Za-z0-9_-]+$/
+
+function sanitizeOAuthNonceForStorage(raw: string): string {
+  const s = raw.trim()
+  if (!s || s.length > 256) return ''
+  if (!OAUTH_NONCE_SAFE_RE.test(s)) return ''
+  return s
+}
+
 /** Router search can lag behind `window.location` with basename; read both. */
 function getOAuthQueryParam(searchParams: URLSearchParams, key: string): string {
   const fromRouter = searchParams.get(key)
@@ -223,10 +233,10 @@ export default function MCPPage() {
 
   useEffect(() => {
     const oauthErrRaw = getOAuthQueryParam(searchParams, 'oauth_error')
-    let nonce = getOAuthQueryParam(searchParams, 'oauth_nonce').trim()
+    let nonce = sanitizeOAuthNonceForStorage(getOAuthQueryParam(searchParams, 'oauth_nonce'))
     if (!nonce) {
       try {
-        nonce = (sessionStorage.getItem(MCP_PENDING_OAUTH_NONCE_KEY) ?? '').trim()
+        nonce = sanitizeOAuthNonceForStorage(sessionStorage.getItem(MCP_PENDING_OAUTH_NONCE_KEY) ?? '')
       } catch {
         nonce = ''
       }
