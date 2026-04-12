@@ -100,13 +100,14 @@ def maybe_notify_job_completed_email(*, job_id: int, business_id: int, title: st
             use_tls=use_tls and not use_ssl,
             use_ssl=use_ssl,
         )
-        logger.info("job_completion_email_sent job_id=%s to=%s", job_id, mail_to)
+        # Do not log raw recipient (PII). Operators correlate by job_id.
+        logger.info("job_completion_email_sent job_id=%s", job_id)
     except Exception as exc:
+        # No exc_info: tracebacks / SMTP responses can contain paths or server text (CodeQL-aligned).
         logger.warning(
-            "job_completion_email_failed job_id=%s err=%s",
+            "job_completion_email_failed job_id=%s err_type=%s",
             job_id,
             type(exc).__name__,
-            exc_info=True,
         )
     finally:
         db.close()
