@@ -120,6 +120,21 @@ pytest -m messaging_live tests/test_live_messaging_e2e.py -v
 
 Tests skip automatically if the token is unset. Extend the same pattern for Graph with a dedicated token env if you add live Teams tests later.
 
+## Test coverage (target ≥ 80% on messaging modules)
+
+With the full `tools/platform_mcp_server` pytest suite, local runs show **≥ 80%** line coverage on:
+
+- `execution_contract.py` (unified errors / idempotency / optional output validation)
+- `execution_teams.py` (Microsoft Graph Teams + mail paths, mocked HTTP)
+- `execution_integrations.py` (Slack, mocked)
+- `execution_smtp.py` (SMTP validate/send + Gmail REST, mocked)
+
+Backend helpers:
+
+- `services/mcp_config_merge.py`, `services/job_completion_notify_email.py` — covered to **100%** via `tests/test_mcp_config_merge.py` and `tests/test_job_completion_notify_email.py`.
+
+`app.py` is not measured as a whole (large FastAPI surface); `_tool_result_is_error` is covered in `tests/test_execution_helpers_unit.py::TestToolResultIsError`.
+
 ## Related environment variables
 
 See `.env.example` for:

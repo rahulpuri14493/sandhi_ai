@@ -8,7 +8,7 @@ import pytest
 
 import execution
 import execution_common
-from app import _parse_platform_tool_id, _tool_result_for_log
+from app import _parse_platform_tool_id, _tool_result_is_error, _tool_result_for_log
 from execution_object_storage import execute_s3_family
 
 pytestmark = pytest.mark.unit
@@ -214,6 +214,30 @@ class TestToolResultForLog:
     def test_error_prefix_sets_error_flag(self):
         out = _tool_result_for_log("Error: secret details")
         assert "is_error=True" in out
+
+
+class TestToolResultIsError:
+    def test_empty_not_error(self):
+        assert _tool_result_is_error(None) is False
+        assert _tool_result_is_error("") is False
+
+    def test_error_prefix(self):
+        assert _tool_result_is_error("Error: x") is True
+
+    def test_contract_error_codes(self):
+        assert _tool_result_is_error(json.dumps({"error": "permission_denied", "message": "m"})) is True
+        assert _tool_result_is_error(json.dumps({"error": "idempotency_required", "message": "m"})) is True
+        assert _tool_result_is_error(json.dumps({"error": "graph_api_error", "status": 403})) is True
+
+    def test_success_json_not_error(self):
+        assert _tool_result_is_error(json.dumps({"teams": []})) is False
+        assert _tool_result_is_error(json.dumps({"status": "ok"})) is False
+
+    def test_other_string_error_field(self):
+        assert _tool_result_is_error(json.dumps({"error": "attachment_not_downloadable"})) is True
+
+    def test_invalid_json_not_error(self):
+        assert _tool_result_is_error("plain text ok") is False
 
 
 class TestParsePlatformToolId:

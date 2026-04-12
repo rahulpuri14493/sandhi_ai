@@ -37,3 +37,29 @@ def test_public_config_preview_omits_secrets():
     assert prev["from_name"] == "Bot"
     assert "access_token" not in prev
     assert "password" not in prev
+
+
+def test_public_config_preview_non_dict():
+    assert public_config_preview(None) == {}  # type: ignore[arg-type]
+    assert public_config_preview("x") == {}  # type: ignore[arg-type]
+
+
+def test_public_config_preview_skips_none_nested_and_empty():
+    cfg = {
+        "keep": "v",
+        "nullish": None,
+        "nested": {"a": 1},
+        "spaces": "   ",
+        "bot_token": "secret",
+    }
+    prev = public_config_preview(cfg)
+    assert prev == {"keep": "v"}
+    assert "nested" not in prev
+
+
+def test_merge_shallow_patch_not_dict():
+    assert merge_shallow_config({"a": 1}, None) == {"a": 1}  # type: ignore[arg-type]
+
+
+def test_merge_shallow_base_not_dict():
+    assert merge_shallow_config(None, {"a": "1"}) == {"a": "1"}  # type: ignore[arg-type]
