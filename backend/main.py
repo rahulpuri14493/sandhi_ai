@@ -22,6 +22,7 @@ from api.routes import (
     mcp,
     mcp_internal,
     execution_internal,
+    enhance_job_description,
 )
 from middleware.error_handler import (
     validation_exception_handler,
@@ -157,7 +158,7 @@ app.add_middleware(InMemoryRateLimitMiddleware)
 # CORS middleware
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000"],  # Next.js default port
+    allow_origins=["http://localhost:3000","http://127.0.0.1:3000"],  # Next.js default port
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -171,6 +172,7 @@ app.add_exception_handler(Exception, general_exception_handler)
 # Include routers
 app.include_router(auth.router)
 app.include_router(agents.router)
+app.include_router(enhance_job_description.router)
 app.include_router(jobs.router)
 app.include_router(payments.router)
 app.include_router(dashboards.router)

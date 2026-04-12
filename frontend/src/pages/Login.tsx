@@ -1,6 +1,22 @@
 import { useState } from 'react'
 import { useNavigate, Link } from 'react-router-dom'
 import { useAuthStore } from '../lib/store'
+import { isAxiosError } from 'axios'
+
+function formatLoginError(err: unknown): string {
+  if (isAxiosError(err)) {
+    const d = err.response?.data?.detail
+    if (typeof d === 'string') return d
+    if (Array.isArray(d)) {
+      return d.map((e) => (typeof e === 'object' && e && 'msg' in e ? String((e as { msg: string }).msg) : JSON.stringify(e))).join(' ')
+    }
+    if (err.code === 'ERR_NETWORK' || err.message === 'Network Error') {
+      return 'Cannot reach the API. Is the backend running on port 8000 and Vite proxy pointing to it?'
+    }
+  }
+  if (err instanceof Error && err.message) return err.message
+  return 'Login failed'
+}
 
 export default function LoginPage() {
   const [email, setEmail] = useState('')
@@ -15,8 +31,8 @@ export default function LoginPage() {
     try {
       await login(email, password)
       navigate('/dashboard')
-    } catch (err: any) {
-      setError(err.response?.data?.detail || 'Login failed')
+    } catch (err: unknown) {
+      setError(formatLoginError(err))
     }
   }
 

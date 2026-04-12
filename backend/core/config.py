@@ -20,6 +20,10 @@ class Settings(BaseSettings):
     ALGORITHM: str = "HS256"
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 30
     PLATFORM_COMMISSION_RATE: float = 0.10
+    # OpenAI-compatible API (job description enhancer, etc.)
+    OPENAI_API_KEY: str = ""
+    OPENAI_BASE_URL: str = "https://api.openai.com/v1"
+    ENHANCE_MODEL: str = "gpt-4o-mini"
     # External API (for end users / systems outside the platform)
     EXTERNAL_API_KEY: str = ""
     EXTERNAL_TOKEN_EXPIRE_DAYS: int = 7

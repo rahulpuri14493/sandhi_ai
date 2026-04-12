@@ -1,7 +1,13 @@
+import logging
+import os
+
 from fastapi import Request, status
+from fastapi.encoders import jsonable_encoder
 from fastapi.responses import JSONResponse
 from fastapi.exceptions import RequestValidationError
 from starlette.exceptions import HTTPException as StarletteHTTPException
+
+logger = logging.getLogger(__name__)
 
 
 def _serializable_errors(errors: list) -> list:
@@ -27,14 +33,30 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
 
 
 async def http_exception_handler(request: Request, exc: StarletteHTTPException):
+    # Ensure detail is JSON-serializable (avoids secondary 500 if detail is odd types).
     return JSONResponse(
         status_code=exc.status_code,
-        content={"detail": exc.detail, "path": request.url.path},
+        content=jsonable_encoder(
+            {"detail": exc.detail, "path": request.url.path}
+        ),
     )
 
 
 async def general_exception_handler(request: Request, exc: Exception):
+    logger.exception(
+        "Unhandled exception %s %s",
+        request.method,
+        request.url.path,
+    )
+    detail: str = "Internal server error"
+    if os.getenv("EXPOSE_INTERNAL_ERRORS", "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    ):
+        detail = f"Internal server error: {exc!s}"
     return JSONResponse(
         status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-        content={"detail": "Internal server error"},
+        content={"detail": detail},
     )

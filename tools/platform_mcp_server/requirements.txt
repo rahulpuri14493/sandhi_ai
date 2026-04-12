@@ -1,3 +1,6 @@
+# Docker builds use requirements-docker.txt (slim, reliable on python:3.11-slim).
+# This file is the full dependency set for local development / custom images.
+
 fastapi==0.121.0
 uvicorn[standard]==0.32.0
 httpx==0.27.2
