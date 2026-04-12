@@ -10,26 +10,42 @@ import {
 type View = 'choose' | 'connect' | 'connections' | 'configure' | 'tools'
 
 const MCP_OAUTH_RETURN_KEY = 'sandhi_mcp_oauth_return'
-/** If `?oauth_nonce=` is gone before `user` is loaded (navigation, router timing), we still claim using this. */
-const MCP_PENDING_OAUTH_NONCE_KEY = 'sandhi_mcp_oauth_nonce_pending'
 
-/** Nonces come from `secrets.token_urlsafe` on the backend; reject anything else before sessionStorage. */
+/**
+ * In-memory only (not sessionStorage): survives React Strict Mode remounts in the same SPA load.
+ * Raw nonce is required by GET /api/mcp/oauth/claim — do not replace with SHA-256 in sessionStorage.
+ */
+let mcpOAuthNonceStrictModeBridge: string | null = null
+
+/** Nonces come from `secrets.token_urlsafe` on the backend; reject anything else. */
 const OAUTH_NONCE_SAFE_RE = /^[A-Za-z0-9_-]+$/
 
-function sanitizeOAuthNonceForStorage(raw: string): string {
+function sanitizeOAuthNonce(raw: string): string {
   const s = raw.trim()
   if (!s || s.length > 256) return ''
   if (!OAUTH_NONCE_SAFE_RE.test(s)) return ''
   return s
 }
 
-/** Router search can lag behind `window.location` with basename; read both. */
-function getOAuthQueryParam(searchParams: URLSearchParams, key: string): string {
-  const fromRouter = searchParams.get(key)
+/** Read oauth_nonce only (separate from oauth_error so CodeQL does not merge taint across keys). */
+function readOAuthNonceQueryRaw(searchParams: URLSearchParams): string {
+  const fromRouter = searchParams.get('oauth_nonce')
   if (fromRouter) return fromRouter
   if (typeof window === 'undefined') return ''
   try {
-    return new URLSearchParams(window.location.search).get(key) ?? ''
+    return new URLSearchParams(window.location.search).get('oauth_nonce') ?? ''
+  } catch {
+    return ''
+  }
+}
+
+/** Read oauth_error only (provider error strings; not used as claim secrets). */
+function readOAuthErrorQueryRaw(searchParams: URLSearchParams): string {
+  const fromRouter = searchParams.get('oauth_error')
+  if (fromRouter) return fromRouter
+  if (typeof window === 'undefined') return ''
+  try {
+    return new URLSearchParams(window.location.search).get('oauth_error') ?? ''
   } catch {
     return ''
   }
@@ -62,7 +78,20 @@ function claimMcpOAuthOnce(nonce: string) {
 
 type OAuthReturnPurpose = 'teams' | 'smtp_outlook' | 'smtp_gmail'
 
-/** Passed from parent so React Strict Mode cannot “consume” it before the second mount (sessionStorage bug). */
+/** Single-char values only (not OAuth tokens) — survives full-page IdP redirect via sessionStorage. */
+const OAUTH_RETURN_PURPOSE_CODE: Record<OAuthReturnPurpose, string> = {
+  teams: 't',
+  smtp_outlook: 'o',
+  smtp_gmail: 'g',
+}
+
+const OAUTH_RETURN_CODE_TO_PURPOSE: Record<string, OAuthReturnPurpose | undefined> = {
+  t: 'teams',
+  o: 'smtp_outlook',
+  g: 'smtp_gmail',
+}
+
+/** Parent state survives Strict Mode remounts so OAuth claim tokens are not dropped between effect runs. */
 type OAuthClaimPayload = {
   access_token: string
   refresh_token?: string
@@ -81,7 +110,7 @@ function purposeToResumeToolType(purpose: string): 'teams' | 'smtp' | null {
 
 function stashOAuthReturnPurpose(purpose: OAuthReturnPurpose) {
   try {
-    sessionStorage.setItem(MCP_OAUTH_RETURN_KEY, JSON.stringify({ purpose }))
+    sessionStorage.setItem(MCP_OAUTH_RETURN_KEY, OAUTH_RETURN_PURPOSE_CODE[purpose])
   } catch {
     /* ignore quota / private mode */
   }
@@ -89,11 +118,19 @@ function stashOAuthReturnPurpose(purpose: OAuthReturnPurpose) {
 
 function consumeOAuthReturnAndResumeTool(): 'teams' | 'smtp' | null {
   try {
-    const raw = sessionStorage.getItem(MCP_OAUTH_RETURN_KEY)
+    const code = (sessionStorage.getItem(MCP_OAUTH_RETURN_KEY) ?? '').trim()
     sessionStorage.removeItem(MCP_OAUTH_RETURN_KEY)
-    if (!raw) return null
-    const o = JSON.parse(raw) as { purpose?: string }
-    return purposeToResumeToolType(o.purpose ?? '')
+    if (!code) return null
+    if (code.startsWith('{')) {
+      try {
+        const o = JSON.parse(code) as { purpose?: string }
+        return purposeToResumeToolType(o.purpose ?? '')
+      } catch {
+        return null
+      }
+    }
+    const purpose = OAUTH_RETURN_CODE_TO_PURPOSE[code]
+    return purpose ? purposeToResumeToolType(purpose) : null
   } catch {
     try {
       sessionStorage.removeItem(MCP_OAUTH_RETURN_KEY)
@@ -232,31 +269,17 @@ export default function MCPPage() {
   }, [loading, user, navigate])
 
   useEffect(() => {
-    const oauthErrRaw = getOAuthQueryParam(searchParams, 'oauth_error')
-    let nonce = sanitizeOAuthNonceForStorage(getOAuthQueryParam(searchParams, 'oauth_nonce'))
-    if (!nonce) {
-      try {
-        nonce = sanitizeOAuthNonceForStorage(sessionStorage.getItem(MCP_PENDING_OAUTH_NONCE_KEY) ?? '')
-      } catch {
-        nonce = ''
-      }
+    const oauthErrRaw = readOAuthErrorQueryRaw(searchParams)
+    const fromQuery = sanitizeOAuthNonce(readOAuthNonceQueryRaw(searchParams))
+    if (fromQuery) {
+      mcpOAuthNonceStrictModeBridge = fromQuery
     }
-    if (nonce) {
-      try {
-        sessionStorage.setItem(MCP_PENDING_OAUTH_NONCE_KEY, nonce)
-      } catch {
-        /* ignore */
-      }
-    }
+    const nonce = fromQuery || sanitizeOAuthNonce(mcpOAuthNonceStrictModeBridge ?? '')
 
     if (!user) return
 
     if (oauthErrRaw) {
-      try {
-        sessionStorage.removeItem(MCP_PENDING_OAUTH_NONCE_KEY)
-      } catch {
-        /* ignore */
-      }
+      mcpOAuthNonceStrictModeBridge = null
       let msg = decodeURIComponent(oauthErrRaw.replace(/\+/g, ' '))
       if (msg.toLowerCase().includes('token_exchange')) {
         const detail = msg.replace(/^token_exchange\s*/i, '').trim()
@@ -288,9 +311,9 @@ export default function MCPPage() {
     void claimMcpOAuthOnce(nonce)
       .then((data) => {
         if (cancelled) return
+        mcpOAuthNonceStrictModeBridge = null
         try {
           sessionStorage.removeItem(MCP_OAUTH_RETURN_KEY)
-          sessionStorage.removeItem(MCP_PENDING_OAUTH_NONCE_KEY)
         } catch {
           /* ignore */
         }
@@ -312,11 +335,7 @@ export default function MCPPage() {
       })
       .catch((err: unknown) => {
         if (cancelled) return
-        try {
-          sessionStorage.removeItem(MCP_PENDING_OAUTH_NONCE_KEY)
-        } catch {
-          /* ignore */
-        }
+        mcpOAuthNonceStrictModeBridge = null
         const detail = (err as { response?: { data?: { detail?: string } } })?.response?.data?.detail
         const resume = consumeOAuthReturnAndResumeTool()
         if (resume) setOauthConfigureToolType(resume)

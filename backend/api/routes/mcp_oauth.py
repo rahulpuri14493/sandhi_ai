@@ -11,9 +11,10 @@ from __future__ import annotations
 import base64
 import json
 import logging
+import re
 import secrets
 from typing import Any, Literal, Optional
-from urllib.parse import quote, urlencode
+from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, Query
@@ -36,13 +37,51 @@ CLAIM_TTL = 600
 CLAIM_REPLAY_PREFIX = "sandhi:mcp_oauth:claim_replay:"
 CLAIM_REPLAY_TTL = 120
 
+_DEFAULT_FRONTEND_OAUTH_URL = "http://localhost:3000/sandhi_ai/mcp"
 
-def _frontend_oauth_error_redirect(front: str, message: str) -> RedirectResponse:
-    msg = (message or "unknown").strip()
-    if len(msg) > 480:
-        msg = msg[:480]
-    sep = "&" if "?" in front else "?"
-    return RedirectResponse(url=f"{front}{sep}oauth_error={quote(msg, safe='')}", status_code=302)
+# OAuth 2.0 error values are ASCII tokens (e.g. access_denied, invalid_grant). Never reflect free-text
+# error_description into redirect URLs (CodeQL: URL redirection from remote source).
+_OAUTH_STD_ERROR_CODE_RE = re.compile(r"^[a-zA-Z0-9._-]{1,128}$")
+
+
+def _authorize_callback_error_redirect(
+    error: Optional[str],
+    error_description: Optional[str],
+    *,
+    provider: str,
+) -> RedirectResponse:
+    e = (error or "").strip()
+    if e and _OAUTH_STD_ERROR_CODE_RE.fullmatch(e):
+        return _safe_frontend_redirect_response({"oauth_error": e[:128]})
+    desc = (error_description or "").strip()
+    if desc:
+        logger.warning(
+            "mcp_oauth authorize callback provider=%s error_param=%r desc_prefix=%.200r",
+            provider,
+            e,
+            desc,
+        )
+    else:
+        logger.warning("mcp_oauth authorize callback provider=%s error_param=%r", provider, e)
+    return _safe_frontend_redirect_response({"oauth_error": "provider_error"})
+
+
+def _safe_frontend_redirect_response(query_additions: dict[str, str]) -> RedirectResponse:
+    """
+    Build a redirect to the configured SPA URL using urlparse/urlencode only.
+    Avoids open-redirect style string concatenation (CodeQL: URL redirection from remote source).
+    """
+    raw = (_frontend_redirect() or "").strip() or _DEFAULT_FRONTEND_OAUTH_URL
+    p = urlparse(raw)
+    if p.scheme not in ("http", "https") or not p.netloc:
+        p = urlparse(_DEFAULT_FRONTEND_OAUTH_URL)
+    netloc = p.netloc.split("@")[-1] if "@" in p.netloc else p.netloc
+    path = p.path if p.path else "/"
+    merged = dict(parse_qsl(p.query, keep_blank_values=True))
+    for k, v in query_additions.items():
+        merged[k] = v
+    new_p = p._replace(netloc=netloc, path=path, params="", query=urlencode(merged), fragment="")
+    return RedirectResponse(url=urlunparse(new_p), status_code=302)
 
 
 def _login_hint_from_access_token_jwt(access_token: str) -> str:
@@ -63,25 +102,6 @@ def _login_hint_from_access_token_jwt(access_token: str) -> str:
             if s and "@" in s:
                 return s
     return ""
-
-
-def _token_exchange_error_message(exc: BaseException) -> str:
-    """Short message for redirect query; prefer provider error_description when available."""
-    if isinstance(exc, httpx.HTTPStatusError) and exc.response is not None:
-        try:
-            body = exc.response.json()
-            desc = body.get("error_description") or body.get("error")
-            if isinstance(desc, str) and desc.strip():
-                return f"token_exchange {desc.strip()[:350]}"
-        except Exception:
-            pass
-        try:
-            t = (exc.response.text or "").strip()
-            if t:
-                return f"token_exchange {t[:350]}"
-        except Exception:
-            pass
-    return "token_exchange"
 
 
 _MS_GRAPH_SCOPES = (
@@ -204,25 +224,23 @@ async def oauth_microsoft_callback(
     error: Optional[str] = Query(None),
     error_description: Optional[str] = Query(None),
 ):
-    front = _frontend_redirect()
     if error:
-        msg = quote((error_description or error)[:400], safe="")
-        return RedirectResponse(url=f"{front}?oauth_error={msg}", status_code=302)
+        return _authorize_callback_error_redirect(error, error_description, provider="microsoft")
 
     if not code or not state:
-        return RedirectResponse(url=f"{front}?oauth_error=missing_code", status_code=302)
+        return _safe_frontend_redirect_response({"oauth_error": "missing_code"})
 
     r = _oauth_redis()
     if not r:
-        return RedirectResponse(url=f"{front}?oauth_error=no_redis", status_code=302)
+        return _safe_frontend_redirect_response({"oauth_error": "no_redis"})
 
     raw_state = r.get(STATE_PREFIX + state)
     if not raw_state:
-        return RedirectResponse(url=f"{front}?oauth_error=invalid_state", status_code=302)
+        return _safe_frontend_redirect_response({"oauth_error": "invalid_state"})
     try:
         st = json.loads(raw_state)
     except json.JSONDecodeError:
-        return RedirectResponse(url=f"{front}?oauth_error=bad_state", status_code=302)
+        return _safe_frontend_redirect_response({"oauth_error": "bad_state"})
     r.delete(STATE_PREFIX + state)
 
     uid = int(st.get("user_id", 0) or 0)
@@ -246,14 +264,17 @@ async def oauth_microsoft_callback(
             tr.raise_for_status()
             tok = tr.json()
     except Exception as exc:
-        logger.warning("microsoft token exchange failed: %s", type(exc).__name__)
-        return _frontend_oauth_error_redirect(front, _token_exchange_error_message(exc))
+        if isinstance(exc, httpx.HTTPStatusError) and exc.response is not None:
+            logger.warning("microsoft token exchange failed status=%s", exc.response.status_code)
+        else:
+            logger.warning("microsoft token exchange failed: %s", type(exc).__name__)
+        return _safe_frontend_redirect_response({"oauth_error": "token_exchange"})
 
     access = (tok.get("access_token") or "").strip()
     refresh = (tok.get("refresh_token") or "").strip()
     expires_in = tok.get("expires_in")
     if not access:
-        return _frontend_oauth_error_redirect(front, "no_access_token")
+        return _safe_frontend_redirect_response({"oauth_error": "no_access_token"})
 
     claim_nonce = secrets.token_urlsafe(32)
     claim: dict[str, Any] = {
@@ -269,8 +290,7 @@ async def oauth_microsoft_callback(
         if hint:
             claim["username"] = hint
     r.setex(CLAIM_PREFIX + claim_nonce, CLAIM_TTL, json.dumps(claim, separators=(",", ":")))
-    sep = "&" if "?" in front else "?"
-    return RedirectResponse(url=f"{front}{sep}oauth_nonce={claim_nonce}", status_code=302)
+    return _safe_frontend_redirect_response({"oauth_nonce": claim_nonce})
 
 
 @router.post("/google/start")
@@ -310,24 +330,24 @@ async def oauth_google_callback(
     code: Optional[str] = Query(None),
     state: Optional[str] = Query(None),
     error: Optional[str] = Query(None),
+    error_description: Optional[str] = Query(None),
 ):
-    front = _frontend_redirect()
     if error:
-        return RedirectResponse(url=f"{front}?oauth_error=google_denied", status_code=302)
+        return _authorize_callback_error_redirect(error, error_description, provider="google")
     if not code or not state:
-        return RedirectResponse(url=f"{front}?oauth_error=missing_code", status_code=302)
+        return _safe_frontend_redirect_response({"oauth_error": "missing_code"})
 
     r = _oauth_redis()
     if not r:
-        return RedirectResponse(url=f"{front}?oauth_error=no_redis", status_code=302)
+        return _safe_frontend_redirect_response({"oauth_error": "no_redis"})
 
     raw_state = r.get(STATE_PREFIX + state)
     if not raw_state:
-        return RedirectResponse(url=f"{front}?oauth_error=invalid_state", status_code=302)
+        return _safe_frontend_redirect_response({"oauth_error": "invalid_state"})
     try:
         st = json.loads(raw_state)
     except json.JSONDecodeError:
-        return RedirectResponse(url=f"{front}?oauth_error=bad_state", status_code=302)
+        return _safe_frontend_redirect_response({"oauth_error": "bad_state"})
     r.delete(STATE_PREFIX + state)
 
     uid = int(st.get("user_id", 0) or 0)
@@ -349,14 +369,17 @@ async def oauth_google_callback(
             tr.raise_for_status()
             tok = tr.json()
     except Exception as exc:
-        logger.warning("google token exchange failed: %s", type(exc).__name__)
-        return _frontend_oauth_error_redirect(front, _token_exchange_error_message(exc))
+        if isinstance(exc, httpx.HTTPStatusError) and exc.response is not None:
+            logger.warning("google token exchange failed status=%s", exc.response.status_code)
+        else:
+            logger.warning("google token exchange failed: %s", type(exc).__name__)
+        return _safe_frontend_redirect_response({"oauth_error": "token_exchange"})
 
     access = (tok.get("access_token") or "").strip()
     refresh = (tok.get("refresh_token") or "").strip()
     expires_in = tok.get("expires_in")
     if not access:
-        return RedirectResponse(url=f"{front}?oauth_error=no_access_token", status_code=302)
+        return _safe_frontend_redirect_response({"oauth_error": "no_access_token"})
 
     claim_nonce = secrets.token_urlsafe(32)
     claim: dict[str, Any] = {
@@ -372,8 +395,7 @@ async def oauth_google_callback(
         if hint:
             claim["username"] = hint
     r.setex(CLAIM_PREFIX + claim_nonce, CLAIM_TTL, json.dumps(claim, separators=(",", ":")))
-    sep = "&" if "?" in front else "?"
-    return RedirectResponse(url=f"{front}{sep}oauth_nonce={claim_nonce}", status_code=302)
+    return _safe_frontend_redirect_response({"oauth_nonce": claim_nonce})
 
 
 @router.get("/claim")

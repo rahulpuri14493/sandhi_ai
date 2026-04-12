@@ -13,6 +13,13 @@ paths-ignore:
 
 # Backup if paths-ignore is not applied (some orgs): same rules by path.
 query-filters:
+  # OAuth UX in SPA: claim nonce must be raw for GET /api/mcp/oauth/claim (server Redis key).
+  # Storing only a hash in sessionStorage (common Copilot suggestion) breaks sign-in. Purpose resume
+  # across IdP full-page redirect is a 1-char enum, not credentials. Module RAM bridge is ephemeral.
+  - exclude:
+      id: js/clear-text-storage-of-sensitive-data
+      paths:
+        - "frontend/src/pages/MCP.tsx"
   - exclude:
       id: py/sql-injection
       paths:
