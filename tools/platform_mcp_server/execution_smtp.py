@@ -100,6 +100,13 @@ def _smtp_oauth_refresh_token(config: Dict[str, Any]) -> str:
     return str(config.get("oauth_refresh_token") or config.get("refresh_token") or "").strip()
 
 
+def _host_is_domain_or_subdomain(host: str, domain: str) -> bool:
+    """True if host is exactly domain or a direct subdomain (avoids naive substring URL matching)."""
+    h = (host or "").strip().lower().rstrip(".")
+    d = (domain or "").strip().lower().rstrip(".")
+    return bool(h) and bool(d) and (h == d or h.endswith("." + d))
+
+
 def _smtp_refresh_oauth_provider(config: Dict[str, Any]) -> str:
     """
     Which IdP to use for refresh_token exchange. Matches MCP OAuth env (MCP_OAUTH_*).
@@ -108,9 +115,9 @@ def _smtp_refresh_oauth_provider(config: Dict[str, Any]) -> str:
     if prov in ("outlook", "gmail"):
         return prov
     host = str(config.get("smtp_host") or "").strip().lower()
-    if "office365.com" in host or host == "smtp-mail.outlook.com":
+    if _host_is_domain_or_subdomain(host, "office365.com") or host == "smtp-mail.outlook.com":
         return "outlook"
-    if "gmail.com" in host:
+    if _host_is_domain_or_subdomain(host, "gmail.com"):
         return "gmail"
     return ""
 

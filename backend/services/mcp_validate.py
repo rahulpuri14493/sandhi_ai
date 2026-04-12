@@ -681,14 +681,21 @@ def _gmail_read_api_probe(access_token: str) -> str:
         return " Warning: could not reach Gmail REST API; check network if you need inbox read."
 
 
+def _host_is_domain_or_subdomain(host: str, domain: str) -> bool:
+    """True if host is exactly domain or a direct subdomain (avoids naive substring URL matching)."""
+    h = (host or "").strip().lower().rstrip(".")
+    d = (domain or "").strip().lower().rstrip(".")
+    return bool(h) and bool(d) and (h == d or h.endswith("." + d))
+
+
 def _smtp_validate_oauth_provider_for_refresh(config: dict) -> str:
     prov = str(config.get("provider") or "custom").strip().lower()
     if prov in ("outlook", "gmail"):
         return prov
     host = str(config.get("smtp_host") or "").strip().lower()
-    if "office365.com" in host or host == "smtp-mail.outlook.com":
+    if _host_is_domain_or_subdomain(host, "office365.com") or host == "smtp-mail.outlook.com":
         return "outlook"
-    if "gmail.com" in host:
+    if _host_is_domain_or_subdomain(host, "gmail.com"):
         return "gmail"
     return ""
 

@@ -17,6 +17,14 @@ def test_normalize_http_url_rstrip_empties():
     assert mv._normalize_http_url(")))") == ""
 
 
+def test_host_is_domain_or_subdomain_smtp_refresh_matching():
+    assert mv._host_is_domain_or_subdomain("smtp.office365.com", "office365.com")
+    assert mv._host_is_domain_or_subdomain("office365.com", "office365.com")
+    assert not mv._host_is_domain_or_subdomain("notoffice365.com", "office365.com")
+    assert mv._host_is_domain_or_subdomain("smtp.gmail.com", "gmail.com")
+    assert not mv._host_is_domain_or_subdomain("notgmail.com", "gmail.com")
+
+
 def test_validate_snowflake_missing_user():
     ok, msg = validate_tool_config("snowflake", {"password": "p", "account": "a"})
     assert ok is False and "user" in msg.lower()
