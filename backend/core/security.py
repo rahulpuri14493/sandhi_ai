@@ -2,7 +2,7 @@ import logging
 from datetime import datetime, timedelta
 from typing import Optional
 import bcrypt
-from jose import JWTError, jwt
+import jwt
 from fastapi import Depends, HTTPException, status
 from fastapi.security import OAuth2PasswordBearer
 from sqlalchemy.orm import Session
@@ -99,7 +99,7 @@ def get_current_user(token: str = Depends(oauth2_scheme), db: Session = Depends(
             detail="Token has expired",
             headers={"WWW-Authenticate": "Bearer"},
         )
-    except JWTError as e:
+    except jwt.InvalidTokenError as e:
         logger.warning("JWT decode error: %s", e)
         raise credentials_exception
     except Exception as e:
@@ -128,7 +128,7 @@ def get_current_user_optional(
         if user_id_str is None:
             return None
         user_id = int(user_id_str)
-    except (JWTError, ValueError, TypeError):
+    except (jwt.InvalidTokenError, ValueError, TypeError):
         return None
     user = db.query(User).filter(User.id == user_id).first()
     return user

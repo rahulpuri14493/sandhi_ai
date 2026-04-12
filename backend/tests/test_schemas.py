@@ -5,7 +5,7 @@ from pydantic import ValidationError
 
 from schemas.user import UserCreate, UserLogin
 from schemas.agent import AgentCreate, AgentUpdate
-from models.agent import PricingModel, AgentStatus
+from models.agent import PricingModel
 from schemas.job import (
     JobCreate,
     JobUpdate,
@@ -85,6 +85,18 @@ def test_step_tools_assignment_with_tool_visibility():
     data = StepToolsAssignment(agent_index=0, tool_visibility="none")
     assert data.agent_index == 0
     assert data.tool_visibility == "none"
+
+
+def test_step_tools_assignment_task_type_slug():
+    """StepToolsAssignment normalizes task_type to a lowercase slug."""
+    data = StepToolsAssignment(agent_index=0, task_type="Search")
+    assert data.task_type == "search"
+
+
+def test_step_tools_assignment_task_type_invalid():
+    """StepToolsAssignment rejects invalid task_type slugs."""
+    with pytest.raises(ValidationError):
+        StepToolsAssignment(agent_index=0, task_type="123bad")
 
 
 def test_auto_split_body_tool_visibility():

@@ -6,31 +6,42 @@ import zipfile
 import random
 import uuid
 from pathlib import Path
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
 from fastapi import APIRouter, Depends, HTTPException, status, UploadFile, File, Form, Query
 from fastapi.responses import FileResponse, Response, StreamingResponse
 from sqlalchemy.orm import Session
-from pydantic import BaseModel
+from pydantic import BaseModel, model_validator
 from db.database import get_db
-from models.job import Job, JobStatus, WorkflowStep, JobSchedule, ScheduleStatus, ScheduleExecutionHistory
+from models.job import Job, JobStatus, WorkflowStep, JobSchedule, ScheduleStatus, ScheduleExecutionHistory, JobPlannerArtifact
 from models.agent import Agent
 from models.user import User, UserRole
 from schemas.job import (
-    JobCreate, JobUpdate, JobResponse, WorkflowStepResponse, WorkflowPreview,
+    JobResponse, WorkflowStepResponse, WorkflowPreview,
     AutoSplitBody, AnswerQuestionBody,
     JobScheduleCreate, JobScheduleUpdate, JobScheduleResponse,
     JobScheduleWithJobResponse, ScheduleExecutionHistoryResponse,
     ScheduleListResponse, ScheduleActionResponse, RerunResponse,
     JobFilterOptions, ScheduleFilterOptions, EnumOption,
+    PlannerArtifactListResponse, PlannerArtifactResponse,
+    PlannerPipelineBundleResponse,
 )
 from core.security import get_current_user, get_current_business_user
 from core.config import settings
 from services.job_scheduler import get_scheduler, reset_job_for_execution, queue_job_execution
-from services.task_queue import get_queue_stats
+from services.task_queue import get_queue_stats, QueueEnqueueError
+from services.task_splitter import PlannerSplitError
 from services.workflow_builder import WorkflowBuilder
 from services.tool_splitter import suggest_tool_assignments_for_agents
+from services.planner_llm import planner_runtime_transport_scope, resolve_runtime_planner_transport
 from services.payment_processor import PaymentProcessor
 from services.document_analyzer import DocumentAnalyzer
+from services.planner_artifact_cache import get_cached_planner_raw, set_cached_planner_raw
+from services.planner_artifact_storage import (
+    load_latest_planner_pipeline_payloads,
+    persist_brd_analysis_artifact,
+    persist_json_planner_artifact,
+    read_planner_artifact_bytes,
+)
 from models.transaction import Transaction, Earnings
 from core.external_token import create_job_token, get_share_url
 from datetime import datetime, timedelta
@@ -80,26 +91,151 @@ def _validate_allowed_tools(db: Session, business_id: int, platform_ids: Optiona
     return (out_platform, out_conn)
 
 
-def _get_first_hired_agent_for_job(db: Session, job_id: int) -> Optional[tuple]:
-    """Return (api_url, api_key, llm_model, temperature, a2a_enabled) for the first hired agent, or None."""
-    first_step = (
-        db.query(WorkflowStep)
-        .filter(WorkflowStep.job_id == job_id)
-        .order_by(WorkflowStep.step_order)
-        .first()
-    )
-    if not first_step:
-        return None
-    agent = db.query(Agent).filter(Agent.id == first_step.agent_id).first()
-    if not agent or not (agent.api_endpoint and (agent.api_endpoint or "").strip()):
-        return None
+def _user_can_access_job(job: Job, current_user: User, db: Session) -> bool:
+    if current_user.role == UserRole.BUSINESS:
+        return job.business_id == current_user.id
     return (
-        agent.api_endpoint.strip(),
-        (agent.api_key or "").strip() or None,
-        (getattr(agent, "llm_model", None) or None),
-        (getattr(agent, "temperature", None)),
-        getattr(agent, "a2a_enabled", False),
+        db.query(WorkflowStep)
+        .join(Agent)
+        .filter(WorkflowStep.job_id == job.id, Agent.developer_id == current_user.id)
+        .first()
+        is not None
     )
+
+
+def _platform_tool_name_map_for_business(db: Session, business_id: int) -> Dict[int, str]:
+    rows = (
+        db.query(MCPToolConfig.id, MCPToolConfig.name)
+        .filter(MCPToolConfig.user_id == business_id, MCPToolConfig.is_active == True)
+        .all()
+    )
+    out: Dict[int, str] = {}
+    for tid, name in rows:
+        try:
+            key = int(tid)
+        except (TypeError, ValueError):
+            continue
+        nm = (str(name or "") or "").strip()
+        if nm:
+            out[key] = nm
+    return out
+
+
+def _agent_name_map_for_job_by_step_index(db: Session, job_id: int) -> Dict[int, str]:
+    rows = (
+        db.query(WorkflowStep.step_order, Agent.name)
+        .join(Agent, Agent.id == WorkflowStep.agent_id)
+        .filter(WorkflowStep.job_id == job_id)
+        .order_by(WorkflowStep.step_order.asc())
+        .all()
+    )
+    out: Dict[int, str] = {}
+    for step_order, agent_name in rows:
+        try:
+            idx = max(0, int(step_order) - 1)
+        except (TypeError, ValueError):
+            continue
+        nm = (str(agent_name or "") or "").strip()
+        if nm:
+            out[idx] = nm
+    return out
+
+
+def _attach_agent_names_by_index(rows: Any, agent_name_by_index: Dict[int, str]) -> None:
+    if not isinstance(rows, list):
+        return
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        name = row.get("agent_name")
+        if isinstance(name, str) and name.strip():
+            continue
+        raw_idx = row.get("agent_index")
+        try:
+            idx = int(raw_idx)
+        except (TypeError, ValueError):
+            continue
+        mapped = agent_name_by_index.get(idx)
+        if mapped:
+            row["agent_name"] = mapped
+
+
+def _attach_tool_names_to_step_suggestions(
+    tool_suggestion: Optional[Dict[str, Any]], tool_name_by_id: Dict[int, str]
+) -> Optional[Dict[str, Any]]:
+    if not isinstance(tool_suggestion, dict):
+        return tool_suggestion
+
+    # Normalize into one stable shape for UI/export:
+    # - keep `step_suggestions` at top level
+    # - enrich each row with `platform_tool_names`
+    # - hide `platform_tool_ids` once names are present
+    if not isinstance(tool_suggestion.get("step_suggestions"), list):
+        parsed_result = tool_suggestion.get("parsed_result")
+        if isinstance(parsed_result, dict) and isinstance(parsed_result.get("step_suggestions"), list):
+            tool_suggestion["step_suggestions"] = list(parsed_result.get("step_suggestions") or [])
+
+    def _enrich_rows(rows: Any) -> None:
+        if not isinstance(rows, list):
+            return
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            existing = row.get("platform_tool_names")
+            if isinstance(existing, list) and len(existing) > 0:
+                # Hide numeric IDs from end-user JSON when readable names are already present.
+                row.pop("platform_tool_ids", None)
+                continue
+            raw_ids = row.get("platform_tool_ids")
+            if not isinstance(raw_ids, list):
+                continue
+            names: List[str] = []
+            for rid in raw_ids:
+                try:
+                    key = int(rid)
+                except (TypeError, ValueError):
+                    continue
+                nm = tool_name_by_id.get(key)
+                if nm:
+                    names.append(nm)
+            if names:
+                row["platform_tool_names"] = names
+                row.pop("platform_tool_ids", None)
+
+    _enrich_rows(tool_suggestion.get("step_suggestions"))
+    parsed_result = tool_suggestion.get("parsed_result")
+    if isinstance(parsed_result, dict):
+        _enrich_rows(parsed_result.get("step_suggestions"))
+    return tool_suggestion
+
+
+def _enrich_tool_suggestion_json_bytes(
+    data: bytes, *, db: Session, business_id: int
+) -> bytes:
+    """Best-effort enrich tool_suggestion JSON with platform_tool_names for display/export."""
+    try:
+        payload = json.loads(data.decode("utf-8"))
+    except Exception:
+        return data
+    if not isinstance(payload, dict):
+        return data
+    tool_name_by_id = _platform_tool_name_map_for_business(db, business_id)
+    enriched = _attach_tool_names_to_step_suggestions(payload, tool_name_by_id)
+    if not isinstance(enriched, dict):
+        return data
+    try:
+        return json.dumps(enriched, ensure_ascii=False).encode("utf-8")
+    except Exception:
+        return data
+
+
+def _attach_agent_names_to_task_split(
+    task_split: Optional[Dict[str, Any]], agent_name_by_index: Dict[int, str]
+) -> Optional[Dict[str, Any]]:
+    if not isinstance(task_split, dict):
+        return task_split
+    _attach_agent_names_by_index(task_split.get("parsed_assignments"), agent_name_by_index)
+    return task_split
 
 
 # Allowed file extensions (including .zip; zip contents are extracted and only allowed types kept)
@@ -110,6 +246,13 @@ ALLOWED_EXTENSIONS = {
 
 # Extensions for files we can extract text from (used when unpacking zip; no nested .zip)
 EXTRACTABLE_EXTENSIONS = ALLOWED_EXTENSIONS - {'.zip'}
+
+
+def _workflow_origin_for_response(job) -> str:
+    v = getattr(job, "workflow_origin", None)
+    if isinstance(v, str) and v.strip().lower() in ("manual", "auto_split"):
+        return v.strip().lower()
+    return "auto_split"
 
 
 def _zip_extract_backoff(attempt_idx: int) -> float:
@@ -228,7 +371,7 @@ class UserResponseRequest(BaseModel):
 
 
 @router.get("/output-contract/template", status_code=status.HTTP_200_OK)
-def get_output_contract_template():
+def get_output_contract_template(current_user=Depends(get_current_user)):
     """
     Universal output contract template for artifact-first write execution.
 
@@ -284,6 +427,30 @@ def _parse_int_list_form(value: Optional[str]) -> Optional[List[int]]:
         return None
 
 
+def _parse_int_list(value: Any) -> Optional[List[int]]:
+    """Parse list[int] from JSON string or iterable; None on invalid."""
+    if value is None:
+        return None
+    raw = value
+    if isinstance(raw, str):
+        txt = raw.strip()
+        if not txt:
+            return None
+        try:
+            raw = json.loads(txt)
+        except Exception:
+            return None
+    if isinstance(raw, (list, tuple, set)):
+        out: List[int] = []
+        for item in raw:
+            try:
+                out.append(int(item))
+            except (TypeError, ValueError):
+                return None
+        return out
+    return None
+
+
 def _validate_tool_visibility(v: Optional[str]) -> Optional[str]:
     if v is None or (isinstance(v, str) and not v.strip()):
         return None
@@ -335,12 +502,19 @@ def _validate_output_contract_policy(contract: Optional[dict]) -> Optional[dict]
         return contract
     if not isinstance(policy, dict):
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="output_contract.write_policy must be an object")
+    policy = dict(policy)
     on_write_error = policy.get("on_write_error")
-    if on_write_error is not None and str(on_write_error).strip().lower() not in ("fail_job", "continue"):
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="output_contract.write_policy.on_write_error must be 'fail_job' or 'continue'",
-        )
+    if on_write_error is not None:
+        raw = str(on_write_error).strip().lower()
+        # UX template historically said "stop"; map common synonyms to canonical values.
+        aliases = {"stop": "fail_job", "halt": "fail_job", "abort": "fail_job", "fail": "fail_job"}
+        normalized = aliases.get(raw, raw)
+        if normalized not in ("fail_job", "continue"):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="output_contract.write_policy.on_write_error must be 'fail_job' or 'continue'",
+            )
+        policy["on_write_error"] = normalized
     min_successful_targets = policy.get("min_successful_targets")
     if min_successful_targets is not None:
         try:
@@ -355,7 +529,9 @@ def _validate_output_contract_policy(contract: Optional[dict]) -> Optional[dict]
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail="output_contract.write_policy.min_successful_targets must be an integer >= 0",
             )
-    return contract
+    out = dict(contract)
+    out["write_policy"] = policy
+    return out
 
 
 def _parse_contract_json(raw: Optional[str]) -> Optional[dict]:
@@ -516,6 +692,7 @@ async def create_job(
         "write_execution_mode": new_job.write_execution_mode,
         "output_artifact_format": new_job.output_artifact_format,
         "output_contract": output_contract_obj,
+        "workflow_origin": _workflow_origin_for_response(new_job),
     }
     return JobResponse(**response_data)
 
@@ -526,7 +703,7 @@ async def analyze_documents(
     current_user: User = Depends(get_current_business_user),
     db: Session = Depends(get_db)
 ):
-    """Analyze uploaded documents and generate questions using the hired agent."""
+    """Analyze uploaded documents and generate questions via platform Agent Planner when configured."""
     job = db.query(Job).filter(Job.id == job_id).first()
     if not job:
         raise HTTPException(
@@ -565,13 +742,6 @@ async def analyze_documents(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="No valid document sources found in job files"
         )
-    hired = _get_first_hired_agent_for_job(db, job.id)
-    if hired:
-        agent_url, agent_key, agent_model, agent_temp, use_a2a = hired
-    else:
-        agent_url = agent_key = agent_model = agent_temp = None
-        use_a2a = False
-    
     try:
         analyzer = DocumentAnalyzer()
         result = await analyzer.analyze_documents_and_generate_questions(
@@ -579,11 +749,6 @@ async def analyze_documents(
             job_title=job.title,
             job_description=job.description,
             conversation_history=conversation_history,
-            agent_api_url=agent_url,
-            agent_api_key=agent_key,
-            agent_llm_model=agent_model,
-            agent_temperature=agent_temp,
-            use_a2a=use_a2a,
         )
         
         # Add the new questions to conversation
@@ -627,6 +792,7 @@ async def analyze_documents(
         
         # Update job conversation
         job.conversation = json.dumps(new_conversation)
+        await persist_brd_analysis_artifact(db, job.id, result)
         db.commit()
         
         return {
@@ -709,12 +875,6 @@ async def answer_question(
     
     files_data = json.loads(job.files)
     documents = [f for f in files_data if has_readable_source(f)]
-    hired = _get_first_hired_agent_for_job(db, job.id)
-    if hired:
-        agent_url, agent_key, agent_model, agent_temp, use_a2a = hired
-    else:
-        agent_url = agent_key = agent_model = agent_temp = None
-        use_a2a = False
 
     try:
         analyzer = DocumentAnalyzer()
@@ -724,11 +884,6 @@ async def answer_question(
             job_title=job.title,
             job_description=job.description,
             conversation_history=conversation_history,
-            agent_api_url=agent_url,
-            agent_api_key=agent_key,
-            agent_llm_model=agent_model,
-            agent_temperature=agent_temp,
-            use_a2a=use_a2a,
         )
         
         # Add new questions if any (dedupe: skip if already in conversation or already in this batch)
@@ -801,10 +956,8 @@ async def generate_workflow_questions(
     db: Session = Depends(get_db)
 ):
     """
-    Generate clarifying questions for the end user based on the workflow (assigned tasks),
-    BRD documents, and job prompt. Use this in the Q&A step after Build Workflow so
-    AI agents can get requirements clarified before execution. Appends new questions
-    to the job conversation.
+    Generate clarifying questions using BRD documents, job context, and the full workflow.
+    Uses the platform Agent Planner only (no per-agent LLM calls). Questions are not tied to a single step id.
     """
     job = db.query(Job).filter(Job.id == job_id).first()
     if not job:
@@ -823,23 +976,6 @@ async def generate_workflow_questions(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="Job has no workflow. Build a workflow first, then generate clarification questions.",
         )
-
-    # Build workflow_tasks from steps (assigned_task, agent_name)
-    workflow_tasks = []
-    for step in steps:
-        agent = db.query(Agent).filter(Agent.id == step.agent_id).first()
-        agent_name = agent.name if agent else "Agent"
-        input_data = {}
-        if step.input_data:
-            try:
-                input_data = json.loads(step.input_data)
-            except (json.JSONDecodeError, TypeError):
-                pass
-        workflow_tasks.append({
-            "step_order": step.step_order,
-            "agent_name": agent_name,
-            "assigned_task": input_data.get("assigned_task", ""),
-        })
 
     # Document content for BRD (read from storage)
     documents_content = []
@@ -866,39 +1002,53 @@ async def generate_workflow_questions(
         except (json.JSONDecodeError, TypeError):
             pass
 
-    hired = _get_first_hired_agent_for_job(db, job.id)
-    if hired:
-        agent_url, agent_key, agent_model, agent_temp, use_a2a = hired
-    else:
-        agent_url = agent_key = agent_model = agent_temp = None
-        use_a2a = False
+    from services.planner_llm import is_agent_planner_configured
+
+    if not is_agent_planner_configured():
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Workflow clarification requires the platform Agent Planner. Configure AGENT_PLANNER_API_KEY.",
+        )
+
+    workflow_tasks = []
+    for step in steps:
+        agent = db.query(Agent).filter(Agent.id == step.agent_id).first()
+        input_data = {}
+        if step.input_data:
+            try:
+                input_data = json.loads(step.input_data)
+            except (json.JSONDecodeError, TypeError):
+                pass
+        workflow_tasks.append({
+            "step_order": step.step_order,
+            "agent_name": agent.name if agent else "Agent",
+            "assigned_task": input_data.get("assigned_task", ""),
+        })
+
+    new_conversation = conversation_history.copy()
+    existing_questions = {
+        str(item.get("question", "")).strip()
+        for item in new_conversation
+        if item.get("type") == "question" and item.get("question")
+    }
+    seen_in_batch = set()
+    added_questions = []
+    analyzer = DocumentAnalyzer()
 
     try:
-        analyzer = DocumentAnalyzer()
         result = await analyzer.generate_workflow_clarification_questions(
             job_title=job.title or "",
             job_description=job.description,
             documents_content=documents_content,
             workflow_tasks=workflow_tasks,
-            conversation_history=conversation_history,
-            agent_api_url=agent_url,
-            agent_api_key=agent_key,
-            agent_llm_model=agent_model,
-            agent_temperature=agent_temp,
-            use_a2a=use_a2a,
+            conversation_history=new_conversation,
+            only_step=None,
         )
     except Exception as e:
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to generate workflow questions: {str(e)}",
-        )
+        logger.warning("Workflow clarification questions failed for job_id=%s: %s", job_id, e)
+        result = {"questions": []}
 
-    questions = result.get("questions") or []
-    new_conversation = conversation_history.copy()
-    existing_questions = {str(item.get("question", "")).strip() for item in new_conversation if item.get("type") == "question" and item.get("question")}
-    seen_in_batch = set()
-    added_questions = []
-    for q in questions:
+    for q in result.get("questions") or []:
         qs = str(q).strip() if q else ""
         if not qs or qs in existing_questions or qs in seen_in_batch:
             continue
@@ -911,6 +1061,8 @@ async def generate_workflow_questions(
             "answer": None,
             "timestamp": str(datetime.utcnow()),
         })
+
+    questions = added_questions
 
     removed_unanswered_questions = 0
     if len(added_questions) == 0:
@@ -936,6 +1088,150 @@ async def generate_workflow_questions(
         "removed_unanswered_questions": removed_unanswered_questions,
         "conversation": new_conversation,
     }
+
+
+@router.get("/planner/status")
+def get_agent_planner_status(current_user: User = Depends(get_current_user)):
+    """Platform Agent Planner configuration (Issue #62). No secrets returned."""
+    from services.planner_llm import get_planner_public_meta, is_agent_planner_configured
+
+    return {
+        "configured": is_agent_planner_configured(),
+        **get_planner_public_meta(),
+    }
+
+
+@router.get("/{job_id}/planner-artifacts", response_model=PlannerArtifactListResponse)
+def list_job_planner_artifacts(
+    job_id: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """List Postgres pointers to planner JSON in object storage (business job owner or assigned developer)."""
+    job = db.query(Job).filter(Job.id == job_id).first()
+    if not job:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Job not found")
+    if not _user_can_access_job(job, current_user, db):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Not authorized")
+    rows = (
+        db.query(JobPlannerArtifact)
+        .filter(JobPlannerArtifact.job_id == job_id)
+        .order_by(JobPlannerArtifact.created_at.desc())
+        .all()
+    )
+    return PlannerArtifactListResponse(
+        items=[PlannerArtifactResponse.model_validate(r, from_attributes=True) for r in rows]
+    )
+
+
+@router.get("/{job_id}/planner-artifacts/{artifact_id}/raw")
+async def download_job_planner_artifact_raw(
+    job_id: int,
+    artifact_id: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Return stored planner JSON (application/json). Business job owner or assigned developer only."""
+    job = db.query(Job).filter(Job.id == job_id).first()
+    if not job:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Job not found")
+    if not _user_can_access_job(job, current_user, db):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Not authorized")
+    row = (
+        db.query(JobPlannerArtifact)
+        .filter(JobPlannerArtifact.id == artifact_id, JobPlannerArtifact.job_id == job_id)
+        .first()
+    )
+    if not row:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Artifact not found")
+    cached = await asyncio.to_thread(get_cached_planner_raw, job_id, artifact_id)
+    if cached is not None:
+        artifact_type = (row.artifact_type or "").strip().lower()
+        if artifact_type == "tool_suggestion":
+            cached = _enrich_tool_suggestion_json_bytes(
+                cached,
+                db=db,
+                business_id=int(job.business_id),
+            )
+        elif artifact_type == "task_split":
+            try:
+                payload = json.loads(cached.decode("utf-8"))
+                if isinstance(payload, dict):
+                    agent_name_by_index = _agent_name_map_for_job_by_step_index(db, job_id)
+                    payload = _attach_agent_names_to_task_split(payload, agent_name_by_index)
+                    if isinstance(payload, dict):
+                        cached = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+            except Exception:
+                pass
+        return Response(content=cached, media_type="application/json")
+    try:
+        data = await asyncio.to_thread(read_planner_artifact_bytes, row)
+    except Exception as e:
+        logger.warning("Failed to read planner artifact id=%s job_id=%s: %s", artifact_id, job_id, e)
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Could not read artifact from storage",
+        )
+    artifact_type = (row.artifact_type or "").strip().lower()
+    if artifact_type == "tool_suggestion":
+        data = _enrich_tool_suggestion_json_bytes(
+            data,
+            db=db,
+            business_id=int(job.business_id),
+        )
+    elif artifact_type == "task_split":
+        try:
+            payload = json.loads(data.decode("utf-8"))
+            if isinstance(payload, dict):
+                agent_name_by_index = _agent_name_map_for_job_by_step_index(db, job_id)
+                payload = _attach_agent_names_to_task_split(payload, agent_name_by_index)
+                if isinstance(payload, dict):
+                    data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        except Exception:
+            pass
+    await asyncio.to_thread(set_cached_planner_raw, job_id, artifact_id, data)
+    return Response(content=data, media_type="application/json")
+
+
+@router.get("/{job_id}/planner-pipeline", response_model=PlannerPipelineBundleResponse)
+def get_job_planner_pipeline(
+    job_id: int,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """
+    Read-only composed view: latest brd_analysis, task_split, and tool_suggestion JSON per job.
+    Same auth as planner-artifacts; does not change storage or execution.
+    """
+    job = db.query(Job).filter(Job.id == job_id).first()
+    if not job:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Job not found")
+    if not _user_can_access_job(job, current_user, db):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Not authorized")
+    payloads, row_ids = load_latest_planner_pipeline_payloads(db, job_id)
+    agent_name_by_index = _agent_name_map_for_job_by_step_index(db, job_id)
+    task_split = payloads.get("task_split")
+    if isinstance(task_split, dict):
+        task_split = _attach_agent_names_to_task_split(task_split, agent_name_by_index)
+    tool_suggestion = payloads.get("tool_suggestion")
+    if isinstance(tool_suggestion, dict):
+        _attach_agent_names_by_index(tool_suggestion.get("step_suggestions"), agent_name_by_index)
+        parsed_result = tool_suggestion.get("parsed_result")
+        if isinstance(parsed_result, dict):
+            _attach_agent_names_by_index(parsed_result.get("step_suggestions"), agent_name_by_index)
+        tool_name_by_id = _platform_tool_name_map_for_business(db, int(job.business_id))
+        tool_suggestion = _attach_tool_names_to_step_suggestions(tool_suggestion, tool_name_by_id)
+    return PlannerPipelineBundleResponse(
+        job_id=job_id,
+        brd_analysis=payloads.get("brd_analysis"),
+        task_split=task_split,
+        tool_suggestion=tool_suggestion,
+        artifact_ids={
+            "brd_analysis": row_ids.get("brd_analysis"),
+            "task_split": row_ids.get("task_split"),
+            "tool_suggestion": row_ids.get("tool_suggestion"),
+        },
+    )
 
 
 @router.get("/filter-options", response_model=JobFilterOptions)
@@ -1044,6 +1340,7 @@ def list_jobs(
             "write_execution_mode": getattr(job, "write_execution_mode", "platform"),
             "output_artifact_format": getattr(job, "output_artifact_format", "jsonl"),
             "output_contract": _parse_contract_json(getattr(job, "output_contract", None)),
+            "workflow_origin": _workflow_origin_for_response(job),
         }
         result.append(JobResponse(**job_dict))
     return result
@@ -1154,6 +1451,7 @@ def get_job(
         "write_execution_mode": getattr(job, "write_execution_mode", "platform"),
         "output_artifact_format": getattr(job, "output_artifact_format", "jsonl"),
         "output_contract": _parse_contract_json(getattr(job, "output_contract", None)),
+        "workflow_origin": _workflow_origin_for_response(job),
     }
     return JobResponse(**job_dict)
 
@@ -1163,7 +1461,7 @@ async def update_job(
     job_id: int,
     title: Optional[str] = Form(None),
     description: Optional[str] = Form(None),
-    status: Optional[str] = Form(None),
+    new_status: Optional[str] = Form(None, alias="status"),
     files: Optional[List[UploadFile]] = File(None),
     allowed_platform_tool_ids: Optional[str] = Form(None),
     allowed_connection_ids: Optional[str] = Form(None),
@@ -1189,7 +1487,7 @@ async def update_job(
         )
 
     # Only allow updates to draft jobs or status changes
-    if job.status != JobStatus.DRAFT and status is None:
+    if job.status != JobStatus.DRAFT and new_status is None:
         if title is not None or description is not None:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
@@ -1222,13 +1520,13 @@ async def update_job(
         job.title = title
     if description is not None:
         job.description = description
-    if status is not None:
+    if new_status is not None:
         try:
-            job.status = JobStatus(status)
+            job.status = JobStatus(new_status)
         except ValueError:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
-                detail=f"Invalid status: {status}"
+                detail=f"Invalid status: {new_status}"
             )
     
     # Handle file uploads (overwrite existing documents with the new upload set)
@@ -1312,19 +1610,11 @@ async def update_job(
             len(old_files_to_cleanup),
         )
     
-    # If new files were added, automatically trigger document analysis (extraction only or via first hired agent)
-    analysis_result = None
+    # If new files were added, automatically trigger document analysis (planner when configured)
     if new_files_added and job.files:
         try:
             files_data = json.loads(job.files)
             documents = [f for f in files_data if has_readable_source(f)]
-            hired = _get_first_hired_agent_for_job(db, job.id)
-            if hired:
-                agent_url, agent_key = hired[0], hired[1]
-                use_a2a = hired[4] if len(hired) > 4 else False
-            else:
-                agent_url = agent_key = None
-                use_a2a = False
 
             analyzer = DocumentAnalyzer()
             result = await analyzer.analyze_documents_and_generate_questions(
@@ -1332,9 +1622,6 @@ async def update_job(
                 job_title=job.title,
                 job_description=job.description,
                 conversation_history=[],
-                agent_api_url=agent_url,
-                agent_api_key=agent_key,
-                use_a2a=use_a2a,
             )
             
             # Add analysis and questions to conversation
@@ -1354,10 +1641,11 @@ async def update_job(
                 })
             
             job.conversation = json.dumps(new_conversation)
+            await persist_brd_analysis_artifact(db, job.id, result)
             db.commit()
             db.refresh(job)
             
-            analysis_result = {
+            {
                 "analysis": result.get("analysis", ""),
                 "questions": result.get("questions", []),
                 "recommendations": result.get("recommendations", [])
@@ -1413,6 +1701,7 @@ async def update_job(
         "write_execution_mode": getattr(job, "write_execution_mode", "platform"),
         "output_artifact_format": getattr(job, "output_artifact_format", "jsonl"),
         "output_contract": _parse_contract_json(getattr(job, "output_contract", None)),
+        "workflow_origin": _workflow_origin_for_response(job),
     }
 
     return JobResponse(**job_dict)
@@ -1514,12 +1803,15 @@ async def auto_split_workflow(
                 "allowed_platform_tool_ids": st.allowed_platform_tool_ids,
                 "allowed_connection_ids": st.allowed_connection_ids,
                 "tool_visibility": getattr(st, "tool_visibility", None),
+                "task_type": getattr(st, "task_type", None),
             }
             for st in body.step_tools
         ]
     tv = body.tool_visibility
     if tv is not None and tv not in ("full", "names_only", "none"):
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="tool_visibility must be 'full', 'names_only', or 'none'")
+    if tv is not None:
+        job.tool_visibility = _validate_tool_visibility(tv)
     if body.write_execution_mode is not None:
         job.write_execution_mode = _validate_write_execution_mode(body.write_execution_mode)
     if body.output_artifact_format is not None:
@@ -1529,15 +1821,41 @@ async def auto_split_workflow(
         job.output_contract = json.dumps(contract_obj) if contract_obj is not None else None
     db.commit()
     workflow_builder = WorkflowBuilder(db)
-    preview = await workflow_builder.auto_split_workflow_async(
-        job_id, body.agent_ids, workflow_mode=workflow_mode, step_tools=step_tools, tool_visibility=tv
-    )
+    try:
+        preview = await workflow_builder.auto_split_workflow_async(
+            job_id, body.agent_ids, workflow_mode=workflow_mode, step_tools=step_tools, tool_visibility=tv
+        )
+    except PlannerSplitError as e:
+        detail = str(e) or "Platform task planner could not build the workflow split."
+        if getattr(e, "last_detail", None):
+            detail = f"{detail} Detail: {e.last_detail}"
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=detail[:2000],
+        ) from e
     return preview
 
 
 class SuggestWorkflowToolsBody(BaseModel):
-    """Agents in workflow order (same as auto-split). Used to suggest per-step platform tools from BRD + job prompt."""
+    """Agents in workflow order (same as auto-split). Optional step_tool_visibility matches agent_ids; else job.tool_visibility applies."""
+
     agent_ids: List[int]
+    # Use Optional elements so JSON null per step inherits job.tool_visibility (not rejected before validator).
+    step_tool_visibility: Optional[List[Optional[str]]] = None
+
+    @model_validator(mode="after")
+    def _step_vis_len_matches_agents(self) -> "SuggestWorkflowToolsBody":
+        if self.step_tool_visibility is not None and len(self.step_tool_visibility) != len(self.agent_ids):
+            raise ValueError("step_tool_visibility must have the same length as agent_ids")
+        for v in self.step_tool_visibility or []:
+            if v is None:
+                continue
+            if not str(v).strip():
+                continue
+            sv = str(v).strip().lower()
+            if sv not in ("full", "names_only", "none"):
+                raise ValueError("step_tool_visibility values must be full, names_only, or none")
+        return self
 
 
 @router.get("/{job_id}/suggest-workflow-tools", include_in_schema=True)
@@ -1616,17 +1934,53 @@ async def suggest_workflow_tools(
 
     wb = WorkflowBuilder(db)
     documents_content = await wb.load_job_documents_content_async(job)
-    splitter_agent = agents_ordered[0]
 
-    result = await suggest_tool_assignments_for_agents(
-        job_title=job.title or "",
-        job_description=job.description or "",
-        documents_content=documents_content,
-        conversation_data=conversation_data,
-        agents=agents_ordered,
-        platform_tools=platform_tools,
-        splitter_agent=splitter_agent,
+    llm_audit: Dict[str, Any] = {}
+    decision = resolve_runtime_planner_transport(
+        db,
+        agent_ids=[int(a.id) for a in agents_ordered if getattr(a, "id", None) is not None],
     )
+    with planner_runtime_transport_scope(decision):
+        result = await suggest_tool_assignments_for_agents(
+            job_title=job.title or "",
+            job_description=job.description or "",
+            documents_content=documents_content,
+            conversation_data=conversation_data,
+            agents=agents_ordered,
+            platform_tools=platform_tools,
+            llm_audit=llm_audit,
+            step_tool_visibility=body.step_tool_visibility,
+            job_tool_visibility=getattr(job, "tool_visibility", None),
+        )
+    persist_payload: Optional[Dict[str, Any]] = None
+    if llm_audit.get("raw_llm_response"):
+        persist_payload = {
+            "raw_llm_response": llm_audit["raw_llm_response"],
+            "source": llm_audit.get("source"),
+            "job_title": job.title or "",
+            "job_description": job.description or "",
+            "parsed_result": {
+                "step_suggestions": result.get("step_suggestions"),
+                "output_contract_stub": result.get("output_contract_stub"),
+                "fallback_used": result.get("fallback_used"),
+            },
+        }
+    elif llm_audit.get("persist_tool_suggestion_without_llm"):
+        persist_payload = {
+            "source": llm_audit.get("source"),
+            "detail": "No platform tool suggestions: all workflow steps have tool_visibility=none.",
+            "job_title": job.title or "",
+            "job_description": job.description or "",
+            "parsed_result": {
+                "step_suggestions": result.get("step_suggestions"),
+                "output_contract_stub": result.get("output_contract_stub"),
+                "fallback_used": result.get("fallback_used"),
+            },
+        }
+    if persist_payload is not None:
+        aid = await persist_json_planner_artifact(db, job_id, "tool_suggestion", persist_payload)
+        if aid is not None:
+            db.commit()
     return result
 
 
@@ -1682,10 +2036,30 @@ def update_workflow_step_tools(
         pids, cids = body.allowed_platform_tool_ids, body.allowed_connection_ids
         if (pids and len(pids)) or (cids and len(cids)):
             pids, cids = _validate_allowed_tools(db, current_user.id, pids, cids)
-        step.allowed_platform_tool_ids = json.dumps(pids) if pids is not None else None
-        step.allowed_connection_ids = json.dumps(cids) if cids is not None else None
+        # Empty lists on step mean "inherit from job scope".
+        step.allowed_platform_tool_ids = json.dumps(pids) if (pids is not None and len(pids) > 0) else None
+        step.allowed_connection_ids = json.dumps(cids) if (cids is not None and len(cids) > 0) else None
     if body.tool_visibility is not None:
         step.tool_visibility = _validate_tool_visibility(body.tool_visibility)
+        # If a step is explicitly hidden, clear step-level allowlists so this update remains valid.
+        # This preserves backwards compatibility for PATCH tool_visibility-only requests.
+        if step.tool_visibility == "none" and (
+            body.allowed_platform_tool_ids is None and body.allowed_connection_ids is None
+        ):
+            step.allowed_platform_tool_ids = None
+            step.allowed_connection_ids = None
+    eff_tv = getattr(step, "tool_visibility", None) or getattr(job, "tool_visibility", None) or "full"
+    step_platform_ids = _parse_int_list(getattr(step, "allowed_platform_tool_ids", None))
+    step_conn_ids = _parse_int_list(getattr(step, "allowed_connection_ids", None))
+    has_scope = bool(
+        (step_platform_ids is not None and len(step_platform_ids) > 0)
+        or (step_conn_ids is not None and len(step_conn_ids) > 0)
+    )
+    if eff_tv == "none" and has_scope:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid step configuration: tool_visibility='none' cannot be used when step tools are assigned. Use 'names_only' or 'full'.",
+        )
     db.commit()
     db.refresh(step)
     agent = db.query(Agent).filter(Agent.id == step.agent_id).first()
@@ -1792,6 +2166,7 @@ def approve_job(
         "write_execution_mode": getattr(job, "write_execution_mode", "platform"),
         "output_artifact_format": getattr(job, "output_artifact_format", "jsonl"),
         "output_contract": _parse_contract_json(getattr(job, "output_contract", None)),
+        "workflow_origin": _workflow_origin_for_response(job),
     }
     return JobResponse(**job_dict)
 
@@ -1846,15 +2221,36 @@ def execute_job(
             execution_token=execution_token,
             strict=bool(getattr(settings, "JOB_EXECUTION_STRICT_QUEUE", False)),
         )
-    except Exception as exc:
-        job.status = JobStatus.PENDING_APPROVAL
-        job.execution_token = None
-        job.failure_reason = f"Failed to enqueue execution: {str(exc)[:200]}"
-        db.commit()
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="Failed to enqueue job execution. Please try again.",
-        )
+    except (QueueEnqueueError, Exception) as exc:
+        if isinstance(exc, QueueEnqueueError):
+            # 1. System is full - move to FAILED so user can see why in the history/status
+            job.status = JobStatus.FAILED
+            job.execution_token = None
+            job.failure_reason = f"Failed to enqueue execution: {str(exc)[:200]}"
+            db.commit()
+
+            raise HTTPException(
+                status_code=503,
+                headers={"Retry-After": "30"},
+                detail={
+                    "error": "queue_overloaded", 
+                    "message": "The system is currently at capacity. Please try again later.",
+                },
+            ) from exc
+        else:
+            # 2. Transient/Unexpected error - roll back to PENDING_APPROVAL per main branch behavior
+            job.status = JobStatus.PENDING_APPROVAL
+            job.execution_token = None
+            job.failure_reason = f"Failed to enqueue execution: {str(exc)[:200]}"
+            db.commit()
+
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail={
+                    "error": "enqueue_failed",
+                    "message": "Failed to enqueue job execution. Please try again.",
+                },
+            ) from exc
     
     # Parse files and conversation for response
     files_data = None
@@ -1888,6 +2284,7 @@ def execute_job(
         "write_execution_mode": getattr(job, "write_execution_mode", "platform"),
         "output_artifact_format": getattr(job, "output_artifact_format", "jsonl"),
         "output_contract": _parse_contract_json(getattr(job, "output_contract", None)),
+        "workflow_origin": _workflow_origin_for_response(job),
     }
     return JobResponse(**job_dict)
 
@@ -2009,6 +2406,7 @@ def get_job_status(
         "write_execution_mode": getattr(job, "write_execution_mode", "platform"),
         "output_artifact_format": getattr(job, "output_artifact_format", "jsonl"),
         "output_contract": _parse_contract_json(getattr(job, "output_contract", None)),
+        "workflow_origin": _workflow_origin_for_response(job),
     }
 
     # Compute schedule-aware fields for frontend UX
@@ -2316,7 +2714,7 @@ def update_job_schedule(
     db.commit()
     db.refresh(schedule)
 
-    # Sync with APScheduler
+    # Sync with Celery ETA tasks
     svc = get_scheduler()
     if svc:
         if schedule.status == ScheduleStatus.ACTIVE:
@@ -2337,14 +2735,20 @@ def update_job_schedule(
 @router.post("/{job_id}/rerun", response_model=RerunResponse)
 def rerun_job(
     job_id: int,
+    mode: Optional[str] = Query(
+        default=None,
+        description="Optional rerun mode override: full (reset all steps) or resume (rerun only non-completed steps).",
+        pattern="^(full|resume)$",
+    ),
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
     """Immediately re-execute a failed or cancelled job ("Run Now" button).
 
-    Only available when job status is FAILED or CANCELLED. Resets all workflow
-    steps, transitions to IN_PROGRESS, and triggers execution in a background thread.
-    For "Schedule Again", the frontend uses PUT /schedule with a new scheduled_at.
+    Only available when job status is FAILED or CANCELLED.
+    Rerun behavior supports both:
+    - Automatic mode (no query param): resume when possible, full fallback if all steps completed.
+    - Explicit mode override: mode=resume or mode=full.
     """
     job = db.query(Job).filter(Job.id == job_id, Job.business_id == current_user.id).first()
     if not job:
@@ -2376,7 +2780,44 @@ def rerun_job(
         db.flush()
         history_id = history.id
 
-    # Acquire execution claim atomically, then reset steps for a clean run.
+    steps = (
+        db.query(WorkflowStep)
+        .filter(WorkflowStep.job_id == job.id)
+        .order_by(WorkflowStep.step_order)
+        .all()
+    )
+    completed_steps = [s for s in steps if s.status == "completed"]
+    rerun_steps = [s for s in steps if s.status != "completed"]
+    requested_mode = (mode or "").strip().lower() or None
+    if requested_mode == "full":
+        mode_effective = "full"
+        resume_start_step_order = 1
+        steps_reused_count = 0
+        steps_rerun_count = len(steps)
+    elif requested_mode == "resume":
+        if not rerun_steps:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="No incomplete workflow steps to resume; use full rerun if needed.",
+            )
+        mode_effective = "resume"
+        resume_start_step_order = min(s.step_order for s in rerun_steps)
+        steps_reused_count = len(completed_steps)
+        steps_rerun_count = len(rerun_steps)
+    else:
+        # Automatic default mode (no query): resume if possible, otherwise full fallback.
+        mode_effective = "resume"
+        if not rerun_steps:
+            mode_effective = "full"
+            resume_start_step_order = 1
+            steps_reused_count = 0
+            steps_rerun_count = len(steps)
+        else:
+            resume_start_step_order = min(s.step_order for s in rerun_steps)
+            steps_reused_count = len(completed_steps)
+            steps_rerun_count = len(rerun_steps)
+
+    # Acquire execution claim atomically, then reset steps for re-execution.
     execution_token = uuid.uuid4().hex
     transitioned = _transition_job_status_if_current(
         db,
@@ -2394,7 +2835,7 @@ def rerun_job(
         )
 
     db.refresh(job)
-    reset_job_for_execution(db, job)
+    reset_job_for_execution(db, job, mode=mode_effective)
     db.commit()
 
     # Spawn execution thread — job is already IN_PROGRESS
@@ -2405,26 +2846,41 @@ def rerun_job(
             execution_token=execution_token,
             strict=bool(getattr(settings, "JOB_EXECUTION_STRICT_QUEUE", False)),
         )
-    except Exception as exc:
+    except (QueueEnqueueError, Exception) as exc:
+        # 1. Shared cleanup logic (runs for BOTH exception types)
         logger.exception("Failed to enqueue execution for job %s", job.id)
         job.status = JobStatus.FAILED
         job.execution_token = None
         job.failure_reason = f"Failed to start execution: {str(exc)[:200]}"
+
         if history_id:
             hist = db.query(ScheduleExecutionHistory).filter(ScheduleExecutionHistory.id == history_id).first()
             if hist:
                 hist.status = "failed"
                 hist.failure_reason = job.failure_reason
         db.commit()
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail=f"Failed to enqueue job execution: {str(exc)[:200]}",
-        )
+
+        # 2. Specific HTTP Responses
+        if isinstance(exc, QueueEnqueueError):
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                headers={"Retry-After": "30"},
+                detail={"error": "queue_overloaded"},
+            )
+        else:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail=f"Failed to enqueue job execution: {str(exc)[:200]}",
+            )
 
     return RerunResponse(
-        message="Job re-execution started",
+        message=f"Job re-execution started ({mode_effective})",
         job_id=job.id,
         status=job.status.value,
+        mode=mode_effective,
+        resume_start_step_order=resume_start_step_order,
+        steps_reused_count=steps_reused_count,
+        steps_rerun_count=steps_rerun_count,
     )
 
 

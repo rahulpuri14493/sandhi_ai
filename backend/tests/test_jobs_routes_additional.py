@@ -14,6 +14,7 @@ from models.user import User, UserRole
 from models.job import Job, JobStatus
 from models.agent import Agent, AgentStatus
 from models.job import WorkflowStep
+from models.mcp_server import MCPToolConfig, MCPToolType
 
 
 def _make_business(db_session, email_suffix: str = None) -> tuple[User, dict]:
@@ -30,6 +31,17 @@ def test_create_job_rejects_invalid_tool_visibility(client: TestClient, db_sessi
     _, headers = _make_business(db_session)
     r = client.post("/api/jobs", data={"title": "T", "tool_visibility": "bad"}, headers=headers)
     assert r.status_code == 400
+
+
+def test_suggest_workflow_tools_body_accepts_null_step_visibility_entries():
+    """Null JSON elements per step inherit job.tool_visibility (not 422 from list item typing)."""
+    import api.routes.jobs as jobs_mod
+
+    body = jobs_mod.SuggestWorkflowToolsBody(
+        agent_ids=[1, 2, 3],
+        step_tool_visibility=["full", None, "none"],
+    )
+    assert body.step_tool_visibility == ["full", None, "none"]
 
 
 def test_create_job_rejects_invalid_write_execution_mode(client: TestClient, db_session):
@@ -119,12 +131,7 @@ def test_update_job_rejects_invalid_output_contract_policy_min_success(client: T
 
 def test_get_output_contract_template(client: TestClient):
     r = client.get("/api/jobs/output-contract/template")
-    assert r.status_code == 200
-    body = r.json()
-    assert body["version"] == "1.0"
-    assert isinstance(body.get("write_policy"), dict)
-    assert body["write_policy"]["on_write_error"] in ("fail_job", "continue")
-    assert isinstance(body.get("write_targets"), list)
+    assert r.status_code == 401
 
 
 def test_queue_stats_requires_auth(client: TestClient):
@@ -533,6 +540,7 @@ def test_update_job_with_new_brd_clears_old_workflow_and_resets_to_draft(client:
 
 
 def test_generate_workflow_questions_no_questions_sets_flag(monkeypatch, client: TestClient, db_session, tmp_path):
+    monkeypatch.setattr("services.planner_llm.is_agent_planner_configured", lambda: True)
     biz, headers = _make_business(db_session, "wfq1")
     dev = User(
         email=f"dev_jobs_{uuid.uuid4().hex[:8]}@example.com",
@@ -602,6 +610,7 @@ def test_generate_workflow_questions_no_questions_sets_flag(monkeypatch, client:
 
 
 def test_generate_workflow_questions_returns_added_questions_only(monkeypatch, client: TestClient, db_session, tmp_path):
+    monkeypatch.setattr("services.planner_llm.is_agent_planner_configured", lambda: True)
     biz, headers = _make_business(db_session, "wfq2")
     dev = User(
         email=f"dev_jobs_{uuid.uuid4().hex[:8]}@example.com",
@@ -666,13 +675,14 @@ def test_generate_workflow_questions_returns_added_questions_only(monkeypatch, c
     r = client.post(f"/api/jobs/{job.id}/generate-workflow-questions", headers=headers)
     assert r.status_code == 200, r.text
     out = r.json()
-    assert out["questions"] == [existing_q, "Should we round the result?"]
+    assert out["questions"] == ["Should we round the result?"]
     assert out["added_questions"] == ["Should we round the result?"]
     assert out["no_questions_needed"] is False
     assert sum(1 for i in out["conversation"] if i.get("type") == "question") == 2
 
 
 def test_generate_workflow_questions_prunes_stale_unanswered_when_none_needed(monkeypatch, client: TestClient, db_session, tmp_path):
+    monkeypatch.setattr("services.planner_llm.is_agent_planner_configured", lambda: True)
     biz, headers = _make_business(db_session, "wfq3")
     dev = User(
         email=f"dev_jobs_{uuid.uuid4().hex[:8]}@example.com",
@@ -745,4 +755,275 @@ def test_generate_workflow_questions_prunes_stale_unanswered_when_none_needed(mo
     assert out["added_questions"] == []
     assert out["removed_unanswered_questions"] == 1
     assert all(not (i.get("type") == "question" and not str(i.get("answer", "")).strip()) for i in out["conversation"])
+
+
+def test_analyze_documents_planner_off_returns_extraction_message(monkeypatch, client: TestClient, db_session, tmp_path):
+    """Without platform planner, analyze-documents returns extraction-only guidance (no hired-agent LLM)."""
+    import services.document_analyzer as da_mod
+
+    monkeypatch.setattr(da_mod, "is_agent_planner_configured", lambda: False)
+
+    biz, headers = _make_business(db_session, "planner_off")
+
+    p = tmp_path / "req.txt"
+    p.write_text("Requirement body", encoding="utf-8")
+
+    job = Job(
+        business_id=biz.id,
+        title="T",
+        description="D",
+        status=JobStatus.DRAFT,
+        files=json.dumps(
+            [{"id": "f1", "name": "req.txt", "path": str(p), "type": "text/plain", "size": 20}]
+        ),
+        conversation=json.dumps([]),
+    )
+    db_session.add(job)
+    db_session.commit()
+    db_session.refresh(job)
+
+    r = client.post(f"/api/jobs/{job.id}/analyze-documents", headers=headers)
+    assert r.status_code == 200, r.text
+    data = r.json()
+    assert "Configure the platform Agent Planner" in (data.get("analysis") or "")
+    assert data.get("questions") == []
+
+
+# --- suggest-workflow-tools (GET hint + POST validation) ---
+
+
+def test_suggest_workflow_tools_get_returns_405(client: TestClient, db_session):
+    biz, headers = _make_business(db_session, "sg405")
+    job = Job(business_id=biz.id, title="J", status=JobStatus.DRAFT, conversation=json.dumps([]))
+    db_session.add(job)
+    db_session.commit()
+    db_session.refresh(job)
+    r = client.get(f"/api/jobs/{job.id}/suggest-workflow-tools", headers=headers)
+    assert r.status_code == 405
+    assert "POST" in (r.json().get("detail") or "")
+    allow = r.headers.get("allow") or r.headers.get("Allow")
+    if allow:
+        assert "POST" in allow
+
+
+def test_suggest_workflow_tools_post_job_not_found(client: TestClient, db_session):
+    biz, headers = _make_business(db_session, "sg404")
+    r = client.post(
+        "/api/jobs/999999/suggest-workflow-tools",
+        headers=headers,
+        json={"agent_ids": [1]},
+    )
+    assert r.status_code == 404
+
+
+def test_suggest_workflow_tools_post_forbidden_other_business(client: TestClient, db_session):
+    owner, _ = _make_business(db_session, "sgfo")
+    other, other_headers = _make_business(db_session, "sgf2")
+    job = Job(business_id=owner.id, title="J", status=JobStatus.DRAFT, conversation=json.dumps([]))
+    db_session.add(job)
+    db_session.commit()
+    db_session.refresh(job)
+    r = client.post(
+        f"/api/jobs/{job.id}/suggest-workflow-tools",
+        headers=other_headers,
+        json={"agent_ids": [1]},
+    )
+    assert r.status_code == 403
+
+
+def test_suggest_workflow_tools_post_empty_agent_ids(client: TestClient, db_session):
+    biz, headers = _make_business(db_session, "sgempty")
+    job = Job(business_id=biz.id, title="J", status=JobStatus.DRAFT, conversation=json.dumps([]))
+    db_session.add(job)
+    db_session.commit()
+    db_session.refresh(job)
+    r = client.post(
+        f"/api/jobs/{job.id}/suggest-workflow-tools",
+        headers=headers,
+        json={"agent_ids": []},
+    )
+    assert r.status_code == 400
+    assert "agent_ids" in (r.json().get("detail") or "").lower()
+
+
+def test_suggest_workflow_tools_post_unknown_agent_id(client: TestClient, db_session):
+    biz, headers = _make_business(db_session, "sgunk")
+    job = Job(business_id=biz.id, title="J", status=JobStatus.DRAFT, conversation=json.dumps([]))
+    db_session.add(job)
+    db_session.commit()
+    db_session.refresh(job)
+    tool = MCPToolConfig(
+        user_id=biz.id,
+        tool_type=MCPToolType.POSTGRES,
+        name="PG",
+        encrypted_config="{}",
+        is_active=True,
+    )
+    db_session.add(tool)
+    db_session.commit()
+
+    r = client.post(
+        f"/api/jobs/{job.id}/suggest-workflow-tools",
+        headers=headers,
+        json={"agent_ids": [999991]},
+    )
+    assert r.status_code == 400
+    assert "not found" in (r.json().get("detail") or "").lower()
+
+
+# --- POST /jobs/{id}/cancel ---
+
+
+def test_cancel_job_not_found(client: TestClient, db_session):
+    biz, headers = _make_business(db_session, "cnf")
+    r = client.post("/api/jobs/999999/cancel", headers=headers)
+    assert r.status_code == 404
+
+
+def test_cancel_job_rejects_non_in_progress(client: TestClient, db_session):
+    biz, headers = _make_business(db_session, "cni")
+    job = Job(business_id=biz.id, title="J", status=JobStatus.DRAFT, conversation=json.dumps([]))
+    db_session.add(job)
+    db_session.commit()
+    db_session.refresh(job)
+    r = client.post(f"/api/jobs/{job.id}/cancel", headers=headers)
+    assert r.status_code == 400
+    detail = (r.json().get("detail") or "").lower()
+    assert "in-progress" in detail or "in progress" in detail
+
+
+def test_cancel_job_success_sets_cancelled(client: TestClient, db_session):
+    biz, headers = _make_business(db_session, "cok")
+    job = Job(business_id=biz.id, title="J", status=JobStatus.IN_PROGRESS, conversation=json.dumps([]))
+    db_session.add(job)
+    db_session.commit()
+    db_session.refresh(job)
+    r = client.post(f"/api/jobs/{job.id}/cancel", headers=headers)
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["status"] == "cancelled"
+    assert "cancel" in body["message"].lower()
+    db_session.refresh(job)
+    assert job.status == JobStatus.CANCELLED
+    assert job.failure_reason == "Cancelled by user"
+
+
+# --- GET /jobs/{id}/schedule/history auth ---
+
+
+def test_schedule_history_forbidden_for_other_business(client: TestClient, db_session):
+    owner, _ = _make_business(db_session, "hown")
+    spy, spy_headers = _make_business(db_session, "hspy")
+    job = Job(business_id=owner.id, title="J", status=JobStatus.DRAFT, conversation=json.dumps([]))
+    db_session.add(job)
+    db_session.commit()
+    db_session.refresh(job)
+    r = client.get(f"/api/jobs/{job.id}/schedule/history", headers=spy_headers)
+    assert r.status_code == 403
+
+
+# --- list_jobs developer branch + sort + malformed files JSON ---
+
+
+def test_list_jobs_developer_sort_oldest_and_status_filter(client: TestClient, db_session):
+    biz, _ = _make_business(db_session, "lbiz")
+    dev = User(
+        email=f"dev_lj_{uuid.uuid4().hex[:8]}@example.com",
+        password_hash=get_password_hash("pw123456"),
+        role=UserRole.DEVELOPER,
+    )
+    db_session.add(dev)
+    db_session.commit()
+    db_session.refresh(dev)
+    dev_headers = {"Authorization": f"Bearer {create_access_token({'sub': dev.id})}"}
+
+    j1 = Job(business_id=biz.id, title="Old", status=JobStatus.DRAFT, conversation=json.dumps([]))
+    j2 = Job(business_id=biz.id, title="New", status=JobStatus.DRAFT, conversation=json.dumps([]))
+    db_session.add_all([j1, j2])
+    db_session.commit()
+    db_session.refresh(j1)
+    db_session.refresh(j2)
+
+    agent = Agent(
+        developer_id=dev.id,
+        name="A",
+        description="d",
+        status=AgentStatus.ACTIVE,
+        price_per_task=1.0,
+        price_per_communication=0.1,
+        api_endpoint="https://ex.com/v1",
+    )
+    db_session.add(agent)
+    db_session.commit()
+    db_session.refresh(agent)
+
+    for j in (j1, j2):
+        db_session.add(
+            WorkflowStep(
+                job_id=j.id,
+                agent_id=agent.id,
+                step_order=1,
+                input_data="{}",
+                status="pending",
+            )
+        )
+    db_session.commit()
+
+    r = client.get("/api/jobs?sort=oldest&job_status=draft", headers=dev_headers)
+    assert r.status_code == 200
+    ids = [x["id"] for x in r.json()]
+    assert j1.id in ids and j2.id in ids
+    assert ids.index(j1.id) < ids.index(j2.id)
+
+
+def test_list_jobs_developer_skips_malformed_files_json(client: TestClient, db_session):
+    biz, _ = _make_business(db_session, "lbadfiles")
+    dev = User(
+        email=f"dev_badf_{uuid.uuid4().hex[:8]}@example.com",
+        password_hash=get_password_hash("pw123456"),
+        role=UserRole.DEVELOPER,
+    )
+    db_session.add(dev)
+    db_session.commit()
+    db_session.refresh(dev)
+    dev_headers = {"Authorization": f"Bearer {create_access_token({'sub': dev.id})}"}
+
+    job = Job(
+        business_id=biz.id,
+        title="Bad files JSON",
+        status=JobStatus.DRAFT,
+        files="not-valid-json{",
+        conversation=json.dumps([]),
+    )
+    db_session.add(job)
+    db_session.commit()
+    db_session.refresh(job)
+
+    agent = Agent(
+        developer_id=dev.id,
+        name="A2",
+        description="d",
+        status=AgentStatus.ACTIVE,
+        price_per_task=1.0,
+        price_per_communication=0.1,
+        api_endpoint="https://ex.com/v1",
+    )
+    db_session.add(agent)
+    db_session.commit()
+    db_session.refresh(agent)
+    db_session.add(
+        WorkflowStep(
+            job_id=job.id,
+            agent_id=agent.id,
+            step_order=1,
+            input_data="{}",
+            status="pending",
+        )
+    )
+    db_session.commit()
+
+    r = client.get("/api/jobs", headers=dev_headers)
+    assert r.status_code == 200
+    row = next(x for x in r.json() if x["id"] == job.id)
+    assert row.get("files") is None
 

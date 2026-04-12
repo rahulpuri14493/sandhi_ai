@@ -1,6 +1,8 @@
-import { useState, useEffect, useRef } from 'react'
+import { useState, useEffect, useRef, useMemo } from 'react'
 import { jobsAPI, agentsAPI, mcpAPI } from '../lib/api'
 import { getToolAccessBadge } from '../lib/mcpToolAccess'
+import { buildIndependentSharedToolWarning } from '../lib/independentWorkflowSharedTools'
+import { filterByJobAllowedIds, jobHasExplicitMcpScope } from '../lib/jobMcpScope'
 import type { Agent } from '../lib/types'
 import type { Job } from '../lib/types'
 import type { MCPToolConfigRes, MCPServerConnectionRes } from '../lib/api'
@@ -17,8 +19,13 @@ export type WorkflowCollaborationMode = 'from_brd' | 'independent' | 'sequential
 
 export type ToolVisibility = 'full' | 'names_only' | 'none'
 
-/** Per-step tool assignment: agent_index -> { platformIds, connectionIds, toolVisibility? } */
-type StepToolSelection = Record<number, { platformIds: number[]; connectionIds: number[]; toolVisibility?: ToolVisibility }>
+/** Per-step tool assignment: agent_index -> { platformIds, connectionIds, toolVisibility?, taskType? } */
+type StepToolSelection = Record<
+  number,
+  { platformIds: number[]; connectionIds: number[]; toolVisibility?: ToolVisibility; taskType?: string }
+>
+
+type StepToolsUpdateOpts = { taskType?: string }
 
 const DEFAULT_OUTPUT_CONTRACT = {
   version: '1.0',
@@ -58,7 +65,8 @@ const DEFAULT_OUTPUT_CONTRACT = {
   write_policy: {
     _description: 'How multi-target writes behave when one or more targets fail.',
     _fields_help: {
-      on_write_error: "Use 'continue' to attempt all targets, or 'stop' to halt on first failure.",
+      on_write_error:
+        "Use 'continue' to attempt all targets after a failure, or 'fail_job' to stop the job when a target errors (Platform mode).",
       min_successful_targets: 'Minimum number of successful write targets required for overall success.',
     },
     on_write_error: 'continue',
@@ -150,18 +158,34 @@ export function WorkflowBuilder({ jobId, onWorkflowCreated, initialSelectedAgent
     }
   }, [job?.id, job?.write_execution_mode, job?.output_artifact_format, job?.output_contract])
 
+  // Sync job-level tool visibility from API (including 'none'; do not use truthy check on the string).
+  useEffect(() => {
+    if (!job?.id) return
+    const tv = job.tool_visibility
+    if (tv === 'full' || tv === 'names_only' || tv === 'none') {
+      setJobToolVisibility(tv)
+    } else {
+      setJobToolVisibility('full')
+    }
+  }, [job?.id, job?.tool_visibility])
+
   // When job has workflow steps, pre-fill step tool selections from saved state (by step order)
   useEffect(() => {
     const jobData = job ?? null
     const steps = jobData?.workflow_steps
-    if (jobData?.tool_visibility) setJobToolVisibility(jobData.tool_visibility as ToolVisibility)
     if (!steps?.length || selectedAgents.length === 0) return
     // Steps are ordered by step_order; index i = step_order - 1
     const next: StepToolSelection = {}
     steps.forEach((step, i) => {
-      const platformIds = step.allowed_platform_tool_ids ?? []
-      const connectionIds = step.allowed_connection_ids ?? []
-      const toolVisibility = step.tool_visibility as ToolVisibility | undefined
+      const rawVis = step.tool_visibility as ToolVisibility | undefined
+      const toolVisibility =
+        rawVis === 'full' || rawVis === 'names_only' || rawVis === 'none' ? rawVis : undefined
+      let platformIds = step.allowed_platform_tool_ids ?? []
+      let connectionIds = step.allowed_connection_ids ?? []
+      if (toolVisibility === 'none') {
+        platformIds = []
+        connectionIds = []
+      }
       next[i] = { platformIds, connectionIds, toolVisibility }
     })
     setStepToolSelections((prev) => {
@@ -170,7 +194,7 @@ export function WorkflowBuilder({ jobId, onWorkflowCreated, initialSelectedAgent
       return prev
     })
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [job?.id, job?.tool_visibility, job?.workflow_steps, selectedAgents.length])
+  }, [job?.id, job?.workflow_steps, selectedAgents.length])
 
   /** After a job has run, keep agent list aligned with saved workflow steps when opening this screen. */
   useEffect(() => {
@@ -180,6 +204,27 @@ export function WorkflowBuilder({ jobId, onWorkflowCreated, initialSelectedAgent
   }, [job?.id, job?.status, job?.workflow_steps])
 
   const workflowLocked = !!(job?.status && job.status !== 'draft')
+
+  const independentSharedToolWarning = useMemo(
+    () =>
+      buildIndependentSharedToolWarning({
+        collaborationMode: workflowCollaboration,
+        selectedAgentCount: selectedAgents.length,
+        stepToolSelections: selectedAgents.map((_, idx) => {
+          const s = stepToolSelections[idx] ?? { platformIds: [], connectionIds: [] }
+          return { platformIds: s.platformIds, connectionIds: s.connectionIds }
+        }),
+        jobAllowedPlatformIds: job?.allowed_platform_tool_ids,
+        jobAllowedConnectionIds: job?.allowed_connection_ids,
+      }),
+    [
+      workflowCollaboration,
+      selectedAgents,
+      stepToolSelections,
+      job?.allowed_platform_tool_ids,
+      job?.allowed_connection_ids,
+    ]
+  )
 
   const loadAgents = async () => {
     try {
@@ -200,30 +245,48 @@ export function WorkflowBuilder({ jobId, onWorkflowCreated, initialSelectedAgent
       const jobData = job ?? (jobId ? await jobsAPI.get(jobId).catch(() => null) : null)
       const allowedPlatform = jobData?.allowed_platform_tool_ids
       const allowedConn = jobData?.allowed_connection_ids
-      setPlatformTools(
-        allowedPlatform?.length
-          ? tools.filter((t: MCPToolConfigRes) => allowedPlatform.includes(t.id))
-          : tools
-      )
-      setConnections(
-        allowedConn?.length
-          ? conns.filter((c: MCPServerConnectionRes) => allowedConn.includes(c.id))
-          : conns
-      )
+      setPlatformTools(filterByJobAllowedIds(tools, allowedPlatform))
+      setConnections(filterByJobAllowedIds(conns, allowedConn))
     } catch (error) {
       console.error('Failed to load tools:', error)
     }
   }
 
-  const setStepTools = (agentIndex: number, platformIds: number[], connectionIds: number[], toolVisibility?: ToolVisibility) => {
+  const setStepTools = (
+    agentIndex: number,
+    platformIds: number[],
+    connectionIds: number[],
+    toolVisibility?: ToolVisibility,
+    opts?: StepToolsUpdateOpts
+  ) => {
     setStepToolSelections((prev) => {
-      const next = { ...prev, [agentIndex]: { platformIds, connectionIds, toolVisibility } }
+      const prevSel = prev[agentIndex]
+      let taskType = prevSel?.taskType
+      if (opts && 'taskType' in opts) {
+        const t = opts.taskType?.trim()
+        taskType = t || undefined
+      }
+      const next = {
+        ...prev,
+        [agentIndex]: {
+          platformIds,
+          connectionIds,
+          toolVisibility,
+          ...(taskType ? { taskType } : {}),
+        },
+      }
       stepToolSelectionsRef.current = next
       return next
     })
   }
 
+  const stepEffectiveToolVisibility = (agentIndex: number): ToolVisibility => {
+    const cur = stepToolSelections[agentIndex]
+    return cur?.toolVisibility ?? jobToolVisibility
+  }
+
   const toggleStepPlatformTool = (agentIndex: number, toolId: number) => {
+    if (stepEffectiveToolVisibility(agentIndex) === 'none') return
     const cur = stepToolSelections[agentIndex] ?? { platformIds: [], connectionIds: [] }
     const platformIds = cur.platformIds.includes(toolId)
       ? cur.platformIds.filter((id) => id !== toolId)
@@ -232,6 +295,7 @@ export function WorkflowBuilder({ jobId, onWorkflowCreated, initialSelectedAgent
   }
 
   const toggleStepConnection = (agentIndex: number, connId: number) => {
+    if (stepEffectiveToolVisibility(agentIndex) === 'none') return
     const cur = stepToolSelections[agentIndex] ?? { platformIds: [], connectionIds: [] }
     const connectionIds = cur.connectionIds.includes(connId)
       ? cur.connectionIds.filter((id) => id !== connId)
@@ -240,12 +304,14 @@ export function WorkflowBuilder({ jobId, onWorkflowCreated, initialSelectedAgent
   }
 
   const addStepPlatformTool = (agentIndex: number, toolId: number) => {
+    if (stepEffectiveToolVisibility(agentIndex) === 'none') return
     const cur = stepToolSelections[agentIndex] ?? { platformIds: [], connectionIds: [] }
     if (cur.platformIds.includes(toolId)) return
     setStepTools(agentIndex, [...cur.platformIds, toolId], cur.connectionIds, cur.toolVisibility)
   }
 
   const addStepConnection = (agentIndex: number, connId: number) => {
+    if (stepEffectiveToolVisibility(agentIndex) === 'none') return
     const cur = stepToolSelections[agentIndex] ?? { platformIds: [], connectionIds: [] }
     if (cur.connectionIds.includes(connId)) return
     setStepTools(agentIndex, cur.platformIds, [...cur.connectionIds, connId], cur.toolVisibility)
@@ -305,7 +371,11 @@ export function WorkflowBuilder({ jobId, onWorkflowCreated, initialSelectedAgent
     setIsLoading(true)
     setError('')
     try {
-      const data = await jobsAPI.suggestWorkflowTools(jobId, selectedAgents)
+      const step_tool_visibility = selectedAgents.map((_, idx) => {
+        const s = stepToolSelections[idx]
+        return (s?.toolVisibility ?? jobToolVisibility) as ToolVisibility
+      })
+      const data = await jobsAPI.suggestWorkflowTools(jobId, selectedAgents, step_tool_visibility)
       if (data.detail && !(data.step_suggestions && data.step_suggestions.length)) {
         setError(data.detail)
         return
@@ -315,10 +385,21 @@ export function WorkflowBuilder({ jobId, onWorkflowCreated, initialSelectedAgent
       for (const s of data.step_suggestions || []) {
         const idx = s.agent_index
         const prev = base[idx] ?? { platformIds: [], connectionIds: [] }
+        const effVis = prev.toolVisibility ?? jobToolVisibility
+        if (effVis === 'none') {
+          next[idx] = {
+            platformIds: [],
+            connectionIds: [],
+            toolVisibility: 'none',
+            ...(prev.taskType ? { taskType: prev.taskType } : {}),
+          }
+          continue
+        }
         next[idx] = {
           platformIds: s.platform_tool_ids ?? [],
           connectionIds: prev.connectionIds,
           toolVisibility: prev.toolVisibility,
+          ...(prev.taskType ? { taskType: prev.taskType } : {}),
         }
       }
       setStepToolSelections(next)
@@ -365,6 +446,18 @@ export function WorkflowBuilder({ jobId, onWorkflowCreated, initialSelectedAgent
       const current = stepToolSelectionsRef.current
       const stepTools = selectedAgents.map((_, idx) => {
         const sel = current[idx]
+        const effVis = sel?.toolVisibility ?? jobToolVisibility
+        const slug = (sel?.taskType ?? '').trim().toLowerCase()
+        const task_type = /^[a-z][a-z0-9_]{0,63}$/i.test(slug) ? slug : undefined
+        if (effVis === 'none') {
+          return {
+            agent_index: idx,
+            allowed_platform_tool_ids: [] as number[],
+            allowed_connection_ids: [] as number[],
+            tool_visibility: 'none' as const,
+            ...(task_type ? { task_type } : {}),
+          }
+        }
         const hasPlatform = (sel?.platformIds?.length ?? 0) > 0
         const hasConn = (sel?.connectionIds?.length ?? 0) > 0
         // When only connections are selected, send empty platform list so backend does not inherit job-level platform tools
@@ -374,16 +467,19 @@ export function WorkflowBuilder({ jobId, onWorkflowCreated, initialSelectedAgent
           agent_index: idx,
           allowed_platform_tool_ids: platformIds,
           allowed_connection_ids: connectionIds,
-          tool_visibility: sel?.toolVisibility,
+          tool_visibility: effVis,
+          ...(task_type ? { task_type } : {}),
         }
       })
-      const hasStepTools = stepTools.some((s) => (s.allowed_platform_tool_ids?.length ?? 0) > 0 || (s.allowed_connection_ids?.length ?? 0) > 0 || s.tool_visibility)
+      // Always send step_tools when building a workflow so each step stores effective tool_visibility
+      // (matches job dropdown). Backend merges omitted allowlists with job-level scope.
+      const hasStepTools = selectedAgents.length > 0
       await jobsAPI.autoSplitWorkflow(
         jobId,
         selectedAgents,
         workflowMode,
         hasStepTools ? stepTools : undefined,
-        jobToolVisibility !== 'full' ? jobToolVisibility : undefined,
+        jobToolVisibility,
         showOutputContractBlock
           ? {
               write_execution_mode: writeExecutionMode,
@@ -524,6 +620,28 @@ export function WorkflowBuilder({ jobId, onWorkflowCreated, initialSelectedAgent
               {workflowCollaboration === 'sequential' && 'Best when agent 2 needs agent 1’s result (pipeline).'}
               {workflowCollaboration === 'from_brd' && 'Uses analyze-documents hint from your BRD when available.'}
             </p>
+            {independentSharedToolWarning && (
+              <div
+                className={`mt-4 p-4 rounded-xl border-2 text-sm ${
+                  independentSharedToolWarning.variant === 'strong'
+                    ? 'bg-amber-500/15 border-amber-500/50 text-amber-100'
+                    : 'bg-slate-600/20 border-slate-400/40 text-white/90'
+                }`}
+                role="status"
+              >
+                <p className="font-bold text-white mb-2">{independentSharedToolWarning.title}</p>
+                <ul className="list-disc list-inside space-y-1.5 text-white/85 leading-relaxed">
+                  {independentSharedToolWarning.lines.map((line, i) => (
+                    <li key={i}>{line}</li>
+                  ))}
+                </ul>
+                <p className="mt-3 text-xs text-white/55">
+                  Operations guide: repository file{' '}
+                  <code className="text-primary-300 bg-dark-200/80 px-1 rounded">backend/docs/INDEPENDENT_WORKFLOW_SHARED_TOOLS.md</code>
+                  — parallel execution, logging headers (<code className="text-primary-300">X-Sandhi-Trace-Id</code>, etc.).
+                </p>
+              </div>
+            )}
             {workflowCollaboration === 'from_brd' && job?.allowed_platform_tool_ids && job.allowed_platform_tool_ids.length > 0 && (
               <p className="text-xs text-emerald-400/90 mt-1.5 font-medium">
                 Job tools will be assigned to all agents automatically. You can optionally restrict tools per agent below.
@@ -591,7 +709,17 @@ export function WorkflowBuilder({ jobId, onWorkflowCreated, initialSelectedAgent
                 </button>
               </div>
               <p className="text-sm text-white/70 mb-4">
-                Add only the tools each agent can use. If none are added, that agent will have access to all job tools.
+                {jobHasExplicitMcpScope(job) ? (
+                  <>
+                    Add only the tools each agent can use. If you leave a step empty, it uses the{' '}
+                    <strong className="text-white/90">job&rsquo;s selected tools</strong> only.
+                  </>
+                ) : (
+                  <>
+                    Add only the tools each agent can use. With no job-level tool selection yet, a step you leave empty shows{' '}
+                    <strong className="text-white/90">no tools</strong> here — pick tools per step or restrict tools when creating the job.
+                  </>
+                )}{' '}
                 Suggestions use the same BRD excerpts and Q&amp;A as task splitting (first selected agent = splitter API).
               </p>
               <div className="mb-4 p-4 rounded-xl bg-dark-100/80 border border-dark-300 text-sm text-white/85 space-y-2">
@@ -612,19 +740,29 @@ export function WorkflowBuilder({ jobId, onWorkflowCreated, initialSelectedAgent
                 {selectedAgents.map((agentId, idx) => {
                   const agent = availableAgents.find((a) => a.id === agentId)
                   const sel = stepToolSelections[idx] ?? { platformIds: [], connectionIds: [] }
+                  const effVis = sel.toolVisibility ?? jobToolVisibility
                   const selectedPlatformTools = platformTools.filter((t) => sel.platformIds.includes(t.id))
                   const selectedConns = connections.filter((c) => sel.connectionIds.includes(c.id))
                   const availableToAddPlatform = platformTools.filter((t) => !sel.platformIds.includes(t.id))
                   const availableToAddConn = connections.filter((c) => !sel.connectionIds.includes(c.id))
-                  const hasAnySelected = selectedPlatformTools.length > 0 || selectedConns.length > 0
+                  const showToolAssignment = effVis !== 'none'
+                  const hasAnySelected =
+                    showToolAssignment && (selectedPlatformTools.length > 0 || selectedConns.length > 0)
                   return (
                     <div key={agentId} className="border border-dark-300 rounded-lg p-4 bg-dark-200/30">
                       <div className="font-bold text-white mb-2">Step {idx + 1}: {agent?.name ?? `Agent ${agentId}`}</div>
                       <div className="mb-3">
                         <label className="text-xs text-white/70 mr-2">Step tool visibility:</label>
                         <select
-                          value={sel.toolVisibility ?? jobToolVisibility}
-                          onChange={(e) => setStepTools(idx, sel.platformIds, sel.connectionIds, e.target.value as ToolVisibility)}
+                          value={effVis}
+                          onChange={(e) => {
+                            const v = e.target.value as ToolVisibility
+                            if (v === 'none') {
+                              setStepTools(idx, [], [], v)
+                            } else {
+                              setStepTools(idx, sel.platformIds, sel.connectionIds, v)
+                            }
+                          }}
                           className="px-2 py-1 bg-dark-200/80 border border-dark-300 rounded text-white text-sm min-w-[200px]"
                           title="Full = names, descriptions, schema. Names only = names + short description. None = no tools."
                         >
@@ -633,10 +771,43 @@ export function WorkflowBuilder({ jobId, onWorkflowCreated, initialSelectedAgent
                           <option value="none">None (no tools)</option>
                         </select>
                       </div>
+                      <div className="mb-3">
+                        <label className="block text-xs text-white/70 mb-1">
+                          Task type slug (optional — tool assignment registry)
+                        </label>
+                        <input
+                          type="text"
+                          value={sel.taskType ?? ''}
+                          onChange={(e) =>
+                            setStepTools(
+                              idx,
+                              effVis === 'none' ? [] : sel.platformIds,
+                              effVis === 'none' ? [] : sel.connectionIds,
+                              sel.toolVisibility,
+                              { taskType: e.target.value }
+                            )
+                          }
+                          placeholder="e.g. search, persist"
+                          className="w-full max-w-md px-3 py-2 bg-dark-200/80 border border-dark-300 rounded-lg text-white text-sm placeholder:text-white/35 focus:ring-2 focus:ring-primary-500 focus:border-primary-500"
+                          title="Letter, then letters, digits, or underscores (max 64 chars). Invalid values are omitted when creating the workflow."
+                        />
+                      </div>
                       <div className="space-y-2">
                         <div className="text-sm font-semibold text-white/90">Selected for this step:</div>
-                        {!hasAnySelected ? (
-                          <p className="text-xs text-white/50 italic">No tools selected — this step will use all job tools.</p>
+                        {!showToolAssignment ? (
+                          <p className="text-xs text-white/60">
+                            No tools for this step — visibility is set to None (no MCP tools).
+                          </p>
+                        ) : !hasAnySelected ? (
+                          jobHasExplicitMcpScope(job) ? (
+                            <p className="text-xs text-white/50 italic">
+                              No tools selected for this step — uses the job&rsquo;s tool list.
+                            </p>
+                          ) : (
+                            <p className="text-xs text-white/45 tabular-nums" aria-label="No tools selected">
+                              —
+                            </p>
+                          )
                         ) : (
                           <div className="flex flex-wrap gap-3">
                             {selectedPlatformTools.map((t) => {
@@ -696,7 +867,8 @@ export function WorkflowBuilder({ jobId, onWorkflowCreated, initialSelectedAgent
                             ))}
                           </div>
                         )}
-                        {(availableToAddPlatform.length > 0 || availableToAddConn.length > 0) && (
+                        {showToolAssignment &&
+                          (availableToAddPlatform.length > 0 || availableToAddConn.length > 0) && (
                           <div className="flex flex-wrap items-center gap-2 pt-1">
                             <span className="text-xs text-white/70">Add tool:</span>
                             {availableToAddPlatform.length > 0 && (
@@ -746,7 +918,48 @@ export function WorkflowBuilder({ jobId, onWorkflowCreated, initialSelectedAgent
             <div className="mb-6 p-5 bg-indigo-500/10 border-2 border-indigo-500/30 rounded-xl">
               <h4 className="font-bold text-indigo-300 mb-2">Output contract and write mode</h4>
               <p className="text-sm text-white/70 mb-3">
-                Default is Sandhi AI universal JSON contract. You can customize this when your job uses MCP write tools.
+                The JSON below is your <strong className="text-white/90">delivery contract</strong> (where copies of step output may go).
+                Choose <strong className="text-white/90">who</strong> performs those writes: the platform (automatic after each step) or the AI agent (by calling tools during the step).
+              </p>
+              <div className="mb-4 grid grid-cols-1 lg:grid-cols-2 gap-3 text-sm">
+                <div className="rounded-xl border border-indigo-400/35 bg-dark-200/50 p-4">
+                  <p className="font-bold text-indigo-200 mb-2">Platform — automatic</p>
+                  <ul className="list-disc list-inside text-white/70 space-y-1.5">
+                    <li>
+                      After a step finishes, Sandhi builds <strong className="text-white/85">one structured artifact</strong> from the
+                      model output (e.g. JSON/JSONL with a <code className="text-primary-300">records</code> array) and{' '}
+                      <strong className="text-white/85">calls each write target</strong> in the contract for you.
+                    </li>
+                    <li>
+                      Best for: loading that step result into a table, warehouse, or cloud storage as{' '}
+                      <strong className="text-white/85">a single file or batch load per completed step</strong> — repeatable and operator-controlled.
+                    </li>
+                    <li>
+                      <strong className="text-white/85">Not</strong> a full bucket-to-bucket sync: it does not crawl every object in MinIO/S3 by itself.
+                    </li>
+                  </ul>
+                </div>
+                <div className="rounded-xl border border-teal-400/35 bg-dark-200/50 p-4">
+                  <p className="font-bold text-teal-200 mb-2">AI agent — tool calls</p>
+                  <ul className="list-disc list-inside text-white/70 space-y-1.5">
+                    <li>
+                      The model must <strong className="text-white/85">invoke MCP tools</strong> (e.g. list/get from MinIO, put to Azure Blob, SQL) during the step.
+                    </li>
+                    <li>
+                      Best for: <strong className="text-white/85">many objects</strong>, custom paths, or logic that needs a loop (copy each key, transform, then write).
+                    </li>
+                    <li>
+                      Requires the right tools (MinIO, Azure, etc.) in the job/step tool list; the agent only does what it can call.
+                    </li>
+                    <li>
+                      Large bucket listings are paginated: use <code className="text-primary-300">continuation_token</code> /{' '}
+                      <code className="text-primary-300">page_token</code> from tool responses when <code className="text-primary-300">is_truncated</code> is true.
+                    </li>
+                  </ul>
+                </div>
+              </div>
+              <p className="text-xs text-white/55 mb-4 border-l-2 border-amber-500/50 pl-3 py-0.5">
+                <strong className="text-amber-100/90">UI only</strong> skips automatic artifact files and contract-driven writes — results stay in the app unless you use tools another way.
               </p>
               <div className="grid grid-cols-1 md:grid-cols-2 gap-4 mb-3">
                 <div>
@@ -758,10 +971,27 @@ export function WorkflowBuilder({ jobId, onWorkflowCreated, initialSelectedAgent
                     }
                     className="px-4 py-2.5 bg-dark-200/80 border-2 border-dark-300 rounded-xl text-white font-medium focus:ring-2 focus:ring-primary-500 focus:border-primary-500 w-full"
                   >
-                    <option value="platform">Platform triggers write tools from artifact reference</option>
-                    <option value="agent">AI agent triggers write tools from artifact reference</option>
-                    <option value="ui_only">UI only — show results in app; no artifact file or contract writes</option>
+                    <option value="platform">Platform — auto-write step artifact to write targets</option>
+                    <option value="agent">AI agent — model calls write/list tools during the step</option>
+                    <option value="ui_only">UI only — in-app results; no contract-driven writes</option>
                   </select>
+                  {writeExecutionMode === 'platform' && (
+                    <p className="mt-2 text-xs text-indigo-200/95 leading-relaxed" role="note">
+                      <span className="font-semibold text-indigo-100">Current mode:</span> Each successful step produces one artifact; the platform pushes it to every
+                      configured destination. Use for structured loads, not &quot;mirror entire bucket&quot; unless a separate sync tool handles that.
+                    </p>
+                  )}
+                  {writeExecutionMode === 'agent' && (
+                    <p className="mt-2 text-xs text-teal-200/95 leading-relaxed" role="note">
+                      <span className="font-semibold text-teal-100">Current mode:</span> The agent must use tools to read and write data. Prefer this when you need many
+                      files copied or per-object behavior. Keep <code className="text-primary-300">write_targets</code> aligned with how your tools are used.
+                    </p>
+                  )}
+                  {writeExecutionMode === 'ui_only' && (
+                    <p className="mt-2 text-xs text-white/60 leading-relaxed" role="note">
+                      <span className="font-semibold text-white/75">Current mode:</span> No automatic upload from the output contract. Use when you only need answers in the UI.
+                    </p>
+                  )}
                 </div>
                 <div>
                   <label className="block text-white/80 text-sm font-semibold mb-1">Output artifact format</label>
@@ -773,14 +1003,27 @@ export function WorkflowBuilder({ jobId, onWorkflowCreated, initialSelectedAgent
                     <option value="jsonl">JSONL (best for bulk and high volume)</option>
                     <option value="json">JSON (single structured payload)</option>
                   </select>
+                  <p className="mt-2 text-xs text-white/55">
+                    Artifact format applies when the platform persists step output (not UI only). Platform mode expects the model to return JSON with a top-level{' '}
+                    <code className="text-primary-300">records</code> array for reliable writes.
+                  </p>
                 </div>
               </div>
+              <label className="block text-white/80 text-sm font-semibold mb-1">Output contract (JSON)</label>
+              <p className="text-xs text-white/55 mb-2">
+                <code className="text-primary-300">write_targets</code> are used by <strong className="text-white/75">Platform</strong> mode for automatic delivery. In{' '}
+                <strong className="text-white/75">Agent</strong> mode, the platform does not run those writes for you — the model must call MinIO/Azure/SQL tools. If saving fails with a contract error, check{' '}
+                <code className="text-primary-300">write_policy.on_write_error</code> is <code className="text-primary-300">fail_job</code> or{' '}
+                <code className="text-primary-300">continue</code> (not &quot;stop&quot;). Optional per-job step timeout override:{' '}
+                <code className="text-primary-300">agent_step_timeout_seconds</code> (or <code className="text-primary-300">step_timeout_seconds</code>) — clamped by server min/max.
+              </p>
               <textarea
                 value={outputContractText}
                 onChange={(e) => setOutputContractText(e.target.value)}
                 rows={10}
                 className="w-full px-4 py-3 bg-dark-200/80 border-2 border-dark-300 rounded-xl text-white font-mono text-sm focus:ring-2 focus:ring-primary-500 focus:border-primary-500"
                 placeholder="Paste output contract JSON"
+                aria-label="Output contract JSON"
               />
             </div>
           )}

@@ -395,7 +395,6 @@ class TestJobsWorkflow:
 
     def test_delete_job_removes_files(self, integration_client: TestClient, business_user):
         """DELETE /api/jobs/{id} should succeed and remove associated files from disk."""
-        from pathlib import Path as _P
 
         payload = io.BytesIO(b"to-be-deleted")
         r = integration_client.post(
@@ -538,22 +537,18 @@ class TestJobsWorkflow:
             {"agent_index": 0, "task": "Handle ANOVA calculations only."},
             {"agent_index": 1, "task": "Handle chi-square calculations only."},
         ]
-        mock_resp = MagicMock()
-        mock_resp.status_code = 200
-        mock_resp.json.return_value = {
-            "choices": [{"message": {"content": json.dumps(llm_assignments)}}]
-        }
-        with patch("services.task_splitter.post_openai_compatible_raw", new=AsyncMock(return_value=mock_resp)) as mock_post:
-            split_resp = integration_client.post(
-                f"/api/jobs/{job_id}/workflow/auto-split",
-                json={"agent_ids": [openai_agent.id, groq_agent.id], "workflow_mode": "independent"},
-                headers=_auth_headers(business_user),
-            )
+        with patch("services.task_splitter.is_agent_planner_configured", return_value=True):
+            with patch(
+                "services.task_splitter.planner_chat_completion",
+                new=AsyncMock(return_value=json.dumps(llm_assignments)),
+            ) as mock_planner:
+                split_resp = integration_client.post(
+                    f"/api/jobs/{job_id}/workflow/auto-split",
+                    json={"agent_ids": [openai_agent.id, groq_agent.id], "workflow_mode": "independent"},
+                    headers=_auth_headers(business_user),
+                )
         assert split_resp.status_code == 200, split_resp.text
-        # Ensure splitter AI interaction is mocked and no real network call is made.
-        mock_post.assert_awaited_once()
-        called_url = mock_post.await_args.args[0]
-        assert called_url == openai_agent.api_endpoint
+        mock_planner.assert_awaited()
 
         job_resp = integration_client.get(
             f"/api/jobs/{job_id}",
@@ -627,15 +622,14 @@ class TestJobsWorkflow:
         assert create_resp.status_code == 201, create_resp.text
         job_id = create_resp.json()["id"]
 
-        with patch("services.task_splitter.post_openai_compatible_raw", new=AsyncMock()) as mock_post:
+        with patch("services.task_splitter.planner_chat_completion", new=AsyncMock()) as mock_planner:
             split_resp = integration_client.post(
                 f"/api/jobs/{job_id}/workflow/auto-split",
                 json={"agent_ids": [solo_agent.id], "workflow_mode": "independent"},
                 headers=_auth_headers(business_user),
             )
         assert split_resp.status_code == 200, split_resp.text
-        # Single-agent split should not call external splitter endpoint at all.
-        assert mock_post.call_count == 0
+        assert mock_planner.await_count == 0
 
         job_resp = integration_client.get(
             f"/api/jobs/{job_id}",
@@ -730,19 +724,18 @@ class TestJobsWorkflow:
                 "assigned_document_ids": [chi_meta["id"]],
             },
         ]
-        mock_resp = MagicMock()
-        mock_resp.status_code = 200
-        mock_resp.json.return_value = {
-            "choices": [{"message": {"content": json.dumps(llm_assignments)}}]
-        }
-        with patch("services.task_splitter.post_openai_compatible_raw", new=AsyncMock(return_value=mock_resp)) as mock_post:
-            split_resp = integration_client.post(
-                f"/api/jobs/{job_id}/workflow/auto-split",
-                json={"agent_ids": [openai_agent.id, groq_agent.id], "workflow_mode": "independent"},
-                headers=_auth_headers(business_user),
-            )
+        with patch("services.task_splitter.is_agent_planner_configured", return_value=True):
+            with patch(
+                "services.task_splitter.planner_chat_completion",
+                new=AsyncMock(return_value=json.dumps(llm_assignments)),
+            ) as mock_planner:
+                split_resp = integration_client.post(
+                    f"/api/jobs/{job_id}/workflow/auto-split",
+                    json={"agent_ids": [openai_agent.id, groq_agent.id], "workflow_mode": "independent"},
+                    headers=_auth_headers(business_user),
+                )
         assert split_resp.status_code == 200, split_resp.text
-        mock_post.assert_awaited_once()
+        mock_planner.assert_awaited()
 
         job_resp = integration_client.get(
             f"/api/jobs/{job_id}",

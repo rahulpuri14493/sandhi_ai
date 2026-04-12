@@ -1,5 +1,4 @@
 """Tests for core/encryption."""
-import pytest
 
 from core.encryption import (
     encrypt_json,

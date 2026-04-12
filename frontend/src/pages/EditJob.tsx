@@ -39,9 +39,15 @@ export default function EditJobPage() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [id])
 
-  // Once both job and tools have loaded, set selection to job's tools that still exist (so checkboxes show and save won't 400)
+  // Sync platform checkboxes to saved job scope (drop ids no longer in catalog). If the job has no
+  // saved platform tools, finish immediately — do not wait on platformTools.length (catalog may be empty).
   useEffect(() => {
-    if (isLoadingJob || platformTools.length === 0 || jobOriginalPlatformToolIds.length === 0 || hasSyncedToolSelection.current) return
+    if (isLoadingJob || hasSyncedToolSelection.current) return
+    if (jobOriginalPlatformToolIds.length === 0) {
+      hasSyncedToolSelection.current = true
+      return
+    }
+    if (platformTools.length === 0) return
     hasSyncedToolSelection.current = true
     const currentIds = new Set(platformTools.map((t) => t.id))
     const validIds = jobOriginalPlatformToolIds.filter((id) => currentIds.has(id))
@@ -65,10 +71,13 @@ export default function EditJobPage() {
         status: job.status || 'draft',
       })
       setExistingFiles(job.files || [])
-      const allowedToolIds = job.allowed_platform_tool_ids ?? []
+      const allowedToolIds = Array.isArray(job.allowed_platform_tool_ids)
+        ? job.allowed_platform_tool_ids
+        : []
+      const allowedConnIds = Array.isArray(job.allowed_connection_ids) ? job.allowed_connection_ids : []
       setJobOriginalPlatformToolIds(allowedToolIds)
       setSelectedPlatformToolIds(allowedToolIds)
-      setSelectedConnectionIds(job.allowed_connection_ids ?? [])
+      setSelectedConnectionIds(allowedConnIds)
       setToolVisibility((job.tool_visibility ?? 'none') as 'full' | 'names_only' | 'none')
       if (
         !selectedAgentsFromState?.length &&
@@ -167,12 +176,18 @@ export default function EditJobPage() {
     setIsLoading(true)
     setError('')
     try {
-      await jobsAPI.update(parseInt(id), {
-        ...formData,
-        allowed_platform_tool_ids: selectedPlatformToolIds,
-        allowed_connection_ids: selectedConnectionIds,
-        tool_visibility: toolVisibility,
-      }, selectedFiles.length > 0 ? selectedFiles : undefined)
+      await jobsAPI.update(
+        parseInt(id),
+        {
+          ...formData,
+          // Same contract as create job: always send both arrays (possibly empty) so the API
+          // stores explicit scope and Build workflow → Tools per agent lists stay in sync.
+          allowed_platform_tool_ids: selectedPlatformToolIds,
+          allowed_connection_ids: selectedConnectionIds,
+          tool_visibility: toolVisibility,
+        },
+        selectedFiles.length > 0 ? selectedFiles : undefined
+      )
       
       // If new files were uploaded, redirect to job detail to show Q&A (analysis happens automatically on backend)
       if (selectedFiles.length > 0) {
@@ -255,7 +270,8 @@ export default function EditJobPage() {
               Tools for this job
             </label>
             <p className="text-sm text-white/60 mb-3 font-medium">
-              Choose which tools agents can use for this job. Leave all unchecked to allow every configured tool.
+              Only tools you select here are in scope for this job and appear in Build workflow → Tools per agent.
+              Leave all unchecked for no job-level tools (add-tool dropdowns there stay empty).
             </p>
             {jobOriginalPlatformToolIds.length > 0 && platformTools.length > 0 && (() => {
               const currentToolIds = new Set(platformTools.map((t) => t.id))

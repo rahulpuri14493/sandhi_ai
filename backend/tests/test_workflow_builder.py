@@ -3,7 +3,7 @@ import json
 import pytest
 from unittest.mock import MagicMock, patch, AsyncMock
 
-from models.job import Job, WorkflowStep, JobStatus
+from models.job import Job, WorkflowStep
 from models.agent import Agent
 from services.workflow_builder import WorkflowBuilder
 
@@ -144,6 +144,35 @@ def test_auto_split_workflow_persists_job_tool_visibility(mock_db, sample_job, s
         assert getattr(step, "tool_visibility", None) == "names_only"
 
 
+def test_auto_split_workflow_persists_step_task_type(mock_db, sample_job, sample_agents):
+    """step_tools with task_type is stored in step input_data."""
+    mock_db.query.return_value.filter.return_value.first.side_effect = [sample_job] + sample_agents
+    mock_db.query.return_value.filter.return_value.all.side_effect = [
+        sample_agents,
+        [], [], [], [],
+    ]
+    mock_db.query.return_value.filter.return_value.order_by.return_value.all.return_value = []
+    mock_db.commit = MagicMock()
+    with patch.object(WorkflowBuilder, "_get_workflow_collaboration_hint", return_value="sequential"):
+        with patch("services.workflow_builder.split_job_for_agents", new_callable=AsyncMock, side_effect=_mock_split_job_for_agents):
+            builder = WorkflowBuilder(mock_db)
+            with patch.object(builder.payment_processor, "calculate_job_cost", return_value=MagicMock()):
+                builder.auto_split_workflow(
+                    1,
+                    [1, 2],
+                    workflow_mode="sequential",
+                    step_tools=[
+                        {"agent_index": 0, "task_type": "search"},
+                        {"agent_index": 1, "task_type": "persist"},
+                    ],
+                )
+    steps_added = [c[0][0] for c in mock_db.add.call_args_list if c[0] and isinstance(c[0][0], WorkflowStep)]
+    step1 = next((s for s in steps_added if s.step_order == 1), None)
+    step2 = next((s for s in steps_added if s.step_order == 2), None)
+    assert step1 is not None and json.loads(step1.input_data).get("task_type") == "search"
+    assert step2 is not None and json.loads(step2.input_data).get("task_type") == "persist"
+
+
 def test_auto_split_workflow_step_tool_visibility_override(mock_db, sample_job, sample_agents):
     """step_tools with tool_visibility overrides job-level for that step."""
     sample_job.tool_visibility = "full"
@@ -172,6 +201,43 @@ def test_auto_split_workflow_step_tool_visibility_override(mock_db, sample_job, 
     step2 = next((s for s in steps_added if s.step_order == 2), None)
     assert step1 is not None and getattr(step1, "tool_visibility", None) == "none"
     assert step2 is not None and getattr(step2, "tool_visibility", None) == "names_only"
+
+
+def test_auto_split_step_tool_visibility_none_does_not_inherit_job_allowlists(mock_db, sample_job, sample_agents):
+    """Step with tool_visibility='none' must not get job-level MCP allowlists (omit = inherit would contradict none)."""
+    sample_job.tool_visibility = "full"
+    sample_job.allowed_platform_tool_ids = json.dumps([10, 20])
+    sample_job.allowed_connection_ids = json.dumps([30])
+    mock_db.query.return_value.filter.return_value.first.side_effect = [sample_job] + sample_agents
+    mock_db.query.return_value.filter.return_value.all.side_effect = [
+        sample_agents,
+        [], [], [], [],
+    ]
+    mock_db.query.return_value.filter.return_value.order_by.return_value.all.return_value = []
+    mock_db.commit = MagicMock()
+    with patch.object(WorkflowBuilder, "_get_workflow_collaboration_hint", return_value="sequential"):
+        with patch("services.workflow_builder.split_job_for_agents", new_callable=AsyncMock, side_effect=_mock_split_job_for_agents):
+            builder = WorkflowBuilder(mock_db)
+            with patch.object(builder.payment_processor, "calculate_job_cost", return_value=MagicMock()):
+                builder.auto_split_workflow(
+                    1,
+                    [1, 2],
+                    workflow_mode="sequential",
+                    tool_visibility="full",
+                    step_tools=[
+                        {"agent_index": 0, "tool_visibility": "none"},
+                        {"agent_index": 1, "tool_visibility": "full"},
+                    ],
+                )
+    steps_added = [c[0][0] for c in mock_db.add.call_args_list if c[0] and isinstance(c[0][0], WorkflowStep)]
+    step1 = next((s for s in steps_added if s.step_order == 1), None)
+    step2 = next((s for s in steps_added if s.step_order == 2), None)
+    assert step1 is not None
+    assert step1.allowed_platform_tool_ids is None
+    assert step1.allowed_connection_ids is None
+    assert step2 is not None
+    assert json.loads(step2.allowed_platform_tool_ids) == [10, 20]
+    assert json.loads(step2.allowed_connection_ids) == [30]
 
 
 def test_auto_split_workflow_filters_documents_per_agent_scope(mock_db, sample_job, sample_agents):
@@ -215,6 +281,49 @@ def test_auto_split_workflow_filters_documents_per_agent_scope(mock_db, sample_j
     assert step2_data.get("document_scope_restricted") is True
     assert [d["id"] for d in step1_data.get("documents", [])] == ["BRD1"]
     assert [d["id"] for d in step2_data.get("documents", [])] == ["BRD2"]
+
+
+def test_auto_split_persists_task_split_artifact_when_split_returns_raw_audit(mock_db, sample_job, sample_agents):
+    """When split_job_for_agents fills llm_audit.raw_llm_response, persist_json_planner_artifact is awaited."""
+    for a in sample_agents:
+        a.api_endpoint = ""
+
+    mock_db.query.return_value.filter.return_value.first.side_effect = [sample_job] + sample_agents
+    mock_db.query.return_value.filter.return_value.all.side_effect = [
+        sample_agents,
+        [],
+        [],
+        [],
+        [],
+    ]
+    mock_db.query.return_value.filter.return_value.order_by.return_value.all.return_value = []
+    mock_db.commit = MagicMock()
+
+    async def split_with_audit(*args, **kwargs):
+        audit = kwargs.get("llm_audit")
+        if audit is not None:
+            audit["raw_llm_response"] = "[]"
+            audit["source"] = "planner"
+        return [
+            {"agent_index": 0, "task": "T1"},
+            {"agent_index": 1, "task": "T2"},
+        ]
+
+    with patch("services.workflow_builder.is_agent_planner_configured", return_value=True):
+        with patch("services.workflow_builder.split_job_for_agents", new_callable=AsyncMock, side_effect=split_with_audit):
+            with patch("services.workflow_builder.persist_json_planner_artifact", new_callable=AsyncMock) as p_artifact:
+                with patch.object(WorkflowBuilder, "_get_workflow_collaboration_hint", return_value="sequential"):
+                    builder = WorkflowBuilder(mock_db)
+                    with patch.object(builder.payment_processor, "calculate_job_cost", return_value=MagicMock()):
+                        builder.auto_split_workflow(1, [1, 2], workflow_mode="sequential")
+    p_artifact.assert_awaited()
+    task_split_calls = [c for c in p_artifact.await_args_list if len(c.args) >= 4 and c.args[2] == "task_split"]
+    assert task_split_calls, "Expected at least one task_split artifact write"
+    aa = task_split_calls[0]
+    assert aa.args[1] == 1
+    payload = aa.args[3]
+    assert payload.get("raw_llm_response") == "[]"
+    assert payload.get("source") == "planner"
 
 
 # ---------- Negative test cases (invalid inputs, expect ValueError) ----------

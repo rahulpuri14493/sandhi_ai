@@ -78,7 +78,13 @@ describe('New Job integration', () => {
     const submit = screen.getByRole('button', { name: /Create Job/i })
     fireEvent.click(submit)
     await waitFor(() => {
-      expect(jobsAPI.create).toHaveBeenCalled()
+      expect(jobsAPI.create).toHaveBeenCalledWith(
+        expect.objectContaining({
+          title: 'E2E Job',
+          allowed_platform_tool_ids: [],
+          allowed_connection_ids: [],
+        })
+      )
     }, { timeout: 10000 })
   }, 12000)
 

@@ -1,0 +1,10 @@
+# Measure production modules only (exclude test package from coverage denominator).
+[run]
+source =
+    .
+omit =
+    tests/*
+    */tests/*
+
+[report]
+precision = 2

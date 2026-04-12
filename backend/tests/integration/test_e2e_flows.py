@@ -8,11 +8,8 @@ import json
 import uuid
 from unittest.mock import AsyncMock, patch
 
-import pytest
 from fastapi.testclient import TestClient
 
-from models.job import Job, JobStatus
-from models.user import UserRole
 
 
 # ---------- Auth ----------
@@ -71,7 +68,6 @@ class TestE2EAgents:
             json={
                 "name": "New E2E Agent",
                 "description": "Created in e2e",
-                "status": "active",
                 "price_per_task": 5.0,
                 "price_per_communication": 0.5,
             },
@@ -80,6 +76,60 @@ class TestE2EAgents:
         assert r.status_code == 201
         data = r.json()
         assert data["name"] == "New E2E Agent"
+
+    def test_create_agent_as_developer_publish_flow(self, integration_client: TestClient):
+        """
+        E2E: developer (publisher) registers, logs in, creates an agent, then loads it by id.
+        Payload matches what the publish UI sends: no client-supplied status (AgentCreate forbids it).
+        """
+        email = f"publisher-e2e-{uuid.uuid4().hex[:8]}@test.com"
+        password = "Publish1a"  # letters + digits, min 8 chars
+
+        reg = integration_client.post(
+            "/api/auth/register",
+            json={"email": email, "password": password, "role": "developer"},
+        )
+        assert reg.status_code == 201, reg.text
+        publisher = reg.json()
+        assert publisher["role"] == "developer"
+        publisher_id = publisher["id"]
+
+        login = integration_client.post(
+            "/api/auth/login",
+            json={"email": email, "password": password},
+        )
+        assert login.status_code == 200, login.text
+        token = login.json()["access_token"]
+        headers = {"Authorization": f"Bearer {token}"}
+
+        payload = {
+            "name": "E2E Published Agent",
+            "description": "Created via full developer publish flow",
+            "capabilities": ["nlp", "automation"],
+            "pricing_model": "pay_per_use",
+            "price_per_task": 1.5,
+            "price_per_communication": 0.25,
+            "llm_model": "gpt-4o-mini",
+            "temperature": 0.7,
+            "api_endpoint": "https://api.example.com/v1/chat/completions",
+            "a2a_enabled": False,
+        }
+        create = integration_client.post("/api/agents", json=payload, headers=headers)
+        assert create.status_code == 201, create.text
+        body = create.json()
+        assert body["name"] == payload["name"]
+        assert body["developer_id"] == publisher_id
+        assert body.get("status") == "pending"
+        assert body.get("pricing_model") == "pay_per_use"
+        assert body.get("capabilities") == ["nlp", "automation"]
+
+        agent_id = body["id"]
+        fetched = integration_client.get(f"/api/agents/{agent_id}", headers=headers)
+        assert fetched.status_code == 200, fetched.text
+        again = fetched.json()
+        assert again["id"] == agent_id
+        assert again["name"] == payload["name"]
+        assert again["developer_id"] == publisher_id
 
     def test_update_agent(
         self, integration_client: TestClient, developer_user, sample_agent
@@ -262,6 +312,118 @@ class TestE2EJobs:
         )
         assert r9.status_code == 200
 
+    def test_planner_status_and_artifacts_list_for_job(
+        self, integration_client: TestClient, business_user
+    ):
+        """E2E: authenticated planner/status and empty planner-artifacts for a new job."""
+        token = business_user["token"]
+        headers = {"Authorization": f"Bearer {token}"}
+
+        r0 = integration_client.get("/api/jobs/planner/status", headers=headers)
+        assert r0.status_code == 200
+        st = r0.json()
+        assert "configured" in st
+        assert "provider" in st
+
+        r = integration_client.post(
+            "/api/jobs",
+            data={"title": "Planner audit job", "description": "e2e"},
+            headers=headers,
+        )
+        assert r.status_code == 201
+        job_id = r.json()["id"]
+
+        r2 = integration_client.get(f"/api/jobs/{job_id}/planner-artifacts", headers=headers)
+        assert r2.status_code == 200
+        assert r2.json().get("items") == []
+
+        r3 = integration_client.get(f"/api/jobs/{job_id}/planner-pipeline", headers=headers)
+        assert r3.status_code == 200
+        pipe = r3.json()
+        assert pipe["schema_version"] == "planner_pipeline.v1"
+        assert pipe["job_id"] == job_id
+        assert pipe["brd_analysis"] is None
+        assert pipe["task_split"] is None
+        assert pipe["tool_suggestion"] is None
+
+    def test_planner_pipeline_with_stored_artifact(
+        self, integration_client: TestClient, business_user, integration_db_session, tmp_path
+    ):
+        """E2E: create job via API, attach local planner file row, read composed planner-pipeline."""
+        from models.job import JobPlannerArtifact
+
+        token = business_user["token"]
+        headers = {"Authorization": f"Bearer {token}"}
+        r = integration_client.post(
+            "/api/jobs",
+            data={"title": "Planner pipeline e2e", "description": "with artifact"},
+            headers=headers,
+        )
+        assert r.status_code == 201
+        job_id = r.json()["id"]
+
+        jf = tmp_path / "e2e_planner_pipeline.json"
+        jf.write_text('{"e2e": true, "stage": "brd"}', encoding="utf-8")
+        integration_db_session.add(
+            JobPlannerArtifact(
+                job_id=job_id,
+                artifact_type="brd_analysis",
+                storage="local",
+                bucket=None,
+                object_key=str(jf),
+                byte_size=int(jf.stat().st_size),
+            )
+        )
+        integration_db_session.commit()
+
+        rp = integration_client.get(f"/api/jobs/{job_id}/planner-pipeline", headers=headers)
+        assert rp.status_code == 200, rp.text
+        body = rp.json()
+        assert body["schema_version"] == "planner_pipeline.v1"
+        assert body["job_id"] == job_id
+        assert body["brd_analysis"] == {"e2e": True, "stage": "brd"}
+        assert body["task_split"] is None
+        assert body["tool_suggestion"] is None
+        assert body["artifact_ids"]["brd_analysis"] is not None
+
+    def test_job_filter_options_shape(self, integration_client: TestClient, business_user):
+        """E2E: authenticated job list filter metadata for the UI."""
+        token = business_user["token"]
+        r = integration_client.get(
+            "/api/jobs/filter-options",
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert r.status_code == 200
+        data = r.json()
+        assert "statuses" in data and "sort_options" in data
+        assert any(s.get("value") == "draft" for s in data["statuses"])
+        assert any(s.get("value") == "oldest" for s in data["sort_options"])
+
+    def test_cancel_in_progress_job_via_api(
+        self, integration_client: TestClient, business_user, integration_db_session
+    ):
+        """E2E: business can cancel a job that is marked in progress."""
+        from models.job import Job, JobStatus
+
+        token = business_user["token"]
+        headers = {"Authorization": f"Bearer {token}"}
+        r = integration_client.post(
+            "/api/jobs",
+            data={"title": "Cancel me", "description": "e2e"},
+            headers=headers,
+        )
+        assert r.status_code == 201
+        job_id = r.json()["id"]
+        job = integration_db_session.query(Job).filter(Job.id == job_id).first()
+        assert job is not None
+        job.status = JobStatus.IN_PROGRESS
+        integration_db_session.commit()
+
+        r2 = integration_client.post(f"/api/jobs/{job_id}/cancel", headers=headers)
+        assert r2.status_code == 200, r2.text
+        body = r2.json()
+        assert body.get("status") == "cancelled"
+
 
 # ---------- Dashboards ----------
 class TestE2EDashboards:
@@ -380,7 +542,7 @@ class TestE2EExternalJobs:
         from core.external_token import create_job_token
         from models.job import Job, JobStatus
 
-        token = business_user["token"]
+        business_user["token"]
         business = business_user["user"]
         job = Job(
             business_id=business.id,

@@ -1,10 +1,11 @@
 """
-Introspect Postgres/MySQL database schema for MCP SQL tools.
+Introspect SQL database schemas for MCP tools.
 Returns tables, columns (name, type, nullable), primary keys, and foreign keys.
 Used to populate schema_metadata so the agent has database context when writing SQL.
 """
-import json
 from typing import Any, Dict, List, Optional, Tuple
+
+from services.sql_server_host import sql_server_host_is_azure_sql
 
 
 def introspect_postgres(config: dict) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
@@ -182,6 +183,139 @@ def introspect_mysql(config: dict) -> Tuple[Optional[Dict[str, Any]], Optional[s
         return None, str(e)
 
 
+def introspect_sqlserver(config: dict) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+    """
+    Introspect SQL Server via INFORMATION_SCHEMA.
+    config must have host, database; optional port, user, password.
+    """
+    try:
+        import pymssql
+    except ImportError:
+        return None, "SQL Server introspection requires pymssql (not installed in backend)"
+
+    host = (config.get("host") or "localhost").strip()
+    port = int(config.get("port", 1433))
+    user = (config.get("user") or "").strip()
+    password = (config.get("password") or "").strip()
+    database = (config.get("database") or "").strip()
+    if not database:
+        return None, "Database name is required"
+
+    kw = {
+        "server": host,
+        "port": port,
+        "user": user,
+        "password": password,
+        "database": database,
+        "login_timeout": 20,
+    }
+    encryption = (config.get("encryption") or config.get("encrypt") or "").strip().lower()
+    if encryption in ("off", "request", "require"):
+        kw["encryption"] = encryption
+    elif sql_server_host_is_azure_sql(host):
+        kw["encryption"] = "require"
+
+    try:
+        conn = pymssql.connect(**kw)
+        cur = conn.cursor()
+    except Exception as e:
+        return None, str(e)
+
+    try:
+        cur.execute(
+            """
+            SELECT TABLE_SCHEMA, TABLE_NAME
+            FROM INFORMATION_SCHEMA.TABLES
+            WHERE TABLE_TYPE = 'BASE TABLE'
+              AND TABLE_SCHEMA NOT IN ('INFORMATION_SCHEMA', 'sys')
+            ORDER BY TABLE_SCHEMA, TABLE_NAME
+            """
+        )
+        table_rows = cur.fetchall()
+
+        tables: List[Dict[str, Any]] = []
+        for schema_name, table_name in table_rows:
+            cur.execute(
+                """
+                SELECT COLUMN_NAME, DATA_TYPE, IS_NULLABLE
+                FROM INFORMATION_SCHEMA.COLUMNS
+                WHERE TABLE_SCHEMA = %s AND TABLE_NAME = %s
+                ORDER BY ORDINAL_POSITION
+                """,
+                (schema_name, table_name),
+            )
+            columns = [
+                {"name": row[0], "type": row[1], "nullable": str(row[2]).upper() == "YES"}
+                for row in cur.fetchall()
+            ]
+
+            cur.execute(
+                """
+                SELECT kcu.COLUMN_NAME
+                FROM INFORMATION_SCHEMA.TABLE_CONSTRAINTS tc
+                JOIN INFORMATION_SCHEMA.KEY_COLUMN_USAGE kcu
+                  ON tc.CONSTRAINT_NAME = kcu.CONSTRAINT_NAME
+                 AND tc.TABLE_SCHEMA = kcu.TABLE_SCHEMA
+                 AND tc.TABLE_NAME = kcu.TABLE_NAME
+                WHERE tc.CONSTRAINT_TYPE = 'PRIMARY KEY'
+                  AND tc.TABLE_SCHEMA = %s
+                  AND tc.TABLE_NAME = %s
+                ORDER BY kcu.ORDINAL_POSITION
+                """,
+                (schema_name, table_name),
+            )
+            pk = [row[0] for row in cur.fetchall()]
+
+            cur.execute(
+                """
+                SELECT
+                  fk.COLUMN_NAME,
+                  pk.TABLE_SCHEMA AS ref_schema,
+                  pk.TABLE_NAME   AS ref_table,
+                  pk.COLUMN_NAME  AS ref_column
+                FROM INFORMATION_SCHEMA.REFERENTIAL_CONSTRAINTS rc
+                JOIN INFORMATION_SCHEMA.KEY_COLUMN_USAGE fk
+                  ON rc.CONSTRAINT_NAME = fk.CONSTRAINT_NAME
+                JOIN INFORMATION_SCHEMA.KEY_COLUMN_USAGE pk
+                  ON rc.UNIQUE_CONSTRAINT_NAME = pk.CONSTRAINT_NAME
+                 AND fk.ORDINAL_POSITION = pk.ORDINAL_POSITION
+                WHERE fk.TABLE_SCHEMA = %s
+                  AND fk.TABLE_NAME = %s
+                ORDER BY fk.ORDINAL_POSITION
+                """,
+                (schema_name, table_name),
+            )
+            fk_rows = cur.fetchall()
+            foreign_keys = [
+                {
+                    "columns": [r[0]],
+                    "references_table": f"{r[1]}.{r[2]}" if r[1] else r[2],
+                    "references_columns": [r[3]],
+                }
+                for r in fk_rows
+            ]
+
+            tables.append(
+                {
+                    "name": f"{schema_name}.{table_name}",
+                    "columns": columns,
+                    "primary_key": pk,
+                    "foreign_keys": foreign_keys,
+                }
+            )
+
+        cur.close()
+        conn.close()
+        return {"tables": tables}, None
+    except Exception as e:
+        try:
+            cur.close()
+            conn.close()
+        except Exception:
+            pass
+        return None, str(e)
+
+
 def introspect_sql_tool(tool_type: str, config: dict) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
     """
     Introspect a SQL tool by type. Returns (schema_dict, error_message).
@@ -191,6 +325,8 @@ def introspect_sql_tool(tool_type: str, config: dict) -> Tuple[Optional[Dict[str
         return introspect_postgres(config)
     if tool_type == "mysql":
         return introspect_mysql(config)
+    if tool_type == "sqlserver":
+        return introspect_sqlserver(config)
     return None, f"Schema introspection not supported for tool type: {tool_type}"
 
 

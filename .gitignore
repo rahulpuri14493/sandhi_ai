@@ -205,7 +205,8 @@ cython_debug/
 #  refer to https://docs.cursor.com/context/ignore-files
 .cursorignore
 .cursorindexingignore
-.cursor/rules/codeql-platform-mcp-security.mdc
+# Local Cursor project rules and editor state (not shared via repo)
+.cursor/
 
 # Marimo
 marimo/_static/
@@ -214,9 +215,7 @@ __marimo__/
 
 # Node
 node_modules/
-# Keep frontend app source tracked; root lib/ above is for Python
-!frontend/lib/
-!frontend/lib/**
+# App code lives under frontend/src (root lib/ is for Python / other tooling)
 !frontend/src/lib/
 !frontend/src/lib/**
 .next/
@@ -243,3 +242,7 @@ Thumbs.db
 # Database
 *.db
 *.sqlite
+
+# Redis: local snapshot or bind-mount data (e.g. MCP guardrails / docker dev)
+dump.rdb
+redis-data/

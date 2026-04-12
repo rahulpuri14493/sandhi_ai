@@ -1,7 +1,6 @@
 """Helpers for external job access tokens (share links)."""
 from datetime import datetime, timedelta
-from typing import Optional
-from jose import jwt, JWTError
+import jwt
 
 from core.config import settings
 from core.security import SECRET_KEY, ALGORITHM
@@ -22,7 +21,7 @@ def verify_job_token(token: str, job_id: int) -> bool:
     try:
         payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
         return payload.get("job_id") == job_id and payload.get("type") == "external_view"
-    except (JWTError, Exception):
+    except (jwt.InvalidTokenError, Exception):
         return False
 
 

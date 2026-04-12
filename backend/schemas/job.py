@@ -1,12 +1,14 @@
-from pydantic import BaseModel, field_validator
+from pydantic import BaseModel, Field, field_validator
 from typing import Optional, List, Dict, Any
 from datetime import datetime, timezone as tz
 import json
+import re
 from zoneinfo import available_timezones
 from models.job import JobStatus, ScheduleStatus
 
 
 _VALID_TIMEZONES = available_timezones()
+_STEP_TASK_TYPE_RE = re.compile(r"^[a-z][a-z0-9_]{0,63}$", re.IGNORECASE)
 
 
 def _validate_timezone(v: str) -> str:
@@ -36,7 +38,7 @@ class JobScheduleCreate(BaseModel):
     """Schema for creating a one-time job schedule.
 
     scheduled_at must be a future datetime. timezone is the IANA timezone
-    the user intended (used by APScheduler's DateTrigger).
+    the user intended (converted to UTC for Celery's distributed clock).
     """
     scheduled_at: datetime
     timezone: str = "UTC"
@@ -153,6 +155,10 @@ class RerunResponse(BaseModel):
     message: str
     job_id: int
     status: str
+    mode: Optional[str] = None
+    resume_start_step_order: Optional[int] = None
+    steps_reused_count: Optional[int] = None
+    steps_rerun_count: Optional[int] = None
 
 
 def _parse_int_list(v):
@@ -204,6 +210,20 @@ class StepToolsAssignment(BaseModel):
     allowed_platform_tool_ids: Optional[List[int]] = None
     allowed_connection_ids: Optional[List[int]] = None
     tool_visibility: Optional[str] = None  # full | names_only | none (step override)
+    # Registry / envelope task_type slug (letter + alphanumeric/underscore, max 64 chars).
+    task_type: Optional[str] = None
+
+    @field_validator("task_type")
+    @classmethod
+    def validate_task_type_slug(cls, v: Optional[str]) -> Optional[str]:
+        if v is None or not str(v).strip():
+            return None
+        t = str(v).strip().lower()
+        if not _STEP_TASK_TYPE_RE.match(t):
+            raise ValueError(
+                "task_type must be a slug: start with a letter, then up to 63 letters, digits, or underscores"
+            )
+        return t
 
 
 class AutoSplitBody(BaseModel):
@@ -254,6 +274,8 @@ class JobResponse(BaseModel):
     write_execution_mode: Optional[str] = "platform"  # platform | agent | ui_only
     output_artifact_format: Optional[str] = "jsonl"  # jsonl | json
     output_contract: Optional[Dict[str, Any]] = None
+    # auto_split | manual — manual jobs skip execute-time planner replan
+    workflow_origin: str = "auto_split"
     # Schedule-aware fields for frontend UX
     show_cancel_option: bool = False  # True when in_progress job exceeds stuck threshold
     scheduled_at: Optional[datetime] = None  # From job's schedule, for countdown timer
@@ -310,6 +332,17 @@ class WorkflowStepResponse(BaseModel):
     allowed_platform_tool_ids: Optional[List[int]] = None
     allowed_connection_ids: Optional[List[int]] = None
     tool_visibility: Optional[str] = None  # full | names_only | none
+    # Runtime telemetry snapshot (Redis-first in internal APIs; durable DB fallback here).
+    live_phase: Optional[str] = None
+    live_phase_started_at: Optional[datetime] = None
+    live_reason_code: Optional[str] = None
+    live_reason_detail: Optional[str] = None
+    live_trace_id: Optional[str] = None
+    live_attempt: Optional[int] = None
+    last_progress_at: Optional[datetime] = None
+    last_activity_at: Optional[datetime] = None
+    stuck_since: Optional[datetime] = None
+    stuck_reason: Optional[str] = None
 
     class Config:
         from_attributes = True
@@ -324,6 +357,40 @@ class WorkflowPreview(BaseModel):
     steps: List[WorkflowStepResponse]
     total_cost: float
     breakdown: Dict[str, float]  # task_costs, communication_costs, commission
+
+
+class PlannerArtifactResponse(BaseModel):
+    """Postgres pointer to planner JSON in MinIO/S3 (or local dev path). object_key is not redacted — job owner only."""
+
+    id: int
+    job_id: int
+    artifact_type: str
+    storage: str
+    bucket: Optional[str] = None
+    object_key: str
+    byte_size: int
+    created_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+class PlannerArtifactListResponse(BaseModel):
+    items: List[PlannerArtifactResponse]
+
+
+class PlannerPipelineBundleResponse(BaseModel):
+    """
+    Read model: latest persisted brd_analysis, task_split, and tool_suggestion JSON per job.
+    Does not change how artifacts are written; composes existing storage pointers.
+    """
+
+    schema_version: str = "planner_pipeline.v1"
+    job_id: int
+    brd_analysis: Optional[Dict[str, Any]] = None
+    task_split: Optional[Dict[str, Any]] = None
+    tool_suggestion: Optional[Dict[str, Any]] = None
+    artifact_ids: Dict[str, Optional[int]] = Field(default_factory=dict)
 
 
 # Update forward references

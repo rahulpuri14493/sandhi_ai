@@ -8,12 +8,10 @@ Verifies no break in handoff between the two protocol paths.
 """
 import json
 import uuid
-from unittest.mock import AsyncMock, patch
+from unittest.mock import patch
 
 import pytest
 
-from db.database import get_db
-from main import app
 from models.user import User, UserRole
 from models.job import Job, JobStatus, WorkflowStep
 from models.agent import Agent

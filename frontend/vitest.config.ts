@@ -15,20 +15,24 @@ export default defineConfig({
     coverage: {
       provider: 'v8',
       include: [
-        'src/lib/**/*.{ts,tsx}',
-        'src/components/AgentCard.tsx',
-        'src/components/Navbar.tsx',
-        'src/components/CostCalculator.tsx',
+        '**/src/components/AgentCard.tsx',
+        '**/src/components/Navbar.tsx',
+        '**/src/components/CostCalculator.tsx',
       ],
       excludeAfterRemap: true,
       exclude: [
-        'tests/**',
+        // Never count test code toward coverage (only production sources in `include`).
+        '**/tests/**',
+        '**/__tests__/**',
         '**/*.test.{ts,tsx}',
+        '**/*.spec.{ts,tsx}',
         '**/*.d.ts',
         '**/main.tsx',
         '**/vite-env.d.ts',
         // Types-only module (TS erased at runtime).
         '**/types.ts',
+        // Spec mirror for A2A envelope (interfaces + single const); coverage is via backend + integration.
+        '**/sandhiA2aTask.ts',
       ],
       reporter: ['text', 'text-summary'],
       thresholds: {

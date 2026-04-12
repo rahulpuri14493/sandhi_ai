@@ -48,6 +48,9 @@ class Job(Base):
     output_artifact_format = Column(String(20), nullable=False, default="jsonl")
     # User-defined output contract and write plan (JSON string)
     output_contract = Column(Text, nullable=True)
+    # How the current workflow was authored: auto_split (planner/UI auto) vs manual (step-by-step build).
+    # Execute-time planner replan skips jobs with workflow_origin=manual to preserve business intent.
+    workflow_origin = Column(String(32), nullable=False, default="auto_split")
 
     # Relationships
     business = relationship("User", back_populates="jobs", foreign_keys=[business_id])
@@ -58,9 +61,15 @@ class Job(Base):
         back_populates="job",
         cascade="all, delete-orphan",
     )
+
     # One schedule per job (uselist=False enforces singular access).
     # The DB UNIQUE constraint on job_schedules.job_id prevents duplicates.
     schedule = relationship("JobSchedule", back_populates="job", uselist=False, cascade="all, delete-orphan")
+    planner_artifacts = relationship(
+        "JobPlannerArtifact",
+        back_populates="job",
+        cascade="all, delete-orphan",
+    )
 
 
 class WorkflowStep(Base):
@@ -77,6 +86,18 @@ class WorkflowStep(Base):
     cost = Column(Float, default=0.0)
     started_at = Column(DateTime, nullable=True)
     completed_at = Column(DateTime, nullable=True)
+    # Durable runtime telemetry snapshot (phase/reason/progress timestamps).
+    # Updated on meaningful phase transitions and progress points (not fixed-interval heartbeats).
+    last_progress_at = Column(DateTime, nullable=True)
+    last_activity_at = Column(DateTime, nullable=True)
+    live_phase = Column(String(32), nullable=True)
+    live_phase_started_at = Column(DateTime, nullable=True)
+    live_reason_code = Column(String(64), nullable=True)
+    live_reason_detail = Column(Text, nullable=True)
+    live_trace_id = Column(String(64), nullable=True)
+    live_attempt = Column(Integer, nullable=True)
+    stuck_since = Column(DateTime, nullable=True)
+    stuck_reason = Column(String(128), nullable=True)
     # Tools this step (agent) can use: JSON arrays (empty/null = use job-level allowed tools)
     allowed_platform_tool_ids = Column(Text, nullable=True)
     allowed_connection_ids = Column(Text, nullable=True)
@@ -95,7 +116,7 @@ class JobSchedule(Base):
 
     Workflow:
       1. User creates a schedule with a future scheduled_at datetime.
-      2. APScheduler fires a DateTrigger at that time → job is reset and executed.
+      2. Celery worker fires an ETA task at that time → job is reset and executed.
       3. After execution, the schedule is deactivated (status=INACTIVE, next_run_time=NULL).
       4. If the job fails, the user can either "Run Now" (POST /rerun) or
          "Schedule Again" (PUT /schedule with a new scheduled_at).
@@ -143,3 +164,20 @@ class ScheduleExecutionHistory(Base):
 
     # Relationships
     schedule = relationship("JobSchedule", back_populates="execution_history")
+
+
+class JobPlannerArtifact(Base):
+    """Pointer to full JSON output from Agent Planner / BRD analysis (object storage or local path)."""
+
+    __tablename__ = "job_planner_artifacts"
+
+    id = Column(Integer, primary_key=True, index=True)
+    job_id = Column(Integer, ForeignKey("jobs.id"), nullable=False, index=True)
+    artifact_type = Column(String(64), nullable=False)  # e.g. brd_analysis
+    storage = Column(String(16), nullable=False, default="s3")  # s3 | local
+    bucket = Column(String(255), nullable=True)
+    object_key = Column(Text, nullable=False)
+    byte_size = Column(Integer, nullable=False, default=0)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+
+    job = relationship("Job", back_populates="planner_artifacts")

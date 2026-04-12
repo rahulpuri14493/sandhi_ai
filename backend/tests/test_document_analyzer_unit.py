@@ -1,6 +1,7 @@
 """Unit tests for services/document_analyzer.py (mocked, no network)."""
 
 import json
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -32,7 +33,10 @@ async def test_read_document_txt_csv_json_and_unsupported(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_analyze_documents_extraction_only_when_no_agent(tmp_path):
+async def test_analyze_documents_extraction_only_when_no_agent(tmp_path, monkeypatch):
+    import services.document_analyzer as mod
+
+    monkeypatch.setattr(mod, "is_agent_planner_configured", lambda: False)
     da = DocumentAnalyzer()
     p_txt = tmp_path / "req.txt"
     p_txt.write_text("Reqs here", encoding="utf-8")
@@ -50,30 +54,28 @@ async def test_analyze_documents_extraction_only_when_no_agent(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_analyze_documents_a2a_json_parse(monkeypatch, tmp_path):
+async def test_analyze_documents_planner_json_parse(monkeypatch, tmp_path):
+    """BRD analysis uses platform planner only; hired-agent URL is ignored."""
+    import services.document_analyzer as mod
+
+    monkeypatch.setattr(mod, "is_agent_planner_configured", lambda: True)
+    planner_payload = {
+        "analysis": "A",
+        "questions": ["Q1?"],
+        "recommendations": ["R1"],
+        "solutions": ["S1"],
+        "next_steps": ["N1"],
+        "workflow_collaboration_hint": "sequential",
+        "workflow_collaboration_reason": "pipeline",
+    }
+    monkeypatch.setattr(
+        mod,
+        "planner_chat_completion",
+        AsyncMock(return_value=json.dumps(planner_payload)),
+    )
     da = DocumentAnalyzer()
     p_txt = tmp_path / "req.txt"
     p_txt.write_text("Reqs here", encoding="utf-8")
-
-    async def fake_execute_via_a2a(url, input_data, **kwargs):
-        return {
-            "content": json.dumps(
-                {
-                    "analysis": "A",
-                    "questions": ["Q1?"],
-                    "recommendations": ["R1"],
-                    "solutions": ["S1"],
-                    "next_steps": ["N1"],
-                    "workflow_collaboration_hint": "sequential",
-                    "workflow_collaboration_reason": "pipeline",
-                }
-            )
-        }
-
-    # Patch the imported symbol inside module
-    import services.document_analyzer as mod
-
-    monkeypatch.setattr(mod, "execute_via_a2a", fake_execute_via_a2a)
 
     out = await da.analyze_documents_and_generate_questions(
         documents=[{"path": str(p_txt), "name": "req.txt"}],
@@ -163,15 +165,15 @@ def test_filter_critical_questions_empty_input():
 
 @pytest.mark.asyncio
 async def test_generate_workflow_clarification_questions_parses_fenced_json(monkeypatch):
-    da = DocumentAnalyzer()
-
-    async def fake_execute_via_a2a(url, input_data, **kwargs):
-        return {"content": "```json\n{\"questions\": [\"Q?\"]}\n```"}
-
     import services.document_analyzer as mod
 
-    monkeypatch.setattr(mod, "execute_via_a2a", fake_execute_via_a2a)
-    monkeypatch.setattr(mod.settings, "A2A_ADAPTER_URL", "http://adapter")
+    monkeypatch.setattr(mod, "is_agent_planner_configured", lambda: True)
+    da = DocumentAnalyzer()
+
+    async def fake_planner(messages, **kwargs):
+        return "```json\n{\"questions\": [\"Q?\"]}\n```"
+
+    monkeypatch.setattr(mod, "planner_chat_completion", fake_planner)
 
     out = await da.generate_workflow_clarification_questions(
         job_title="T",
@@ -179,10 +181,6 @@ async def test_generate_workflow_clarification_questions_parses_fenced_json(monk
         documents_content=[],
         workflow_tasks=[{"step_order": 1, "agent_name": "A", "assigned_task": "Do X"}],
         conversation_history=[],
-        agent_api_url="http://openai",
-        agent_api_key="k",
-        agent_llm_model="m",
-        use_a2a=False,
     )
     assert out["questions"] == ["Q?"]
 

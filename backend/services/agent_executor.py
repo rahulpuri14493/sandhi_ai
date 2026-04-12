@@ -1,12 +1,15 @@
+import asyncio
 import logging
 import json
 import hashlib
 import hmac
 import uuid
+import time
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 import httpx
 from sqlalchemy.orm import Session
+from db.database import SessionLocal
 from models.job import Job, JobStatus, WorkflowStep
 from models.agent import Agent
 from models.communication import AgentCommunication
@@ -14,15 +17,232 @@ from models.audit_log import AuditLog
 from models.mcp_server import MCPToolConfig, MCPServerConnection
 from services.payment_processor import PaymentProcessor
 from services.a2a_client import execute_via_a2a
-from services.mcp_client import call_tool as mcp_call_tool, list_tools as mcp_list_tools
+from services.mcp_client import call_tool as mcp_call_tool
+from services.mcp_guardrails import (
+    MCPGuardrailError,
+    get_mcp_guardrails,
+    guarded_mcp_list_tools,
+    infer_mcp_tool_operation_class,
+    resolve_mcp_tenant_tier,
+)
 from core.encryption import decrypt_json
 from services.db_schema_introspection import format_schema_for_prompt
 from services.job_file_storage import persist_file
 from core.config import settings
 from services.mcp_tool_input_schemas import input_schema_for_platform_tool_type
-from core.artifact_contract import normalize_agent_output_for_artifact
+from services.mcp_platform_naming import platform_tool_id_from_mcp_function_name
+from core.artifact_contract import (
+    extract_record_rows_from_agent_output,
+    normalize_agent_output_for_artifact,
+)
+from schemas.executor_platform_payload import (
+    enrich_executor_payload_trace_only,
+    validate_and_enrich_executor_payload,
+)
+from schemas.sandhi_a2a_task import (
+    NextAgentRef,
+    ParallelExecutionContext,
+    SandhiA2ATaskV1,
+    task_envelope_to_dict,
+)
+from services.agent_tool_compatibility import filter_tools_for_agent, validate_tools_for_agent
+from services.a2a_outbound_validation import validate_outbound_a2a_payload
+from services.tool_assignment_engine import assign_tools_for_step, infer_task_type
+from services.planner_llm import (
+    resolve_runtime_planner_transport,
+    set_planner_runtime_transport,
+    reset_planner_runtime_transport,
+)
+from services.execution_heartbeat import publish_step_heartbeat
+from services.business_job_alerts import send_business_job_alert
 
 logger = logging.getLogger(__name__)
+
+
+def _extract_token_usage_from_payload(payload: Any) -> Optional[Dict[str, int]]:
+    """Best-effort token usage extraction across OpenAI/A2A response shapes."""
+    if not isinstance(payload, dict):
+        return None
+
+    def _as_nonneg_int(v: Any) -> int:
+        try:
+            return max(0, int(v))
+        except Exception:
+            return 0
+
+    candidates: List[Any] = [
+        payload.get("usage"),
+        payload.get("token_usage"),
+        payload.get("usage_metadata"),
+    ]
+    response_meta = payload.get("response_metadata")
+    if isinstance(response_meta, dict):
+        candidates.append(response_meta.get("token_usage"))
+        candidates.append(response_meta.get("usage"))
+    raw_message = payload.get("raw_message")
+    if isinstance(raw_message, dict):
+        raw_meta = raw_message.get("metadata")
+        if isinstance(raw_meta, dict):
+            candidates.append(raw_meta.get("token_usage"))
+            candidates.append(raw_meta.get("usage"))
+    task_obj = payload.get("task")
+    if isinstance(task_obj, dict):
+        status_obj = task_obj.get("status")
+        if isinstance(status_obj, dict):
+            status_meta = status_obj.get("metadata")
+            if isinstance(status_meta, dict):
+                candidates.append(status_meta.get("token_usage"))
+                candidates.append(status_meta.get("usage"))
+    agent_output = payload.get("agent_output")
+    if isinstance(agent_output, dict):
+        candidates.extend(
+            [
+                agent_output.get("usage"),
+                agent_output.get("token_usage"),
+                agent_output.get("usage_metadata"),
+            ]
+        )
+        ao_meta = agent_output.get("response_metadata")
+        if isinstance(ao_meta, dict):
+            candidates.append(ao_meta.get("token_usage"))
+
+    for c in candidates:
+        if not isinstance(c, dict):
+            continue
+        prompt = _as_nonneg_int(c.get("prompt_tokens") or c.get("input_tokens"))
+        completion = _as_nonneg_int(c.get("completion_tokens") or c.get("output_tokens"))
+        total = _as_nonneg_int(c.get("total_tokens"))
+        if total == 0:
+            total = prompt + completion
+        if prompt > 0 or completion > 0 or total > 0:
+            return {
+                "prompt_tokens": prompt,
+                "completion_tokens": completion,
+                "total_tokens": total,
+            }
+
+    return None
+
+
+def _estimate_token_usage_from_io(input_payload: Any, output_payload: Any) -> Optional[Dict[str, int]]:
+    """
+    Fallback token estimate when upstream/provider usage is unavailable.
+    Uses a conservative chars/4 heuristic over serialized input and output.
+    """
+    try:
+        in_text = json.dumps(input_payload, default=str, ensure_ascii=False) if input_payload is not None else ""
+    except Exception:
+        in_text = str(input_payload or "")
+    try:
+        out_text = json.dumps(output_payload, default=str, ensure_ascii=False) if output_payload is not None else ""
+    except Exception:
+        out_text = str(output_payload or "")
+
+    prompt_tokens = max(0, int(round(len(in_text) / 4.0))) if in_text else 0
+    completion_tokens = max(0, int(round(len(out_text) / 4.0))) if out_text else 0
+    total_tokens = prompt_tokens + completion_tokens
+    if total_tokens <= 0:
+        return None
+    return {
+        "prompt_tokens": prompt_tokens,
+        "completion_tokens": completion_tokens,
+        "total_tokens": total_tokens,
+    }
+
+
+def _load_step_input_json(
+    raw: Optional[str],
+    *,
+    job_id: int,
+    step_id: int,
+    step_order: int,
+) -> Dict[str, Any]:
+    """Parse WorkflowStep.input_data; raise ValueError with correlation context on failure."""
+    if not raw or not str(raw).strip():
+        return {}
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError as e:
+        raise ValueError(
+            f"WorkflowStep input_data is not valid JSON "
+            f"(job_id={job_id} workflow_step_id={step_id} step_order={step_order}): {e}"
+        ) from e
+    if not isinstance(data, dict):
+        raise ValueError(
+            f"WorkflowStep input_data must be a JSON object, got {type(data).__name__} "
+            f"(job_id={job_id} workflow_step_id={step_id} step_order={step_order})"
+        )
+    return data
+
+
+def _partition_workflow_waves(workflow_steps: List[WorkflowStep]) -> List[List[WorkflowStep]]:
+    """
+    Partition ordered workflow steps into execution waves.
+    Each wave is a maximal consecutive group where every step after the first has
+    depends_on_previous=False, so those steps may run concurrently without sharing
+    previous_step_output. The first step in a wave may still depend on the prior wave.
+    """
+    if not workflow_steps:
+        return []
+    waves: List[List[WorkflowStep]] = []
+    i = 0
+    n = len(workflow_steps)
+    while i < n:
+        wave = [workflow_steps[i]]
+        j = i
+        while j + 1 < n and not getattr(workflow_steps[j + 1], "depends_on_previous", True):
+            j += 1
+            wave.append(workflow_steps[j])
+        waves.append(wave)
+        i = j + 1
+    return waves
+
+
+def _next_workflow_step(
+    workflow_steps: List[WorkflowStep], current: WorkflowStep
+) -> Optional[WorkflowStep]:
+    """Next step by ``step_order`` (linear successor in the workflow DAG we execute)."""
+    successors = [s for s in workflow_steps if s.step_order > current.step_order]
+    if not successors:
+        return None
+    return min(successors, key=lambda s: s.step_order)
+
+
+def _parallel_context_for_step(
+    workflow_steps: List[WorkflowStep], step: WorkflowStep
+) -> Optional[Dict[str, Any]]:
+    waves = _partition_workflow_waves(workflow_steps)
+    for wi, wave in enumerate(waves):
+        ids = [s.id for s in wave]
+        if step.id in ids:
+            return {
+                "wave_index": wi,
+                "parallel_group_id": f"job-wave-{wi}",
+                "concurrent_workflow_step_ids": ids,
+                "depends_on_previous_wave": wi > 0,
+            }
+    return None
+
+
+def _load_step_output_json(step: WorkflowStep) -> Optional[Any]:
+    """Parse persisted output_data JSON for resume mode handoff."""
+    raw = getattr(step, "output_data", None)
+    if not raw:
+        return None
+    if isinstance(raw, (dict, list)):
+        return raw
+    if isinstance(raw, str):
+        try:
+            return json.loads(raw)
+        except (TypeError, json.JSONDecodeError):
+            return None
+    return None
+
+
+# Tool types that fetch text from an external corpus (vector DB, PageIndex, etc.)
+_RETRIEVAL_MCP_TOOL_TYPES = frozenset(
+    {"pinecone", "vector_db", "weaviate", "qdrant", "chroma", "elasticsearch", "pageindex"}
+)
 
 
 def _sign_trusted_bootstrap_payload(
@@ -121,6 +341,31 @@ def _parse_output_contract(raw: Optional[str]) -> Dict[str, Any]:
     return data if isinstance(data, dict) else {}
 
 
+def _resolve_agent_step_timeout_seconds(contract: Dict[str, Any]) -> float:
+    """Optional job-level step timeout from output_contract (clamped for platform safety)."""
+    default_t = float(getattr(settings, "AGENT_STEP_TIMEOUT_SECONDS", 180.0) or 180.0)
+    max_t = float(getattr(settings, "AGENT_STEP_TIMEOUT_MAX_SECONDS", 900.0) or 900.0)
+    min_t = float(getattr(settings, "AGENT_STEP_TIMEOUT_MIN_SECONDS", 30.0) or 30.0)
+
+    def _from_settings_default() -> float:
+        # Operator / env default: honor AGENT_STEP_TIMEOUT_SECONDS as-is (capped at max only).
+        # Min clamp applies only to explicit output_contract overrides below.
+        return min(max_t, max(0.0, default_t))
+
+    if not isinstance(contract, dict):
+        return _from_settings_default()
+    raw = contract.get("agent_step_timeout_seconds")
+    if raw is None:
+        raw = contract.get("step_timeout_seconds")
+    if raw is None:
+        return _from_settings_default()
+    try:
+        t = float(raw)
+    except (TypeError, ValueError):
+        return _from_settings_default()
+    return max(min_t, min(max_t, t))
+
+
 def _parse_write_policy(contract: Dict[str, Any], write_targets_count: int) -> Dict[str, Any]:
     policy = contract.get("write_policy") if isinstance(contract, dict) else {}
     if not isinstance(policy, dict):
@@ -141,18 +386,125 @@ def _parse_write_policy(contract: Dict[str, Any], write_targets_count: int) -> D
     }
 
 
+def _format_workflow_step_error_message(exc: BaseException, *, timeout_seconds: Optional[float] = None) -> str:
+    """
+    asyncio.wait_for raises TimeoutError whose str() is empty on Python 3.11+, which produced
+    opaque 'Workflow step N failed: ' messages in logs and job output.
+    """
+    if isinstance(exc, asyncio.TimeoutError):
+        if isinstance(timeout_seconds, (int, float)) and timeout_seconds > 0:
+            ts_txt = f"{float(timeout_seconds):g}s"
+        else:
+            ts_txt = "the configured limit"
+        return (
+            f"Agent step timed out after {ts_txt} (see AGENT_STEP_TIMEOUT_SECONDS). "
+            "The LLM or upstream API did not finish in time — increase the timeout, reduce tool calls, or use a faster model."
+        )
+    msg = str(exc).strip()
+    if msg:
+        return msg
+    return f"{type(exc).__name__} (no error message)"
+
+
+def _mcp_tool_result_summary(write_result: Dict[str, Any], *, max_len: int = 2000) -> str:
+    """Extract text from MCP tools/call result for exception messages and step metadata."""
+    if not isinstance(write_result, dict):
+        return ""
+    parts: List[str] = []
+    for block in write_result.get("content") or []:
+        if isinstance(block, dict) and block.get("type") == "text":
+            t = str(block.get("text", "")).strip()
+            if t:
+                parts.append(t)
+    joined = " | ".join(parts)
+    if len(joined) > max_len:
+        return joined[: max_len - 3] + "..."
+    return joined
+
+
 def _input_schema_for_tool_type(tool_type: str) -> dict:
     """OpenAI-style parameters for platform MCP tools (same JSON Schema as internal tools/list)."""
     return input_schema_for_platform_tool_type(tool_type)
 
 
 def _sanitize_platform_sql_tool_arguments(tool_type: str, arguments: Dict[str, Any]) -> Dict[str, Any]:
-    """Strip artifact/output-contract keys models sometimes mix into interactive Postgres/MySQL calls."""
+    """Strip artifact/output-contract keys models sometimes mix into interactive SQL tool calls."""
     tt = (tool_type or "").strip().lower()
-    if tt not in ("postgres", "mysql") or not isinstance(arguments, dict):
+    if tt not in ("postgres", "mysql", "sqlserver") or not isinstance(arguments, dict):
         return arguments
     out = {k: v for k, v in arguments.items() if k in ("query", "params")}
     return out
+
+
+def _ensure_records_for_platform_write(
+    output_data: Any,
+    *,
+    write_mode: str,
+    write_targets: Any,
+) -> Any:
+    """
+    For platform write-target jobs, require tabular rows to avoid writing narrative fallback text.
+    Accepts empty records list, but rejects non-tabular prose payloads.
+    """
+    if write_mode != "platform" or not isinstance(write_targets, list) or not write_targets:
+        return output_data
+    if isinstance(output_data, dict) and isinstance(output_data.get("records"), list):
+        return output_data
+    rows = extract_record_rows_from_agent_output(output_data)
+    if rows is None:
+        raise ValueError(
+            "Output contract requires structured tabular output with top-level `records` array; "
+            "agent returned non-tabular content."
+        )
+    return {"records": rows}
+
+
+def _normalize_placeholder_error_values(output_data: Any) -> Any:
+    """
+    Normalize low-quality placeholder strings from model summaries to null.
+    Example: {"total_users": "Error retrieving data"} -> {"total_users": None}
+    """
+    if isinstance(output_data, dict):
+        return {k: _normalize_placeholder_error_values(v) for k, v in output_data.items()}
+    if isinstance(output_data, list):
+        return [_normalize_placeholder_error_values(v) for v in output_data]
+    if isinstance(output_data, str):
+        s = output_data.strip().lower()
+        if s in ("error retrieving data", "error retrieving"):
+            return None
+    return output_data
+
+
+def _is_sql_programming_error_tool_result(tool_result: str) -> bool:
+    t = str(tool_result or "")
+    return "ProgrammingError" in t and "Error:" in t
+
+
+def _sql_schema_discovery_query(tool_type: str) -> Optional[str]:
+    tt = (tool_type or "").strip().lower()
+    if tt == "sqlserver":
+        return (
+            "SELECT TOP 200 TABLE_SCHEMA, TABLE_NAME, COLUMN_NAME, DATA_TYPE "
+            "FROM INFORMATION_SCHEMA.COLUMNS "
+            "ORDER BY TABLE_SCHEMA, TABLE_NAME, ORDINAL_POSITION"
+        )
+    if tt == "postgres":
+        return (
+            "SELECT table_schema, table_name, column_name, data_type "
+            "FROM information_schema.columns "
+            "WHERE table_schema NOT IN ('information_schema', 'pg_catalog') "
+            "ORDER BY table_schema, table_name, ordinal_position "
+            "LIMIT 200"
+        )
+    if tt == "mysql":
+        return (
+            "SELECT TABLE_SCHEMA, TABLE_NAME, COLUMN_NAME, DATA_TYPE "
+            "FROM INFORMATION_SCHEMA.COLUMNS "
+            "WHERE TABLE_SCHEMA = DATABASE() "
+            "ORDER BY TABLE_SCHEMA, TABLE_NAME, ORDINAL_POSITION "
+            "LIMIT 200"
+        )
+    return None
 
 
 def _openai_tools_from_mcp(available_mcp_tools: list) -> list:
@@ -188,6 +540,168 @@ class AgentExecutor:
     def __init__(self, db: Session):
         self.db = db
         self.payment_processor = PaymentProcessor(db)
+        self._mcp_correlation_job_id: Optional[int] = None
+        self._mcp_correlation_step_id: Optional[int] = None
+        self._mcp_correlation_trace_id: Optional[str] = None
+
+    def _sandhi_mcp_correlation_headers(self) -> Dict[str, str]:
+        """HTTP headers for platform/BYO MCP calls — observability in platform-mcp-server logs."""
+        h: Dict[str, str] = {}
+        jid = getattr(self, "_mcp_correlation_job_id", None)
+        sid = getattr(self, "_mcp_correlation_step_id", None)
+        tid = getattr(self, "_mcp_correlation_trace_id", None)
+        if jid is not None:
+            h["X-Sandhi-Job-Id"] = str(jid)
+        if sid is not None:
+            h["X-Sandhi-Workflow-Step-Id"] = str(sid)
+        if tid:
+            h["X-Sandhi-Trace-Id"] = str(tid)
+        return h
+
+    def _emit_step_heartbeat(
+        self,
+        step: WorkflowStep,
+        *,
+        phase: str,
+        reason_code: str,
+        message: Optional[str] = None,
+        reason_detail: Optional[Dict[str, Any]] = None,
+        attempt: Optional[int] = None,
+        max_retries: Optional[int] = None,
+        meaningful_progress: bool = False,
+        commit_db: bool = False,
+    ) -> None:
+        publish_step_heartbeat(
+            db=self.db,
+            step=step,
+            phase=phase,
+            reason_code=reason_code,
+            message=message,
+            reason_detail=reason_detail,
+            trace_id=self._mcp_correlation_trace_id,
+            attempt=attempt,
+            max_retries=max_retries,
+            execution_token=getattr(getattr(step, "job", None), "execution_token", None),
+            meaningful_progress=meaningful_progress,
+            commit_db=commit_db,
+        )
+
+    def _emit_current_step_heartbeat(
+        self,
+        *,
+        phase: str,
+        reason_code: str,
+        message: Optional[str] = None,
+        reason_detail: Optional[Dict[str, Any]] = None,
+        meaningful_progress: bool = False,
+        commit_db: bool = False,
+    ) -> None:
+        sid = getattr(self, "_mcp_correlation_step_id", None)
+        jid = getattr(self, "_mcp_correlation_job_id", None)
+        if sid is None or jid is None:
+            return
+        try:
+            step = (
+                self.db.query(WorkflowStep)
+                .filter(WorkflowStep.id == int(sid), WorkflowStep.job_id == int(jid))
+                .first()
+            )
+            if not step:
+                return
+            self._emit_step_heartbeat(
+                step,
+                phase=phase,
+                reason_code=reason_code,
+                message=message,
+                reason_detail=reason_detail,
+                meaningful_progress=meaningful_progress,
+                commit_db=commit_db,
+            )
+        except Exception:
+            # Heartbeat path must not break execution.
+            return
+
+    def _is_retryable_step_exception(self, exc: BaseException) -> bool:
+        if isinstance(exc, asyncio.TimeoutError):
+            return True
+        if isinstance(exc, httpx.HTTPStatusError):
+            status = exc.response.status_code if exc.response is not None else None
+            return status in {408, 409, 425, 429, 500, 502, 503, 504}
+        if isinstance(exc, httpx.TransportError):
+            return True
+        msg = str(exc).lower()
+        retryable_markers = (
+            "timeout",
+            "timed out",
+            "temporarily unavailable",
+            "temporary failure",
+            "connection reset",
+            "connection refused",
+            "service unavailable",
+            "too many requests",
+            "rate limit",
+            "gateway",
+            "try again",
+            "retryable_error",
+        )
+        return any(m in msg for m in retryable_markers)
+
+    def _classify_endpoint_error(self, exc: BaseException) -> str:
+        if isinstance(exc, asyncio.TimeoutError):
+            return "timeout"
+        if isinstance(exc, httpx.HTTPStatusError):
+            code = exc.response.status_code if exc.response is not None else None
+            if code == 429:
+                return "throttled"
+            if code is not None and 500 <= int(code) <= 599:
+                return "upstream_5xx"
+            if code is not None and 400 <= int(code) <= 499:
+                return "upstream_4xx"
+            return "http_error"
+        if isinstance(exc, httpx.TransportError):
+            return "transport_error"
+        msg = str(exc).lower()
+        if " 500" in msg or "internal server error" in msg:
+            return "upstream_5xx"
+        if " 429" in msg or "too many requests" in msg or "rate limit" in msg:
+            return "throttled"
+        if "timeout" in msg or "timed out" in msg:
+            return "timeout"
+        return "unknown"
+
+    def _validate_agent_output_guardrails(self, output_data: Any) -> None:
+        if output_data is None and getattr(settings, "AGENT_OUTPUT_REQUIRE_NONEMPTY", True):
+            raise ValueError("Agent returned empty output")
+        if isinstance(output_data, str) and getattr(settings, "AGENT_OUTPUT_REQUIRE_NONEMPTY", True):
+            if not output_data.strip():
+                raise ValueError("Agent returned empty text output")
+        if isinstance(output_data, list) and getattr(settings, "AGENT_OUTPUT_REQUIRE_NONEMPTY", True):
+            if len(output_data) == 0:
+                raise ValueError("Agent returned empty list output")
+        if not isinstance(output_data, dict):
+            return
+
+        status_val = str(output_data.get("status") or "").strip().lower()
+        if status_val in {"retryable_error", "transient_error", "timeout"}:
+            raise RuntimeError(f"retryable_error: status={status_val}")
+        if status_val in {"failed", "error", "fatal_error"}:
+            raise ValueError(f"fatal agent status={status_val}")
+
+        min_conf = float(getattr(settings, "AGENT_OUTPUT_MIN_CONFIDENCE", 0.0) or 0.0)
+        confidence = output_data.get("confidence")
+        if isinstance(confidence, (int, float)):
+            if float(confidence) < min_conf:
+                raise ValueError(
+                    f"Low confidence output: confidence={float(confidence):.3f} < min={min_conf:.3f}"
+                )
+
+        err_blob = output_data.get("error") or output_data.get("errors")
+        has_useful_content = any(
+            output_data.get(k) not in (None, "", [], {})
+            for k in ("content", "result", "output", "text", "data", "records", "choices")
+        )
+        if err_blob and not has_useful_content:
+            raise ValueError(f"Agent output only contains error: {err_blob}")
 
     async def _persist_output_artifact(self, job: Job, step: WorkflowStep, output_data: Dict[str, Any]) -> Dict[str, Any]:
         output_format = (getattr(job, "output_artifact_format", None) or "jsonl").strip().lower()
@@ -259,311 +773,853 @@ class AgentExecutor:
                     "sig": sig,
                 }
         timeout = float(write_spec.get("timeout_seconds") or getattr(settings, "MCP_TOOL_DEFAULT_TIMEOUT_SECONDS", 60.0))
-        return await mcp_call_tool(
-            base_url=settings.PLATFORM_MCP_SERVER_URL.rstrip("/"),
+        extra_headers = {"X-MCP-Business-Id": str(business_id)}
+        extra_headers.update(self._sandhi_mcp_correlation_headers())
+        guard = get_mcp_guardrails()
+        target_key = f"platform:{settings.PLATFORM_MCP_SERVER_URL.rstrip('/')}:/mcp:{tool_name}"
+        tenant_tier = self._resolve_business_tier(int(business_id))
+        return await guard.call_tool_with_guardrails(
+            business_id=int(business_id),
+            target_key=target_key,
+            timeout_seconds=timeout,
+            operation_class="write_like",
             tool_name=tool_name,
-            arguments=arguments,
-            endpoint_path="/mcp",
-            extra_headers={"X-MCP-Business-Id": str(business_id)},
-            timeout=timeout,
+            tenant_tier=tenant_tier,
+            idempotency_key=str(arguments.get("idempotency_key") or ""),
+            execute_call=lambda bounded_timeout: mcp_call_tool(
+                base_url=settings.PLATFORM_MCP_SERVER_URL.rstrip("/"),
+                tool_name=tool_name,
+                arguments=arguments,
+                endpoint_path="/mcp",
+                extra_headers=extra_headers,
+                timeout=bounded_timeout,
+            ),
         )
-    
-    async def execute_job(self, job_id: int):
-        """Execute a job by running all workflow steps"""
+
+    async def _execute_one_step_core(
+        self,
+        job_id: int,
+        step_id: int,
+        previous_chain_output: Optional[Any],
+    ) -> Any:
+        """Execute a single workflow step using this executor's DB session."""
         job = self.db.query(Job).filter(Job.id == job_id).first()
         if not job:
             raise ValueError("Job not found")
-        
-        # Process payment first
-        transaction = self.payment_processor.process_payment(job_id)
-        
-        # Get workflow steps in order
-        workflow_steps = self.db.query(WorkflowStep).filter(
-            WorkflowStep.job_id == job_id
-        ).order_by(WorkflowStep.step_order).all()
-        
-        if not workflow_steps:
-            job.status = JobStatus.FAILED
-            job.execution_token = None
-            job.failure_reason = "No workflow steps found for this job"
+        workflow_steps = (
+            self.db.query(WorkflowStep)
+            .filter(WorkflowStep.job_id == job_id)
+            .order_by(WorkflowStep.step_order)
+            .all()
+        )
+        step = self.db.query(WorkflowStep).filter(
+            WorkflowStep.id == step_id, WorkflowStep.job_id == job_id
+        ).first()
+        if not step:
+            raise ValueError(f"Workflow step {step_id} not found for job {job_id}")
+
+        self._mcp_correlation_job_id = job_id
+        self._mcp_correlation_step_id = step.id
+        self._mcp_correlation_trace_id = str(uuid.uuid4())
+        logger.info(
+            "workflow_step_mcp_context job_id=%s workflow_step_id=%s trace_id=%s",
+            job_id,
+            step.id,
+            self._mcp_correlation_trace_id,
+        )
+
+        async def _run_step_body() -> Any:
+
+            step.status = "in_progress"
+            step.started_at = datetime.utcnow()
             self.db.commit()
-            return
-        
-        previous_output = None
-        
-        try:
-            # Strict sequential execution: steps run in step_order; each step gets previous_output only when depends_on_previous is True
-            for step in workflow_steps:
-                # Update step status
-                step.status = "in_progress"
-                step.started_at = datetime.utcnow()
-                self.db.commit()
-                
-                # Log execution start
-                self._log_action("workflow_step", step.id, "execution_started", {
-                    "job_id": job_id,
-                    "agent_id": step.agent_id
-                })
-                
-                # Execute agent
-                agent = self.db.query(Agent).filter(Agent.id == step.agent_id).first()
-                if not agent:
-                    raise ValueError(f"Agent {step.agent_id} not found")
-                
-                # Prepare input data
-                # Independent steps (depends_on_previous=False) do not receive previous agent output.
-                # Sequential steps receive previous_step_output for handoff.
-                depends_on_previous = getattr(step, "depends_on_previous", True)
-                if previous_output and depends_on_previous:
-                    # Merge previous output with base input data from step
-                    base_input = json.loads(step.input_data) if step.input_data else {}
-                    input_data = {
-                        **base_input,  # Job context, conversation, documents, etc.
-                        "previous_step_output": previous_output  # Output from previous agent
-                    }
-                else:
-                    # First step or independent step - use step's input data only (no previous output)
-                    input_data = json.loads(step.input_data) if step.input_data else {}
+            self._emit_step_heartbeat(
+                step,
+                phase="starting",
+                reason_code="step_started",
+                message="Workflow step execution started",
+                meaningful_progress=True,
+                commit_db=True,
+            )
 
-                # Strict BRD scope guard: if step is document-restricted, ensure only allowed docs are present.
-                if input_data.get("document_scope_restricted"):
-                    allowed_ids_raw = input_data.get("allowed_document_ids") or []
-                    allowed_ids = {str(x) for x in allowed_ids_raw if str(x).strip()}
-                    docs_in_payload = input_data.get("documents") or []
-                    payload_doc_ids = {str((d or {}).get("id")) for d in docs_in_payload if isinstance(d, dict) and (d or {}).get("id")}
-                    if not allowed_ids:
-                        raise ValueError("Document scope restricted but allowed_document_ids is empty")
-                    if payload_doc_ids and not payload_doc_ids.issubset(allowed_ids):
-                        raise ValueError(
-                            f"Policy violation: step {step.step_order} received out-of-scope BRDs. "
-                            f"allowed={sorted(allowed_ids)} payload={sorted(payload_doc_ids)}"
-                        )
+            self._log_action("workflow_step", step.id, "execution_started", {
+                "job_id": job_id,
+                "agent_id": step.agent_id
+            })
 
-                # Resolve which tools this step (agent) can use: step-level overrides; else job-level; else all business tools
-                job_platform_ids = _parse_allowed_ids(getattr(job, "allowed_platform_tool_ids", None))
-                job_conn_ids = _parse_allowed_ids(getattr(job, "allowed_connection_ids", None))
-                step_platform_ids = _parse_allowed_ids(getattr(step, "allowed_platform_tool_ids", None))
-                step_conn_ids = _parse_allowed_ids(getattr(step, "allowed_connection_ids", None))
-                # Step explicit list (including []) overrides job; else use job list; else None = all business tools
+            agent = self.db.query(Agent).filter(Agent.id == step.agent_id).first()
+            if not agent:
+                raise ValueError(f"Agent {step.agent_id} not found")
+
+            depends_on_previous = getattr(step, "depends_on_previous", True)
+            if previous_chain_output and depends_on_previous:
+                base_input = _load_step_input_json(
+                    step.input_data, job_id=job_id, step_id=step.id, step_order=step.step_order
+                )
+                input_data = {
+                    **base_input,
+                    "previous_step_output": previous_chain_output
+                }
+            else:
+                input_data = _load_step_input_json(
+                    step.input_data, job_id=job_id, step_id=step.id, step_order=step.step_order
+                )
+
+            if input_data.get("document_scope_restricted"):
+                allowed_ids_raw = input_data.get("allowed_document_ids") or []
+                allowed_ids = {str(x) for x in allowed_ids_raw if str(x).strip()}
+                docs_in_payload = input_data.get("documents") or []
+                payload_doc_ids = {str((d or {}).get("id")) for d in docs_in_payload if isinstance(d, dict) and (d or {}).get("id")}
+                if not allowed_ids:
+                    raise ValueError("Document scope restricted but allowed_document_ids is empty")
+                if payload_doc_ids and not payload_doc_ids.issubset(allowed_ids):
+                    raise ValueError(
+                        f"Policy violation: step {step.step_order} received out-of-scope BRDs. "
+                        f"allowed={sorted(allowed_ids)} payload={sorted(payload_doc_ids)}"
+                    )
+
+            job_platform_ids = _parse_allowed_ids(getattr(job, "allowed_platform_tool_ids", None))
+            job_conn_ids = _parse_allowed_ids(getattr(job, "allowed_connection_ids", None))
+            step_platform_ids = _parse_allowed_ids(getattr(step, "allowed_platform_tool_ids", None))
+            step_conn_ids = _parse_allowed_ids(getattr(step, "allowed_connection_ids", None))
+
+            def _norm_tool_visibility(raw: object) -> Optional[str]:
+                if not isinstance(raw, str):
+                    return None
+                s = raw.strip().lower()
+                return s if s in ("full", "names_only", "none") else None
+
+            step_tv_norm = _norm_tool_visibility(getattr(step, "tool_visibility", None))
+            job_tv_norm = _norm_tool_visibility(getattr(job, "tool_visibility", None))
+            tool_visibility = step_tv_norm or job_tv_norm or "full"
+            # Step-level "none" must not inherit job tool lists (otherwise DB null/[] is treated as inherit).
+            if step_tv_norm == "none":
+                effective_platform = []
+                effective_conn = []
+            else:
+                # Step-level empty arrays mean "inherit job scope", not "no tools".
+                if isinstance(step_platform_ids, list) and len(step_platform_ids) == 0:
+                    step_platform_ids = None
+                if isinstance(step_conn_ids, list) and len(step_conn_ids) == 0:
+                    step_conn_ids = None
                 effective_platform = step_platform_ids if step_platform_ids is not None else job_platform_ids
                 effective_conn = step_conn_ids if step_conn_ids is not None else job_conn_ids
-                # Step can only use tools that are in job scope
                 if job_platform_ids is not None and effective_platform is not None:
                     effective_platform = [x for x in effective_platform if x in job_platform_ids]
                 if job_conn_ids is not None and effective_conn is not None:
                     effective_conn = [x for x in effective_conn if x in job_conn_ids]
-
-                available_mcp_tools = await self._get_available_mcp_tools_async(
-                    job.business_id,
-                    platform_tool_ids=effective_platform if effective_platform is not None else None,
-                    connection_ids=effective_conn if effective_conn is not None else None,
+            has_configured_tool_scope = bool((effective_platform is not None and len(effective_platform) > 0) or (effective_conn is not None and len(effective_conn) > 0))
+            if tool_visibility == "none" and has_configured_tool_scope:
+                raise ValueError(
+                    "Invalid tool configuration: step has MCP tool scope but tool_visibility='none'. "
+                    "Set step/job tool_visibility to 'names_only' or 'full'."
                 )
-                # Hybrid A2A: restrict what tool info agents see (credentials never shared)
-                tool_visibility = getattr(step, "tool_visibility", None) or getattr(job, "tool_visibility", None) or "full"
-                available_mcp_tools = _apply_tool_visibility(available_mcp_tools or [], tool_visibility)
-                if available_mcp_tools:
-                    input_data["available_mcp_tools"] = available_mcp_tools
-                    input_data["business_id"] = job.business_id
+
+            available_mcp_tools = await self._get_available_mcp_tools_async(
+                job.business_id,
+                platform_tool_ids=effective_platform if effective_platform is not None else None,
+                connection_ids=effective_conn if effective_conn is not None else None,
+            )
+            raw_mcp_tools = available_mcp_tools or []
+            compat_errors = validate_tools_for_agent(agent, raw_mcp_tools)
+            if compat_errors:
+                raise ValueError(compat_errors[0])
+            available_mcp_tools = filter_tools_for_agent(agent, raw_mcp_tools)
+            visible_mcp_tools = _apply_tool_visibility(available_mcp_tools or [], tool_visibility)
+            inp_for_assign = dict(input_data)
+            if (
+                getattr(settings, "TOOL_ASSIGNMENT_ENABLED", True)
+                and getattr(settings, "TOOL_ASSIGNMENT_LLM_PICK_TOOLS", True)
+                and getattr(settings, "TOOL_ASSIGNMENT_USE_LLM", True)
+                and not inp_for_assign.get("llm_suggested_tool_names")
+                and visible_mcp_tools
+            ):
+                try:
+                    from services.planner_llm import is_agent_planner_configured
+                    from services.tool_assignment_llm import suggest_tool_names_with_llm
+
+                    if is_agent_planner_configured():
+                        max_n = int(getattr(settings, "TOOL_ASSIGNMENT_LLM_MAX_TOOLS", 12) or 12)
+                        max_n = max(1, min(max_n, len(visible_mcp_tools)))
+                        picked = await suggest_tool_names_with_llm(
+                            job_title=str(inp_for_assign.get("job_title") or ""),
+                            assigned_task=str(inp_for_assign.get("assigned_task") or ""),
+                            task_type=infer_task_type(inp_for_assign),
+                            tools=visible_mcp_tools,
+                            max_names=max_n,
+                        )
+                        if picked:
+                            inp_for_assign["llm_suggested_tool_names"] = picked
+                except Exception as e:
+                    logger.warning("tool_assignment_llm_pick_failed: %s", e)
+            ordered_tools, assigned_meta, assign_src, assign_flagged = assign_tools_for_step(
+                input_data=inp_for_assign,
+                agent=agent,
+                available_mcp_tools=visible_mcp_tools,
+            )
+            picked_names = inp_for_assign.get("llm_suggested_tool_names")
+            if picked_names is not None:
+                input_data["llm_suggested_tool_names"] = picked_names
+            input_data["assigned_tools"] = [
+                m.model_dump(mode="python", exclude_none=True) for m in assigned_meta
+            ]
+            nxt_step = _next_workflow_step(workflow_steps, step)
+            next_ref: Optional[NextAgentRef] = None
+            if nxt_step:
+                next_agent_row = self.db.query(Agent).filter(Agent.id == nxt_step.agent_id).first()
+                endpoint: Optional[str] = None
+                if next_agent_row and getattr(next_agent_row, "a2a_enabled", False):
+                    endpoint = (next_agent_row.api_endpoint or "").strip() or None
+                next_ref = NextAgentRef(
+                    agent_id=nxt_step.agent_id,
+                    workflow_step_id=nxt_step.id,
+                    name=(next_agent_row.name if next_agent_row else None),
+                    a2a_endpoint=endpoint,
+                    step_order=nxt_step.step_order,
+                )
+            par_raw = _parallel_context_for_step(workflow_steps, step)
+            par_ctx = ParallelExecutionContext(**par_raw) if par_raw else None
+            sandhi_task = SandhiA2ATaskV1(
+                agent_id=agent.id,
+                task_id=f"{job_id}-{step.id}-{self._mcp_correlation_trace_id}",
+                payload={
+                    "assigned_task": input_data.get("assigned_task"),
+                    "job_title": input_data.get("job_title"),
+                    "job_id": job_id,
+                    "workflow_step_id": step.id,
+                    "step_order": step.step_order,
+                },
+                next_agent=next_ref,
+                assigned_tools=assigned_meta,
+                parallel=par_ctx,
+                task_type=infer_task_type(input_data),
+                assignment_source=assign_src,
+                assignment_flagged=assign_flagged,
+            )
+            input_data["sandhi_a2a_task"] = task_envelope_to_dict(sandhi_task)
+            if ordered_tools:
+                input_data["available_mcp_tools"] = ordered_tools
+                input_data["business_id"] = job.business_id
+                if step.step_order == 1:
+                    self._log_action("job", job_id, "mcp_tool_discovery", {
+                        "business_id": job.business_id,
+                        "tool_count": len(ordered_tools),
+                        "tool_names": [t.get("name") for t in ordered_tools[:20]],
+                    })
+
+            collaboration_hint = _get_workflow_collaboration_hint_from_job(job)
+            if collaboration_hint == "async_a2a":
+                peer_agents = self._get_peer_agents_for_step(workflow_steps, step, agent)
+                if peer_agents:
+                    input_data["peer_agents"] = peer_agents
                     if step.step_order == 1:
-                        self._log_action("job", job_id, "mcp_tool_discovery", {
-                            "business_id": job.business_id,
-                            "tool_count": len(available_mcp_tools),
-                            "tool_names": [t.get("name") for t in available_mcp_tools[:20]],
+                        self._log_action("job", job_id, "peer_a2a_context", {
+                            "peer_count": len(peer_agents),
+                            "peer_ids": [p["agent_id"] for p in peer_agents],
                         })
 
-                # Hybrid A2A: peer context for async_a2a — agents can call each other; no tools/credentials shared
-                collaboration_hint = _get_workflow_collaboration_hint_from_job(job)
-                if collaboration_hint == "async_a2a":
-                    peer_agents = self._get_peer_agents_for_step(workflow_steps, step, agent)
-                    if peer_agents:
-                        input_data["peer_agents"] = peer_agents
-                        if step.step_order == 1:
-                            self._log_action("job", job_id, "peer_a2a_context", {
-                                "peer_count": len(peer_agents),
-                                "peer_ids": [p["agent_id"] for p in peer_agents],
-                            })
-                
-                # Uploaded documents are requirement documents: agent must understand them, ask questions if any, else execute and answer.
-                documents = input_data.get('documents', [])
-                conversation = input_data.get('conversation', [])
-                
-                # Execution flow: 1) Get step's input_data (job context, requirement docs, conversation).
-                # 2) Only hired agents (with api_endpoint) are supported – call agent's endpoint with api_key.
-                # 3) If agent has plugin_config → run plugin. 4) Response is stored as step output.
-                if not (agent.api_endpoint and (agent.api_endpoint or "").strip()):
-                    raise ValueError(
-                        f"Only hired agents with an API endpoint are supported. "
-                        f"Agent '{agent.name}' (id={agent.id}) has no api_endpoint configured."
+            documents = input_data.get('documents', [])
+            conversation = input_data.get('conversation', [])
+
+            if not (agent.api_endpoint and (agent.api_endpoint or "").strip()):
+                raise ValueError(
+                    f"Only hired agents with an API endpoint are supported. "
+                    f"Agent '{agent.name}' (id={agent.id}) has no api_endpoint configured."
+                )
+            logger.debug("========== Executing Step %s ==========", step.step_order)
+            logger.debug("Agent: %s (hired endpoint)", agent.name)
+            logger.debug("Agent endpoint: %s", agent.api_endpoint)
+            logger.debug("Job Title: %s", input_data.get('job_title', 'N/A'))
+            logger.debug("Job Description: %s...", (input_data.get('job_description') or 'N/A')[:100])
+
+            if documents:
+                logger.debug("Found %s document(s) to send to agent", len(documents))
+                for i, doc in enumerate(documents):
+                    content_length = len(doc.get('content', '')) if doc.get('content') else 0
+                    content_preview = doc.get('content', '')[:150] if doc.get('content') else 'EMPTY'
+                    logger.debug("Document %s: %s type=%s content_length=%s preview=%s...", i + 1, doc.get('name', 'Unknown'), doc.get('type', 'unknown'), content_length, content_preview)
+            else:
+                logger.warning("No documents found in input_data")
+
+            if conversation:
+                questions = [item for item in conversation if item.get('type') == 'question']
+                answers = [item for item in conversation if item.get('type') == 'question' and item.get('answer')]
+                completions = [item for item in conversation if item.get('type') == 'completion']
+                logger.debug("Found %s conversation item(s) questions=%s answered=%s completions=%s", len(conversation), len(questions), len(answers), len(completions))
+                if completions:
+                    logger.debug("Latest completion: %s...", (completions[-1].get('message') or 'N/A')[:100])
+            else:
+                logger.warning("No conversation found in input_data")
+
+            logger.debug("=================================================")
+
+            output_data = None
+            token_usage: Optional[Dict[str, int]] = None
+            token_usage_source: Optional[str] = None
+            mcp_tools_used: List[str] = []
+            artifact_ref = None
+            contract = _parse_output_contract(getattr(job, "output_contract", None))
+            guardrail_meta: Dict[str, Any] = {
+                "timeout_seconds": _resolve_agent_step_timeout_seconds(contract),
+                "max_retries": max(1, int(getattr(settings, "AGENT_STEP_MAX_RETRIES", 2) or 2)),
+                "attempts_used": 0,
+                "retryable_failures": 0,
+            }
+            write_mode = (getattr(job, "write_execution_mode", None) or "platform").strip().lower()
+            write_targets: List[Dict[str, Any]] = contract.get("write_targets") if isinstance(contract, dict) else []
+            write_policy = _parse_write_policy(contract, len(write_targets) if isinstance(write_targets, list) else 0)
+            write_results: List[Dict[str, Any]] = []
+            input_data["output_contract"] = contract
+            input_data["write_execution_mode"] = write_mode
+            input_data["write_targets"] = write_targets
+            if getattr(settings, "EXECUTOR_PAYLOAD_VALIDATE", True):
+                input_data = validate_and_enrich_executor_payload(
+                    input_data,
+                    job_id=job_id,
+                    workflow_step_id=step.id,
+                    step_order=step.step_order,
+                    agent_id=agent.id,
+                    total_steps=len(workflow_steps),
+                )
+            else:
+                input_data = enrich_executor_payload_trace_only(
+                    input_data,
+                    job_id=job_id,
+                    workflow_step_id=step.id,
+                    step_order=step.step_order,
+                    agent_id=agent.id,
+                    total_steps=len(workflow_steps),
+                )
+            self._emit_step_heartbeat(
+                step,
+                phase="planning",
+                reason_code="payload_ready",
+                message="Payload prepared; calling agent",
+                commit_db=True,
+            )
+            try:
+                timeout_seconds = float(guardrail_meta["timeout_seconds"])
+                max_retries = int(guardrail_meta["max_retries"])
+                backoff_base = float(getattr(settings, "AGENT_STEP_RETRY_BACKOFF_SECONDS", 2.0) or 2.0)
+                last_exc: Optional[BaseException] = None
+                for attempt in range(1, max_retries + 1):
+                    guardrail_meta["attempts_used"] = attempt
+                    try:
+                        self._emit_step_heartbeat(
+                            step,
+                            phase="calling_agent",
+                            reason_code="agent_call_start",
+                            message=f"Calling agent (attempt {attempt}/{max_retries})",
+                            reason_detail={
+                                "kind": "agent_call",
+                                "attempt": attempt,
+                                "max_retries": max_retries,
+                                "timeout_seconds": timeout_seconds,
+                            },
+                            attempt=attempt,
+                            max_retries=max_retries,
+                            commit_db=True,
+                        )
+                        started = time.perf_counter()
+                        raw_candidate = await asyncio.wait_for(
+                            self._execute_agent(agent, input_data),
+                            timeout=timeout_seconds,
+                        )
+                        elapsed_ms = int((time.perf_counter() - started) * 1000.0)
+                        usage_candidate = _extract_token_usage_from_payload(raw_candidate)
+                        if usage_candidate:
+                            token_usage = usage_candidate
+                            token_usage_source = "reported"
+                        tools_used_candidate = raw_candidate.get("mcp_tools_used") if isinstance(raw_candidate, dict) else None
+                        if isinstance(tools_used_candidate, list):
+                            mcp_tools_used = [
+                                str(x).strip()
+                                for x in tools_used_candidate
+                                if isinstance(x, str) and str(x).strip()
+                            ]
+                        candidate = raw_candidate
+                        candidate = normalize_agent_output_for_artifact(candidate)
+                        candidate = _normalize_placeholder_error_values(candidate)
+                        candidate = _ensure_records_for_platform_write(
+                            candidate,
+                            write_mode=write_mode,
+                            write_targets=write_targets,
+                        )
+                        self._validate_agent_output_guardrails(candidate)
+                        output_data = candidate
+                        self._emit_step_heartbeat(
+                            step,
+                            phase="calling_agent",
+                            reason_code="agent_response_received",
+                            message=f"Agent response received (attempt {attempt}/{max_retries})",
+                            reason_detail={"kind": "agent_call", "attempt": attempt, "max_retries": max_retries, "elapsed_ms": elapsed_ms},
+                            attempt=attempt,
+                            max_retries=max_retries,
+                            meaningful_progress=True,
+                            commit_db=True,
+                        )
+                        break
+                    except Exception as exec_err:
+                        last_exc = exec_err
+                        is_retryable = self._is_retryable_step_exception(exec_err)
+                        if is_retryable:
+                            guardrail_meta["retryable_failures"] = int(guardrail_meta["retryable_failures"]) + 1
+                        if attempt < max_retries and is_retryable:
+                            sleep_s = backoff_base * (2 ** (attempt - 1))
+                            self._emit_step_heartbeat(
+                                step,
+                                phase="retry_backoff",
+                                reason_code="retryable_error_backoff",
+                                message=(
+                                    f"Retryable {type(exec_err).__name__}; "
+                                    f"backoff {sleep_s:.2f}s before retry"
+                                ),
+                                reason_detail={
+                                    "kind": "backoff",
+                                    "error_type": type(exec_err).__name__,
+                                    "attempt": attempt,
+                                    "max_retries": max_retries,
+                                    "sleep_seconds": sleep_s,
+                                },
+                                attempt=attempt,
+                                max_retries=max_retries,
+                                commit_db=True,
+                            )
+                            logger.warning(
+                                "step_guardrail_retry job_id=%s step_id=%s step_order=%s attempt=%s/%s sleep_seconds=%.2f reason=%s",
+                                job_id,
+                                step.id,
+                                step.step_order,
+                                attempt,
+                                max_retries,
+                                sleep_s,
+                                type(exec_err).__name__,
+                            )
+                            await asyncio.sleep(sleep_s)
+                            continue
+                        raise exec_err
+                if output_data is None and last_exc is not None:
+                    raise last_exc
+                if token_usage is None:
+                    est = _estimate_token_usage_from_io(input_data, output_data)
+                    if est:
+                        token_usage = est
+                        token_usage_source = "estimated"
+                if write_mode == "ui_only":
+                    output_format = (getattr(job, "output_artifact_format", None) or "jsonl").strip().lower()
+                    if output_format not in ("jsonl", "json"):
+                        output_format = "jsonl"
+                    artifact_ref = {
+                        "artifact_id": str(uuid.uuid4()),
+                        "storage": "inline",
+                        "inline_only": True,
+                        "format": output_format,
+                        "created_at": datetime.utcnow().isoformat(),
+                    }
+                else:
+                    self._emit_step_heartbeat(
+                        step,
+                        phase="writing_artifact",
+                        reason_code="artifact_persist_started",
+                        message="Persisting output artifact",
+                        commit_db=True,
                     )
-                logger.debug("========== Executing Step %s ==========", step.step_order)
-                logger.debug("Agent: %s (hired endpoint)", agent.name)
-                logger.debug("Agent endpoint: %s", agent.api_endpoint)
-                logger.debug("Job Title: %s", input_data.get('job_title', 'N/A'))
-                logger.debug("Job Description: %s...", (input_data.get('job_description') or 'N/A')[:100])
-                
-                # Log documents
-                if documents:
-                    logger.debug("Found %s document(s) to send to agent", len(documents))
-                    for i, doc in enumerate(documents):
-                        content_length = len(doc.get('content', '')) if doc.get('content') else 0
-                        content_preview = doc.get('content', '')[:150] if doc.get('content') else 'EMPTY'
-                        logger.debug("Document %s: %s type=%s content_length=%s preview=%s...", i + 1, doc.get('name', 'Unknown'), doc.get('type', 'unknown'), content_length, content_preview)
-                else:
-                    logger.warning("No documents found in input_data")
-                
-                # Log conversation
-                if conversation:
-                    questions = [item for item in conversation if item.get('type') == 'question']
-                    answers = [item for item in conversation if item.get('type') == 'question' and item.get('answer')]
-                    completions = [item for item in conversation if item.get('type') == 'completion']
-                    logger.debug("Found %s conversation item(s) questions=%s answered=%s completions=%s", len(conversation), len(questions), len(answers), len(completions))
-                    if completions:
-                        logger.debug("Latest completion: %s...", (completions[-1].get('message') or 'N/A')[:100])
-                else:
-                    logger.warning("No conversation found in input_data")
-                
-                logger.debug("=================================================")
-                
-                # Execute agent (API or plugin)
-                output_data = None
-                artifact_ref = None
-                contract = _parse_output_contract(getattr(job, "output_contract", None))
-                write_mode = (getattr(job, "write_execution_mode", None) or "platform").strip().lower()
-                write_targets: List[Dict[str, Any]] = contract.get("write_targets") if isinstance(contract, dict) else []
-                write_policy = _parse_write_policy(contract, len(write_targets) if isinstance(write_targets, list) else 0)
-                write_results: List[Dict[str, Any]] = []
-                try:
-                    output_data = await self._execute_agent(agent, input_data)
-                    output_data = normalize_agent_output_for_artifact(output_data)
-                    # ui_only: keep results in step.output_data (DB) for the UI only — no S3/local artifact file, no contract writes.
-                    if write_mode == "ui_only":
-                        output_format = (getattr(job, "output_artifact_format", None) or "jsonl").strip().lower()
-                        if output_format not in ("jsonl", "json"):
-                            output_format = "jsonl"
-                        artifact_ref = {
-                            "artifact_id": str(uuid.uuid4()),
-                            "storage": "inline",
-                            "inline_only": True,
-                            "format": output_format,
-                            "created_at": datetime.utcnow().isoformat(),
-                        }
-                    else:
-                        artifact_ref = await self._persist_output_artifact(job, step, output_data)
-                    if write_mode == "platform" and isinstance(write_targets, list) and write_targets:
-                        successful_writes = 0
-                        for target in write_targets:
-                            if not isinstance(target, dict):
-                                continue
-                            tool_name = str(target.get("tool_name", "")).strip() or None
-                            try:
-                                write_result = await self._trigger_platform_write(
-                                    business_id=job.business_id,
-                                    write_spec=target,
-                                    artifact_ref=artifact_ref,
-                                    step=step,
+                    artifact_ref = await self._persist_output_artifact(job, step, output_data)
+                    self._emit_step_heartbeat(
+                        step,
+                        phase="writing_artifact",
+                        reason_code="artifact_persisted",
+                        message="Output artifact persisted",
+                        meaningful_progress=True,
+                        commit_db=True,
+                    )
+                if write_mode == "platform" and isinstance(write_targets, list) and write_targets:
+                    successful_writes = 0
+                    for target in write_targets:
+                        if not isinstance(target, dict):
+                            continue
+                        tool_name = str(target.get("tool_name", "")).strip() or None
+                        try:
+                            self._emit_step_heartbeat(
+                                step,
+                                phase="writing_artifact",
+                                reason_code="platform_write_target_start",
+                                message=f"Writing target via {tool_name or 'unknown_tool'}",
+                                reason_detail={"tool_name": tool_name},
+                                commit_db=True,
+                            )
+                            write_result = await self._trigger_platform_write(
+                                business_id=job.business_id,
+                                write_spec=target,
+                                artifact_ref=artifact_ref,
+                                step=step,
+                            )
+                            is_error_result = bool(
+                                isinstance(write_result, dict) and (
+                                    bool(write_result.get("isError"))
+                                    or str(write_result.get("status", "")).strip().lower() in ("error", "failed")
                                 )
+                            )
+                            if is_error_result:
+                                mcp_detail = _mcp_tool_result_summary(write_result)
+                                err_label = mcp_detail or "platform write target returned isError=true"
+                                write_results.append({
+                                    "tool_name": tool_name,
+                                    "status": "failed",
+                                    "error": err_label,
+                                    "result": write_result,
+                                })
+                                self._emit_step_heartbeat(
+                                    step,
+                                    phase="writing_artifact",
+                                    reason_code="platform_write_target_error",
+                                    message=f"Write target failed via {tool_name or 'unknown_tool'}",
+                                    reason_detail={
+                                        "tool_name": tool_name,
+                                        "error_type": "platform_write_error",
+                                        "mcp_detail": mcp_detail[:500] if mcp_detail else None,
+                                    },
+                                    commit_db=True,
+                                )
+                                if write_policy.get("on_write_error") == "fail_job":
+                                    msg = f"Write target {tool_name or 'unknown_tool'} returned error response"
+                                    if mcp_detail:
+                                        msg = f"{msg}: {mcp_detail}"
+                                    raise ValueError(msg)
+                            else:
                                 write_results.append({
                                     "tool_name": tool_name,
                                     "status": "success",
                                     "result": write_result,
                                 })
                                 successful_writes += 1
-                            except Exception as target_error:
-                                write_results.append({
-                                    "tool_name": tool_name,
-                                    "status": "failed",
-                                    "error": str(target_error),
-                                })
-                                # Policy-controlled behavior: fail immediately or continue collecting target outcomes.
-                                if write_policy.get("on_write_error") == "fail_job":
-                                    raise
-                        if successful_writes < int(write_policy.get("min_successful_targets", 0)):
-                            raise ValueError(
-                                "Write policy violation: "
-                                f"successful_targets={successful_writes} < "
-                                f"min_successful_targets={write_policy.get('min_successful_targets')}"
-                            )
+                                self._emit_step_heartbeat(
+                                    step,
+                                    phase="writing_artifact",
+                                    reason_code="platform_write_target_success",
+                                    message=f"Write target success via {tool_name or 'unknown_tool'}",
+                                    reason_detail={"tool_name": tool_name},
+                                    meaningful_progress=True,
+                                    commit_db=True,
+                                )
+                        except Exception as target_error:
+                            write_results.append({
+                                "tool_name": tool_name,
+                                "status": "failed",
+                                "error": str(target_error),
+                            })
+                            if write_policy.get("on_write_error") == "fail_job":
+                                raise
+                    if successful_writes < int(write_policy.get("min_successful_targets", 0)):
+                        raise ValueError(
+                            "Write policy violation: "
+                            f"successful_targets={successful_writes} < "
+                            f"min_successful_targets={write_policy.get('min_successful_targets')}"
+                        )
 
-                    # Update step with output + persisted artifact reference contract
-                    step.output_data = json.dumps({
-                        "agent_output": output_data,
-                        "artifact_ref": artifact_ref,
-                        "write_execution_mode": write_mode,
-                        "write_policy": write_policy,
-                        "write_results": write_results,
-                    })
-                    step.status = "completed"
-                    step.completed_at = datetime.utcnow()
-                    step.cost = agent.price_per_task
-                except Exception as step_error:
-                    # Mark step as failed
-                    step.status = "failed"
-                    step.completed_at = datetime.utcnow()
-                    error_msg = str(step_error)
-                    if len(error_msg) > 500:
-                        error_msg = error_msg[:500] + "..."
-                    # Persist error with best-effort context for postmortem debugging.
-                    step.output_data = json.dumps({
-                        "error": error_msg,
-                        "agent_output": output_data,
-                        "artifact_ref": artifact_ref,
-                        "write_execution_mode": write_mode,
-                        "write_policy": write_policy,
-                        "write_results": write_results,
-                    })
-                    self.db.commit()
-                    
-                    # Re-raise to mark job as failed
-                    raise Exception(f"Workflow step {step.step_order} failed: {error_msg}")
-                
-                # Log communication if there's a previous step
-                if previous_output is not None:
-                    previous_step = workflow_steps[workflow_steps.index(step) - 1]
-                    self._log_communication(previous_step, step, previous_output)
-                
-                previous_output = output_data
+                step.output_data = json.dumps({
+                    "agent_output": output_data,
+                    "token_usage": token_usage,
+                    "token_usage_source": token_usage_source,
+                    "mcp_tools_used": mcp_tools_used,
+                    "artifact_ref": artifact_ref,
+                    "write_execution_mode": write_mode,
+                    "write_policy": write_policy,
+                    "write_results": write_results,
+                    "guardrail_meta": guardrail_meta,
+                })
+                step.status = "completed"
+                step.completed_at = datetime.utcnow()
+                step.cost = agent.price_per_task
+                self._emit_step_heartbeat(
+                    step,
+                    phase="completed",
+                    reason_code="step_completed",
+                    message="Workflow step completed",
+                    meaningful_progress=True,
+                    commit_db=False,
+                )
+            except Exception as step_error:
+                step.status = "failed"
+                step.completed_at = datetime.utcnow()
+                error_msg = _format_workflow_step_error_message(
+                    step_error,
+                    timeout_seconds=float(guardrail_meta.get("timeout_seconds") or 0) or None,
+                )
+                if len(error_msg) > 500:
+                    error_msg = error_msg[:500] + "..."
+                step.output_data = json.dumps({
+                    "error": error_msg,
+                    "agent_output": output_data,
+                    "token_usage": token_usage,
+                    "token_usage_source": token_usage_source,
+                    "mcp_tools_used": mcp_tools_used,
+                    "artifact_ref": artifact_ref,
+                    "write_execution_mode": write_mode,
+                    "write_policy": write_policy,
+                    "write_results": write_results,
+                    "guardrail_meta": guardrail_meta,
+                })
+                hb_detail = {
+                    "error_type": type(step_error).__name__,
+                    "timeout_seconds": guardrail_meta.get("timeout_seconds"),
+                }
+                hb_msg = _format_workflow_step_error_message(
+                    step_error,
+                    timeout_seconds=float(guardrail_meta.get("timeout_seconds") or 0) or None,
+                )
+                if len(hb_msg) > 280:
+                    hb_msg = hb_msg[:277] + "..."
+                self._emit_step_heartbeat(
+                    step,
+                    phase="failed",
+                    reason_code="step_failed",
+                    message=f"Workflow step failed: {hb_msg}",
+                    reason_detail=hb_detail,
+                    commit_db=False,
+                )
                 self.db.commit()
+
+                raise Exception(f"Workflow step {step.step_order} failed: {error_msg}") from step_error
+
+            if previous_chain_output is not None and getattr(step, "depends_on_previous", True):
+                idx = next((i for i, w in enumerate(workflow_steps) if w.id == step.id), -1)
+                if idx > 0:
+                    previous_step = workflow_steps[idx - 1]
+                    self._log_communication(previous_step, step, previous_chain_output)
+
+            self.db.commit()
+
+            self._log_action("workflow_step", step.id, "execution_completed", {
+                "job_id": job_id,
+                "agent_id": step.agent_id,
+                "output_size": len(str(output_data))
+            })
+            return output_data
+
+        try:
+            return await _run_step_body()
+        finally:
+            self._mcp_correlation_job_id = None
+            self._mcp_correlation_step_id = None
+            self._mcp_correlation_trace_id = None
+
+    async def execute_job(self, job_id: int):
+        """Execute a job by running all workflow steps"""
+        job = self.db.query(Job).filter(Job.id == job_id).first()
+        if not job:
+            raise ValueError("Job not found")
+        pre_steps = (
+            self.db.query(WorkflowStep.agent_id)
+            .filter(WorkflowStep.job_id == job_id)
+            .order_by(WorkflowStep.step_order)
+            .all()
+        )
+        decision = resolve_runtime_planner_transport(
+            self.db,
+            agent_ids=[int(r[0]) for r in pre_steps if r and r[0] is not None],
+        )
+        planner_ctx_token = set_planner_runtime_transport(decision)
+        try:
+            # Execute-time replan before payment so job.total_cost matches the workflow we charge for.
+            if getattr(settings, "AGENT_PLANNER_EXECUTE_REPLAN", True):
+                from services.planner_llm import is_agent_planner_configured
+                from services.task_splitter import PlannerSplitError
+                from services.workflow_builder import WorkflowBuilder
+
+                if is_agent_planner_configured():
+                    origin = (getattr(job, "workflow_origin", None) or "auto_split").strip().lower()
+                    if origin != "manual":
+                        try:
+                            await WorkflowBuilder(self.db).replan_workflow_steps_at_execute_async(job_id)
+                        except PlannerSplitError as e:
+                            policy = (
+                                getattr(settings, "AGENT_PLANNER_EXECUTE_REPLAN_ON_FAILURE", None) or "fail"
+                            ).strip().lower()
+                            if policy == "continue":
+                                logger.warning(
+                                    "Execute-time replan failed for job_id=%s; continuing with built workflow: %s",
+                                    job_id,
+                                    e,
+                                )
+                            else:
+                                job = self.db.query(Job).filter(Job.id == job_id).first()
+                                if job:
+                                    job.status = JobStatus.FAILED
+                                    job.execution_token = None
+                                    msg = (
+                                        str(e)
+                                        or "Platform task planner failed to refresh workflow before execution."
+                                    )
+                                    if getattr(e, "last_detail", None):
+                                        msg = f"{msg} ({e.last_detail})"
+                                    job.failure_reason = msg[:450]
+                                    self.db.commit()
+                                    try:
+                                        send_business_job_alert(
+                                            event_type="job_failed",
+                                            job_id=int(job.id),
+                                            business_id=int(job.business_id),
+                                            title=str(job.title or f"Job {job.id}"),
+                                            status="failed",
+                                            reason=str(job.failure_reason or ""),
+                                        )
+                                    except Exception:
+                                        pass
+                                return
+                    self.db.expire_all()
+
+            try:
+                self.payment_processor.calculate_job_cost(job_id)
+            except ValueError:
+                logger.warning("calculate_job_cost skipped: job %s missing", job_id)
+
+            self.payment_processor.process_payment(job_id)
+            
+            # Get workflow steps in order
+            workflow_steps = self.db.query(WorkflowStep).filter(
+                WorkflowStep.job_id == job_id
+            ).order_by(WorkflowStep.step_order).all()
+            
+            if not workflow_steps:
+                job.status = JobStatus.FAILED
+                job.execution_token = None
+                job.failure_reason = "No workflow steps found for this job"
+                self.db.commit()
+                try:
+                    send_business_job_alert(
+                        event_type="job_failed",
+                        job_id=int(job.id),
+                        business_id=int(job.business_id),
+                        title=str(job.title or f"Job {job.id}"),
+                        status="failed",
+                        reason=str(job.failure_reason or ""),
+                    )
+                except Exception:
+                    pass
+                return
+            
+            if getattr(settings, "WORKFLOW_PARALLEL_INDEPENDENT_STEPS", True):
+                waves = _partition_workflow_waves(workflow_steps)
+            else:
+                waves = [[s] for s in workflow_steps]
+
+            try:
+                max_parallel = getattr(settings, "WORKFLOW_MAX_PARALLEL_STEPS", 8) or 8
+                try:
+                    max_parallel = max(1, int(max_parallel))
+                except (TypeError, ValueError):
+                    max_parallel = 8
+                sem = asyncio.Semaphore(max_parallel)
+                previous_chain_output: Optional[Any] = None
+
+                async def _run_step_isolated(st: WorkflowStep, prev: Optional[Any]) -> Any:
+                    async with sem:
+                        child_db = SessionLocal()
+                        try:
+                            child_ex = AgentExecutor(child_db)
+                            return await child_ex._execute_one_step_core(job_id, st.id, prev)
+                        finally:
+                            child_db.close()
+
+                for wave in waves:
+                    wave_sorted = sorted(wave, key=lambda s: s.step_order)
+                    runnable = [st for st in wave_sorted if st.status != "completed"]
+                    wave_outputs: Dict[int, Any] = {}
+                    for st in wave_sorted:
+                        if st.status == "completed":
+                            out = _load_step_output_json(st)
+                            if out is not None:
+                                wave_outputs[st.id] = out
+                    if not runnable:
+                        last_step = wave_sorted[-1]
+                        previous_chain_output = wave_outputs.get(last_step.id, previous_chain_output)
+                        self.db.expire_all()
+                        continue
+                    if len(runnable) == 1:
+                        st = runnable[0]
+                        result = await self._execute_one_step_core(
+                            job_id, st.id, previous_chain_output
+                        )
+                        wave_outputs[st.id] = result
+                    else:
+                        async with asyncio.TaskGroup() as tg:
+                            task_objs = {
+                                st.id: tg.create_task(_run_step_isolated(st, previous_chain_output))
+                                for st in runnable
+                            }
+                        for st in runnable:
+                            wave_outputs[st.id] = task_objs[st.id].result()
+                    previous_chain_output = wave_outputs.get(wave_sorted[-1].id, previous_chain_output)
+                    self.db.expire_all()
+
+                # Mark job as completed
+                job.status = JobStatus.COMPLETED
+                job.execution_token = None
+                job.completed_at = datetime.utcnow()
+                self.db.commit()
+                try:
+                    send_business_job_alert(
+                        event_type="job_completed",
+                        job_id=int(job.id),
+                        business_id=int(job.business_id),
+                        title=str(job.title or f"Job {job.id}"),
+                        status="completed",
+                        stage="done",
+                    )
+                except Exception:
+                    pass
                 
-                # Log execution completion
-                self._log_action("workflow_step", step.id, "execution_completed", {
-                    "job_id": job_id,
-                    "agent_id": step.agent_id,
-                    "output_size": len(str(output_data))
+                # Distribute earnings
+                self.payment_processor.distribute_earnings(job_id)
+                
+                # Log job completion
+                self._log_action("job", job_id, "completed", {
+                    "total_cost": job.total_cost
                 })
             
-            # Mark job as completed
-            job.status = JobStatus.COMPLETED
-            job.execution_token = None
-            job.completed_at = datetime.utcnow()
-            self.db.commit()
-            
-            # Distribute earnings
-            self.payment_processor.distribute_earnings(job_id)
-            
-            # Log job completion
-            self._log_action("job", job_id, "completed", {
-                "total_cost": job.total_cost
-            })
-        
-        except Exception as e:
-            # Mark job as failed with reason
-            logger.exception("Job execution failed job_id=%s", job_id)
-            job.status = JobStatus.FAILED
-            job.execution_token = None
-            error_message = type(e).__name__
-            job.failure_reason = error_message
-            self.db.commit()
-            
-            # Log error
-            self._log_action("job", job_id, "failed", {
-                "error": error_message
-            })
-            raise
+            except (Exception, BaseExceptionGroup) as caught:
+                # TaskGroup raises ExceptionGroup (not a subclass of Exception); unwrap to one Exception for logging.
+                err: BaseException = caught
+                if isinstance(err, BaseExceptionGroup):
+                    while isinstance(err, BaseExceptionGroup) and err.exceptions:
+                        err = err.exceptions[0]
+                if not isinstance(err, Exception):
+                    raise caught
+                e = err
+                # Mark job as failed with reason
+                logger.exception("Job execution failed job_id=%s", job_id)
+                job.status = JobStatus.FAILED
+                job.execution_token = None
+                detail = str(e).strip()
+                error_message = f"{type(e).__name__}: {detail}" if detail else type(e).__name__
+                job.failure_reason = error_message[:2000]
+                self.db.commit()
+                try:
+                    send_business_job_alert(
+                        event_type="job_failed",
+                        job_id=int(job.id),
+                        business_id=int(job.business_id),
+                        title=str(job.title or f"Job {job.id}"),
+                        status="failed",
+                        reason=str(job.failure_reason or ""),
+                    )
+                except Exception:
+                    pass
+
+                # Log error
+                self._log_action("job", job_id, "failed", {
+                    "error": error_message
+                })
+                raise e
+        finally:
+            reset_planner_runtime_transport(planner_ctx_token)
     
     async def _execute_agent(self, agent: Agent, input_data: Dict[str, Any]) -> Dict[str, Any]:
         """Execute agent via plugin, A2A protocol, or OpenAI-compatible (via platform adapter). Architecture runs A2A everywhere: native A2A agents or OpenAI endpoints via the adapter."""
         if agent.plugin_config:
             return await self._execute_plugin_agent(agent, input_data)
+        validate_outbound_a2a_payload(input_data)
         if getattr(agent, "a2a_enabled", False):
             return await self._execute_a2a_agent(agent, input_data)
         # OpenAI-compatible endpoint: route through platform A2A adapter so architecture is A2A everywhere
@@ -586,12 +1642,39 @@ class AgentExecutor:
             )
         api_key = (agent.api_key or "").strip() or None
         logger.debug("Executing agent '%s' via A2A: %s", agent.name, url)
-        result = await execute_via_a2a(
-            url,
-            input_data,
-            api_key=api_key,
-            blocking=True,
-            timeout=120.0,
+        started = time.perf_counter()
+        try:
+            result = await execute_via_a2a(
+                url,
+                input_data,
+                api_key=api_key,
+                blocking=True,
+                timeout=120.0,
+            )
+        except Exception as exc:
+            elapsed_ms = int((time.perf_counter() - started) * 1000.0)
+            self._emit_current_step_heartbeat(
+                phase="calling_agent",
+                reason_code="agent_endpoint_error",
+                message=f"A2A endpoint failed: {type(exc).__name__}",
+                reason_detail={
+                    "kind": "agent_call",
+                    "endpoint_host": url,
+                    "error_type": type(exc).__name__,
+                    "error_class": self._classify_endpoint_error(exc),
+                    "elapsed_ms": elapsed_ms,
+                },
+                commit_db=True,
+            )
+            raise
+        elapsed_ms = int((time.perf_counter() - started) * 1000.0)
+        self._emit_current_step_heartbeat(
+            phase="calling_agent",
+            reason_code="agent_endpoint_ok",
+            message="A2A endpoint returned response",
+            reason_detail={"kind": "agent_call", "endpoint_host": url, "elapsed_ms": elapsed_ms},
+            meaningful_progress=True,
+            commit_db=True,
         )
         # Return shape compatible with step output and _extract_agent_output_content
         return result
@@ -623,17 +1706,41 @@ class AgentExecutor:
         max_agent_rounds = 20
         round_idx = 0
         content = ""
+        usage_totals = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+        used_mcp_tools: set[str] = set()
+        auto_schema_retry_used = False
+        last_tool_name: Optional[str] = None
+        same_tool_count: int = 0
 
         while round_idx < max_agent_rounds:
             round_idx += 1
+            self._emit_current_step_heartbeat(
+                phase="calling_agent",
+                reason_code="adapter_round_start",
+                message=f"A2A adapter round {round_idx}/{max_agent_rounds}",
+                reason_detail={
+                    "kind": "agent_call",
+                    "loop": {"name": "adapter_tool_round", "round_idx": round_idx, "max_rounds": max_agent_rounds},
+                },
+                commit_db=True,
+            )
             metadata = {
                 "openai_url": url,
                 "openai_api_key": api_key or "",
                 "openai_model": model,
                 "openai_messages": messages,
+                # Deterministic tool-use behavior for stable SQL/MCP execution.
+                "openai_temperature": 0.0 if openai_tools else (
+                    float(getattr(agent, "temperature", 0.0))
+                    if getattr(agent, "temperature", None) is not None
+                    else 0.2
+                ),
             }
             if openai_tools:
+                metadata["openai_seed"] = int(getattr(settings, "AGENT_TOOLCALL_OPENAI_SEED", 42) or 42)
+            if openai_tools:
                 metadata["openai_tools"] = openai_tools
+            started = time.perf_counter()
             result = await execute_via_a2a(
                 adapter_url,
                 input_data,
@@ -642,9 +1749,27 @@ class AgentExecutor:
                 timeout=120.0,
                 adapter_metadata=metadata,
             )
+            elapsed_ms = int((time.perf_counter() - started) * 1000.0)
+            round_usage = _extract_token_usage_from_payload(result)
+            if round_usage:
+                usage_totals["prompt_tokens"] += int(round_usage.get("prompt_tokens") or 0)
+                usage_totals["completion_tokens"] += int(round_usage.get("completion_tokens") or 0)
+                usage_totals["total_tokens"] += int(round_usage.get("total_tokens") or 0)
             content = result.get("content") or ""
             tool_calls = result.get("tool_calls")
             if not tool_calls or not business_id:
+                self._emit_current_step_heartbeat(
+                    phase="calling_agent",
+                    reason_code="adapter_round_completed",
+                    message="Adapter returned final response (no tool calls)",
+                    reason_detail={
+                        "kind": "agent_call",
+                        "elapsed_ms": elapsed_ms,
+                        "loop": {"name": "adapter_tool_round", "round_idx": round_idx, "max_rounds": max_agent_rounds},
+                    },
+                    meaningful_progress=True,
+                    commit_db=True,
+                )
                 break
             # Append assistant message with tool_calls
             messages.append({"role": "assistant", "content": content or None, "tool_calls": tool_calls})
@@ -653,12 +1778,40 @@ class AgentExecutor:
                 tc_id = tc.get("id")
                 fn = tc.get("function") or {}
                 tool_name = fn.get("name")
+                if tool_name and tool_name == last_tool_name:
+                    same_tool_count += 1
+                else:
+                    same_tool_count = 1
+                    last_tool_name = tool_name
                 args_raw = fn.get("arguments") or "{}"
                 try:
                     args = json.loads(args_raw) if isinstance(args_raw, str) else args_raw
                 except (json.JSONDecodeError, TypeError):
                     args = {}
                 tool_result = await self._invoke_mcp_tool(business_id, tool_name, args, routing)
+                if isinstance(tool_name, str) and tool_name.strip():
+                    used_mcp_tools.add(tool_name.strip())
+                self._emit_current_step_heartbeat(
+                    phase="calling_tool",
+                    reason_code="tool_call_loop_observed",
+                    message=f"Tool loop call {tool_name}",
+                    reason_detail={
+                        "kind": "tool_call",
+                        "tool_name": tool_name,
+                        "same_tool_count": same_tool_count,
+                        "loop": {"name": "adapter_tool_round", "round_idx": round_idx, "max_rounds": max_agent_rounds},
+                    },
+                    commit_db=True,
+                )
+                tool_meta = routing.get(tool_name) or {}
+                tool_result, used_now = await self._maybe_auto_discover_sql_schema_once(
+                    business_id=business_id,
+                    tool_name=tool_name,
+                    tool_meta=tool_meta,
+                    tool_result=tool_result,
+                    already_used=auto_schema_retry_used,
+                )
+                auto_schema_retry_used = auto_schema_retry_used or used_now
                 messages.append({"role": "tool", "tool_call_id": tc_id, "content": tool_result})
             logger.info("MCP tool round %s: %s tool call(s), continuing agent loop", round_idx, len(tool_calls))
 
@@ -673,7 +1826,15 @@ class AgentExecutor:
                         )
                         break
 
-        return {"content": content}
+        if usage_totals["total_tokens"] <= 0:
+            usage_totals["total_tokens"] = usage_totals["prompt_tokens"] + usage_totals["completion_tokens"]
+        out: Dict[str, Any] = {"content": content}
+        if usage_totals["total_tokens"] > 0:
+            out["token_usage"] = usage_totals
+            out["usage"] = usage_totals
+        if used_mcp_tools:
+            out["mcp_tools_used"] = sorted(used_mcp_tools)
+        return out
 
     async def _execute_api_agent(self, agent: Agent, input_data: Dict[str, Any]) -> Dict[str, Any]:
         """
@@ -699,8 +1860,10 @@ class AgentExecutor:
         payload_for_log = self._truncate_payload_for_log(payload, max_content_len=1500)
         logger.info("Request payload: %s", json.dumps(payload_for_log, indent=2, default=str))
 
+        started = time.perf_counter()
         async with httpx.AsyncClient(**client_kwargs) as client:
             response = await client.post(url, json=payload, headers=headers)
+            elapsed_ms = int((time.perf_counter() - started) * 1000.0)
 
             try:
                 response_body = response.text
@@ -713,9 +1876,40 @@ class AgentExecutor:
             if response.status_code >= 400:
                 body = response_body if len(response_body) <= 800 else response_body[:800] + "..."
                 logger.error("Agent API returned %s: %s", response.status_code, body)
+                err_class = (
+                    "upstream_5xx"
+                    if 500 <= int(response.status_code) <= 599
+                    else ("throttled" if int(response.status_code) == 429 else "upstream_4xx")
+                )
+                self._emit_current_step_heartbeat(
+                    phase="calling_agent",
+                    reason_code="agent_endpoint_http_error",
+                    message=f"Agent endpoint HTTP {response.status_code}",
+                    reason_detail={
+                        "kind": "agent_call",
+                        "endpoint_host": url,
+                        "http_status": int(response.status_code),
+                        "error_class": err_class,
+                        "elapsed_ms": elapsed_ms,
+                    },
+                    commit_db=True,
+                )
                 raise Exception(
                     f"Agent inference returned {response.status_code} {response.reason_phrase}. Response: {body}"
                 )
+            self._emit_current_step_heartbeat(
+                phase="calling_agent",
+                reason_code="agent_endpoint_http_ok",
+                message=f"Agent endpoint HTTP {response.status_code}",
+                reason_detail={
+                    "kind": "agent_call",
+                    "endpoint_host": url,
+                    "http_status": int(response.status_code),
+                    "elapsed_ms": elapsed_ms,
+                },
+                meaningful_progress=True,
+                commit_db=True,
+            )
             return response.json()
 
     def _extract_agent_output_content(self, prev_output: Any) -> str:
@@ -863,13 +2057,28 @@ class AgentExecutor:
             for t in available_mcp_tools:
                 system_content += f"  - {t.get('name', '')}: {t.get('description', '')}\n"
             system_content += "\n"
-            if any(str(t.get("tool_type", "")).lower() in ("postgres", "mysql") for t in available_mcp_tools):
+            retrieval_tools = [
+                t
+                for t in available_mcp_tools
+                if str(t.get("tool_type", "")).lower() in _RETRIEVAL_MCP_TOOL_TYPES
+            ]
+            if len(retrieval_tools) > 1:
                 system_content += (
-                    "CRITICAL — PostgreSQL/MySQL platform tools: call with ONLY the arguments allowed by the tool schema: "
+                    "CRITICAL — Multiple search/retrieval tools are enabled (e.g. a vector store and PageIndex). "
+                    "They are different corpora. Use ONLY the tool that matches the assigned task and job wording "
+                    "(e.g. Pinecone for the tenant’s vector index). Do not call PageIndex or another retrieval API "
+                    "as a substitute for a Pinecone query unless the task explicitly names that source. "
+                    "Never present documents from one backend as results for another.\n\n"
+                )
+            if any(str(t.get("tool_type", "")).lower() in ("postgres", "mysql", "sqlserver") for t in available_mcp_tools):
+                system_content += (
+                    "CRITICAL — PostgreSQL/MySQL/SQL Server platform tools: call with ONLY the arguments allowed by the tool schema: "
                     "`query` (required) and optionally `params`. "
                     "Do NOT send write_mode, operation_type, target, artifact_ref, merge_keys, or idempotency_key with "
                     "these tools — those fields belong to the job output contract (e.g. MinIO/Snowflake artifact writes), "
                     "not to interactive SQL. "
+                    "For SQL Server, use T-SQL syntax (e.g. SELECT TOP 100, schema-qualified [schema].[table], bracketed identifiers like [column_name]); "
+                    "do NOT use LIMIT, backticks, or Postgres/MySQL-only syntax. "
                     "For a row count use only: {\"query\": \"SELECT COUNT(*) FROM your_table\"}.\n\n"
                 )
             if any(
@@ -883,6 +2092,10 @@ class AgentExecutor:
                 )
             # Database schema and business context for SQL tools (so the agent can write correct queries)
             schema_tools = [t for t in available_mcp_tools if t.get("schema_metadata") or t.get("business_description")]
+            sql_tools_without_schema = [
+                t for t in available_mcp_tools
+                if str(t.get("tool_type", "")).lower() in ("postgres", "mysql", "sqlserver") and not t.get("schema_metadata")
+            ]
             if schema_tools:
                 system_content += "═══════════════════════════════════════════════════════\n"
                 system_content += "DATABASE SCHEMA AND CONTEXT (use this to write correct SQL)\n"
@@ -902,7 +2115,39 @@ class AgentExecutor:
                             pass
                     system_content += "\n"
                 system_content += "Use the schema above to write valid SQL for the corresponding tool. Do not guess table or column names. "
-                system_content += "Then invoke that tool with your SQL so the platform executes it and returns results; do not only show the SQL in your message.\n\n"
+                system_content += (
+                    "Then invoke that tool with your SQL so the platform executes it and returns results; do not only show the SQL in your message. "
+                    "Report only metrics you can compute from existing tables/columns in the discovered schema. "
+                    "If a requested metric is not derivable from available schema, return null (or omit that key) instead of placeholder text like "
+                    "'Error retrieving data'.\n\n"
+                )
+            elif sql_tools_without_schema:
+                system_content += (
+                    "CRITICAL — SQL schema metadata is not available for one or more SQL tools. "
+                    "Before generating analytical insights, first discover schema via tool calls, then run analysis queries. "
+                    "Start with INFORMATION_SCHEMA.TABLES and INFORMATION_SCHEMA.COLUMNS for the selected SQL tool. "
+                    "Do not guess table/column names.\n\n"
+                )
+                system_content += (
+                    "Example schema discovery (SQL Server): "
+                    "{\"query\": \"SELECT TABLE_SCHEMA, TABLE_NAME FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_TYPE='BASE TABLE' ORDER BY TABLE_SCHEMA, TABLE_NAME\"}\n\n"
+                )
+        write_mode = (input_data.get("write_execution_mode") or "").strip().lower()
+        write_targets = input_data.get("write_targets") or []
+        if write_mode == "platform" and isinstance(write_targets, list) and write_targets:
+            system_content += "═══════════════════════════════════════════════════════\n"
+            system_content += "OUTPUT CONTRACT (STRICT)\n"
+            system_content += "═══════════════════════════════════════════════════════\n\n"
+            system_content += (
+                "Your final answer MUST be valid JSON with top-level key `records` containing an array of objects. "
+                "Do not return prose, markdown, or `{ \"content\": ... }` for this job. "
+                "If a query fails, retry with corrected SQL using schema context. "
+                "If no rows match, return `{ \"records\": [] }`.\n\n"
+            )
+            system_content += (
+                "Example valid output:\n"
+                "{\"records\":[{\"product_id\":980,\"queried_at\":\"2026-04-01T18:40:00Z\"}]}\n\n"
+            )
         messages.append({"role": "system", "content": system_content})
         
         # Add document content to messages with clear formatting (if documents exist)
@@ -1109,7 +2354,10 @@ END DOCUMENT {i+1}: {doc_name}
             "pinecone": "Pinecone vector store",
             "weaviate": "Weaviate vector store",
             "qdrant": "Qdrant vector store",
-            "chroma": "Chroma vector store",
+            "chroma": (
+                "Chroma vector store (per-user MCP config only; hits include sender/metadata for attribution; "
+                "similarity search is not exact email match; Chroma API key for Cloud; OpenAI on tool for self-hosted embed fallback)"
+            ),
             "postgres": "PostgreSQL database",
             "mysql": "MySQL database",
             "sqlserver": "SQL Server database",
@@ -1134,9 +2382,18 @@ END DOCUMENT {i+1}: {doc_name}
             MCPToolConfig.user_id == business_id,
             MCPToolConfig.is_active == True,
         )
-        if platform_tool_ids:
-            platform_query = platform_query.filter(MCPToolConfig.id.in_(platform_tool_ids))
-        platform = platform_query.order_by(MCPToolConfig.name).all()
+        # [] must mean "no platform tools" — `if platform_tool_ids` wrongly treated [] as "no filter" (all tools).
+        if platform_tool_ids is not None:
+            if len(platform_tool_ids) == 0:
+                platform = []
+            else:
+                platform = (
+                    platform_query.filter(MCPToolConfig.id.in_(platform_tool_ids))
+                    .order_by(MCPToolConfig.name)
+                    .all()
+                )
+        else:
+            platform = platform_query.order_by(MCPToolConfig.name).all()
         for t in platform:
             name = f"platform_{t.id}_{_safe_slug(t.name)}" if _safe_slug(t.name) else f"platform_{t.id}"
             desc = TOOL_TYPE_DESC.get(t.tool_type.value, t.tool_type.value)
@@ -1156,9 +2413,17 @@ END DOCUMENT {i+1}: {doc_name}
             MCPServerConnection.user_id == business_id,
             MCPServerConnection.is_active == True,
         )
-        if connection_ids:
-            conn_query = conn_query.filter(MCPServerConnection.id.in_(connection_ids))
-        conns = conn_query.order_by(MCPServerConnection.name).all()
+        if connection_ids is not None:
+            if len(connection_ids) == 0:
+                conns = []
+            else:
+                conns = (
+                    conn_query.filter(MCPServerConnection.id.in_(connection_ids))
+                    .order_by(MCPServerConnection.name)
+                    .all()
+                )
+        else:
+            conns = conn_query.order_by(MCPServerConnection.name).all()
         for c in conns:
             creds = None
             if c.encrypted_credentials:
@@ -1172,14 +2437,27 @@ END DOCUMENT {i+1}: {doc_name}
                 endpoint_path = "/" + endpoint_path
             remote_tools: list = []
             try:
-                res = await mcp_list_tools(
+                xh = self._sandhi_mcp_correlation_headers()
+                res = await guarded_mcp_list_tools(
+                    business_id=int(business_id),
+                    connection_id=int(c.id),
                     base_url=base_url,
                     endpoint_path=endpoint_path,
                     auth_type=c.auth_type or "none",
                     credentials=creds,
-                    timeout=20.0,
+                    timeout_seconds=20.0,
+                    extra_headers=xh if xh else None,
                 )
                 remote_tools = res.get("tools") or []
+            except MCPGuardrailError as ge:
+                logger.warning(
+                    "BYO MCP tools/list guardrail connection id=%s name=%s url=%s code=%s",
+                    c.id,
+                    c.name,
+                    base_url,
+                    ge.code,
+                )
+                continue
             except Exception as e:
                 logger.warning(
                     "BYO MCP tools/list failed for connection id=%s name=%s url=%s: %s",
@@ -1235,9 +2513,24 @@ END DOCUMENT {i+1}: {doc_name}
         Route tool call to platform MCP server or BYO (external) MCP connection.
         BYO tools use names from tools/list (byo_{connection_id}_{slug}) and forward to tools/call on that server.
         """
+        started = time.perf_counter()
+        self._emit_current_step_heartbeat(
+            phase="calling_tool",
+            reason_code="tool_call_start",
+            message=f"Calling tool {tool_name}",
+            reason_detail={"kind": "tool_call", "tool_name": tool_name},
+            commit_db=True,
+        )
         meta = routing.get(tool_name) if routing else None
         if not meta:
             return json.dumps({"error": f"Unknown tool {tool_name!r}. Not in this job's MCP tool list."})
+        if meta.get("source") == "platform":
+            parsed_id = platform_tool_id_from_mcp_function_name(tool_name)
+            if parsed_id is None:
+                return json.dumps({"error": "Invalid platform tool name"})
+            reg_id = meta.get("platform_tool_id")
+            if reg_id is not None and int(reg_id) != parsed_id:
+                return json.dumps({"error": "Tool name does not match this job's registered MCP tool"})
         if meta.get("source") == "external":
             conn = self.db.query(MCPServerConnection).filter(
                 MCPServerConnection.id == meta["connection_id"],
@@ -1251,24 +2544,166 @@ END DOCUMENT {i+1}: {doc_name}
                 return json.dumps({"error": "External MCP tool name missing in registry."})
             creds = decrypt_json(conn.encrypted_credentials) if conn.encrypted_credentials else None
             timeout = float(getattr(settings, "MCP_TOOL_DEFAULT_TIMEOUT_SECONDS", 60.0))
+            xh = self._sandhi_mcp_correlation_headers()
+            guard = get_mcp_guardrails()
+            target_key = f"external:{meta.get('connection_id')}:{conn.base_url.rstrip('/')}:{conn.endpoint_path or '/mcp'}:{ext_name}"
+            tenant_tier = self._resolve_business_tier(int(business_id))
             try:
-                result = await mcp_call_tool(
-                    base_url=conn.base_url.rstrip("/"),
-                    tool_name=ext_name,
-                    arguments=arguments or {},
-                    endpoint_path=conn.endpoint_path or "/mcp",
-                    auth_type=conn.auth_type or "none",
-                    credentials=creds,
-                    timeout=timeout,
+                logger.info(
+                    "byo_mcp_tools_call connection_id=%s tool=%s job_id=%s workflow_step_id=%s trace_id=%s",
+                    meta.get("connection_id"),
+                    ext_name,
+                    xh.get("X-Sandhi-Job-Id", "-"),
+                    xh.get("X-Sandhi-Workflow-Step-Id", "-"),
+                    xh.get("X-Sandhi-Trace-Id", "-"),
                 )
+                result = await guard.call_tool_with_guardrails(
+                    business_id=int(business_id),
+                    target_key=target_key,
+                    timeout_seconds=timeout,
+                    operation_class=self._infer_mcp_operation_class(ext_name, arguments or {}),
+                    tool_name=ext_name,
+                    tenant_tier=tenant_tier,
+                    idempotency_key=str((arguments or {}).get("idempotency_key") or ""),
+                    execute_call=lambda bounded_timeout: mcp_call_tool(
+                        base_url=conn.base_url.rstrip("/"),
+                        tool_name=ext_name,
+                        arguments=arguments or {},
+                        endpoint_path=conn.endpoint_path or "/mcp",
+                        auth_type=conn.auth_type or "none",
+                        credentials=creds,
+                        timeout=bounded_timeout,
+                        extra_headers=xh if xh else None,
+                    ),
+                )
+            except MCPGuardrailError as e:
+                elapsed_ms = int((time.perf_counter() - started) * 1000.0)
+                logger.warning(
+                    "BYO MCP guardrail blocked/failed connection_id=%s tool=%s code=%s job_id=%s step_id=%s",
+                    meta.get("connection_id"),
+                    ext_name,
+                    e.code,
+                    xh.get("X-Sandhi-Job-Id"),
+                    xh.get("X-Sandhi-Workflow-Step-Id"),
+                )
+                self._emit_current_step_heartbeat(
+                    phase="calling_tool",
+                    reason_code="tool_call_error",
+                    message=f"Tool {ext_name} failed: {e.code}",
+                    reason_detail={
+                        "kind": "tool_call",
+                        "tool_name": ext_name,
+                        "error_type": type(e).__name__,
+                        "error_code": e.code,
+                        "elapsed_ms": elapsed_ms,
+                        "tool_source": "external",
+                        "connection_id": meta.get("connection_id"),
+                    },
+                    commit_db=True,
+                )
+                return json.dumps({"error": e.code})
             except Exception as e:
-                logger.exception("BYO MCP tools/call failed connection_id=%s tool=%s", meta.get("connection_id"), ext_name)
+                elapsed_ms = int((time.perf_counter() - started) * 1000.0)
+                logger.exception(
+                    "BYO MCP tools/call failed connection_id=%s tool=%s job_id=%s workflow_step_id=%s",
+                    meta.get("connection_id"),
+                    ext_name,
+                    xh.get("X-Sandhi-Job-Id"),
+                    xh.get("X-Sandhi-Workflow-Step-Id"),
+                )
+                self._emit_current_step_heartbeat(
+                    phase="calling_tool",
+                    reason_code="tool_call_error",
+                    message=f"Tool {ext_name} failed: {type(e).__name__}",
+                    reason_detail={
+                        "kind": "tool_call",
+                        "tool_name": ext_name,
+                        "error_type": type(e).__name__,
+                        "elapsed_ms": elapsed_ms,
+                        "tool_source": "external",
+                        "connection_id": meta.get("connection_id"),
+                    },
+                    commit_db=True,
+                )
                 return json.dumps({"error": type(e).__name__})
-            return self._mcp_tool_result_to_text(result)
+            out = self._mcp_tool_result_to_text(result)
+            elapsed_ms = int((time.perf_counter() - started) * 1000.0)
+            self._emit_current_step_heartbeat(
+                phase="calling_tool",
+                reason_code="tool_call_result",
+                message=f"Tool {ext_name} returned result",
+                reason_detail={
+                    "kind": "tool_call",
+                    "tool_name": ext_name,
+                    "elapsed_ms": elapsed_ms,
+                    "tool_source": "external",
+                    "connection_id": meta.get("connection_id"),
+                },
+                meaningful_progress=True,
+                commit_db=True,
+            )
+            return out
         args = arguments if isinstance(arguments, dict) else {}
         if meta.get("source") == "platform":
             args = _sanitize_platform_sql_tool_arguments(str(meta.get("tool_type") or ""), args)
-        return await self._call_platform_mcp_tool(business_id, tool_name, args)
+        out = await self._call_platform_mcp_tool(business_id, tool_name, args)
+        elapsed_ms = int((time.perf_counter() - started) * 1000.0)
+        self._emit_current_step_heartbeat(
+            phase="calling_tool",
+            reason_code="tool_call_result",
+            message=f"Tool {tool_name} returned result",
+            reason_detail={"kind": "tool_call", "tool_name": tool_name, "elapsed_ms": elapsed_ms, "tool_source": "platform"},
+            meaningful_progress=True,
+            commit_db=True,
+        )
+        return out
+
+    async def _maybe_auto_discover_sql_schema_once(
+        self,
+        *,
+        business_id: int,
+        tool_name: str,
+        tool_meta: Dict[str, Any],
+        tool_result: str,
+        already_used: bool,
+    ) -> tuple[str, bool]:
+        """
+        Generic one-time fallback:
+        on first SQL ProgrammingError from a platform SQL tool, run schema discovery query and
+        append discovery output so the model can retry with corrected SQL in the next round.
+        """
+        if already_used:
+            return tool_result, False
+        if not isinstance(tool_meta, dict) or tool_meta.get("source") != "platform":
+            return tool_result, False
+        tool_type = str(tool_meta.get("tool_type") or "").strip().lower()
+        if tool_type not in ("sqlserver", "postgres", "mysql"):
+            return tool_result, False
+        if not _is_sql_programming_error_tool_result(tool_result):
+            return tool_result, False
+        query = _sql_schema_discovery_query(tool_type)
+        if not query:
+            return tool_result, False
+        try:
+            discovery = await self._call_platform_mcp_tool(
+                business_id,
+                tool_name,
+                {"query": query},
+            )
+        except Exception:
+            logger.exception(
+                "Auto schema discovery failed tool=%s tool_type=%s",
+                tool_name,
+                tool_type,
+            )
+            discovery = "Error: auto schema discovery failed"
+        enriched = (
+            f"{tool_result}\n\n"
+            "[auto_schema_discovery_once]\n"
+            f"{discovery}\n\n"
+            "Retry with corrected SQL using the discovered schema above."
+        )
+        return enriched, True
 
     async def _call_platform_mcp_tool(
         self, business_id: int, tool_name: str, arguments: Dict[str, Any]
@@ -1278,19 +2713,66 @@ END DOCUMENT {i+1}: {doc_name}
         if not base:
             return json.dumps({"error": "Platform MCP server not configured"})
         extra_headers = {"X-MCP-Business-Id": str(business_id)}
+        extra_headers.update(self._sandhi_mcp_correlation_headers())
+        corr = self._sandhi_mcp_correlation_headers()
+        guard = get_mcp_guardrails()
+        timeout = float(getattr(settings, "MCP_TOOL_DEFAULT_TIMEOUT_SECONDS", 60.0))
+        target_key = f"platform:{base}:/mcp:{tool_name}"
+        operation_class = self._infer_mcp_operation_class(tool_name, arguments)
+        tenant_tier = self._resolve_business_tier(int(business_id))
         try:
-            result = await mcp_call_tool(
-                base_url=base,
-                tool_name=tool_name,
-                arguments=arguments,
-                endpoint_path="/mcp",
-                timeout=60.0,
-                extra_headers=extra_headers,
+            logger.info(
+                "platform_mcp_tools_call tool_name=%s business_id=%s job_id=%s workflow_step_id=%s trace_id=%s",
+                tool_name,
+                business_id,
+                corr.get("X-Sandhi-Job-Id", "-"),
+                corr.get("X-Sandhi-Workflow-Step-Id", "-"),
+                corr.get("X-Sandhi-Trace-Id", "-"),
             )
+            result = await guard.call_tool_with_guardrails(
+                business_id=int(business_id),
+                target_key=target_key,
+                timeout_seconds=timeout,
+                operation_class=operation_class,
+                tool_name=tool_name,
+                tenant_tier=tenant_tier,
+                idempotency_key=str((arguments or {}).get("idempotency_key") or ""),
+                execute_call=lambda bounded_timeout: mcp_call_tool(
+                    base_url=base,
+                    tool_name=tool_name,
+                    arguments=arguments,
+                    endpoint_path="/mcp",
+                    timeout=bounded_timeout,
+                    extra_headers=extra_headers,
+                ),
+            )
+        except MCPGuardrailError as e:
+            logger.warning(
+                "Platform MCP guardrail blocked/failed tool_name=%s business_id=%s code=%s job_id=%s workflow_step_id=%s",
+                tool_name,
+                business_id,
+                e.code,
+                corr.get("X-Sandhi-Job-Id"),
+                corr.get("X-Sandhi-Workflow-Step-Id"),
+            )
+            return json.dumps({"error": e.code})
         except Exception as e:
-            logger.exception("Platform MCP tools/call failed tool_name=%s", tool_name)
+            logger.exception(
+                "Platform MCP tools/call failed tool_name=%s business_id=%s job_id=%s workflow_step_id=%s",
+                tool_name,
+                business_id,
+                corr.get("X-Sandhi-Job-Id"),
+                corr.get("X-Sandhi-Workflow-Step-Id"),
+            )
             return json.dumps({"error": type(e).__name__})
         return self._mcp_tool_result_to_text(result)
+
+    @staticmethod
+    def _infer_mcp_operation_class(tool_name: str, arguments: Optional[Dict[str, Any]]) -> str:
+        return infer_mcp_tool_operation_class(tool_name, arguments)
+
+    def _resolve_business_tier(self, business_id: int) -> str:
+        return resolve_mcp_tenant_tier(int(business_id))
 
     def _log_action(self, entity_type: str, entity_id: int, action: str, details: Dict[str, Any]):
         """Log an action to the audit log"""

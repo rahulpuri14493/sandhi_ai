@@ -1,5 +1,5 @@
 import axios from 'axios'
-import type { User } from './types'
+import type { JobRerunResponse, PlannerPipelineBundle, User } from './types'
 
 const API_BASE = '/api'
 
@@ -128,9 +128,20 @@ export const jobsAPI = {
   },
   update(jobId: number, data: Record<string, unknown>, files?: File[]) {
     const form = new FormData()
-    Object.entries(data).forEach(([k, v]) => {
+    const platformAllow = data.allowed_platform_tool_ids
+    const connectionAllow = data.allowed_connection_ids
+    const rest = { ...data } as Record<string, unknown>
+    delete rest.allowed_platform_tool_ids
+    delete rest.allowed_connection_ids
+    Object.entries(rest).forEach(([k, v]) => {
       if (v !== undefined && v !== null) form.append(k, typeof v === 'string' ? v : JSON.stringify(v))
     })
+    if (Array.isArray(platformAllow)) {
+      form.append('allowed_platform_tool_ids', JSON.stringify(platformAllow))
+    }
+    if (Array.isArray(connectionAllow)) {
+      form.append('allowed_connection_ids', JSON.stringify(connectionAllow))
+    }
     if (files?.length) files.forEach((f) => form.append('files', f))
     return api.put('/jobs/' + jobId, form, { headers: { 'Content-Type': 'multipart/form-data' } }).then((res) => res.data)
   },
@@ -152,8 +163,9 @@ export const jobsAPI = {
   execute(jobId: number) {
     return api.post('/jobs/' + jobId + '/execute').then((res) => res.data)
   },
-  rerun(jobId: number) {
-    return api.post('/jobs/' + jobId + '/rerun').then((res) => res.data)
+  rerun(jobId: number, mode?: 'resume' | 'full') {
+    const qs = mode ? `?mode=${encodeURIComponent(mode)}` : ''
+    return api.post<JobRerunResponse>('/jobs/' + jobId + '/rerun' + qs).then((res) => res.data)
   },
   getShareLink(jobId: number) {
     return api.get('/jobs/' + jobId + '/share-link').then((res) => res.data)
@@ -193,21 +205,55 @@ export const jobsAPI = {
   generateWorkflowQuestions(jobId: number) {
     return api.post('/jobs/' + jobId + '/generate-workflow-questions').then((res) => res.data)
   },
-  suggestWorkflowTools(jobId: number, agentIds: number[]) {
+  getAgentPlannerStatus() {
+    return api.get('/jobs/planner/status').then((res) => res.data)
+  },
+  listPlannerArtifacts(jobId: number) {
+    return api.get(`/jobs/${jobId}/planner-artifacts`).then((res) => res.data)
+  },
+  getPlannerArtifactRaw(jobId: number, artifactId: number) {
+    return api.get(`/jobs/${jobId}/planner-artifacts/${artifactId}/raw`, { responseType: 'json' }).then((res) => res.data)
+  },
+  getPlannerPipeline(jobId: number) {
+    return api.get<PlannerPipelineBundle>(`/jobs/${jobId}/planner-pipeline`).then((res) => res.data)
+  },
+  suggestWorkflowTools(
+    jobId: number,
+    agentIds: number[],
+    stepToolVisibility?: Array<'full' | 'names_only' | 'none'>
+  ) {
+    const body: {
+      agent_ids: number[]
+      step_tool_visibility?: Array<'full' | 'names_only' | 'none'>
+    } = { agent_ids: agentIds }
+    if (
+      stepToolVisibility &&
+      stepToolVisibility.length > 0 &&
+      stepToolVisibility.length === agentIds.length
+    ) {
+      body.step_tool_visibility = stepToolVisibility
+    }
     return api
       .post<{
-        step_suggestions: Array<{ agent_index: number; platform_tool_ids: number[]; rationale?: string }>
+        step_suggestions: Array<{ agent_index: number; agent_name?: string | null; platform_tool_ids: number[]; rationale?: string }>
         output_contract_stub: Record<string, unknown> | null
         fallback_used: boolean
         detail?: string
-      }>('/jobs/' + jobId + '/suggest-workflow-tools', { agent_ids: agentIds })
+      }>('/jobs/' + jobId + '/suggest-workflow-tools', body)
       .then((res) => res.data)
   },
   autoSplitWorkflow(
     jobId: number,
     agentIds: number[],
     workflowMode?: 'independent' | 'sequential',
-    stepTools?: Array<{ agent_index: number; allowed_platform_tool_ids?: number[]; allowed_connection_ids?: number[]; tool_visibility?: 'full' | 'names_only' | 'none' }>,
+    stepTools?: Array<{
+      agent_index: number
+      allowed_platform_tool_ids?: number[]
+      allowed_connection_ids?: number[]
+      tool_visibility?: 'full' | 'names_only' | 'none'
+      /** Registry / envelope task slug (optional); must match backend pattern. */
+      task_type?: string
+    }>,
     toolVisibility?: 'full' | 'names_only' | 'none',
     outputSettings?: {
       write_execution_mode?: 'platform' | 'agent' | 'ui_only'
@@ -218,7 +264,13 @@ export const jobsAPI = {
     const body: {
       agent_ids: number[]
       workflow_mode?: string
-      step_tools?: Array<{ agent_index: number; allowed_platform_tool_ids?: number[]; allowed_connection_ids?: number[]; tool_visibility?: string }>
+      step_tools?: Array<{
+        agent_index: number
+        allowed_platform_tool_ids?: number[]
+        allowed_connection_ids?: number[]
+        tool_visibility?: string
+        task_type?: string
+      }>
       tool_visibility?: string
       write_execution_mode?: string
       output_artifact_format?: string
@@ -226,7 +278,8 @@ export const jobsAPI = {
     } = { agent_ids: agentIds }
     if (workflowMode) body.workflow_mode = workflowMode
     if (stepTools?.length) body.step_tools = stepTools
-    if (toolVisibility) body.tool_visibility = toolVisibility
+    // Omit when undefined so the server uses the job default; all union values are non-empty strings.
+    if (toolVisibility !== undefined) body.tool_visibility = toolVisibility
     if (outputSettings) {
       if (outputSettings.write_execution_mode !== undefined) {
         body.write_execution_mode = outputSettings.write_execution_mode
@@ -255,6 +308,11 @@ export const dashboardsAPI = {
   getBusinessJobs() {
     return api.get('/businesses/jobs').then((res) => res.data)
   },
+  getBusinessAgentPerformance(limitSteps = 500) {
+    return api
+      .get('/businesses/agents/performance?limit_steps=' + encodeURIComponent(String(limitSteps)))
+      .then((res) => res.data)
+  },
   getDeveloperEarnings() {
     return api.get('/developers/earnings').then((res) => res.data)
   },
@@ -263,6 +321,11 @@ export const dashboardsAPI = {
   },
   getDeveloperStats() {
     return api.get('/developers/stats').then((res) => res.data)
+  },
+  getDeveloperAgentPerformance(limitSteps = 800) {
+    return api
+      .get('/developers/agents/performance?limit_steps=' + encodeURIComponent(String(limitSteps)))
+      .then((res) => res.data)
   },
 }
 
@@ -319,6 +382,12 @@ export interface MCPToolConfigRes {
   business_description?: string | null
   schema_metadata?: string | null
   schema_table_count?: number | null
+  /** GET /mcp/tools/:id only — non-secret Chroma URL so the form can hide Cloud-only fields when editing. */
+  chroma_url_preview?: string | null
+  /** WCD cluster display name; GET /tools/{id} only */
+  weaviate_cluster_preview?: string | null
+  /** Weaviate class/collection name; GET /tools/{id} only */
+  weaviate_class_preview?: string | null
   created_at: string
   updated_at: string
 }

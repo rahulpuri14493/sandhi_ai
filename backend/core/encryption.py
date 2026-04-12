@@ -8,7 +8,6 @@ Generate a key: python -c "import secrets; print(secrets.token_urlsafe(32))"
 import base64
 import hashlib
 import logging
-from typing import Optional
 
 from core.config import settings
 

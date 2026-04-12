@@ -1,13 +1,18 @@
+# Fork PRs: analyze PR head; do not use pull_request_target. Same-repo PRs to any base branch get CodeQL.
 name: CodeQL Analysis
 
 on:
   push:
     branches: ["main"]
   pull_request:
-    branches: ["main"]
+    branches: ["**"]
   schedule:
     - cron: "0 3 * * 1"
   workflow_dispatch:
+
+concurrency:
+  group: codeql-${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
   actions: read
@@ -16,7 +21,10 @@ permissions:
 
 jobs:
   analyze:
-    if: ${{ vars.CODEQL_ADVANCED_ENABLED == 'true' }}
+    # Run by default. Fork PR runs may not resolve repository variables the same way;
+    # treating unset as "enabled" avoids a skipped job blocking merge when CodeQL is required.
+    # Set repository variable CODEQL_ADVANCED_ENABLED=false to disable this workflow.
+    if: ${{ vars.CODEQL_ADVANCED_ENABLED != 'false' }}
     name: Analyze (${{ matrix.language }})
     runs-on: ubuntu-latest
     strategy:

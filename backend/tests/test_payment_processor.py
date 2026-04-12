@@ -3,10 +3,8 @@ import pytest
 from unittest.mock import MagicMock
 from datetime import datetime
 
-from models.job import Job, WorkflowStep, JobStatus
+from models.job import Job, WorkflowStep
 from models.agent import Agent
-from models.user import User
-from models.transaction import Transaction
 from services.payment_processor import PaymentProcessor
 
 

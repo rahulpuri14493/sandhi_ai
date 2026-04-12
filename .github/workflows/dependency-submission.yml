@@ -1,0 +1,40 @@
+# Submits resolved Python dependencies to GitHub's dependency graph so
+# dependency-review can diff base/head and reduce "no snapshot" / stale metadata
+# warnings. Fork PRs cannot submit (token is read-only); same-repo PRs and pushes
+# to main populate snapshots for Component Detection (pip + simple pip manifests).
+name: Dependency submission
+
+on:
+  pull_request:
+    branches: ["**"]
+  push:
+    branches: ["main"]
+
+permissions:
+  contents: write
+  id-token: write
+
+concurrency:
+  group: dependency-submission-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  submit:
+    name: Submit Python dependency snapshot
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # Fork PRs: default GITHUB_TOKEN cannot write dependency graph snapshots.
+      # Keep this job green (same job name) so branch protection is not blocked by "skipped".
+      - name: Component detection (pip)
+        if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+        uses: advanced-security/component-detection-dependency-submission-action@v0.1.1
+        with:
+          filePath: "."
+          detectorArgs: Pip=EnableIfDefaultOff,SimplePip=EnableIfDefaultOff
+
+      - name: Fork PR — skip dependency snapshot (read-only token)
+        if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository
+        run: echo "Skipping dependency graph submission for fork PR (token cannot write snapshots)."

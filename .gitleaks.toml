@@ -2,8 +2,18 @@
 useDefault = true
 
 [allowlist]
-description = "Allow historical test-fixture false positive only"
+description = "Test fixtures and documented non-production defaults (not real credentials)"
 commits = ["5d46632c9ad1a15f381e80812eff0d45157cd05b"]
-paths = ['''backend/tests/test_mcp\.py''']
+paths = [
+  '''backend/tests/test_mcp\.py''',
+  '''backend/tests/integration/test_vector_e2e\.py''',
+  '''docs/HEARTBEAT_AND_KPI_GUIDE\.md''',
+  '''tools/platform_mcp_server/tests/test_integrations_object_storage_deep\.py''',
+]
 regexTarget = "line"
-regexes = ['''"idempotency_key"\s*:\s*"[A-Za-z0-9_-]{8,}"''']
+# docker-compose dev fallback (${MCP_INTERNAL_SECRET:-dev-mcp-internal-secret}); not a committed production secret.
+regexes = [
+  '''"idempotency_key"\s*:\s*"[A-Za-z0-9_-]{8,}"''',
+  '''\$\{MCP_INTERNAL_SECRET:-dev-mcp-internal-secret\}''',
+  '''"execution_token"\s*:\s*"(?:sched-[^"]+|<redacted>)"''',
+]

@@ -57,18 +57,10 @@ def client_with_agents(db_session):
 
 
 def test_list_agents_public(client_with_agents):
-    """GET /api/agents returns active agents without auth."""
+    """GET /api/agents requires auth (APIsec: unenforced credentials)."""
     client, _, agent1, agent2 = client_with_agents
     response = client.get("/api/agents")
-    assert response.status_code == 200
-    data = response.json()
-    assert isinstance(data, list)
-    assert len(data) >= 2
-    names = [a["name"] for a in data]
-    assert "Test Agent 1" in names
-    assert "Test Agent 2" in names
-    for a in data:
-        assert "api_key" not in a or a.get("api_key") is None
+    assert response.status_code == 401
 
 
 def test_list_agents_includes_average_rating_and_review_count(client_with_agents):
@@ -80,7 +72,7 @@ def test_list_agents_includes_average_rating_and_review_count(client_with_agents
         json={"rating": 4, "review_text": "Good"},
         headers={"Authorization": f"Bearer {token}"},
     )
-    response = client.get("/api/agents")
+    response = client.get("/api/agents", headers={"Authorization": f"Bearer {token}"})
     assert response.status_code == 200
     data = response.json()
     agent1_data = next(a for a in data if a["id"] == agent1.id)
@@ -92,8 +84,9 @@ def test_list_agents_includes_average_rating_and_review_count(client_with_agents
 
 def test_list_agents_filter_by_status(client_with_agents):
     """GET /api/agents?status=active returns only active agents."""
-    client, _, _, _ = client_with_agents
-    response = client.get("/api/agents", params={"status": "active"})
+    client, dev, _, _ = client_with_agents
+    token = create_access_token(data={"sub": dev.id})
+    response = client.get("/api/agents", params={"status": "active"}, headers={"Authorization": f"Bearer {token}"})
     assert response.status_code == 200
     data = response.json()
     assert all(a["status"] == "active" for a in data)

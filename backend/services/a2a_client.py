@@ -34,7 +34,10 @@ def _message_parts_from_input(input_data: Dict[str, Any]) -> List[Dict[str, Any]
     """
     Convert our executor input_data into A2A Message parts.
     We send a single text part containing JSON so the agent receives full context.
-    Agents that expect natural language can parse or we could add a human-readable part.
+
+    Payloads are normalized by the job executor (see ``schemas.executor_platform_payload``):
+    ``platform_a2a_schema`` (e.g. sandhi.executor_context.v1) and ``sandhi_trace`` (job_id,
+    workflow_step_id, step_order, agent_id) appear in that JSON for debugging and external agents.
     """
     return [_text_part(json.dumps(input_data, default=str))]
 
@@ -72,6 +75,10 @@ def _extract_result_from_send_message_response(response_body: Dict[str, Any]) ->
         out = {"content": content, "raw_message": msg}
         if "tool_calls" in result:
             out["tool_calls"] = result["tool_calls"]
+        if isinstance(result.get("usage"), dict):
+            out["usage"] = result["usage"]
+        if isinstance(result.get("token_usage"), dict):
+            out["token_usage"] = result["token_usage"]
         return out
 
     # Task response
@@ -118,10 +125,32 @@ def _extract_result_from_send_message_response(response_body: Dict[str, Any]) ->
     return {"content": "", "task_id": task.get("id"), "state": state}
 
 
-def _validate_public_http_url(url: str) -> str:
+def _a2a_urls_equivalent(a: str, b: str) -> bool:
+    """True if two http(s) URLs point to the same scheme, host, and port (default ports normalized)."""
+    try:
+        ua = httpx.URL((a or "").strip())
+        ub = httpx.URL((b or "").strip())
+    except Exception:
+        return False
+
+    def norm(u: httpx.URL) -> tuple:
+        p = u.port
+        if p is None:
+            p = 443 if u.scheme == "https" else 80
+        host = (u.host or "").lower()
+        return (u.scheme, host, p)
+
+    return norm(ua) == norm(ub)
+
+
+def _validate_public_http_url(url: str, *, allow_private_resolve: bool = False) -> str:
     """
     SSRF protection: ensure the URL uses http/https, uses an allowed port,
     and resolves to a public IP. Raises ValueError if invalid or private/internal.
+
+    When allow_private_resolve is True (e.g. target is the configured platform
+    A2A adapter URL), private/Docker DNS resolution is allowed. External agent
+    URLs still use the default strict check unless ALLOW_PRIVATE_AGENT_ENDPOINTS is set.
     """
     if not (url or "").strip():
         raise ValueError("Agent endpoint URL is required")
@@ -150,7 +179,7 @@ def _validate_public_http_url(url: str) -> str:
     except OSError as exc:
         raise ValueError(f"Could not resolve agent endpoint host: {hostname}") from exc
 
-    if not settings.ALLOW_PRIVATE_AGENT_ENDPOINTS:
+    if not settings.ALLOW_PRIVATE_AGENT_ENDPOINTS and not allow_private_resolve:
         for family, _, _, _, sockaddr in addr_info:
             ip_str = None
             if family == socket.AF_INET:
@@ -213,7 +242,19 @@ async def send_message(
         headers["Authorization"] = f"Bearer {(api_key or '').strip()}"
 
     normalized_url = (url or "").strip()
-    safe_url = _validate_public_http_url(normalized_url)
+    adapter = (settings.A2A_ADAPTER_URL or "").strip()
+    planner_adapter = (getattr(settings, "AGENT_PLANNER_ADAPTER_URL", None) or "").strip()
+    planner_native = (getattr(settings, "AGENT_PLANNER_A2A_URL", None) or "").strip()
+    allow_private = bool(
+        adapter and _a2a_urls_equivalent(normalized_url, adapter)
+    ) or bool(
+        planner_adapter and _a2a_urls_equivalent(normalized_url, planner_adapter)
+    ) or bool(
+        planner_native and _a2a_urls_equivalent(normalized_url, planner_native)
+    )
+    safe_url = _validate_public_http_url(
+        normalized_url, allow_private_resolve=allow_private
+    )
 
     async with httpx.AsyncClient(timeout=timeout, verify=httpx_verify_parameter()) as client:
         # codeql[py/full-ssrf] URL validated by _validate_public_http_url (scheme, hostname, port, public IP)

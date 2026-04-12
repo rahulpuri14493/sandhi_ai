@@ -1,12 +1,44 @@
-import { useEffect, useState } from 'react'
+import { useCallback, useEffect, useState } from 'react'
 import { useParams, useSearchParams, useNavigate, useLocation } from 'react-router-dom'
 import { jobsAPI, mcpAPI } from '../lib/api'
-import type { Job, WorkflowPreview, WorkflowStep, JobSchedule } from '../lib/types'
+import type { Job, WorkflowPreview, WorkflowStep, JobSchedule, PlannerPipelineBundle } from '../lib/types'
+import { FlashToast } from '../components/FlashToast'
+import { RerunModeModal } from '../components/RerunModeModal'
 import SchedulePicker, { humanReadableSchedule } from '../components/SchedulePicker'
 import { WorkflowBuilder } from '../components/WorkflowBuilder'
 import { CostCalculator } from '../components/CostCalculator'
 import { JobStatusTracker } from '../components/JobStatusTracker'
 import { DocumentConversation } from '../components/DocumentConversation'
+import { buildJobDetailSharedToolWarning } from '../lib/independentWorkflowSharedTools'
+import { filterByJobAllowedIds, jobHasExplicitMcpScope } from '../lib/jobMcpScope'
+import {
+  buildPlatformToolIdToNameMap,
+  enrichPlannerArtifactJsonForDisplay,
+  formatPlannerAgentLabel,
+  orderedWorkflowSteps,
+} from '../lib/plannerArtifactDisplay'
+import { formatRerunStartedMessage } from '../lib/rerunFeedback'
+
+function ppStr(v: unknown): string {
+  if (v == null) return ''
+  if (typeof v === 'string') return v
+  if (typeof v === 'number' || typeof v === 'boolean') return String(v)
+  return ''
+}
+
+function ppStrList(v: unknown): string[] {
+  if (!Array.isArray(v)) return []
+  return v.map(ppStr).filter((s) => s.length > 0)
+}
+
+type StepToolVisibilityUi = 'full' | 'names_only' | 'none'
+
+/** Step override, else job default, else full (legacy rows with no stored visibility). */
+function effectiveStepToolVisibility(step: WorkflowStep, job: Job | null | undefined): StepToolVisibilityUi {
+  const v = step.tool_visibility ?? job?.tool_visibility
+  if (v === 'full' || v === 'names_only' || v === 'none') return v
+  return 'full'
+}
 
 export default function JobDetailPage() {
   const { id } = useParams<{ id: string }>()
@@ -39,6 +71,26 @@ export default function JobDetailPage() {
   })
   const [isSavingSchedule, setIsSavingSchedule] = useState(false)
   const [countdown, setCountdown] = useState<number | null>(null)
+  const [plannerSectionOpen, setPlannerSectionOpen] = useState(false)
+  const [plannerStatus, setPlannerStatus] = useState<{
+    configured: boolean
+    provider?: string
+    model?: string
+    base_url_configured?: boolean
+  } | null>(null)
+  const [plannerArtifacts, setPlannerArtifacts] = useState<
+    Array<{
+      id: number
+      artifact_type: string
+      storage: string
+      byte_size: number
+      created_at: string
+    }>
+  >([])
+  const [plannerSupportLoading, setPlannerSupportLoading] = useState(false)
+  const [plannerRawModal, setPlannerRawModal] = useState<{ title: string; body: string } | null>(null)
+  const [plannerPipeline, setPlannerPipeline] = useState<PlannerPipelineBundle | null>(null)
+  const [plannerPipelineError, setPlannerPipelineError] = useState<string | null>(null)
 
   useEffect(() => {
     if (jobId) {
@@ -49,8 +101,23 @@ export default function JobDetailPage() {
     if (searchParams.get('qa') === 'true') {
       setMode('qa')
     }
+    const requestedMode = searchParams.get('mode')
+    if (requestedMode === 'status' || requestedMode === 'workflow' || requestedMode === 'preview' || requestedMode === 'qa') {
+      setMode(requestedMode)
+    }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [jobId, searchParams])
+
+  useEffect(() => {
+    const focusStep = searchParams.get('focus_step')
+    if (!focusStep || !job?.workflow_steps?.length) return
+    const sid = parseInt(focusStep, 10)
+    if (!Number.isFinite(sid)) return
+    const target = document.getElementById(`workflow-step-${sid}`)
+    if (target) {
+      target.scrollIntoView({ behavior: 'smooth', block: 'center' })
+    }
+  }, [job, searchParams])
 
   useEffect(() => {
     if (job && mode === 'preview') {
@@ -117,6 +184,9 @@ export default function JobDetailPage() {
   }
 
   const [showExecuteConfirm, setShowExecuteConfirm] = useState(false)
+  const [showRerunModal, setShowRerunModal] = useState(false)
+  const [isRerunning, setIsRerunning] = useState(false)
+  const [rerunToast, setRerunToast] = useState<string | null>(null)
 
   const handleExecute = async () => {
     if (!job) return
@@ -154,17 +224,26 @@ export default function JobDetailPage() {
   }
 
   const openStepToolsModal = async (step: WorkflowStep) => {
-    setEditingStepTools(step)
+    let latestJob: Job | null = job
+    try {
+      latestJob = await jobsAPI.get(jobId)
+      setJob(latestJob)
+    } catch {
+      // keep cached job
+    }
+    const stepFromServer = latestJob?.workflow_steps?.find((s) => s.id === step.id) ?? step
+    setEditingStepTools(stepFromServer)
     setStepToolsSelection({
-      platformIds: step.allowed_platform_tool_ids ?? [],
-      connectionIds: step.allowed_connection_ids ?? [],
+      platformIds: stepFromServer.allowed_platform_tool_ids ?? [],
+      connectionIds: stepFromServer.allowed_connection_ids ?? [],
+      toolVisibility: effectiveStepToolVisibility(stepFromServer, latestJob),
     })
     try {
       const [tools, conns] = await Promise.all([mcpAPI.listTools(), mcpAPI.listConnections()])
-      const allowedPlatform = job?.allowed_platform_tool_ids
-      const allowedConn = job?.allowed_connection_ids
-      setStepToolsModalPlatform(allowedPlatform?.length ? tools.filter((t: { id: number }) => allowedPlatform.includes(t.id)) : tools)
-      setStepToolsModalConnections(allowedConn?.length ? conns.filter((c: { id: number }) => allowedConn.includes(c.id)) : conns)
+      const allowedPlatform = latestJob?.allowed_platform_tool_ids
+      const allowedConn = latestJob?.allowed_connection_ids
+      setStepToolsModalPlatform(filterByJobAllowedIds(tools, allowedPlatform))
+      setStepToolsModalConnections(filterByJobAllowedIds(conns, allowedConn))
     } catch (e) {
       console.error(e)
     }
@@ -177,6 +256,7 @@ export default function JobDetailPage() {
       await jobsAPI.updateStepTools(jobId, editingStepTools.id, {
         allowed_platform_tool_ids: stepToolsSelection.platformIds,
         allowed_connection_ids: stepToolsSelection.connectionIds,
+        tool_visibility: stepToolsSelection.toolVisibility,
       })
       await loadJob()
       await loadWorkflowPreview()
@@ -226,17 +306,7 @@ export default function JobDetailPage() {
 
   const handleRerun = async () => {
     if (!job) return
-    if (!window.confirm('Are you sure you want to rerun this job? This will reset the workflow and execute it again.')) {
-      return
-    }
-    try {
-      await jobsAPI.rerun(jobId)
-      await loadJob()
-      setMode('status')
-    } catch (error) {
-      console.error('Failed to rerun job:', error)
-      alert('Failed to rerun job. Only failed or cancelled jobs can be rerun.')
-    }
+    setShowRerunModal(true)
   }
 
   const handleCancel = async () => {
@@ -273,6 +343,79 @@ export default function JobDetailPage() {
     return () => clearInterval(timer)
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [job?.status, job?.scheduled_at])
+
+  useEffect(() => {
+    if (!jobId || !plannerSectionOpen) return
+    let cancelled = false
+    setPlannerSupportLoading(true)
+    setPlannerPipeline(null)
+    setPlannerPipelineError(null)
+    ;(async () => {
+      try {
+        const [stRes, listRes, pipeRes, toolsRes] = await Promise.allSettled([
+          jobsAPI.getAgentPlannerStatus(),
+          jobsAPI.listPlannerArtifacts(jobId),
+          jobsAPI.getPlannerPipeline(jobId),
+          mcpAPI.listTools(),
+        ])
+        if (cancelled) return
+        if (stRes.status === 'fulfilled') setPlannerStatus(stRes.value)
+        else setPlannerStatus(null)
+        if (listRes.status === 'fulfilled') {
+          setPlannerArtifacts(Array.isArray(listRes.value?.items) ? listRes.value.items : [])
+        } else {
+          setPlannerArtifacts([])
+        }
+        if (pipeRes.status === 'fulfilled') {
+          setPlannerPipeline(pipeRes.value)
+          setPlannerPipelineError(null)
+        } else {
+          setPlannerPipeline(null)
+          setPlannerPipelineError('Could not load combined planning view.')
+        }
+        if (toolsRes.status === 'fulfilled') {
+          setPlatformToolsList(Array.isArray(toolsRes.value) ? toolsRes.value : [])
+        }
+      } finally {
+        if (!cancelled) setPlannerSupportLoading(false)
+      }
+    })()
+    return () => {
+      cancelled = true
+    }
+  }, [jobId, plannerSectionOpen])
+
+  const platformToolNamesForSuggestion = useCallback(
+    (row: Record<string, unknown>): string[] => {
+      const explicit = row.platform_tool_names
+      if (Array.isArray(explicit)) {
+        const names = explicit.map(ppStr).filter(Boolean)
+        if (names.length > 0) return names
+      }
+      const byId = buildPlatformToolIdToNameMap(platformToolsList)
+      const ids = Array.isArray(row.platform_tool_ids) ? (row.platform_tool_ids as unknown[]) : []
+      return ids
+        .map((id) => {
+          const key = ppStr(id)
+          if (!key) return ''
+          return byId.get(key) || `Tool #${key}`
+        })
+        .filter(Boolean)
+    },
+    [platformToolsList],
+  )
+
+  const refreshPlannerPipelineIfOpen = useCallback(async () => {
+    if (!jobId || !plannerSectionOpen) return
+    try {
+      const pipe = await jobsAPI.getPlannerPipeline(jobId)
+      setPlannerPipeline(pipe)
+      setPlannerPipelineError(null)
+    } catch {
+      setPlannerPipeline(null)
+      setPlannerPipelineError('Could not load combined planning view.')
+    }
+  }, [jobId, plannerSectionOpen])
 
   if (isLoading) {
     return (
@@ -477,6 +620,324 @@ export default function JobDetailPage() {
           )}
         </div>
 
+        <div className="mb-8 bg-dark-100/50 backdrop-blur-xl rounded-2xl shadow-2xl border border-dark-200/50 overflow-hidden">
+          <button
+            type="button"
+            onClick={() => setPlannerSectionOpen((o) => !o)}
+            className="w-full flex items-center justify-between gap-4 px-6 py-4 text-left hover:bg-dark-200/30 transition-colors"
+          >
+            <span className="text-white font-bold text-lg">Agent planner &amp; audit artifacts</span>
+            <span className="text-white/50 text-sm font-semibold">{plannerSectionOpen ? 'Hide' : 'Show'}</span>
+          </button>
+          {plannerSectionOpen && (
+            <div className="px-6 pb-6 pt-0 border-t border-dark-200/50">
+              {plannerSupportLoading ? (
+                <p className="text-white/60 py-4">Loading planner status and artifacts…</p>
+              ) : (
+                <>
+                  <div className="py-4 space-y-2 text-white/80 text-sm">
+                    <p className="font-semibold text-white">Platform planner</p>
+                    {plannerStatus ? (
+                      <ul className="list-disc list-inside space-y-1 text-white/70">
+                        <li>Configured: {plannerStatus.configured ? 'yes' : 'no'}</li>
+                        {plannerStatus.provider != null && <li>Provider: {plannerStatus.provider}</li>}
+                        {plannerStatus.model != null && <li>Model: {plannerStatus.model}</li>}
+                        {plannerStatus.base_url_configured != null && (
+                          <li>Base URL set: {plannerStatus.base_url_configured ? 'yes' : 'no'}</li>
+                        )}
+                      </ul>
+                    ) : (
+                      <p className="text-white/50">Could not load planner status.</p>
+                    )}
+                  </div>
+
+                  <div className="mt-6 pt-6 border-t border-dark-200/50">
+                    <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3 mb-4">
+                      <div>
+                        <p className="font-semibold text-white text-sm">Planning overview</p>
+                        <p className="text-white/50 text-xs mt-0.5">
+                          Latest BRD analysis, auto-split tasks, and tool suggestions in one place. Export downloads the same JSON as the API.
+                        </p>
+                      </div>
+                      <button
+                        type="button"
+                        disabled={!plannerPipeline}
+                        onClick={() => {
+                          if (!plannerPipeline) return
+                          const blob = new Blob([JSON.stringify(plannerPipeline, null, 2)], {
+                            type: 'application/json',
+                          })
+                          const url = window.URL.createObjectURL(blob)
+                          const a = document.createElement('a')
+                          a.href = url
+                          a.download = `job-${jobId}-planner-pipeline.json`
+                          document.body.appendChild(a)
+                          a.click()
+                          window.URL.revokeObjectURL(url)
+                          document.body.removeChild(a)
+                        }}
+                        className="shrink-0 px-4 py-2 rounded-xl text-sm font-bold bg-dark-200/70 text-white border border-dark-300 hover:bg-dark-200 disabled:opacity-40 disabled:pointer-events-none"
+                      >
+                        Export combined JSON
+                      </button>
+                    </div>
+                    {plannerPipelineError && (
+                      <p className="text-amber-400/90 text-sm mb-3">{plannerPipelineError}</p>
+                    )}
+                    {plannerPipeline && (
+                      <div className="space-y-5">
+                        <section className="rounded-xl border border-dark-200/50 bg-dark-200/20 p-4">
+                          <h4 className="text-white font-bold text-sm mb-2">BRD analysis</h4>
+                          {plannerPipeline.artifact_ids?.brd_analysis != null &&
+                          plannerPipeline.brd_analysis == null ? (
+                            <p className="text-amber-400/90 text-xs">
+                              Latest artifact is stored but JSON could not be read. Open raw from the table below.
+                            </p>
+                          ) : plannerPipeline.brd_analysis ? (
+                            <div className="space-y-3 text-sm text-white/85">
+                              {ppStr(plannerPipeline.brd_analysis.analysis) ? (
+                                <div>
+                                  <p className="text-white/50 text-xs font-semibold uppercase tracking-wide mb-1">
+                                    Analysis
+                                  </p>
+                                  <div className="max-h-48 overflow-y-auto rounded-lg bg-dark-100/50 p-3 text-white/90 whitespace-pre-wrap">
+                                    {ppStr(plannerPipeline.brd_analysis.analysis)}
+                                  </div>
+                                </div>
+                              ) : null}
+                              {ppStrList(plannerPipeline.brd_analysis.questions).length > 0 ? (
+                                <div>
+                                  <p className="text-white/50 text-xs font-semibold uppercase tracking-wide mb-1">
+                                    Questions
+                                  </p>
+                                  <ul className="list-disc list-inside space-y-1 text-white/80">
+                                    {ppStrList(plannerPipeline.brd_analysis.questions).map((q, i) => (
+                                      <li key={i}>{q}</li>
+                                    ))}
+                                  </ul>
+                                </div>
+                              ) : null}
+                              {ppStrList(plannerPipeline.brd_analysis.recommendations).length > 0 ? (
+                                <div>
+                                  <p className="text-white/50 text-xs font-semibold uppercase tracking-wide mb-1">
+                                    Recommendations
+                                  </p>
+                                  <ul className="list-disc list-inside space-y-1 text-white/80">
+                                    {ppStrList(plannerPipeline.brd_analysis.recommendations).map((r, i) => (
+                                      <li key={i}>{r}</li>
+                                    ))}
+                                  </ul>
+                                </div>
+                              ) : null}
+                              {!ppStr(plannerPipeline.brd_analysis.analysis) &&
+                                ppStrList(plannerPipeline.brd_analysis.questions).length === 0 &&
+                                ppStrList(plannerPipeline.brd_analysis.recommendations).length === 0 && (
+                                  <p className="text-white/50 text-xs">No summary fields in this artifact.</p>
+                                )}
+                            </div>
+                          ) : (
+                            <p className="text-white/50 text-xs">No BRD analysis artifact for this job yet.</p>
+                          )}
+                        </section>
+
+                        <section className="rounded-xl border border-dark-200/50 bg-dark-200/20 p-4">
+                          <h4 className="text-white font-bold text-sm mb-2">Task split (auto-split)</h4>
+                          {plannerPipeline.artifact_ids?.task_split != null &&
+                          plannerPipeline.task_split == null ? (
+                            <p className="text-amber-400/90 text-xs">
+                              Latest artifact is stored but JSON could not be read. Open raw from the table below.
+                            </p>
+                          ) : plannerPipeline.task_split &&
+                            Array.isArray(plannerPipeline.task_split.parsed_assignments) ? (
+                            <ol className="space-y-3 list-decimal list-inside text-sm text-white/85">
+                              {(plannerPipeline.task_split.parsed_assignments as Record<string, unknown>[]).map(
+                                (row, idx) => {
+                                  const reason = ppStr(row.assignment_reason)
+                                  const docs = Array.isArray(row.assigned_document_ids)
+                                    ? (row.assigned_document_ids as unknown[]).map(ppStr).filter(Boolean)
+                                    : []
+                                  return (
+                                    <li key={idx} className="pl-1">
+                                      <span className="font-semibold text-white">
+                                        {formatPlannerAgentLabel(
+                                          row.agent_name,
+                                          row.agent_index,
+                                          orderedWorkflowSteps(job.workflow_steps),
+                                        )}
+                                      </span>
+                                      {ppStr(row.task) ? (
+                                        <p className="mt-1 text-white/80 whitespace-pre-wrap">{ppStr(row.task)}</p>
+                                      ) : null}
+                                      {docs.length > 0 ? (
+                                        <p className="mt-1 text-xs text-white/55">
+                                          Documents: {docs.join(', ')}
+                                        </p>
+                                      ) : null}
+                                      {reason ? (
+                                        <p className="mt-2 text-xs text-primary-300/90 border-l-2 border-primary-500/40 pl-2">
+                                          <span className="text-white/50 font-semibold">Why this agent: </span>
+                                          {reason}
+                                        </p>
+                                      ) : null}
+                                    </li>
+                                  )
+                                },
+                              )}
+                            </ol>
+                          ) : plannerPipeline.task_split ? (
+                            <p className="text-white/50 text-xs">
+                              No parsed_assignments in the latest task split. Use View on the artifact row for full JSON.
+                            </p>
+                          ) : (
+                            <p className="text-white/50 text-xs">No task split artifact for this job yet.</p>
+                          )}
+                        </section>
+
+                        <section className="rounded-xl border border-dark-200/50 bg-dark-200/20 p-4">
+                          <h4 className="text-white font-bold text-sm mb-2">Tool suggestions</h4>
+                          {plannerPipeline.artifact_ids?.tool_suggestion != null &&
+                          plannerPipeline.tool_suggestion == null ? (
+                            <p className="text-amber-400/90 text-xs">
+                              Latest artifact is stored but JSON could not be read. Open raw from the table below.
+                            </p>
+                          ) : plannerPipeline.tool_suggestion &&
+                            Array.isArray(plannerPipeline.tool_suggestion.step_suggestions) ? (
+                            <ul className="space-y-3 text-sm text-white/85">
+                              {(plannerPipeline.tool_suggestion.step_suggestions as Record<string, unknown>[]).map(
+                                (s, idx) => (
+                                  <li
+                                    key={idx}
+                                    className="rounded-lg bg-dark-100/40 border border-dark-200/30 p-3"
+                                  >
+                                    <p className="font-semibold text-white">
+                                      Step {idx + 1}
+                                      {' · '}
+                                      {formatPlannerAgentLabel(
+                                        s.agent_name,
+                                        s.agent_index,
+                                        orderedWorkflowSteps(job.workflow_steps),
+                                      )}
+                                    </p>
+                                    {ppStr(s.rationale) ? (
+                                      <p className="mt-1 text-white/75 text-xs whitespace-pre-wrap">
+                                        {ppStr(s.rationale)}
+                                      </p>
+                                    ) : null}
+                                    {platformToolNamesForSuggestion(s).length > 0 ? (
+                                      <p className="mt-1 text-xs text-white/50">
+                                        Platform tools: {platformToolNamesForSuggestion(s).join(', ')}
+                                      </p>
+                                    ) : null}
+                                  </li>
+                                ),
+                              )}
+                            </ul>
+                          ) : plannerPipeline.tool_suggestion ? (
+                            <p className="text-white/50 text-xs">
+                              No step_suggestions in this artifact. Use View for full JSON.
+                            </p>
+                          ) : (
+                            <p className="text-white/50 text-xs">No tool suggestion artifact for this job yet.</p>
+                          )}
+                        </section>
+                      </div>
+                    )}
+                  </div>
+
+                  <div>
+                    <p className="font-semibold text-white mb-2 text-sm">Stored artifacts (BRD / task split / tool suggestion)</p>
+                    {plannerArtifacts.length === 0 ? (
+                      <p className="text-white/50 text-sm">No artifacts for this job yet.</p>
+                    ) : (
+                      <div className="overflow-x-auto rounded-xl border border-dark-200/50">
+                        <table className="w-full text-sm text-left">
+                          <thead className="bg-dark-200/40 text-white/70">
+                            <tr>
+                              <th className="px-3 py-2 font-semibold">Type</th>
+                              <th className="px-3 py-2 font-semibold">Storage</th>
+                              <th className="px-3 py-2 font-semibold">Size</th>
+                              <th className="px-3 py-2 font-semibold">Created</th>
+                              <th className="px-3 py-2 font-semibold">Raw JSON</th>
+                            </tr>
+                          </thead>
+                          <tbody className="text-white/85">
+                            {plannerArtifacts.map((row) => (
+                              <tr key={row.id} className="border-t border-dark-200/40">
+                                <td className="px-3 py-2">{row.artifact_type}</td>
+                                <td className="px-3 py-2">{row.storage}</td>
+                                <td className="px-3 py-2">{row.byte_size}</td>
+                                <td className="px-3 py-2 whitespace-nowrap">
+                                  {row.created_at ? new Date(row.created_at).toLocaleString() : '—'}
+                                </td>
+                                <td className="px-3 py-2">
+                                  <button
+                                    type="button"
+                                    className="text-primary-400 hover:text-primary-300 font-semibold underline-offset-2 hover:underline"
+                                    onClick={async () => {
+                                      try {
+                                        const data = await jobsAPI.getPlannerArtifactRaw(jobId, row.id)
+                                        const toolMap = buildPlatformToolIdToNameMap(platformToolsList)
+                                        const displayData =
+                                          row.artifact_type === 'tool_suggestion' ||
+                                          row.artifact_type === 'task_split'
+                                            ? enrichPlannerArtifactJsonForDisplay(row.artifact_type, data, {
+                                                workflowSteps: job.workflow_steps || [],
+                                                platformToolIdToName: toolMap,
+                                              })
+                                            : data
+                                        setPlannerRawModal({
+                                          title: `${row.artifact_type} (#${row.id})`,
+                                          body: JSON.stringify(displayData, null, 2),
+                                        })
+                                      } catch (e) {
+                                        console.error(e)
+                                        alert('Failed to load artifact JSON')
+                                      }
+                                    }}
+                                  >
+                                    View
+                                  </button>
+                                </td>
+                              </tr>
+                            ))}
+                          </tbody>
+                        </table>
+                      </div>
+                    )}
+                  </div>
+                </>
+              )}
+            </div>
+          )}
+        </div>
+
+        {plannerRawModal && (
+          <div
+            className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/70 backdrop-blur-sm"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="planner-raw-title"
+          >
+            <div className="bg-dark-100 border border-dark-200 rounded-2xl shadow-2xl max-w-4xl w-full max-h-[85vh] flex flex-col">
+              <div className="flex items-center justify-between px-5 py-4 border-b border-dark-200/50">
+                <h2 id="planner-raw-title" className="text-lg font-bold text-white">
+                  {plannerRawModal.title}
+                </h2>
+                <button
+                  type="button"
+                  onClick={() => setPlannerRawModal(null)}
+                  className="text-white/70 hover:text-white px-3 py-1 rounded-lg hover:bg-dark-200/50 font-semibold"
+                >
+                  Close
+                </button>
+              </div>
+              <pre className="flex-1 overflow-auto p-4 text-xs text-white/90 font-mono whitespace-pre-wrap break-all">
+                {plannerRawModal.body}
+              </pre>
+            </div>
+          </div>
+        )}
+
         {job.status === 'draft' && (
           <div className="mb-8 bg-dark-100/50 backdrop-blur-xl rounded-2xl shadow-2xl p-6 border border-dark-200/50">
             <div className="flex gap-4">
@@ -579,13 +1040,45 @@ export default function JobDetailPage() {
               key={jobId}
               jobId={jobId}
               job={job}
-              onWorkflowCreated={() => { loadJob(); loadWorkflowPreview(); }}
+              onWorkflowCreated={() => {
+                loadJob()
+                loadWorkflowPreview()
+                void refreshPlannerPipelineIfOpen()
+              }}
               initialSelectedAgentIds={selectedAgentsFromCreate}
             />
             {job.workflow_steps && job.workflow_steps.length > 0 && (
               <div className="mt-6 p-6 bg-dark-100/50 rounded-2xl border border-dark-200/50">
                 <h3 className="font-bold text-white mb-3">Tools per step</h3>
-                <p className="text-sm text-white/60 mb-4">Choose which tools each agent can use. You can limit an agent to specific tools (e.g. only Postgres) or leave it to use all job tools.</p>
+                {(() => {
+                  const w = buildJobDetailSharedToolWarning(job)
+                  if (!w) return null
+                  return (
+                    <div
+                      className={`mb-4 p-4 rounded-xl border-2 text-sm ${
+                        w.variant === 'strong'
+                          ? 'bg-amber-500/15 border-amber-500/50 text-amber-100'
+                          : 'bg-slate-600/20 border-slate-400/40 text-white/90'
+                      }`}
+                      role="status"
+                    >
+                      <p className="font-bold text-white mb-2">{w.title}</p>
+                      <ul className="list-disc list-inside space-y-1.5 text-white/85">
+                        {w.lines.map((line, i) => (
+                          <li key={i}>{line}</li>
+                        ))}
+                      </ul>
+                      <p className="mt-2 text-xs text-white/50">
+                        See <code className="text-primary-300">backend/docs/INDEPENDENT_WORKFLOW_SHARED_TOOLS.md</code> for headers and behavior.
+                      </p>
+                    </div>
+                  )
+                })()}
+                <p className="text-sm text-white/60 mb-4">
+                  {jobHasExplicitMcpScope(job)
+                    ? 'Choose which tools each agent can use. You can limit an agent to specific tools (e.g. only Postgres) or leave a step empty to use the job\u2019s tool list.'
+                    : 'Choose which tools each agent can use. With no job-level tool list, a step left empty shows no tools assigned here.'}
+                </p>
                 <div className="space-y-2">
                   {job.workflow_steps.map((step) => (
                     <div key={step.id} className="flex items-center justify-between py-2 px-4 bg-dark-200/30 rounded-xl border border-dark-300">
@@ -594,7 +1087,9 @@ export default function JobDetailPage() {
                         <span className="text-sm text-white/50">
                           {(step.allowed_platform_tool_ids?.length ?? 0) + (step.allowed_connection_ids?.length ?? 0) > 0
                             ? `${step.allowed_platform_tool_ids?.length ?? 0} platform, ${step.allowed_connection_ids?.length ?? 0} connection(s)`
-                            : 'All job tools'}
+                            : jobHasExplicitMcpScope(job)
+                              ? 'Uses job-scoped tools'
+                              : '—'}
                         </span>
                         <button
                           type="button"
@@ -622,8 +1117,16 @@ export default function JobDetailPage() {
                 <div className="mb-4">
                   <h4 className="text-white font-semibold mb-2">Tool visibility (what this step sees)</h4>
                   <select
-                    value={stepToolsSelection.toolVisibility ?? 'full'}
-                    onChange={(e) => setStepToolsSelection((prev) => ({ ...prev, toolVisibility: e.target.value as 'full' | 'names_only' | 'none' }))}
+                    value={
+                      stepToolsSelection.toolVisibility ??
+                      (editingStepTools ? effectiveStepToolVisibility(editingStepTools, job) : 'full')
+                    }
+                    onChange={(e) =>
+                      setStepToolsSelection((prev) => ({
+                        ...prev,
+                        toolVisibility: e.target.value as StepToolVisibilityUi,
+                      }))
+                    }
                     className="w-full px-3 py-2 bg-dark-200 border border-dark-300 rounded-lg text-white focus:ring-2 focus:ring-primary-500"
                   >
                     <option value="full">Full — Names, descriptions, schema & business context</option>
@@ -719,7 +1222,12 @@ export default function JobDetailPage() {
         )}
 
         {mode === 'status' && (
-          <JobStatusTracker jobId={jobId} job={job} onJobUpdate={loadJob} />
+          <JobStatusTracker
+            jobId={jobId}
+            job={job}
+            onJobUpdate={loadJob}
+            focusedStepId={Number(searchParams.get('focus_step') || 0) || undefined}
+          />
         )}
 
         {mode === 'status' && job.status !== 'draft' && job.workflow_steps && job.workflow_steps.length > 0 && (
@@ -756,7 +1264,9 @@ export default function JobDetailPage() {
                     <span className="text-sm text-white/70">
                       {names || (platformIds.length > 0 || connCount > 0
                         ? `${platformIds.length} platform, ${connCount} connection(s)`
-                        : 'All job tools')}
+                        : jobHasExplicitMcpScope(job)
+                          ? 'Uses job-scoped tools'
+                          : '—')}
                       {visibilityLabel && <span className="text-white/50 ml-1">(visibility: {visibilityLabel})</span>}
                     </span>
                   </div>
@@ -996,12 +1506,13 @@ export default function JobDetailPage() {
             <div className="flex flex-wrap gap-3">
               <button
                 onClick={handleRerun}
+                disabled={isRerunning}
                 className="px-8 py-4 bg-gradient-to-r from-primary-500 to-primary-700 text-white rounded-xl font-bold hover:shadow-2xl hover:shadow-primary-500/50 hover:scale-105 transition-all duration-200 flex items-center gap-2"
               >
                 <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                   <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
                 </svg>
-                Rerun Now
+                {isRerunning ? 'Rerunning...' : 'Rerun Now'}
               </button>
               <button
                 onClick={() => {
@@ -1034,6 +1545,27 @@ export default function JobDetailPage() {
             )}
           </div>
         )}
+        <RerunModeModal
+          isOpen={showRerunModal}
+          isSubmitting={isRerunning}
+          onClose={() => setShowRerunModal(false)}
+          onSelect={async (mode) => {
+            setIsRerunning(true)
+            try {
+              const resp = await jobsAPI.rerun(jobId, mode)
+              setShowRerunModal(false)
+              setRerunToast(formatRerunStartedMessage(resp))
+              await loadJob()
+              setMode('status')
+            } catch (error) {
+              console.error('Failed to rerun job:', error)
+              setRerunToast('Failed to rerun job. Only failed or cancelled jobs can be rerun.')
+            } finally {
+              setIsRerunning(false)
+            }
+          }}
+        />
+        <FlashToast message={rerunToast} onDismiss={() => setRerunToast(null)} />
       </div>
     </div>
   )

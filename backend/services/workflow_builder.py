@@ -8,9 +8,19 @@ from models.job import Job, WorkflowStep
 from models.agent import Agent
 from models.transaction import Earnings
 from models.communication import AgentCommunication
-from schemas.job import WorkflowPreview, WorkflowStepResponse
+from schemas.job import WorkflowPreview
+from core.config import settings
 from services.payment_processor import PaymentProcessor
-from services.task_splitter import split_job_for_agents
+from services.planner_artifact_storage import (
+    persist_brd_analysis_artifact,
+    persist_json_planner_artifact,
+)
+from services.planner_llm import (
+    is_agent_planner_configured,
+    planner_runtime_transport_scope,
+    resolve_runtime_planner_transport,
+)
+from services.task_splitter import PlannerSplitError, split_job_for_agents
 
 logger = logging.getLogger(__name__)
 
@@ -83,6 +93,78 @@ class WorkflowBuilder:
         """Sync wrapper for tests and non-async code paths (runs the async loader in a new event loop)."""
         return asyncio.run(self.load_job_documents_content_async(job))
 
+    async def replan_workflow_steps_at_execute_async(self, job_id: int) -> None:
+        """Re-run platform task split and replace workflow steps immediately before job execution.
+
+        Preserves agent order, sequential vs independent wiring, per-step tool allowlists and task_type.
+        No-op when ``AGENT_PLANNER_EXECUTE_REPLAN`` is false, planner is not configured, or the job has
+        at most one workflow step. Raises :class:`PlannerSplitError` when the planner cannot produce a
+        valid split (same as auto-split).
+        """
+        if not getattr(settings, "AGENT_PLANNER_EXECUTE_REPLAN", True):
+            return
+        if not is_agent_planner_configured():
+            return
+        job = self.db.query(Job).filter(Job.id == job_id).first()
+        if not job:
+            raise ValueError("Job not found")
+        origin = (getattr(job, "workflow_origin", None) or "auto_split").strip().lower()
+        if origin == "manual":
+            logger.info(
+                "Skipping execute-time replan for job_id=%s (workflow_origin=manual)",
+                job_id,
+            )
+            return
+        steps = (
+            self.db.query(WorkflowStep)
+            .filter(WorkflowStep.job_id == job_id)
+            .order_by(WorkflowStep.step_order)
+            .all()
+        )
+        if len(steps) <= 1:
+            return
+        agent_ids = [s.agent_id for s in steps]
+        workflow_mode = (
+            "sequential"
+            if any(s.depends_on_previous for s in steps if s.step_order and s.step_order > 1)
+            else "independent"
+        )
+        step_tools: List[Dict[str, Any]] = []
+        for idx, s in enumerate(steps):
+
+            def _loads_col(raw: Optional[str]) -> Optional[Any]:
+                if raw is None or raw == "":
+                    return None
+                try:
+                    return json.loads(raw)
+                except (json.JSONDecodeError, TypeError):
+                    return None
+
+            task_type_val: Optional[str] = None
+            if s.input_data:
+                try:
+                    inp = json.loads(s.input_data)
+                    if isinstance(inp, dict) and inp.get("task_type"):
+                        task_type_val = str(inp["task_type"]).strip().lower() or None
+                except (json.JSONDecodeError, TypeError):
+                    pass
+            step_tools.append(
+                {
+                    "agent_index": idx,
+                    "allowed_platform_tool_ids": _loads_col(s.allowed_platform_tool_ids),
+                    "allowed_connection_ids": _loads_col(s.allowed_connection_ids),
+                    "tool_visibility": s.tool_visibility,
+                    "task_type": task_type_val,
+                }
+            )
+        await self.auto_split_workflow_async(
+            job_id,
+            agent_ids,
+            workflow_mode=workflow_mode,
+            step_tools=step_tools,
+            tool_visibility=job.tool_visibility,
+        )
+
     def _get_workflow_collaboration_hint(self, job: Job) -> Optional[str]:
         """Get workflow_collaboration_hint from job conversation (BRD/analyze-documents). Returns 'sequential', 'async_a2a', or None."""
         if not job.conversation:
@@ -108,11 +190,16 @@ class WorkflowBuilder:
         tool_visibility: Optional[str] = None,
     ) -> WorkflowPreview:
         """Automatically split a job across selected agents. workflow_mode: 'independent' | 'sequential' | None.
-        step_tools: optional list of {agent_index, allowed_platform_tool_ids, allowed_connection_ids, tool_visibility} per step.
-        tool_visibility: job-level full | names_only | none (restricts what tool info agents see; credentials never shared)."""
+        step_tools: optional list of {agent_index, allowed_platform_tool_ids, allowed_connection_ids, tool_visibility, task_type} per step.
+        tool_visibility: job-level full | names_only | none (restricts what tool info agents see; credentials never shared).
+
+        Task splitting uses the platform Agent Planner when it is configured; otherwise the first selected
+        agent's OpenAI-compatible API (if that agent has api_endpoint set). If neither applies, per-step
+        tasks fall back to simple defaults."""
         job = self.db.query(Job).filter(Job.id == job_id).first()
         if not job:
             raise ValueError("Job not found")
+        job.workflow_origin = "auto_split"
         if tool_visibility is not None:
             job.tool_visibility = tool_visibility
             self.db.commit()
@@ -149,27 +236,37 @@ class WorkflowBuilder:
             "output_artifact_format": artifact_format,
         }
         
-        # Split job into subtasks per agent (generalized, uses first agent's API when available)
+        # Task split: platform planner when configured; else heuristic fallback (no hired-agent LLM).
         task_assignments = []
+        task_split_audit: Dict[str, Any] = {}
         if agents:
-            splitter = agents[0] if (agents[0].api_endpoint and (agents[0].api_endpoint or "").strip()) else None
-            try:
-                if splitter:
+            decision = resolve_runtime_planner_transport(
+                self.db,
+                agent_ids=[int(a.id) for a in agents if getattr(a, "id", None) is not None],
+            )
+            with planner_runtime_transport_scope(decision):
+                try:
+                    async def _reload_docs() -> List[Dict[str, Any]]:
+                        return await self.load_job_documents_content_async(job)
+
                     task_assignments = await split_job_for_agents(
                         job_title=job.title,
                         job_description=job.description or "",
                         documents_content=documents_content,
                         conversation_data=conversation_data,
                         agents=agents,
-                        splitter_agent=splitter,
+                        llm_audit=task_split_audit,
+                        reload_documents_content=_reload_docs,
                     )
-            except Exception as e:
-                logger.warning("Task split failed: %s, using fallback", e)
-            if not task_assignments:
-                task_assignments = [
-                    {"agent_index": i, "task": f"Execute the job. You are agent {i+1} of {len(agents)}. {job.description or job.title}"}
-                    for i in range(len(agents))
-                ]
+                except PlannerSplitError:
+                    raise
+                except Exception as e:
+                    logger.warning("Task split failed: %s, using fallback", e)
+                if not task_assignments:
+                    task_assignments = [
+                        {"agent_index": i, "task": f"Execute the job. You are agent {i+1} of {len(agents)}. {job.description or job.title}"}
+                        for i in range(len(agents))
+                    ]
         
         # Independent vs sequential: from request override or BRD/conversation hint
         if workflow_mode == "independent":
@@ -199,25 +296,22 @@ class WorkflowBuilder:
                 self.db.query(AgentCommunication).filter(comm_filter).delete(synchronize_session=False)
         self.db.query(WorkflowStep).filter(WorkflowStep.job_id == job_id).delete(synchronize_session=False)
         
-        # When no step_tools provided (e.g. "From BRD/document"): assign job-level tools to every step so selection is saved and visible when job is opened
-        job_platform_ids = None
-        job_conn_ids = None
-        if not step_tools:
-            if getattr(job, "allowed_platform_tool_ids", None):
-                try:
-                    parsed = json.loads(job.allowed_platform_tool_ids)
-                    if isinstance(parsed, list) and len(parsed) > 0:
-                        job_platform_ids = [int(x) for x in parsed if x is not None]
-                except (TypeError, ValueError, json.JSONDecodeError):
-                    pass
-            if getattr(job, "allowed_connection_ids", None):
-                try:
-                    parsed = json.loads(job.allowed_connection_ids)
-                    if isinstance(parsed, list) and len(parsed) > 0:
-                        job_conn_ids = [int(x) for x in parsed if x is not None]
-                except (TypeError, ValueError, json.JSONDecodeError):
-                    pass
-        
+        def _parse_job_tool_allowlist(raw) -> Optional[list]:
+            if not raw:
+                return None
+            try:
+                parsed = json.loads(raw)
+                if isinstance(parsed, list):
+                    return [int(x) for x in parsed if x is not None]
+            except (TypeError, ValueError, json.JSONDecodeError):
+                pass
+            return None
+
+        # Job-level allowlists: used when step_tools is absent, or to fill per-step defaults when
+        # the client sends step_tools with tool_visibility but omits IDs (inherit job scope).
+        job_platform_ids = _parse_job_tool_allowlist(getattr(job, "allowed_platform_tool_ids", None))
+        job_conn_ids = _parse_job_tool_allowlist(getattr(job, "allowed_connection_ids", None))
+
         # Create workflow steps - each agent gets assigned task + base context
         steps = []
         for idx, agent in enumerate(agents):
@@ -261,27 +355,44 @@ class WorkflowBuilder:
                 "document_scope_restricted": document_scope_restricted,
                 "previous_agents_outputs": []  # Filled by executor when passing previous outputs
             }
-            
+
             # Validate step input data includes documents and conversation
             step_docs = step_input_data.get('documents', [])
             step_conv = step_input_data.get('conversation', [])
             logger.debug("Step %s for agent '%s': depends_on_previous=%s documents=%s conversation_items=%s", idx + 1, agent.name, depends_on_previous, len(step_docs), len(step_conv))
-            
-            step_platform = step_conn = step_tool_visibility = None
+
+            step_platform = step_conn = step_tool_visibility = step_task_type = None
             if step_tools:
                 for st in step_tools:
                     if st.get("agent_index") == idx:
-                        step_platform = st.get("allowed_platform_tool_ids")
-                        step_conn = st.get("allowed_connection_ids")
+                        # Only override when the client sent an explicit list (including []); None = inherit job allowlist.
+                        if st.get("allowed_platform_tool_ids") is not None:
+                            step_platform = st.get("allowed_platform_tool_ids")
+                        if st.get("allowed_connection_ids") is not None:
+                            step_conn = st.get("allowed_connection_ids")
                         step_tool_visibility = st.get("tool_visibility")
+                        tt = st.get("task_type")
+                        if tt is not None and str(tt).strip():
+                            step_task_type = str(tt).strip().lower()
                         break
+            step_visibility = step_tool_visibility if step_tool_visibility is not None else (tool_visibility or getattr(job, "tool_visibility", None))
+            # tool_visibility='none' means no MCP tools for this step — never inherit job allowlists (would contradict "none").
+            step_vis_norm = str(step_visibility or "").strip().lower()
+            if step_vis_norm == "none":
+                step_platform = []
+                step_conn = []
+            elif step_tools:
+                if step_platform is None and job_platform_ids is not None:
+                    step_platform = job_platform_ids
+                if step_conn is None and job_conn_ids is not None:
+                    step_conn = job_conn_ids
             else:
-                # Auto-assign job-level tools to this step (From BRD/document: tools selection by system, saved for completed job view)
                 if job_platform_ids is not None:
                     step_platform = job_platform_ids
                 if job_conn_ids is not None:
                     step_conn = job_conn_ids
-            step_visibility = step_tool_visibility if step_tool_visibility is not None else (tool_visibility or getattr(job, "tool_visibility", None))
+            if step_task_type:
+                step_input_data["task_type"] = step_task_type
             step = WorkflowStep(
                 job_id=job_id,
                 agent_id=agent.id,
@@ -289,13 +400,85 @@ class WorkflowBuilder:
                 input_data=json.dumps(step_input_data),
                 status="pending",
                 depends_on_previous=depends_on_previous,
-                allowed_platform_tool_ids=json.dumps(step_platform) if step_platform else None,
-                allowed_connection_ids=json.dumps(step_conn) if step_conn else None,
+                allowed_platform_tool_ids=json.dumps(step_platform) if (step_platform is not None and len(step_platform) > 0) else None,
+                allowed_connection_ids=json.dumps(step_conn) if (step_conn is not None and len(step_conn) > 0) else None,
                 tool_visibility=step_visibility,
             )
             self.db.add(step)
             steps.append(step)
-        
+
+        task_split_source = task_split_audit.get("source")
+        raw_split = task_split_audit.get("raw_llm_response")
+        if not task_split_source:
+            # Keep planner/audit panel populated even when split uses single-agent or fallback path.
+            task_split_source = "single_agent_short_circuit" if len(agents) <= 1 else "fallback_or_heuristic"
+        task_split_payload: Dict[str, Any] = {
+            "job_title": job.title,
+            "job_description": job.description,
+            "source": task_split_source,
+            "parsed_assignments": task_assignments,
+            "planner_audit": {
+                "has_raw_llm_response": bool(raw_split),
+                "agent_count": len(agents),
+                "document_count": len(documents_content),
+            },
+        }
+        if raw_split:
+            task_split_payload["raw_llm_response"] = raw_split
+        await persist_json_planner_artifact(
+            self.db,
+            job_id,
+            "task_split",
+            task_split_payload,
+        )
+
+        # Keep planner pipeline populated even when /suggest-workflow-tools was not called.
+        step_suggestions: List[Dict[str, Any]] = []
+        for s in steps:
+            platform_ids: List[int] = []
+            if s.allowed_platform_tool_ids:
+                try:
+                    raw_ids = json.loads(s.allowed_platform_tool_ids)
+                    if isinstance(raw_ids, list):
+                        platform_ids = [int(x) for x in raw_ids if x is not None]
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    platform_ids = []
+            step_suggestions.append(
+                {
+                    "agent_index": max(0, int(s.step_order or 1) - 1),
+                    "platform_tool_ids": platform_ids,
+                    "rationale": "Derived from workflow step allowlists.",
+                }
+            )
+        await persist_json_planner_artifact(
+            self.db,
+            job_id,
+            "tool_suggestion",
+            {
+                "source": "auto_split_placeholder",
+                "fallback_used": True,
+                "detail": "Generated during auto-split when explicit tool suggestion flow is not invoked.",
+                "parsed_result": {
+                    "step_suggestions": step_suggestions,
+                    "output_contract_stub": None,
+                    "fallback_used": True,
+                },
+            },
+        )
+
+        # If no BRD docs are present, persist a lightweight placeholder so UI doesn't show an empty section.
+        if not documents_content:
+            await persist_brd_analysis_artifact(
+                self.db,
+                job_id,
+                {
+                    "analysis": "No BRD documents attached for this job at auto-split time.",
+                    "questions": [],
+                    "recommendations": ["Upload BRD documents to enable full BRD analysis artifacts."],
+                    "source": "auto_split_placeholder",
+                },
+            )
+
         self.db.commit()
         
         # Calculate costs
@@ -326,7 +509,8 @@ class WorkflowBuilder:
         job = self.db.query(Job).filter(Job.id == job_id).first()
         if not job:
             raise ValueError("Job not found")
-        
+        job.workflow_origin = "manual"
+
         # Parse conversation data from job
         conversation_data = None
         if job.conversation:

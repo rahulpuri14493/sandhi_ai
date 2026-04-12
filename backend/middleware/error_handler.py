@@ -24,7 +24,11 @@ def _serializable_errors(errors: list) -> list:
 async def validation_exception_handler(request: Request, exc: RequestValidationError):
     return JSONResponse(
         status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-        content={"detail": _serializable_errors(exc.errors())},
+        content={
+            "detail": _serializable_errors(exc.errors()),
+            "message": "Validation failed for one or more fields.",
+            "path": request.url.path,
+        },
     )
 
 
@@ -32,7 +36,9 @@ async def http_exception_handler(request: Request, exc: StarletteHTTPException):
     # Ensure detail is JSON-serializable (avoids secondary 500 if detail is odd types).
     return JSONResponse(
         status_code=exc.status_code,
-        content=jsonable_encoder({"detail": exc.detail}),
+        content=jsonable_encoder(
+            {"detail": exc.detail, "path": request.url.path}
+        ),
     )
 
 

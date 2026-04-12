@@ -97,4 +97,20 @@ describe('Auth Store', () => {
     await useAuthStore.getState().loadUser()
     expect(useAuthStore.getState().user).toBeNull()
   })
+
+  it('login fails when getCurrentUser returns null after login', async () => {
+    vi.mocked(authAPI.login).mockResolvedValue(undefined as never)
+    vi.mocked(authAPI.getCurrentUser).mockResolvedValue(null)
+    await expect(useAuthStore.getState().login('a@b.com', 'pw')).rejects.toThrow(
+      'Failed to get user after login'
+    )
+    expect(useAuthStore.getState().isLoading).toBe(false)
+  })
+
+  it('loadUser clears user when getCurrentUser rejects', async () => {
+    vi.mocked(authAPI.getCurrentUser).mockRejectedValue(new Error('network'))
+    await useAuthStore.getState().loadUser()
+    expect(useAuthStore.getState().user).toBeNull()
+    expect(useAuthStore.getState().isLoading).toBe(false)
+  })
 })

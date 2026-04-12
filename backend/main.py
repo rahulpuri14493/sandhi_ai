@@ -3,56 +3,79 @@ import time
 import uuid
 import os
 from contextlib import asynccontextmanager
-from fastapi import FastAPI, Request
+from fastapi import Depends, FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.exceptions import RequestValidationError
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.responses import Response
 from db.run_alembic_upgrade import run_alembic_upgrade
-from api.routes import auth, agents, jobs, payments, dashboards, hiring, external_jobs, mcp, mcp_internal, enhance_job_description
+from api.routes import (
+    auth,
+    agents,
+    jobs,
+    payments,
+    dashboards,
+    hiring,
+    external_jobs,
+    external_platform,
+    mcp,
+    mcp_internal,
+    execution_internal,
+    enhance_job_description,
+)
 from middleware.error_handler import (
     validation_exception_handler,
     http_exception_handler,
     general_exception_handler,
 )
+from middleware.rate_limiter import InMemoryRateLimitMiddleware
 from core.encryption import ensure_encryption_key_for_production
 from core.logging_config import configure_logging
 from services.job_file_storage import verify_s3_connectivity
 from services.task_queue import get_queue_health
 from core.config import settings
 from services.job_scheduler import JobSchedulerService
+from core.security import get_current_user
+from core.startup_sanity import warn_mcp_guardrail_sanity
+from services.mcp_metrics import render_prometheus
 
 configure_logging()
 logger = logging.getLogger(__name__)
 request_logger = logging.getLogger("uvicorn.error")
 
-# Run Alembic migrations (PostgreSQL only; retry until DB is ready, e.g. Docker).
-# This completes before the scheduler starts (lifespan), so all tables exist when
-# load_all_schedules() runs.
-for attempt in range(30):
-    try:
-        run_alembic_upgrade()
-        break
-    except Exception as e:
-        if attempt == 29:
-            logger.exception("Alembic upgrade failed after 30 attempts")
-            raise
-        logger.warning("Alembic upgrade attempt %s failed: %s; retrying in 1s", attempt + 1, e)
-        time.sleep(1)
-ensure_encryption_key_for_production()
 
-# Verify S3 connectivity on startup when object storage is enabled.
-# Retries alongside the Alembic loop above may already have given enough
-# time for the RGW container to become healthy.  We try once more here
-# and log a clear warning rather than crashing, because the RGW may still
-# be starting up (the Compose healthcheck guards the depends_on gate, but
-# direct deploys might not have that).
-_s3_check = verify_s3_connectivity()
-if _s3_check["ok"]:
-    logger.info("S3 storage check passed: %s", _s3_check["detail"])
-else:
-    logger.warning("S3 storage check FAILED: %s — file uploads will fail until resolved", _s3_check["detail"])
+def _run_alembic_startup_with_retries(max_attempts: int = 30) -> None:
+    """Run Alembic migrations; retry until DB is ready (e.g. Docker). Used at import and unit-tested."""
+    for attempt in range(max_attempts):
+        try:
+            run_alembic_upgrade()
+            return
+        except Exception as e:
+            if attempt == max_attempts - 1:
+                logger.exception("Alembic upgrade failed after %s attempts", max_attempts)
+                raise
+            logger.warning("Alembic upgrade attempt %s failed: %s; retrying in 1s", attempt + 1, e)
+            time.sleep(1)
+
+
+def _log_s3_startup_status() -> None:
+    """Log S3/RGW connectivity once at startup (warning only on failure)."""
+    check = verify_s3_connectivity()
+    if check["ok"]:
+        logger.info("S3 storage check passed: %s", check["detail"])
+    else:
+        logger.warning(
+            "S3 storage check FAILED: %s — file uploads will fail until resolved",
+            check["detail"],
+        )
+
+
+# Run Alembic before the scheduler starts (lifespan) so tables exist for load_all_schedules().
+_run_alembic_startup_with_retries()
+ensure_encryption_key_for_production()
+_log_s3_startup_status()
+warn_mcp_guardrail_sanity()
 _scheduler_service = JobSchedulerService()
 
 
@@ -130,6 +153,7 @@ class RequestLoggingMiddleware(BaseHTTPMiddleware):
 
 # Log every API request/response (helps debugging in Docker).
 app.add_middleware(RequestLoggingMiddleware)
+app.add_middleware(InMemoryRateLimitMiddleware)
 
 # CORS middleware
 app.add_middleware(
@@ -154,17 +178,19 @@ app.include_router(payments.router)
 app.include_router(dashboards.router)
 app.include_router(hiring.router)
 app.include_router(external_jobs.router)
+app.include_router(external_platform.router)
 app.include_router(mcp.router)
 app.include_router(mcp_internal.router)
+app.include_router(execution_internal.router)
 
 
 @app.get("/")
-def root():
+def root(current_user=Depends(get_current_user)):
     return {"message": "Sandhi AI API", "version": "1.0.0"}
 
 
 @app.get("/health")
-def health_check():
+def health_check(current_user=Depends(get_current_user)):
     s3 = verify_s3_connectivity()
     queue = get_queue_health()
     overall_ok = bool(s3["ok"]) and bool(queue["ok"])
@@ -173,3 +199,17 @@ def health_check():
         "storage": s3,
         "queue": queue,
     }
+
+
+@app.get("/healthz")
+def healthz():
+    """Minimal unauthenticated liveness endpoint."""
+    return {"status": "ok"}
+
+
+@app.get("/metrics")
+def metrics():
+    payload = render_prometheus()
+    if payload is None:
+        return Response(content="# prometheus metrics unavailable\n", media_type="text/plain; version=0.0.4")
+    return Response(content=payload, media_type="text/plain; version=0.0.4")

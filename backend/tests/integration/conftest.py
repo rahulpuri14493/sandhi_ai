@@ -1,5 +1,4 @@
 """Shared fixtures for integration tests."""
-import json
 import os
 import tempfile
 import uuid

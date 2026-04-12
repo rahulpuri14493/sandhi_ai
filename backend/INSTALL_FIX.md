@@ -49,7 +49,7 @@ pip install pydantic pydantic-settings
 pip install fastapi uvicorn[standard]
 pip install sqlalchemy alembic
 pip install psycopg[binary]
-pip install python-jose[cryptography] passlib[bcrypt]
+pip install PyJWT[crypto] passlib[bcrypt]
 pip install python-multipart httpx
 ```
 

@@ -15,7 +15,7 @@ import re
 import secrets
 import sys
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 from urllib.parse import urlparse, unquote, urlunparse
 
 # Local dev: .../repo/tools/platform_mcp_server/execution_common.py -> parents[2] is repo root.
@@ -46,6 +46,177 @@ def safe_tool_error(event: str, exc: BaseException) -> str:
     """
     logger.error("%s (%s)", event, type(exc).__name__)
     return f"Error: {event} ({type(exc).__name__})"
+
+
+def _pymssql_connect_kwargs(config: Dict[str, Any], database: Optional[str] = None) -> Dict[str, Any]:
+    """
+    Build pymssql.connect keyword args. Azure SQL Database (*.database.windows.net) requires TLS;
+    default encryption is **require** for Azure (pymssql/FreeTDS often fails with "request" only).
+
+    Config keys: host, port, user, password, database, encryption|encrypt (off|request|require),
+    tds_version (e.g. 7.4), login_timeout, timeout (int seconds).
+
+    Env: MCP_SQLSERVER_AZURE_ENCRYPTION_DEFAULT=request|require|off — overrides Azure host default
+    when tool config does not set encryption/encrypt.
+    """
+    host = (config.get("host") or "localhost").strip()
+    db = (database if database is not None else (config.get("database") or "")).strip()
+    kw: Dict[str, Any] = {
+        "server": host,
+        "port": int(config.get("port") or 1433),
+        "user": (config.get("user") or "").strip(),
+        "password": (config.get("password") or "").strip(),
+        "database": db,
+    }
+    enc = (config.get("encryption") or config.get("encrypt") or "").strip().lower()
+    if enc in ("off", "request", "require"):
+        kw["encryption"] = enc
+    elif "database.windows.net" in host.lower():
+        env_def = (os.environ.get("MCP_SQLSERVER_AZURE_ENCRYPTION_DEFAULT") or "require").strip().lower()
+        if env_def not in ("off", "request", "require"):
+            env_def = "require"
+        kw["encryption"] = env_def
+    tds = (config.get("tds_version") or "").strip()
+    if tds:
+        kw["tds_version"] = tds
+    lt = config.get("login_timeout")
+    if lt is not None:
+        try:
+            kw["login_timeout"] = int(lt)
+        except (TypeError, ValueError):
+            pass
+    elif "database.windows.net" in host.lower():
+        # Cold resume / TLS handshake can exceed pymssql default (60s) on serverless Azure SQL.
+        kw["login_timeout"] = 90
+    to = config.get("timeout")
+    if to is not None:
+        try:
+            kw["timeout"] = int(to)
+        except (TypeError, ValueError):
+            pass
+    return kw
+
+
+def _pymysql_connect_kwargs(config: Dict[str, Any], database: Optional[str] = None) -> Dict[str, Any]:
+    """
+    Build pymysql.connect kwargs with optional TLS settings.
+
+    Accepted config keys:
+    - host, port, user, password, database
+    - ssl_mode: disabled|preferred|required|verify_ca|verify_identity
+    - ssl, tls, require_secure_transport: truthy to force TLS
+    - ssl_ca, ssl_cert, ssl_key, ssl_check_hostname
+    """
+    db = (database if database is not None else (config.get("database") or "")).strip()
+    kw: Dict[str, Any] = {
+        "host": (config.get("host") or "localhost").strip(),
+        "port": int(config.get("port") or 3306),
+        "user": (config.get("user") or "").strip(),
+        "password": (config.get("password") or "").strip(),
+        "database": db,
+    }
+
+    mode = str(config.get("ssl_mode") or "").strip().lower()
+
+    def _truthy(v: Any) -> bool:
+        if isinstance(v, bool):
+            return v
+        return str(v or "").strip().lower() in ("1", "true", "yes", "on", "required", "require")
+
+    if mode == "require":
+        mode = "required"
+    want_tls = mode in ("preferred", "required", "verify_ca", "verify_identity")
+    want_tls = want_tls or _truthy(config.get("ssl")) or _truthy(config.get("tls")) or _truthy(config.get("require_secure_transport"))
+    if mode == "disabled":
+        want_tls = False
+
+    if want_tls:
+        ssl_opts: Dict[str, Any] = {}
+        for src, dst in (
+            ("ssl_ca", "ca"),
+            ("ssl_cert", "cert"),
+            ("ssl_key", "key"),
+        ):
+            val = str(config.get(src) or "").strip()
+            if val:
+                ssl_opts[dst] = val
+        # PyMySQL enables TLS only when `ssl` is truthy; avoid empty dict for mode=required.
+        if str(config.get("ssl_check_hostname") or "").strip():
+            ssl_opts["check_hostname"] = _truthy(config.get("ssl_check_hostname"))
+        elif mode == "verify_identity":
+            ssl_opts["check_hostname"] = True
+        else:
+            ssl_opts["check_hostname"] = False
+        if mode in ("verify_ca", "verify_identity"):
+            ssl_opts["verify_mode"] = "required"
+        else:
+            ssl_opts.setdefault("verify_mode", "none")
+        kw["ssl"] = ssl_opts
+    return kw
+
+
+def sqlserver_tool_error_response(event: str, exc: BaseException, config: Dict[str, Any]) -> str:
+    """
+    Like safe_tool_error but adds static SQL Server hints (no str(exc)).
+    """
+    logger.error("%s (%s)", event, type(exc).__name__)
+    msg = f"Error: {event} ({type(exc).__name__})"
+    exc_name = type(exc).__name__
+    host_l = (config.get("host") or "").lower()
+    is_azure = "database.windows.net" in host_l
+    if exc_name == "ProgrammingError":
+        msg += (
+            ". SQL syntax/object hint: verify SQL Server table/column names and schema qualification "
+            "(example SELECT DISTINCT [column_name] FROM [schema_name].[table_name]). "
+            "If this tool has a default query in config, remove it for agent-driven queries. "
+            "Refresh schema_metadata for this SQL Server tool so the agent can use real tables/columns."
+        )
+    if exc_name == "OperationalError":
+        msg += (
+            ". Connection/DDL hint: run the same bootstrap T-SQL in SSMS or sqlcmd using this tool's SQL login "
+            "to see the full error; verify CREATE TABLE (or ALTER) permission on the target schema."
+        )
+        if is_azure:
+            msg += (
+                " Azure SQL checklist: database Online not Paused; firewall must allow the MCP host's public egress IP "
+                "(not Docker 172.x); login as user@logicalServer; tool JSON may need encryption require."
+            )
+    return msg
+
+
+def mysql_tool_error_response(event: str, exc: BaseException, config: Dict[str, Any]) -> str:
+    """
+    Safe MySQL error response with static, non-sensitive hints.
+    """
+    logger.error("%s (%s)", event, type(exc).__name__)
+    msg = f"Error: {event} ({type(exc).__name__})"
+    exc_name = type(exc).__name__
+    host_l = str(config.get("host") or "").lower()
+    is_azure = "mysql.database.azure.com" in host_l
+
+    if exc_name == "ProgrammingError":
+        msg += (
+            ". MySQL syntax/object hint: verify table/column names and schema qualification "
+            "(example SELECT DISTINCT `column_name` FROM `table_name` LIMIT 100). "
+            "For MySQL use LIMIT (not TOP), NOW() for current timestamp, and avoid SQL Server bracket syntax. "
+            "If this tool has a default query in config, remove it for agent-driven queries. "
+            "Refresh schema_metadata for this MySQL tool so the agent can use real tables/columns."
+        )
+        return msg
+
+    if exc_name == "OperationalError":
+        msg += (
+            ". MySQL connection/auth hint: verify host, port, user, password, and database. "
+            "If your server enforces TLS, set ssl_mode='required'."
+        )
+        if is_azure:
+            msg += (
+                " Azure MySQL commonly uses username format user@server-name "
+                "(for example app_user@myserver)."
+            )
+        return msg
+
+    return msg
 
 
 def _truncate_for_log(text: str, max_len: int = 2000) -> str:
@@ -483,12 +654,12 @@ def _sql_query_from_args(config: Dict[str, Any], arguments: Dict[str, Any]) -> s
     Return SQL text for SQL-backed tools.
 
     Priority:
-    1) trusted tool configuration (``query`` / ``sql`` / ``statement``)
-    2) runtime arguments (``query`` / ``sql`` / ``statement``) **only** when the runtime SQL
+    1) runtime arguments (``query`` / ``sql`` / ``statement``) **only** when the runtime SQL
        is a strict read-only single SELECT/WITH statement.
+    2) trusted tool configuration (``query`` / ``sql`` / ``statement``) as fallback.
 
     This keeps write SQL/DDL in trusted config or output_contract flows while allowing
-    agent-generated read queries per job.
+    agent-generated read queries per job and preserving optional fallback SQL in tool config.
 
     ``arguments`` may still supply ``params`` for bound placeholders (see execution_sql).
     Invalid runtime SQL raises ``ValueError``.
@@ -512,6 +683,21 @@ def _sql_query_from_args(config: Dict[str, Any], arguments: Dict[str, Any]) -> s
                         return sv.strip()
         return ""
 
+    # Runtime SQL (agent/user path) is allowed only for strict read-only queries.
+    runtime_q = ""
+    if isinstance(arguments, dict):
+        runtime_q = str(
+            arguments.get("query") or arguments.get("sql") or arguments.get("statement") or ""
+        ).strip()
+    if runtime_q:
+        if not _is_safe_runtime_read_sql(runtime_q):
+            raise ValueError(
+                "Runtime SQL is allowed only for a single read-only statement "
+                "(SELECT/WITH/SHOW/DESCRIBE/DESC/EXPLAIN)"
+            )
+        return runtime_q
+
+    # Fallback to trusted tool configuration (optional default query).
     q = _extract_query(config)
     if q:
         return q
@@ -520,24 +706,11 @@ def _sql_query_from_args(config: Dict[str, Any], arguments: Dict[str, Any]) -> s
         q = _extract_query(config.get(container_key))
         if q:
             return q
-
-    # Fallback: runtime SQL (agent/user path) is allowed only for strict read-only queries.
-    runtime_q = ""
-    if isinstance(arguments, dict):
-        runtime_q = str(
-            arguments.get("query") or arguments.get("sql") or arguments.get("statement") or ""
-        ).strip()
-    if not runtime_q:
-        return ""
-    if not _is_safe_runtime_read_sql(runtime_q):
-        raise ValueError(
-            "Runtime SQL is allowed only for single read-only SELECT/WITH statements"
-        )
-    return runtime_q
+    return ""
 
 
 def _is_safe_runtime_read_sql(query: str) -> bool:
-    """Best-effort guard for runtime SQL: single read-only SELECT/WITH only."""
+    """Best-effort guard for runtime SQL: single read-only SELECT/WITH or safe metadata statement."""
     if not isinstance(query, str):
         return False
     q = query.strip()
@@ -550,7 +723,14 @@ def _is_safe_runtime_read_sql(query: str) -> bool:
         return False
     q = q.rstrip(";").strip()
     upper = q.upper()
-    if not (upper.startswith("SELECT") or upper.startswith("WITH")):
+    if not (
+        upper.startswith("SELECT")
+        or upper.startswith("WITH")
+        or upper.startswith("SHOW")
+        or upper.startswith("DESCRIBE")
+        or upper.startswith("DESC")
+        or upper.startswith("EXPLAIN")
+    ):
         return False
     # Disallow common write/DDL/control keywords in runtime SQL.
     if re.search(

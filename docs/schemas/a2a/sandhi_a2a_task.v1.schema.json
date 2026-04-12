@@ -1,0 +1,63 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://sandhi.ai/schemas/a2a/sandhi_a2a_task.v1.schema.json",
+  "title": "Sandhi A2A task envelope v1",
+  "type": "object",
+  "additionalProperties": true,
+  "required": ["schema_version", "agent_id", "task_id", "payload", "next_agent", "assigned_tools"],
+  "properties": {
+    "schema_version": {
+      "type": "string",
+      "const": "sandhi.a2a_task.v1"
+    },
+    "agent_id": { "type": "integer" },
+    "task_id": { "type": "string", "minLength": 1 },
+    "payload": { "type": "object", "additionalProperties": true },
+    "next_agent": {
+      "type": ["object", "null"],
+      "additionalProperties": true,
+      "required": ["agent_id"],
+      "properties": {
+        "agent_id": { "type": "integer" },
+        "workflow_step_id": { "type": ["integer", "null"] },
+        "name": { "type": ["string", "null"] },
+        "a2a_endpoint": { "type": ["string", "null"] },
+        "step_order": { "type": ["integer", "null"] }
+      }
+    },
+    "assigned_tools": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": true,
+        "required": ["tool_name"],
+        "properties": {
+          "tool_name": { "type": "string" },
+          "platform_tool_id": { "type": ["integer", "null"] },
+          "external_tool_name": { "type": ["string", "null"] },
+          "tool_type": { "type": ["string", "null"] },
+          "connection_id": { "type": ["integer", "null"] },
+          "input_schema": { "type": ["object", "null"], "additionalProperties": true },
+          "execution_hints": { "type": ["object", "null"], "additionalProperties": true }
+        }
+      }
+    },
+    "parallel": {
+      "type": ["object", "null"],
+      "additionalProperties": true,
+      "required": ["wave_index", "parallel_group_id"],
+      "properties": {
+        "wave_index": { "type": "integer", "minimum": 0 },
+        "parallel_group_id": { "type": "string", "minLength": 1 },
+        "concurrent_workflow_step_ids": {
+          "type": "array",
+          "items": { "type": "integer" }
+        },
+        "depends_on_previous_wave": { "type": "boolean" }
+      }
+    },
+    "task_type": { "type": ["string", "null"] },
+    "assignment_source": { "type": ["string", "null"] },
+    "assignment_flagged": { "type": "boolean" }
+  }
+}

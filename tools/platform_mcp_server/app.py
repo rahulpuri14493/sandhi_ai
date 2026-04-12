@@ -5,25 +5,53 @@ Exposes MCP protocol (JSON-RPC 2.0): initialize, tools/list, tools/call.
 Tools are resolved per business (tenant) via the Sandhi AI backend internal API.
 Implements Vector DB, PostgreSQL, and File system tools using tenant-stored config.
 """
-from execution_common import safe_tool_error
-from execution import (
-    execute_artifact_write,
-    execute_azure_blob,
-    execute_bigquery_sql,
-    execute_databricks_sql,
-    execute_elasticsearch,
-    execute_gcs,
-    execute_github,
-    execute_mysql,
-    execute_notion,
-    execute_postgres,
-    execute_rest_api,
-    execute_s3_family,
-    execute_slack,
-    execute_sqlserver_sql,
-    execute_snowflake_sql,
-    is_artifact_platform_write,
-)
+try:
+    from execution_common import safe_tool_error
+    from execution import (
+        execute_artifact_write,
+        execute_azure_blob,
+        execute_bigquery_sql,
+        execute_databricks_sql,
+        execute_elasticsearch,
+        execute_gcs,
+        execute_github,
+        execute_mysql,
+        execute_notion,
+        execute_postgres,
+        execute_rest_api,
+        execute_s3_family,
+        execute_slack,
+        execute_sqlserver_sql,
+        execute_snowflake_sql,
+        is_artifact_platform_write,
+    )
+except ModuleNotFoundError:
+    # Support direct module loading in tests where package path differs.
+    import os as _os
+    import sys as _sys
+
+    _here = _os.path.dirname(_os.path.abspath(__file__))
+    if _here not in _sys.path:
+        _sys.path.insert(0, _here)
+    from execution_common import safe_tool_error
+    from execution import (
+        execute_artifact_write,
+        execute_azure_blob,
+        execute_bigquery_sql,
+        execute_databricks_sql,
+        execute_elasticsearch,
+        execute_gcs,
+        execute_github,
+        execute_mysql,
+        execute_notion,
+        execute_postgres,
+        execute_rest_api,
+        execute_s3_family,
+        execute_slack,
+        execute_sqlserver_sql,
+        execute_snowflake_sql,
+        is_artifact_platform_write,
+    )
 import json
 import logging
 import os
@@ -45,6 +73,41 @@ logging.basicConfig(
     force=True,
 )
 logger = logging.getLogger(__name__)
+
+# Exact strings accepted by https://embed.trychroma.com for `x-chroma-embedding-model` (as of Chroma Cloud API).
+CHROMA_CLOUD_HTTP_EMBED_MODELS = frozenset(
+    {
+        "Qwen/Qwen3-Embedding-0.6B",
+        "BAAI/bge-m3",
+        "sentence-transformers/all-MiniLM-L6-v2",
+        "prithivida/Splade_PP_en_v1",
+        "naver/efficient-splade-VI-BT-large-doc",
+        "naver/efficient-splade-VI-BT-large-query",
+    }
+)
+
+
+def _resolve_chroma_cloud_http_embed_model(config: Dict[str, Any]) -> str:
+    """Pick model id for embed.trychroma.com. OpenAI model names belong in self-hosted paths only — ignore them here."""
+    default = "Qwen/Qwen3-Embedding-0.6B"
+    for key in ("chroma_embed_model", "embedding_model"):
+        raw = config.get(key)
+        if raw is None:
+            continue
+        s = str(raw).strip()
+        if not s:
+            continue
+        if s in CHROMA_CLOUD_HTTP_EMBED_MODELS:
+            return s
+        logger.warning(
+            "Chroma tool config %r=%r is not a Chroma Cloud HTTP embed model id; using %r "
+            "(use **chroma_embed_model** with a HuggingFace id from the Chroma dashboard, not OpenAI names).",
+            key,
+            s,
+            default,
+        )
+    return default
+
 
 # Backend internal API (same network as platform)
 BACKEND_BASE = os.environ.get("BACKEND_INTERNAL_URL", "http://backend:8000").strip().rstrip("/")
@@ -71,6 +134,17 @@ app = FastAPI(
 
 JSONRPC_VERSION = "2.0"
 BUSINESS_ID_HEADER = "x-mcp-business-id"
+
+
+def _sandhi_correlation_log_suffix(request: Request) -> str:
+    """Optional executor correlation headers for production log filtering."""
+    parts = []
+    for hdr in ("X-Sandhi-Job-Id", "X-Sandhi-Workflow-Step-Id", "X-Sandhi-Trace-Id"):
+        v = request.headers.get(hdr) or request.headers.get(hdr.lower())
+        if v:
+            key = hdr.replace("X-Sandhi-", "").lower().replace("-", "_")
+            parts.append(f"{key}={v}")
+    return (" " + " ".join(parts)) if parts else ""
 
 
 def _get_business_id(request: Request) -> int:
@@ -232,6 +306,187 @@ _MSG_ADD_OPENAI_IN_CONFIG = (
     "(optional field 'OpenAI API key for embedding'). The platform does not provide an API key."
 )
 
+# --- Pinecone only -----------------------------------------------------------------
+# All `_pinecone_*` helpers and `_parse_pinecone_fields_argument` are used exclusively
+# by `_execute_pinecone`. Chroma, Weaviate, Qdrant, `vector_db`, and PageIndex keep
+# their own code paths—do not route those tools through these helpers. After edits here,
+# run: pytest tests/ -q (from tools/platform_mcp_server; skip test_mcp_live_e2e if offline).
+# ------------------------------------------------------------------------------------
+
+
+def _pinecone_coerce_response_dict(result: Any, _depth: int = 0) -> Optional[Dict[str, Any]]:
+    """Turn Pinecone OpenAPI / Pydantic responses into a plain dict so we can find nested hits."""
+    if result is None or _depth > 4:
+        return None
+    if isinstance(result, dict):
+        return result
+    for attr in ("actual_instance", "value", "data"):
+        inner = getattr(result, attr, None)
+        if inner is not None and inner is not result:
+            d = _pinecone_coerce_response_dict(inner, _depth + 1)
+            if d is not None:
+                return d
+    model_dump = getattr(result, "model_dump", None)
+    if callable(model_dump):
+        for kwargs in ({"by_alias": True, "mode": "python"}, {"mode": "python"}, {}):
+            try:
+                dumped = model_dump(**kwargs)
+            except TypeError:
+                continue
+            except Exception:
+                break
+            if isinstance(dumped, dict):
+                return dumped
+    to_dict = getattr(result, "to_dict", None)
+    if callable(to_dict):
+        try:
+            dumped = to_dict()
+        except Exception:
+            dumped = None
+        if isinstance(dumped, dict):
+            return dumped
+    return None
+
+
+def _pinecone_hits_from_plain_dict(d: Any, _depth: int = 0) -> List[Any]:
+    """Recursively find the first non-empty hits / matches / records list (prefer result.* subtree)."""
+    if not isinstance(d, dict) or _depth > 10:
+        return []
+    for nest_key in ("result", "data", "response", "body"):
+        nested = d.get(nest_key)
+        if isinstance(nested, dict):
+            got = _pinecone_hits_from_plain_dict(nested, _depth + 1)
+            if got:
+                return got
+    for list_key in ("hits", "matches", "records"):
+        v = d.get(list_key)
+        if isinstance(v, list) and len(v) > 0:
+            return v
+    return []
+
+
+def _pinecone_collect_hits(result: Any) -> List[Any]:
+    """Collect hit/match objects from Pinecone search() or query() (SDK return shapes differ)."""
+    if result is None:
+        return []
+
+    plain = _pinecone_coerce_response_dict(result)
+    if plain is not None:
+        from_dict = _pinecone_hits_from_plain_dict(plain)
+        if from_dict:
+            return from_dict
+
+    def as_list_nonempty(v: Any) -> Optional[List[Any]]:
+        if v is None:
+            return None
+        try:
+            lst = list(v)
+        except TypeError:
+            return None
+        return lst if lst else None
+
+    def from_obj(obj: Any) -> Optional[List[Any]]:
+        if obj is None:
+            return None
+        for key in ("hits", "matches", "records"):
+            if isinstance(obj, dict):
+                lst = as_list_nonempty(obj.get(key))
+            else:
+                lst = as_list_nonempty(getattr(obj, key, None))
+            if lst is not None:
+                return lst
+        return None
+
+    inner = getattr(result, "result", None)
+    if inner is None and isinstance(result, dict):
+        inner = result.get("result")
+    for node in (inner, result):
+        lst = from_obj(node)
+        if lst is not None:
+            return lst
+    return []
+
+
+def _pinecone_hit_to_metadata_dict(hit: Any) -> Dict[str, Any]:
+    """Merge `fields` and `metadata` from integrated search hits or query matches."""
+    out: Dict[str, Any] = {}
+    if isinstance(hit, dict):
+        fields = hit.get("fields")
+        meta = hit.get("metadata")
+        if isinstance(fields, dict):
+            out.update(fields)
+        if isinstance(meta, dict):
+            for k, v in meta.items():
+                if k not in out:
+                    out[k] = v
+        if not out:
+            skip = {"id", "_id", "score", "_score", "metadata", "fields"}
+            for k, v in hit.items():
+                if k not in skip:
+                    out[k] = v
+        return out
+    for attr in ("fields", "metadata"):
+        src = getattr(hit, attr, None)
+        if src is None:
+            continue
+        if isinstance(src, dict):
+            for k, v in src.items():
+                if k not in out:
+                    out[k] = v
+        elif hasattr(src, "items"):
+            try:
+                for k, v in src.items():
+                    kk = str(k)
+                    if kk not in out:
+                        out[kk] = v
+            except Exception:
+                pass
+    return out
+
+
+def _pinecone_normalize_result(result: Any, ns: Optional[str]) -> str:
+    """JSON string with matches[{id, score, metadata?}] for agents."""
+    matches = _pinecone_collect_hits(result)
+    namespace_out: Optional[str] = ns
+    if hasattr(result, "namespace"):
+        n = getattr(result, "namespace", None)
+        if n is not None and n != "":
+            namespace_out = n
+    if isinstance(result, dict):
+        n = result.get("namespace")
+        if n is not None and n != "":
+            namespace_out = n
+    out: Dict[str, Any] = {"matches": [], "namespace": namespace_out}
+    for m in matches:
+        mid = getattr(m, "id", None) or getattr(m, "_id", None)
+        if mid is None and isinstance(m, dict):
+            mid = m.get("id") or m.get("_id")
+        score = getattr(m, "score", None) or getattr(m, "_score", None)
+        if score is None and isinstance(m, dict):
+            score = m.get("score") or m.get("_score")
+        meta_dict = _pinecone_hit_to_metadata_dict(m)
+        entry: Dict[str, Any] = {"id": mid, "score": score}
+        if meta_dict:
+            entry["metadata"] = meta_dict
+        out["matches"].append(entry)
+    return json.dumps(out, indent=2, default=str)
+
+
+def _parse_pinecone_fields_argument(raw: Any) -> Optional[List[str]]:
+    if raw is None:
+        return None
+    if isinstance(raw, list):
+        return [str(x).strip() for x in raw if str(x).strip()]
+    if isinstance(raw, str) and raw.strip():
+        try:
+            parsed = json.loads(raw)
+            if isinstance(parsed, list):
+                return [str(x).strip() for x in parsed if str(x).strip()]
+        except Exception:
+            pass
+        return [s.strip() for s in raw.split(",") if s.strip()]
+    return None
+
 
 def _execute_pinecone(config: Dict[str, Any], arguments: Dict[str, Any]) -> str:
     """Query Pinecone index. Prefer integrated text search (no OpenAI). Fall back to OpenAI embed + vector query if needed."""
@@ -252,35 +507,7 @@ def _execute_pinecone(config: Dict[str, Any], arguments: Dict[str, Any]) -> str:
         return "Error: Pinecone host (URL) is not configured. Use the index host from Pinecone console."
 
     index_host = host.replace("https://", "").replace("http://", "").split("/")[0].strip()
-
-    def _normalize_result(result: Any, ns: Optional[str]) -> str:
-        """Build a consistent JSON response from Pinecone search/query result.
-        search() returns result.result.hits with _id, _score, fields; query() returns matches with id, score, metadata."""
-        matches = getattr(result, "matches", None) or getattr(result, "hits", None)
-        if matches is None:
-            inner = getattr(result, "result", None) or (result.get("result") if isinstance(result, dict) else None)
-            if inner is not None:
-                matches = getattr(inner, "hits", None) or (inner.get("hits") if isinstance(inner, dict) else None)
-        if matches is None and isinstance(result, dict):
-            matches = result.get("matches") or result.get("hits") or []
-        matches = matches or []
-        namespace_out = getattr(result, "namespace", None) or (getattr(result, "namespace", None) if hasattr(result, "namespace") else None) or ns
-        out = {"matches": [], "namespace": namespace_out}
-        for m in matches:
-            mid = getattr(m, "id", None) or getattr(m, "_id", None)
-            if mid is None and isinstance(m, dict):
-                mid = m.get("id") or m.get("_id")
-            score = getattr(m, "score", None) or getattr(m, "_score", None)
-            if score is None and isinstance(m, dict):
-                score = m.get("score") or m.get("_score")
-            meta = getattr(m, "metadata", None) or getattr(m, "fields", None)
-            if meta is None and isinstance(m, dict):
-                meta = m.get("metadata") or m.get("fields") or {k: v for k, v in m.items() if k not in ("id", "_id", "score", "_score")}
-            entry = {"id": mid, "score": score}
-            if meta:
-                entry["metadata"] = dict(meta) if hasattr(meta, "items") else meta
-            out["matches"].append(entry)
-        return json.dumps(out, indent=2)
+    fields_list = _parse_pinecone_fields_argument(arguments.get("fields"))
 
     try:
         from pinecone import Pinecone
@@ -289,11 +516,20 @@ def _execute_pinecone(config: Dict[str, Any], arguments: Dict[str, Any]) -> str:
 
         # 1) Try integrated text search first (no OpenAI key required)
         try:
-            search_result = index.search(
-                namespace=namespace,
-                query={"inputs": {"text": query_text}, "top_k": top_k},
-            )
-            return _normalize_result(search_result, namespace)
+            search_kw: Dict[str, Any] = {
+                "namespace": namespace,
+                "query": {"inputs": {"text": query_text}, "top_k": top_k},
+                # Explicit default: some SDK/API combos omit field payloads if `fields` is unset
+                "fields": fields_list if fields_list else ["*"],
+            }
+            search_result = index.search(**search_kw)
+            normalized = _pinecone_normalize_result(search_result, namespace)
+            if json.loads(normalized).get("matches") == []:
+                logger.debug(
+                    "Pinecone search returned 0 matches after normalize; coerced keys=%s",
+                    list((_pinecone_coerce_response_dict(search_result) or {}).keys()),
+                )
+            return normalized
         except Exception as text_err:
             err_msg = str(text_err).lower()
             fallback = (
@@ -316,9 +552,21 @@ def _execute_pinecone(config: Dict[str, Any], arguments: Dict[str, Any]) -> str:
                 "This Pinecone index does not support query-by-text (integrated embedding). "
                 + _MSG_ADD_OPENAI_IN_CONFIG
             )
-        payload = {"vector": vector, "topK": top_k, "includeMetadata": True, "namespace": namespace}
-        result = index.query(**payload)
-        return _normalize_result(result, namespace)
+        try:
+            result = index.query(
+                vector=vector,
+                top_k=top_k,
+                namespace=namespace,
+                include_metadata=True,
+            )
+        except TypeError:
+            result = index.query(
+                vector=vector,
+                topK=top_k,
+                namespace=namespace,
+                includeMetadata=True,
+            )
+        return _pinecone_normalize_result(result, namespace)
     except Exception as e:
         logger.error("Pinecone query error (%s)", type(e).__name__)
         return "Pinecone query error"
@@ -341,13 +589,175 @@ def _url_host(url_str: str) -> str:
     return (u.hostname or "localhost").lower()
 
 
+def _host_is_weaviate_cloud(host: str) -> bool:
+    """True for WCD / Weaviate Cloud hostnames (incl. *.gcp.weaviate.cloud). Must use connect_to_weaviate_cloud so gRPC host differs from REST."""
+    h = (host or "").lower()
+    return (
+        h == "weaviate.cloud"
+        or h.endswith(".weaviate.io")
+        or h.endswith(".weaviate.network")
+        or h.endswith(".weaviate.cloud")
+    )
+
+
+def _weaviate_config_bool(config: Dict[str, Any], key: str) -> bool:
+    v = config.get(key)
+    if v is None:
+        return False
+    if isinstance(v, bool):
+        return v
+    s = str(v).strip().lower()
+    return s in ("1", "true", "yes", "on")
+
+
+def _weaviate_init_timeout_seconds(config: Dict[str, Any]) -> int:
+    """Client default init timeout is ~2s; Docker / WCD often needs longer."""
+    try:
+        raw = config.get("weaviate_init_timeout_seconds")
+        if raw is None or not str(raw).strip():
+            return 45
+        return max(5, min(int(str(raw).strip()), 180))
+    except (TypeError, ValueError):
+        return 45
+
+
+def _weaviate_additional_config(config: Dict[str, Any]) -> Any:
+    from weaviate.classes.init import AdditionalConfig, Timeout
+
+    return AdditionalConfig(
+        timeout=Timeout(
+            init=_weaviate_init_timeout_seconds(config),
+            query=90,
+            insert=120,
+        ),
+        trust_env=_weaviate_config_bool(config, "weaviate_trust_env"),
+    )
+
+
+def _weaviate_exception_detail(exc: BaseException) -> str:
+    """Include __cause__ / __context__ — Weaviate often wraps gRPC errors with empty top message."""
+    parts: List[str] = []
+    seen: set[int] = set()
+    cur: Optional[BaseException] = exc
+    for _ in range(10):
+        if cur is None or id(cur) in seen:
+            break
+        seen.add(id(cur))
+        msg = (str(cur) or "").strip()
+        if msg:
+            parts.append(msg)
+        nxt = cur.__cause__ or cur.__context__
+        cur = nxt
+    if not parts:
+        return type(exc).__name__
+    return " | ".join(parts)[:1200]
+
+
+def _weaviate_localhost_docker_hint(url: str) -> str:
+    h = _url_host(url)
+    if h in ("localhost", "127.0.0.1", "::1"):
+        return (
+            " This MCP server appears to use localhost for Weaviate; from inside Docker, localhost is the container itself. "
+            "Use host.docker.internal (Docker Desktop) or your LAN IP / Docker bridge gateway if Weaviate runs on the host."
+        )
+    return ""
+
+
+def _weaviate_connection_refused_hint(detail: str, url: str, is_weaviate_cloud: bool) -> str:
+    """errno 111 / 'connection refused' = TCP reset; almost always wrong host or port from Docker."""
+    dlow = detail.lower()
+    if "connection refused" not in dlow and "errno 111" not in dlow and "[111]" not in detail:
+        return ""
+    if is_weaviate_cloud:
+        return (
+            " Diagnosis: TCP connection refused to Weaviate Cloud from this container — check outbound firewall/proxy, "
+            "VPN, and that the cluster URL matches the Weaviate Cloud console (no typo in hostname)."
+        )
+    h = _url_host(url)
+    _, port, secure = _parse_url(url)
+    grpc_p = 443 if secure else 50051
+    parts = [
+        " Diagnosis: TCP connection refused (errno 111) — from inside the platform-mcp-server container, nothing is "
+        f"accepting connections to host {h!r} on REST port {port} and gRPC port {grpc_p}."
+    ]
+    if h in ("localhost", "127.0.0.1", "::1"):
+        parts.append(
+            " Fix: point the tool URL at the machine running Weaviate, not localhost — e.g. "
+            "http://host.docker.internal:8080 when Weaviate runs on the Docker host. "
+            "On Linux Docker, add to the platform-mcp-server service: "
+            "extra_hosts: [\"host.docker.internal:host-gateway\"]."
+        )
+    parts.append(
+        " Ensure Weaviate publishes both REST (8080) and gRPC (50051 for HTTP, or 443 for HTTPS) to that address. "
+        "If Weaviate is a Compose service on the same stack, use its service name as the hostname (not localhost)."
+    )
+    return "".join(parts)
+
+
+def _weaviate_err_message(exc: BaseException, max_len: int = 600) -> str:
+    """Human-readable Weaviate client error (WeaviateQueryError often embeds the server message in str())."""
+    msg = (str(exc) or "").strip()
+    if not msg:
+        msg = type(exc).__name__
+    return msg[:max_len]
+
+
+def _weaviate_result_context(config: Dict[str, Any], class_name: str) -> Dict[str, Any]:
+    """Non-secret metadata echoed with query results (matches Chroma envelope pattern)."""
+    cluster = (config.get("weaviate_cluster_name") or config.get("cluster_name") or "").strip()
+    note = (
+        f"Queried Weaviate class/collection `{class_name}`. "
+        + (f"WCD cluster label (informational): `{cluster}`. " if cluster else "")
+        + "The collection/class name must match your Weaviate schema (e.g. from GET /v1/schema), not the cluster display name alone."
+    )
+    ctx: Dict[str, Any] = {
+        "weaviate_collection": class_name,
+        "retrieval_note": note,
+        "access_scope_note": (
+            "This call used only this Sandhi user's Weaviate URL, API key, and collection settings."
+        ),
+    }
+    if cluster:
+        ctx["weaviate_cluster_name"] = cluster
+    return ctx
+
+
+def _weaviate_query_response_to_json(
+    response: Any, *, extra: Optional[Dict[str, Any]] = None
+) -> str:
+    """Serialize Weaviate v4 query response.objects to JSON matches (near_text, bm25, or near_vector)."""
+    out: Dict[str, Any] = {"matches": []}
+    for obj in response.objects:
+        entry: Dict[str, Any] = {"id": str(obj.uuid), "properties": dict(obj.properties) if obj.properties else {}}
+        meta = getattr(obj, "metadata", None)
+        if meta is not None:
+            if getattr(meta, "score", None) is not None:
+                try:
+                    entry["score"] = float(meta.score)
+                except (TypeError, ValueError):
+                    pass
+            dist = getattr(meta, "distance", None)
+            if dist is not None and "score" not in entry:
+                try:
+                    entry["score"] = 1.0 - float(dist)
+                except (TypeError, ValueError):
+                    pass
+        out["matches"].append(entry)
+    if extra:
+        out.update(extra)
+    return json.dumps(out, indent=2)
+
+
 def _execute_weaviate(config: Dict[str, Any], arguments: Dict[str, Any]) -> str:
-    """Query Weaviate. Try near_text first (no key). If that fails, use user's OpenAI key from config + near_vector."""
+    """Query Weaviate: near_text, then bm25 (keyword), then OpenAI embed + near_vector."""
     url = (config.get("url") or "").strip()
     api_key = (config.get("api_key") or "").strip() or None
     class_name = (config.get("index_name") or config.get("class_name") or "Document").strip()
+    cluster_label = (config.get("weaviate_cluster_name") or config.get("cluster_name") or "").strip()
     query_text = (arguments.get("query") or "").strip()
     top_k = min(max(int(arguments.get("top_k") or 5), 1), 100)
+    skip_init_user = _weaviate_config_bool(config, "weaviate_skip_init_checks")
+    result_ctx = _weaviate_result_context(config, class_name)
 
     if not query_text:
         return "Error: query is required"
@@ -359,57 +769,116 @@ def _execute_weaviate(config: Dict[str, Any], arguments: Dict[str, Any]) -> str:
         from weaviate.classes.init import Auth
         auth = Auth.api_key(api_key) if api_key else None
         host = _url_host(url)
-        is_weaviate_cloud = host == "weaviate.cloud" or host.endswith(".weaviate.io")
-        if is_weaviate_cloud:
-            client = weaviate.connect_to_weaviate_cloud(
-                cluster_url=url.rstrip("/"),
-                auth_credentials=auth,
+        is_weaviate_cloud = _host_is_weaviate_cloud(host)
+        if is_weaviate_cloud and not api_key:
+            return (
+                "Error: Weaviate Cloud requires api_key in this tool's config (cluster admin key from Weaviate Cloud console)."
             )
-        else:
-            host, port, secure = _parse_url(url)
-            client = weaviate.connect_to_custom(
-                http_host=host,
+
+        add_cfg = _weaviate_additional_config(config)
+
+        def _open_client(skip_init_checks: bool):
+            if is_weaviate_cloud:
+                return weaviate.connect_to_weaviate_cloud(
+                    cluster_url=url.rstrip("/"),
+                    auth_credentials=auth,
+                    additional_config=add_cfg,
+                    skip_init_checks=skip_init_checks,
+                )
+            host_p, port, secure = _parse_url(url)
+            return weaviate.connect_to_custom(
+                http_host=host_p,
                 http_port=port,
                 http_secure=secure,
-                grpc_host=host,
+                grpc_host=host_p,
                 grpc_port=50051 if not secure else 443,
                 grpc_secure=secure,
                 auth_credentials=auth,
+                additional_config=add_cfg,
+                skip_init_checks=skip_init_checks,
             )
+
+        client = None
+        last_exc: Optional[BaseException] = None
+        # Default: run startup checks; on WeaviateStartUpError retry once with skip_init_checks (slow WCD / Docker).
+        skip_sequence = [True] if skip_init_user else [False, True]
+        for i, skip_checks in enumerate(skip_sequence):
+            try:
+                client = _open_client(skip_checks)
+                if skip_checks and i > 0:
+                    logger.info("Weaviate connected with skip_init_checks=True after WeaviateStartUpError")
+                break
+            except Exception as e:
+                last_exc = e
+                if type(e).__name__ == "WeaviateStartUpError" and not skip_checks and not skip_init_user:
+                    logger.warning(
+                        "Weaviate WeaviateStartUpError with skip_init_checks=False; retrying with skip_init_checks=True"
+                    )
+                    continue
+                raise
+        if client is None:
+            raise last_exc if last_exc else RuntimeError("Weaviate client connect failed")
+
         try:
+            logger.info(
+                "Weaviate query class=%s cluster_name=%s",
+                class_name,
+                cluster_label or "(not set)",
+            )
             collection = client.collections.get(class_name)
-            # 1) Try near_text first (Weaviate server vectorizer; no key from us)
+            # 1) Semantic search via server vectorizer (no OpenAI key)
             try:
                 response = collection.query.near_text(query=query_text, limit=top_k)
-                out = {"matches": []}
-                for obj in response.objects:
-                    entry = {"id": str(obj.uuid), "properties": dict(obj.properties) if obj.properties else {}}
-                    if hasattr(obj, "metadata") and obj.metadata and getattr(obj.metadata, "distance", None) is not None:
-                        entry["score"] = 1 - (obj.metadata.distance or 0)
-                    out["matches"].append(entry)
-                return json.dumps(out, indent=2)
+                return _weaviate_query_response_to_json(response, extra=result_ctx)
             except Exception as text_err:
                 logger.info(
-                    "Weaviate near_text not available, trying embed + near_vector (exc_type=%s)",
+                    "Weaviate near_text failed (%s): %s; trying bm25 keyword search",
                     type(text_err).__name__,
+                    _weaviate_err_message(text_err, 800),
                 )
-            # 2) Fall back: user's OpenAI key from config + near_vector
+            # 2) Keyword BM25 — works for many collections without a text2vec module
+            bm_err: Optional[BaseException] = None
+            try:
+                response = collection.query.bm25(query=query_text, limit=top_k)
+                logger.info("Weaviate bm25 query succeeded")
+                return _weaviate_query_response_to_json(response, extra=result_ctx)
+            except Exception as e_bm:
+                bm_err = e_bm
+                logger.info(
+                    "Weaviate bm25 failed (%s): %s; trying OpenAI embed + near_vector",
+                    type(e_bm).__name__,
+                    _weaviate_err_message(e_bm, 800),
+                )
+            # 3) Client-side embed + near_vector
             vector = _embed_with_user_key(query_text, config)
             if not vector:
-                return "Weaviate collection has no vectorizer for query-by-text. " + _MSG_ADD_OPENAI_IN_CONFIG
+                bm_why = _weaviate_err_message(bm_err) if bm_err else "n/a"
+                return (
+                    "Error: Weaviate cannot answer this text query with current collection settings. "
+                    "near_text failed (often: no text vectorizer on the class, or query not supported). "
+                    f"bm25 failed ({type(bm_err).__name__ if bm_err else 'n/a'}): {bm_why}. "
+                    "Common BM25 causes: no text properties with inverted index / tokenization, "
+                    "multi-tenancy without tenant filter, or class name mismatch. "
+                    "Add openai_api_key + embedding_model for near_vector, or fix schema in Weaviate (vectorizer + searchable text)."
+                )
             response = collection.query.near_vector(near_vector=vector, limit=top_k)
-            out = {"matches": []}
-            for obj in response.objects:
-                entry = {"id": str(obj.uuid), "properties": dict(obj.properties) if obj.properties else {}}
-                if hasattr(obj, "metadata") and obj.metadata and getattr(obj.metadata, "distance", None) is not None:
-                    entry["score"] = 1 - (obj.metadata.distance or 0)
-                out["matches"].append(entry)
-            return json.dumps(out, indent=2)
+            return _weaviate_query_response_to_json(response, extra=result_ctx)
         finally:
             client.close()
     except Exception as e:
-        logger.error("Weaviate query error (%s)", type(e).__name__)
-        return "Weaviate query error"
+        detail = _weaviate_exception_detail(e)
+        logger.error("Weaviate query error (%s): %s", type(e).__name__, detail[:800])
+        uh = _url_host(url)
+        is_cloud = _host_is_weaviate_cloud(uh)
+        refused = _weaviate_connection_refused_hint(detail, url, is_cloud)
+        hint = refused or _weaviate_localhost_docker_hint(url)
+        return (
+            f"Error: Weaviate connection or query failed ({type(e).__name__}): {detail[:900]}.{hint} "
+            "For Weaviate Cloud: use the cluster hostname from the console, a valid admin API key, and the correct class name. "
+            "Ensure outbound HTTPS/gRPC (TCP 443) from this container to Weaviate is allowed. "
+            "Optional tool config: weaviate_init_timeout_seconds (default 45), weaviate_trust_env=true behind an HTTP(S) proxy, "
+            "weaviate_skip_init_checks=true if startup probes fail but the cluster is up."
+        )
 
 
 def _execute_qdrant(config: Dict[str, Any], arguments: Dict[str, Any]) -> str:
@@ -496,13 +965,88 @@ def _execute_qdrant(config: Dict[str, Any], arguments: Dict[str, Any]) -> str:
         return "Qdrant query error"
 
 
+def _chroma_cloud_http_embed_query_vector(api_key: str, text: str, model: str) -> List[float]:
+    """Embed query text via Chroma Cloud's embed service (same contract as chromadb ChromaCloudQwenEmbeddingFunction with task=None)."""
+    with httpx.Client(timeout=60.0) as client:
+        r = client.post(
+            "https://embed.trychroma.com",
+            json={"instructions": "", "texts": [text]},
+            headers={
+                "x-chroma-token": api_key.strip(),
+                "x-chroma-embedding-model": model.strip(),
+                "Content-Type": "application/json",
+            },
+        )
+        if r.status_code >= 400:
+            raise RuntimeError(f"embed.trychroma.com HTTP {r.status_code}: {r.text[:600]}")
+        data = r.json()
+    if isinstance(data, dict) and data.get("error"):
+        raise RuntimeError(str(data.get("error"))[:600])
+    embeddings = data.get("embeddings") if isinstance(data, dict) else None
+    if not embeddings or not isinstance(embeddings, list) or not embeddings[0]:
+        raise RuntimeError(f"unexpected embed response: {type(data).__name__} keys={list(data.keys()) if isinstance(data, dict) else 'n/a'}")
+    vec = embeddings[0]
+    if isinstance(vec, list):
+        return [float(x) for x in vec]
+    return [float(x) for x in list(vec)]
+
+
+def _chroma_host_is_try_chroma_cloud(host: str) -> bool:
+    """True if URL host points at Chroma Cloud (chromadb.CloudClient default is api.trychroma.com)."""
+    h = (host or "").strip().lower()
+    return h == "trychroma.com" or h.endswith(".trychroma.com")
+
+
+_CHROMA_QUERY_INCLUDE = ["metadatas", "documents", "distances"]
+
+
+def _chroma_meta_get_ci(meta: Dict[str, Any], want_key: str) -> Any:
+    """Case-insensitive metadata lookup (Chroma keys vary by ingestion pipeline)."""
+    w = want_key.lower()
+    for k, v in meta.items():
+        if str(k).lower() == w:
+            return v
+    return None
+
+
+def _chroma_sender_from_metadata(meta: Any) -> tuple[Optional[str], Optional[str]]:
+    """
+    Best-effort sender/creator for agent-facing output. Returns (value, original_metadata_key_used).
+    """
+    if not isinstance(meta, dict):
+        return (None, None)
+    for key in (
+        "from",
+        "sender",
+        "author",
+        "user_email",
+        "email",
+        "customer_email",
+        "submitted_by",
+        "created_by",
+        "user_id",
+        "userid",
+    ):
+        v = _chroma_meta_get_ci(meta, key)
+        if v is None or v == "":
+            continue
+        s = str(v).strip()
+        if s:
+            return (s, key)
+    return (None, None)
+
+
 def _execute_chroma(config: Dict[str, Any], arguments: Dict[str, Any]) -> str:
     """Query Chroma collection. Uses Chroma Cloud (api_key + tenant + database) or HttpClient for self-hosted."""
     url = (config.get("url") or "").strip() or "http://localhost:8000"
     collection_name = (config.get("index_name") or "default").strip()
     query_text = (arguments.get("query") or "").strip()
     top_k = min(max(int(arguments.get("top_k") or 5), 1), 100)
-    api_key = (config.get("api_key") or "").strip() or None
+    api_key = (
+        (config.get("api_key") or config.get("chroma_api_key") or config.get("chroma_token") or "")
+        .strip()
+        or None
+    )
     tenant = (config.get("tenant") or "").strip() or None
     database = (config.get("database") or "").strip() or None
 
@@ -511,76 +1055,150 @@ def _execute_chroma(config: Dict[str, Any], arguments: Dict[str, Any]) -> str:
 
     try:
         import chromadb
-        host = _url_host(url)
-        is_cloud = host == "trychroma.com" or host.endswith(".trychroma.com")
-        if is_cloud and api_key:
+        host_only = _url_host(url)
+        use_cloud_sdk = bool(api_key) and _chroma_host_is_try_chroma_cloud(host_only)
+        if use_cloud_sdk:
             client = chromadb.CloudClient(
                 tenant=tenant,
                 database=database,
                 api_key=api_key,
             )
         else:
-            if is_cloud and not api_key:
+            if _chroma_host_is_try_chroma_cloud(host_only) and not api_key:
                 return (
-                    "Chroma Cloud requires an API key. Set **Chroma API key** in this tool's config "
-                    "(create one in Chroma Cloud → Settings → Create API key). Optionally set Tenant ID and Database name."
+                    "Chroma Cloud (trychroma host) requires a **Chroma API key** in this tool's config "
+                    "(field 'Chroma API key (for Cloud)'). Create one in Chroma Cloud → Settings. "
+                    "Also set **Tenant ID** and **Database name** if your project uses them."
                 )
-            host, port, _ = _parse_url(url)
-            client = chromadb.HttpClient(host=host, port=port)
-        coll = client.get_or_create_collection(name=collection_name or "default")
-        # Prefer query_texts (Chroma's embedding); fallback to user's OpenAI key from config
+            host, port, secure = _parse_url(url)
+            headers = {"X-Chroma-Token": api_key} if api_key else None
+            hc_kw: Dict[str, Any] = {"host": host, "port": port, "ssl": secure}
+            if headers:
+                hc_kw["headers"] = headers
+            if tenant:
+                hc_kw["tenant"] = tenant
+            if database:
+                hc_kw["database"] = database
+            client = chromadb.HttpClient(**hc_kw)
         try:
-            result = coll.query(query_texts=[query_text], n_results=top_k)
+            coll = client.get_collection(name=collection_name or "default")
+        except Exception as ge:
+            return (
+                f"Chroma: no collection named {collection_name!r} ({type(ge).__name__}: {ge}). "
+                "Set **Collection name** in this MCP tool to the exact name in the Chroma UI "
+                "(e.g. customer-support-messages)."
+            )
+        # Prefer query_texts (Chroma Cloud / server embeds the query, e.g. Qwen—same as the dashboard).
+        try:
+            result = coll.query(
+                query_texts=[query_text], n_results=top_k, include=_CHROMA_QUERY_INCLUDE
+            )
         except Exception as text_err:
-            # Use config embedding_dimension if set (e.g. 1024) to match collection
-            want_dim = None
-            try:
-                raw = config.get("embedding_dimension")
-                if raw is not None and str(raw).strip():
-                    want_dim = int(str(raw).strip())
-            except (TypeError, ValueError):
-                pass
-            vector = _embed_with_user_key(query_text, config, dimensions=want_dim)
-            if not vector:
-                reason = str(text_err).strip() or "collection may have no embedding function"
-                return (
-                    f"Chroma query by text failed ({reason}). "
-                    "Add your **OpenAI API key** in this tool's config (field 'OpenAI API key (optional, for embedding)') so the query can be embedded and searched. "
-                    "The platform does not provide an API key."
-                )
-            try:
-                result = coll.query(query_embeddings=[vector], n_results=top_k)
-            except Exception as dim_err:  # e.g. InvalidArgumentError: dimension 1024 vs 1536
-                err_str = str(dim_err)
-                match = re.search(r"dimension\s+of\s+(\d+)", err_str, re.IGNORECASE) or re.search(
-                    r"expecting\s+embedding\s+with\s+dimension\s+of\s+(\d+)", err_str, re.IGNORECASE
-                )
-                if match:
-                    want_dim = int(match.group(1))
-                    vector = _embed_with_user_key(query_text, config, dimensions=want_dim)
-                    if vector and len(vector) == want_dim:
-                        result = coll.query(query_embeddings=[vector], n_results=top_k)
+            if use_cloud_sdk:
+                logger.warning("Chroma Cloud query_texts failed: %s", text_err)
+                # Dashboard hits server-side search; the Python client may fail to rebuild Qwen EF config
+                # (jsonschema vs stored metadata, e.g. task null / instructions). Same vectors as UI via embed.trychroma.com.
+                embed_model = _resolve_chroma_cloud_http_embed_model(config)
+                try:
+                    qvec = _chroma_cloud_http_embed_query_vector(api_key, query_text, embed_model)
+                    result = coll.query(
+                        query_embeddings=[qvec], n_results=top_k, include=_CHROMA_QUERY_INCLUDE
+                    )
+                    logger.info("Chroma Cloud: embed.trychroma.com fallback succeeded after query_texts failure")
+                except Exception as embed_err:
+                    logger.warning("Chroma Cloud HTTP embed fallback failed: %s", embed_err)
+                    return (
+                        "Chroma Cloud: the Python client's `query_texts` failed (often Qwen collection metadata vs local schema). "
+                        f"SDK error: {text_err}. "
+                        f"HTTP embed fallback: {embed_err}. "
+                        "**chroma_embed_model** must be a Chroma Cloud id (e.g. Qwen/Qwen3-Embedding-0.6B), not an OpenAI model name."
+                    )
+            else:
+                # Self-hosted only: optional local embed via OpenAI when the server has no embedding for query_texts
+                want_dim = None
+                try:
+                    raw = config.get("embedding_dimension")
+                    if raw is not None and str(raw).strip():
+                        want_dim = int(str(raw).strip())
+                except (TypeError, ValueError):
+                    pass
+                vector = _embed_with_user_key(query_text, config, dimensions=want_dim)
+                if not vector:
+                    reason = str(text_err).strip() or "collection may have no embedding function"
+                    return (
+                        "Chroma (self-hosted): `query_texts` failed and no **OpenAI API key** is set for local embedding. "
+                        f"Details: {reason}. "
+                        "Add **OpenAI API key (for query embedding)** in this tool's config, or configure a default embedding on the collection in Chroma."
+                    )
+                try:
+                    result = coll.query(
+                        query_embeddings=[vector], n_results=top_k, include=_CHROMA_QUERY_INCLUDE
+                    )
+                except Exception as dim_err:  # e.g. InvalidArgumentError: dimension 1024 vs 1536
+                    err_str = str(dim_err)
+                    match = re.search(r"dimension\s+of\s+(\d+)", err_str, re.IGNORECASE) or re.search(
+                        r"expecting\s+embedding\s+with\s+dimension\s+of\s+(\d+)", err_str, re.IGNORECASE
+                    )
+                    if match:
+                        want_dim = int(match.group(1))
+                        vector = _embed_with_user_key(query_text, config, dimensions=want_dim)
+                        if vector and len(vector) == want_dim:
+                            result = coll.query(
+                                query_embeddings=[vector],
+                                n_results=top_k,
+                                include=_CHROMA_QUERY_INCLUDE,
+                            )
+                        else:
+                            return (
+                                f"Chroma dimension mismatch: collection expects {want_dim}-dim embeddings. "
+                                f"Set **embedding_model** to a model that supports dimensions (e.g. text-embedding-3-small) and optionally **embedding_dimension** to {want_dim} in this tool's config."
+                            )
                     else:
-                        return (
-                            f"Chroma dimension mismatch: collection expects {want_dim}-dim embeddings. "
-                            f"Set **embedding_model** to a model that supports dimensions (e.g. text-embedding-3-small) and optionally **embedding_dimension** to {want_dim} in this tool's config."
-                        )
-                else:
-                    raise
-        out = {"ids": result.get("ids", [[]])[0], "metadatas": result.get("metadatas", [[]])[0], "documents": result.get("documents", [[]])[0]}
+                        raise
+        out = {
+            "ids": result.get("ids", [[]])[0],
+            "metadatas": result.get("metadatas", [[]])[0],
+            "documents": result.get("documents", [[]])[0],
+            "distances": (result.get("distances") or [[]])[0],
+        }
         # Normalize to matches list for consistency
         matches = []
         ids = out["ids"] or []
         metas = out["metadatas"] or []
         docs = out["documents"] or []
+        dists = out["distances"] or []
         for i, id_ in enumerate(ids):
-            m = {"id": id_}
-            if i < len(metas) and metas[i]:
-                m["metadata"] = _to_json_safe(metas[i])
+            m: Dict[str, Any] = {"id": id_}
+            raw_meta = metas[i] if i < len(metas) else None
+            if raw_meta:
+                safe_meta = _to_json_safe(raw_meta)
+                if isinstance(safe_meta, dict):
+                    m["metadata"] = safe_meta
+                sender_val, sender_key = _chroma_sender_from_metadata(raw_meta)
+                if sender_val:
+                    m["sender"] = sender_val
+                if sender_key:
+                    m["sender_metadata_key"] = sender_key
+            if i < len(dists) and dists[i] is not None:
+                try:
+                    m["distance"] = float(dists[i])
+                except (TypeError, ValueError):
+                    pass
             if i < len(docs) and docs[i]:
                 m["document"] = _to_json_safe(docs[i])
             matches.append(m)
-        return json.dumps({"matches": matches}, indent=2)
+        envelope: Dict[str, Any] = {
+            "matches": matches,
+            "retrieval_note": (
+                "Results are ranked by vector similarity to the query, not by exact match on words like an email address. "
+                "Always report each hit's `sender` (and full `metadata`) so the reader sees who the message is from."
+            ),
+            "access_scope_note": (
+                "This call used only the Chroma collection and API credentials stored in this Sandhi user's MCP tool. "
+                "Other Sandhi users cannot invoke this tool configuration."
+            ),
+        }
+        return json.dumps(envelope, indent=2)
     except Exception as e:
         logger.error("Chroma query error (%s)", type(e).__name__)
         return "Chroma query error"
@@ -810,13 +1428,14 @@ async def jsonrpc(request: Request, x_mcp_business_id: Optional[str] = Header(No
             result_text = execute_platform_tool(tool_type, config, arguments)
             is_err = result_text.startswith("Error:")
             logger.info(
-                "MCP tools/call business_id=%s tool=%s tool_type=%s is_error=%s result_chars=%s result_output=%s",
+                "MCP tools/call business_id=%s tool=%s tool_type=%s is_error=%s result_chars=%s result_output=%s%s",
                 business_id,
                 name,
                 tool_type,
                 is_err,
                 len(result_text),
                 _tool_result_for_log(result_text),
+                _sandhi_correlation_log_suffix(request),
             )
             return JSONResponse({
                 "jsonrpc": JSONRPC_VERSION,
@@ -840,7 +1459,13 @@ async def jsonrpc(request: Request, x_mcp_business_id: Optional[str] = Header(No
                 "error": {"code": -32000, "message": "Failed to fetch tool configuration from backend"},
             })
         except Exception as e:
-            logger.error("tools/call error business_id=%s tool=%s (%s)", business_id, name, type(e).__name__)
+            logger.error(
+                "tools/call error business_id=%s tool=%s (%s)%s",
+                business_id,
+                name,
+                type(e).__name__,
+                _sandhi_correlation_log_suffix(request),
+            )
             return JSONResponse({
                 "jsonrpc": JSONRPC_VERSION,
                 "id": req_id,

@@ -1,15 +1,16 @@
 from typing import List, Dict, Any, Optional
-import httpx
+import logging
 from pathlib import Path
 import json
 from core.config import settings
-from services.a2a_client import execute_via_a2a
-from services.httpx_tls import httpx_verify_parameter
 from services.job_file_storage import materialize_to_temp_path, cleanup_temp_path
+from services.planner_llm import is_agent_planner_configured, planner_chat_completion
+
+logger = logging.getLogger(__name__)
 
 
 class DocumentAnalyzer:
-    """Extract document text and run Q&A via hired agent."""
+    """Extract document text; BRD reasoning and workflow clarification use the platform Agent Planner only."""
 
     def __init__(self):
         pass
@@ -164,160 +165,15 @@ class DocumentAnalyzer:
         finally:
             cleanup_temp_path(file_info, local_path)
     
-    async def _analyze_documents_via_a2a(
+    async def _analyze_with_platform_planner(
         self,
+        *,
         all_content: str,
         job_title: str,
         job_description: Optional[str],
         conversation_history: List[Dict[str, str]],
-        agent_api_url: str,
-        agent_api_key: Optional[str],
-        *,
-        adapter_url: Optional[str] = None,
-        adapter_metadata: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
-        """Call hired agent via A2A for BRD analysis (direct or via platform adapter); return same shape as OpenAI path."""
-        input_data = {
-            "job_title": job_title,
-            "job_description": job_description or "",
-            "documents_content": all_content,
-            "conversation_history": conversation_history,
-            "task": "Analyze the documents and requirements. Ask ONLY important clarifying questions (critical gaps, real ambiguities, risks). Do NOT ask minor or obvious questions (e.g. for simple math like 'add 2+5' do not ask output format—integer/float; use a reasonable default). Return valid JSON: {\"analysis\": \"...\", \"questions\": [] (only if truly needed), \"recommendations\": [], \"solutions\": [], \"next_steps\": []}. Works for both sequential and A2A workflows.",
-        }
-        if adapter_url and adapter_metadata is not None:
-            result = await execute_via_a2a(
-                adapter_url,
-                input_data,
-                api_key=None,
-                blocking=True,
-                timeout=120.0,
-                adapter_metadata=adapter_metadata,
-            )
-        else:
-            result = await execute_via_a2a(
-                agent_api_url,
-                input_data,
-                api_key=agent_api_key,
-                blocking=True,
-                timeout=120.0,
-            )
-        content = (result.get("content") or "").strip()
-        try:
-            parsed = json.loads(content)
-            hint = parsed.get("workflow_collaboration_hint")
-            if hint not in ("sequential", "async_a2a"):
-                hint = None
-            return {
-                "analysis": parsed.get("analysis", ""),
-                "questions": parsed.get("questions", []),
-                "recommendations": parsed.get("recommendations", []),
-                "solutions": parsed.get("solutions", []),
-                "next_steps": parsed.get("next_steps", []),
-                "workflow_collaboration_hint": hint,
-                "workflow_collaboration_reason": (parsed.get("workflow_collaboration_reason") or "").strip() or None if hint else None,
-                "raw_response": content,
-            }
-        except json.JSONDecodeError:
-            return {
-                "analysis": content,
-                "questions": self._extract_questions(content),
-                "recommendations": self._extract_recommendations(content),
-                "solutions": [],
-                "next_steps": [],
-                "workflow_collaboration_hint": None,
-                "workflow_collaboration_reason": None,
-                "raw_response": content,
-            }
-    
-    async def analyze_documents_and_generate_questions(
-        self, 
-        documents: List[Dict[str, str]], 
-        job_title: str,
-        job_description: Optional[str] = None,
-        conversation_history: Optional[List[Dict[str, str]]] = None,
-        *,
-        agent_api_url: Optional[str] = None,
-        agent_api_key: Optional[str] = None,
-        agent_llm_model: Optional[str] = None,
-        agent_temperature: Optional[float] = None,
-        use_a2a: bool = False,
-    ) -> Dict[str, Any]:
-        """
-        Extract document text and optionally analyze via hired agent.
-        - When agent_api_url is provided: use hired agent for analysis and Q&A.
-        - When not provided: only extract text; return extracted data and empty questions.
-        """
-        conversation_history = conversation_history or []
-        job_title = str(job_title).strip() if job_title is not None else ""
-        job_description = str(job_description).strip() if job_description is not None else None
-        if job_description is not None and not job_description:
-            job_description = None
-        # Extract data from all documents (no inference)
-        document_contents = []
-        for doc in documents:
-            name = doc.get("name", "Unknown")
-            try:
-                if doc.get("path"):
-                    content = await self.read_document(doc["path"])
-                else:
-                    content = await self.read_file_info(doc)
-            except Exception as e:
-                content = f"[Error reading {name}: {str(e)}]"
-            document_contents.append(f"=== {name} ===\n{content}\n")
-        
-        if not document_contents:
-            return {
-                "analysis": f"No documents could be read for job '{job_title}'.",
-                "questions": [],
-                "recommendations": [],
-                "solutions": [],
-                "next_steps": [],
-                "raw_response": "",
-            }
-        all_content = "\n".join(document_contents)
-        
-        # No hired agent endpoint → extraction only
-        if not (agent_api_url and (agent_api_url or "").strip()):
-            return {
-                "analysis": f"Document text extracted for job '{job_title}'. Select and assign agents to this job to enable AI-powered analysis and Q&A.",
-                "questions": [],
-                "recommendations": [],
-                "solutions": [],
-                "next_steps": [],
-                "raw_response": "",
-            }
-        
-        # A2A path: call hired agent via A2A protocol (same semantics, different transport)
-        if use_a2a:
-            return await self._analyze_documents_via_a2a(
-                all_content=all_content,
-                job_title=job_title,
-                job_description=job_description,
-                conversation_history=conversation_history,
-                agent_api_url=agent_api_url.strip(),
-                agent_api_key=agent_api_key,
-            )
-        
-        # OpenAI-compatible via platform adapter: route through A2A so architecture is A2A everywhere
-        adapter_url = (getattr(settings, "A2A_ADAPTER_URL", None) or "").strip()
-        if adapter_url:
-            model = (agent_llm_model or "").strip() or "gpt-4o-mini"
-            return await self._analyze_documents_via_a2a(
-                all_content=all_content,
-                job_title=job_title,
-                job_description=job_description,
-                conversation_history=conversation_history,
-                agent_api_url=agent_api_url.strip(),
-                agent_api_key=agent_api_key,
-                adapter_url=adapter_url,
-                adapter_metadata={
-                    "openai_url": agent_api_url.strip(),
-                    "openai_api_key": (agent_api_key or "").strip() or "",
-                    "openai_model": model,
-                },
-            )
-        
-        # Hired agent: build the prompt and call agent endpoint (OpenAI-compatible, no adapter)
+        """BRD analysis via platform-configured planner model (Issue #62)."""
         system_prompt = """You are an expert AI assistant specialized in deeply understanding business requirements from documents and providing intelligent solutions.
 
 Your primary tasks:
@@ -368,14 +224,13 @@ IMPORTANT: You must respond with valid JSON only. Format your response as JSON w
 }
 
 When you have enough information to understand the problem, provide solutions and recommendations instead of asking more questions."""
-        
-        # Build user prompt
+
         job_desc_part = f'Job Description: {job_description}\n\n' if job_description else ''
         conv_part = ''
         if conversation_history:
             formatted_conv = self._format_conversation(conversation_history)
             conv_part = f'\n\nPrevious Conversation History:\n{formatted_conv}\n\n'
-        
+
         user_prompt = f"""Job Title: {job_title}
 {job_desc_part}=== UPLOADED DOCUMENTS WITH REQUIREMENTS ===
 {all_content}
@@ -388,13 +243,12 @@ TASK:
 5. Once you understand the problem, provide SOLUTIONS and RECOMMENDATIONS
 
 Be thorough and solution-oriented. Prefer sensible defaults over asking trivial questions."""
-        
-        messages = [
+
+        messages: List[Dict[str, Any]] = [
             {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt}
+            {"role": "user", "content": user_prompt},
         ]
-        
-        # Add conversation history if provided - only include Q&A pairs with both question and answer
+
         def _str_strip(val: Any) -> str:
             if val is None:
                 return ""
@@ -414,83 +268,121 @@ Be thorough and solution-oriented. Prefer sensible defaults over asking trivial 
                     content = _str_strip(item.get("content"))
                     if content:
                         messages.append({"role": "assistant", "content": f"Analysis: {content}"})
-        
+
+        max_content_length = 50000
+        for msg in messages:
+            if len(msg.get("content", "")) > max_content_length:
+                msg["content"] = msg["content"][:max_content_length] + "\n\n[Content truncated due to length...]"
+
+        temp = getattr(settings, "AGENT_PLANNER_TEMPERATURE", None)
+        if temp is None:
+            temp = 0.7
         try:
-            max_content_length = 50000
-            for msg in messages:
-                if len(msg.get("content", "")) > max_content_length:
-                    msg["content"] = msg["content"][:max_content_length] + "\n\n[Content truncated due to length...]"
-            
-            model = (agent_llm_model or "").strip() or "gpt-4o-mini"
-            temperature = agent_temperature if agent_temperature is not None else 0.7
-            payload = {
-                "model": model,
-                "messages": messages,
-                "temperature": temperature,
-                "max_tokens": 2000,
-            }
-            headers = {"Content-Type": "application/json"}
-            if agent_api_key and (agent_api_key or "").strip():
-                headers["Authorization"] = f"Bearer {(agent_api_key or '').strip()}"
-            
-            async with httpx.AsyncClient(timeout=120.0, verify=False) as client:
-                response = await client.post(
-                    agent_api_url.strip(),
-                    json=payload,
-                    headers=headers,
-                )
-                response.raise_for_status()
-                result = response.json()
-                raw_content = result["choices"][0]["message"].get("content")
-                # OpenAI can return content as string or list of parts (e.g. multimodal)
-                if isinstance(raw_content, list):
-                    assistant_message = " ".join(
-                        p.get("text", p.get("content", "")) if isinstance(p, dict) else str(p)
-                        for p in raw_content
-                    )
-                elif isinstance(raw_content, str):
-                    assistant_message = raw_content
-                else:
-                    assistant_message = str(raw_content or "")
-                
-                try:
-                    parsed = json.loads(assistant_message)
-                    hint = parsed.get("workflow_collaboration_hint")
-                    if hint not in ("sequential", "async_a2a"):
-                        hint = None
-                    return {
-                        "analysis": parsed.get("analysis", ""),
-                        "questions": parsed.get("questions", []),
-                        "recommendations": parsed.get("recommendations", []),
-                        "solutions": parsed.get("solutions", []),
-                        "next_steps": parsed.get("next_steps", []),
-                        "workflow_collaboration_hint": hint,
-                        "workflow_collaboration_reason": (parsed.get("workflow_collaboration_reason") or "").strip() or None if hint else None,
-                        "raw_response": assistant_message,
-                    }
-                except json.JSONDecodeError:
-                    return {
-                        "analysis": assistant_message,
-                        "questions": self._extract_questions(assistant_message),
-                        "recommendations": self._extract_recommendations(assistant_message),
-                        "solutions": [],
-                        "next_steps": [],
-                        "workflow_collaboration_hint": None,
-                        "workflow_collaboration_reason": None,
-                        "raw_response": assistant_message,
-                    }
-        except httpx.HTTPStatusError as e:
-            error_detail = f"Hired agent API error: {e.response.status_code}"
-            try:
-                error_detail += f" - {e.response.text[:500]}"
-            except Exception:
-                pass
-            raise Exception(error_detail)
-        except httpx.RequestError as e:
-            raise Exception(f"Hired agent API request error: {str(e)}")
+            assistant_message = await planner_chat_completion(
+                messages,
+                temperature=float(temp),
+                max_tokens=2000,
+            )
         except Exception as e:
-            raise Exception(f"Error analyzing documents: {str(e)}")
+            logger.exception("Planner BRD analysis failed")
+            raise Exception(f"Agent planner analysis failed: {str(e)}") from e
+
+        try:
+            parsed = json.loads(assistant_message)
+            hint = parsed.get("workflow_collaboration_hint")
+            if hint not in ("sequential", "async_a2a"):
+                hint = None
+            return {
+                "analysis": parsed.get("analysis", ""),
+                "questions": parsed.get("questions", []),
+                "recommendations": parsed.get("recommendations", []),
+                "solutions": parsed.get("solutions", []),
+                "next_steps": parsed.get("next_steps", []),
+                "workflow_collaboration_hint": hint,
+                "workflow_collaboration_reason": (parsed.get("workflow_collaboration_reason") or "").strip() or None if hint else None,
+                "raw_response": assistant_message,
+            }
+        except json.JSONDecodeError:
+            return {
+                "analysis": assistant_message,
+                "questions": self._extract_questions(assistant_message),
+                "recommendations": self._extract_recommendations(assistant_message),
+                "solutions": [],
+                "next_steps": [],
+                "workflow_collaboration_hint": None,
+                "workflow_collaboration_reason": None,
+                "raw_response": assistant_message,
+            }
     
+    async def analyze_documents_and_generate_questions(
+        self, 
+        documents: List[Dict[str, str]], 
+        job_title: str,
+        job_description: Optional[str] = None,
+        conversation_history: Optional[List[Dict[str, str]]] = None,
+        *,
+        agent_api_url: Optional[str] = None,
+        agent_api_key: Optional[str] = None,
+        agent_llm_model: Optional[str] = None,
+        agent_temperature: Optional[float] = None,
+        use_a2a: bool = False,
+    ) -> Dict[str, Any]:
+        """
+        Extract document text; when the platform Agent Planner is configured, run BRD analysis via planner.
+        Optional agent_api_url / use_a2a kwargs are ignored (kept for call-site compatibility).
+        """
+        conversation_history = conversation_history or []
+        job_title = str(job_title).strip() if job_title is not None else ""
+        job_description = str(job_description).strip() if job_description is not None else None
+        if job_description is not None and not job_description:
+            job_description = None
+        # Extract data from all documents (no inference)
+        document_contents = []
+        for doc in documents:
+            name = doc.get("name", "Unknown")
+            try:
+                if doc.get("path"):
+                    content = await self.read_document(doc["path"])
+                else:
+                    content = await self.read_file_info(doc)
+            except Exception as e:
+                content = f"[Error reading {name}: {str(e)}]"
+            document_contents.append(f"=== {name} ===\n{content}\n")
+        
+        if not document_contents:
+            return {
+                "analysis": f"No documents could be read for job '{job_title}'.",
+                "questions": [],
+                "recommendations": [],
+                "solutions": [],
+                "next_steps": [],
+                "raw_response": "",
+            }
+        all_content = "\n".join(document_contents)
+
+        # Platform Agent Planner (Issue #62): admin-configured model for BRD analysis
+        if is_agent_planner_configured():
+            return await self._analyze_with_platform_planner(
+                all_content=all_content,
+                job_title=job_title,
+                job_description=job_description,
+                conversation_history=conversation_history,
+            )
+        
+        # BRD reasoning is platform-owned; no hired-agent LLM fallback.
+        return {
+            "analysis": (
+                f"Document text extracted for job '{job_title}'. "
+                "Configure the platform Agent Planner (AGENT_PLANNER_API_KEY and related settings) "
+                "for AI-powered BRD analysis and Q&A."
+            ),
+            "questions": [],
+            "recommendations": [],
+            "solutions": [],
+            "next_steps": [],
+            "raw_response": "",
+        }
+
     async def process_user_response(
         self,
         user_answer: str,
@@ -555,15 +447,29 @@ Be thorough and solution-oriented. Prefer sensible defaults over asking trivial 
         agent_llm_model: Optional[str] = None,
         agent_temperature: Optional[float] = None,
         use_a2a: bool = False,
+        only_step: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """
         Generate clarifying questions for the end user based on the workflow (assigned tasks),
         BRD documents, and job prompt. Used in the Q&A step after Build Workflow so agents
         can get requirements clarified before execution.
-        Returns {"questions": ["...", ...]}.
+        When only_step is set, scope is that workflow step only in the prompt.
+        Uses platform Agent Planner only; returns {"questions": [...]}.
         """
-        if not workflow_tasks:
-            return {"questions": []}
+        max_q = 2 if only_step is not None else 3
+        if only_step is not None:
+            tasks_for_prompt = [
+                {
+                    "step_order": only_step.get("step_order", 1),
+                    "agent_name": only_step.get("agent_name", "Agent"),
+                    "assigned_task": only_step.get("assigned_task", ""),
+                }
+            ]
+        else:
+            if not workflow_tasks:
+                return {"questions": []}
+            tasks_for_prompt = workflow_tasks
+
         job_title = (job_title or "").strip()
         job_description = (job_description or "").strip() or ""
         docs_text = ""
@@ -574,7 +480,7 @@ Be thorough and solution-oriented. Prefer sensible defaults over asking trivial 
             )
         workflow_text = "\n".join(
             f"Step {t.get('step_order', i+1)} ({t.get('agent_name', 'Agent')}): {t.get('assigned_task', '')}"
-            for i, t in enumerate(workflow_tasks)
+            for i, t in enumerate(tasks_for_prompt)
         )
         conv_text = self._format_conversation(conversation_history) if conversation_history else "(none)"
         user_prompt = f"""JOB TITLE: {job_title}
@@ -591,6 +497,7 @@ EXISTING Q&A:
 
 TASK: Generate clarification questions ONLY (no answers, no analysis summary, no solutions).
 Your goal is to help each assigned agent execute its own task correctly by asking targeted requirement questions.
+{"You are generating questions ONLY for the single workflow step listed above (you represent that assigned agent)." if only_step is not None else ""}
 
 RULES:
 1) Questions must be tied to specific workflow steps/agents (based on assigned tasks above).
@@ -601,7 +508,7 @@ RULES:
 3) Do NOT provide answers, computed results, recommendations, or implementation steps in this stage.
 4) If and only if all assigned tasks are executable with clear requirements, return an empty array.
 5) Prefer concise, actionable questions. Avoid generic or conversational filler.
-6) Maximum 3 questions total. If more than 3 are possible, keep only the highest-impact blockers.
+6) Maximum {max_q} questions total. If more than {max_q} are possible, keep only the highest-impact blockers.
 7) Before returning each question, apply this quality gate:
    - Would the answer materially change implementation/scope for a workflow step?
    - Is this information truly unavailable from BRD + job + existing Q&A?
@@ -631,64 +538,34 @@ or
 {{"questions": []}}
 No markdown. No extra keys. No explanation text."""
 
-        if not (agent_api_url and (agent_api_url or "").strip()):
+        if not is_agent_planner_configured():
             return {"questions": []}
 
-        adapter_url = (getattr(settings, "A2A_ADAPTER_URL", None) or "").strip()
-        if use_a2a and not adapter_url:
-            # Direct A2A to agent
-            input_data = {"job_title": job_title, "job_description": job_description, "prompt": user_prompt}
-            result = await execute_via_a2a(
-                agent_api_url.strip(),
-                input_data,
-                api_key=(agent_api_key or "").strip() or None,
-                blocking=True,
-                timeout=120.0,
-            )
-            content = (result.get("content") or "").strip()
-        elif adapter_url:
-            model = (agent_llm_model or "").strip() or "gpt-4o-mini"
-            input_data = {"job_title": job_title, "job_description": job_description, "prompt": user_prompt}
-            result = await execute_via_a2a(
-                adapter_url,
-                input_data,
-                api_key=None,
-                blocking=True,
-                timeout=120.0,
-                adapter_metadata={
-                    "openai_url": agent_api_url.strip(),
-                    "openai_api_key": (agent_api_key or "").strip() or "",
-                    "openai_model": model,
-                },
-            )
-            content = (result.get("content") or "").strip()
-        else:
-            # Direct OpenAI
-            model = (agent_llm_model or "").strip() or "gpt-4o-mini"
-            payload = {
-                "model": model,
-                "messages": [
-                    {"role": "system", "content": "You are in CLARIFICATION mode for workflow execution. Generate ONLY execution-critical questions mapped to workflow steps/agents. NEVER provide answers, calculations, solutions, recommendations, summaries, or next steps. Ask only when a required input/constraint/ambiguity blocks correct execution for a step. Enforce strict quality gate: each question must materially change implementation/scope and be currently blocking and not already answered. MAX 3 questions. Reject trivial questions (format preference, method preference, generic context). If all steps are executable, return empty array. Return only valid JSON: {\"questions\": [\"[Step N - Agent Name] ...?\"]} or {\"questions\": []}. No markdown. No extra keys."},
+        system_content = (
+            "You are in CLARIFICATION mode for workflow execution. Generate ONLY execution-critical "
+            "questions mapped to workflow steps/agents. NEVER provide answers, calculations, solutions, "
+            "recommendations, summaries, or next steps. Ask only when a required input/constraint/"
+            "ambiguity blocks correct execution for a step. Enforce strict quality gate: each question "
+            "must materially change implementation/scope and be currently blocking and not already answered. "
+            f"MAX {max_q} questions. Reject trivial questions (format preference, method preference, "
+            "generic context). If all steps are executable, return empty array. Return only valid JSON: "
+            '{"questions": ["[Step N - Agent Name] ...?"]} or {"questions": []}. No markdown. No extra keys.'
+        )
+        try:
+            planner_temp = float(getattr(settings, "AGENT_PLANNER_TEMPERATURE", 0.5) or 0.5)
+            content = await planner_chat_completion(
+                [
+                    {"role": "system", "content": system_content},
                     {"role": "user", "content": user_prompt[:50000]},
                 ],
-                "temperature": agent_temperature if agent_temperature is not None else 0.5,
-                "max_tokens": 1500,
-            }
-            headers = {"Content-Type": "application/json"}
-            if agent_api_key and (agent_api_key or "").strip():
-                headers["Authorization"] = f"Bearer {(agent_api_key or '').strip()}"
-            async with httpx.AsyncClient(timeout=120.0, verify=httpx_verify_parameter()) as client:
-                resp = await client.post(agent_api_url.strip(), json=payload, headers=headers)
-                resp.raise_for_status()
-                data = resp.json()
-                raw = (data.get("choices") or [{}])[0].get("message") or {}
-                content = (raw.get("content") or "").strip()
-                if isinstance(content, list):
-                    content = " ".join(
-                        p.get("text", p.get("content", "")) if isinstance(p, dict) else str(p)
-                        for p in content
-                    )
+                temperature=min(0.5, planner_temp),
+                max_tokens=1500,
+            )
+        except Exception as e:
+            logger.warning("Workflow clarification via platform planner failed: %s", e)
+            return {"questions": []}
 
+        content = (content or "").strip()
         if not content:
             return {"questions": []}
         if content.startswith("```"):
@@ -700,10 +577,20 @@ No markdown. No extra keys. No explanation text."""
             parsed = json.loads(content)
             questions = parsed.get("questions")
             if isinstance(questions, list):
-                return {"questions": self._filter_critical_questions([str(q).strip() for q in questions if str(q).strip()])}
+                return {
+                    "questions": self._filter_critical_questions(
+                        [str(q).strip() for q in questions if str(q).strip()],
+                        max_count=max_q,
+                    )
+                }
         except (json.JSONDecodeError, TypeError):
             pass
-        return {"questions": self._filter_critical_questions(self._extract_questions(content))}
+        return {
+            "questions": self._filter_critical_questions(
+                self._extract_questions(content)[:max_q],
+                max_count=max_q,
+            )
+        }
 
     def _format_conversation(self, history: List[Dict[str, Any]]) -> str:
         """Format conversation history for the prompt"""
@@ -745,10 +632,10 @@ No markdown. No extra keys. No explanation text."""
                     recommendations.append(cleaned)
         return recommendations[:5]  # Limit to 5 recommendations
 
-    def _filter_critical_questions(self, questions: List[str]) -> List[str]:
+    def _filter_critical_questions(self, questions: List[str], max_count: int = 3) -> List[str]:
         """
         Keep only high-signal clarification questions.
-        Filters out common trivial/silly prompt artifacts and limits to top 3.
+        Filters out common trivial/silly prompt artifacts and limits to top max_count.
         """
         if not questions:
             return []
@@ -779,6 +666,6 @@ No markdown. No extra keys. No explanation text."""
                 continue
             seen.add(low)
             keep.append(clean)
-            if len(keep) >= 3:
+            if len(keep) >= max_count:
                 break
         return keep

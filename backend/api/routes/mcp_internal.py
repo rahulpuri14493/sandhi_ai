@@ -6,7 +6,7 @@ Protected by MCP_INTERNAL_SECRET header.
 import json
 from fastapi import APIRouter, Depends, HTTPException, Header
 from sqlalchemy.orm import Session
-from typing import List, Optional
+from typing import Optional
 from pydantic import BaseModel
 
 from db.database import get_db
@@ -43,6 +43,8 @@ def internal_list_tools(
     List platform MCP tools for a business (tenant).
     Returns tool id, name, type, and inputSchema for MCP tools/list.
     """
+    if business_id <= 0:
+        raise HTTPException(status_code=400, detail="Invalid business_id")
     rows = db.query(MCPToolConfig).filter(
         MCPToolConfig.user_id == business_id,
         MCPToolConfig.is_active == True,
@@ -77,7 +79,11 @@ def _description_for_type(tool_type: MCPToolType, name: str) -> str:
         MCPToolType.PINECONE: "Query Pinecone vector index (read/search; writes via provider or job flows)",
         MCPToolType.WEAVIATE: "Query Weaviate vector store (read/search; writes via provider or job flows)",
         MCPToolType.QDRANT: "Query Qdrant vector database (read/search; writes via provider or job flows)",
-        MCPToolType.CHROMA: "Query Chroma vector store (read/search; writes via provider or job flows)",
+        MCPToolType.CHROMA: (
+            "Query Chroma vector store (read/search; writes via provider or job flows). "
+            "Scoped to this Sandhi user's MCP tool only—config and credentials are not shared across accounts. "
+            "Results are similarity-ranked; each hit includes `sender` when metadata has from/sender/email-style fields."
+        ),
         MCPToolType.POSTGRES: "Execute PostgreSQL SQL (reads and writes)",
         MCPToolType.MYSQL: "Execute MySQL SQL (reads and writes)",
         MCPToolType.SQLSERVER: "Execute SQL Server SQL (reads and writes)",
@@ -115,6 +121,8 @@ def internal_get_tool_config(
     Return decrypted config for a platform tool. Caller (platform MCP server) must
     use this to execute the tool. Only tools belonging to business_id are allowed.
     """
+    if body.business_id <= 0:
+        raise HTTPException(status_code=400, detail="Invalid business_id")
     t = db.query(MCPToolConfig).filter(
         MCPToolConfig.id == tool_id,
         MCPToolConfig.user_id == body.business_id,

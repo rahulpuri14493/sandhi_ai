@@ -48,5 +48,18 @@ describe('getStepOutputDisplayText', () => {
     expect(getStepOutputDisplayText('s')).toBe('s')
     expect(getStepOutputDisplayText(7)).toBe('7')
   })
+
+  it('handles non-serializable content with String fallback', () => {
+    const circular: Record<string, unknown> = { a: 1 }
+    circular.self = circular
+    expect(getStepOutputDisplayText({ content: circular })).toBe('[object Object]')
+  })
+
+  it('handles non-serializable top-level object fallback', () => {
+    const circular: Record<string, unknown> = {}
+    circular.loop = circular
+    const text = getStepOutputDisplayText(circular)
+    expect(text).toBe('[object Object]')
+  })
 })
 

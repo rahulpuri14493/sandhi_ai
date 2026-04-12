@@ -237,6 +237,12 @@ export function DocumentConversation({
                       Q
                     </div>
                     <div className="flex-1">
+                      {(item.agent_name || item.agent_id != null) && (
+                        <p className="text-xs text-primary-300/90 font-bold uppercase tracking-wide mb-2">
+                          From assigned agent: {item.agent_name ?? `Agent #${item.agent_id}`}
+                          {item.workflow_step_id != null ? ` · Step ${item.workflow_step_id}` : ''}
+                        </p>
+                      )}
                       <p className="font-bold text-white mb-3 text-lg">{item.question}</p>
                       {item.answer && (
                         <div className="mt-4 p-4 bg-dark-50/50 rounded-xl border border-dark-200/50">
@@ -300,6 +306,11 @@ export function DocumentConversation({
             <label className="block text-base font-bold text-white mb-3">
               Answer the question:
             </label>
+            {(unansweredQuestion.agent_name || unansweredQuestion.agent_id != null) && (
+              <p className="text-xs text-primary-300 font-bold mb-2">
+                From: {unansweredQuestion.agent_name ?? `Agent #${unansweredQuestion.agent_id}`}
+              </p>
+            )}
             <p className="text-white/90 mb-4 p-4 bg-yellow-500/10 rounded-xl border-2 border-yellow-500/30 font-medium">
               {unansweredQuestion.question}
             </p>

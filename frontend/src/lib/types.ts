@@ -85,6 +85,10 @@ export interface ConversationItem {
   workflow_collaboration_hint?: WorkflowCollaborationHint | null;
   workflow_collaboration_reason?: string | null;
   timestamp?: string;
+  /** Workflow Q&A: which step's assigned agent asked this */
+  workflow_step_id?: number;
+  agent_id?: number;
+  agent_name?: string | null;
 }
 
 export interface Job {
@@ -118,6 +122,16 @@ export interface Job {
   scheduled_at?: string | null;
 }
 
+export interface JobRerunResponse {
+  message: string
+  job_id: number
+  status: string
+  mode?: 'resume' | 'full' | string | null
+  resume_start_step_order?: number | null
+  steps_reused_count?: number | null
+  steps_rerun_count?: number | null
+}
+
 export interface WorkflowStep {
   id: number;
   job_id: number;
@@ -136,6 +150,16 @@ export interface WorkflowStep {
   allowed_connection_ids?: number[] | null;
   /** Override job tool_visibility for this step: full | names_only | none. */
   tool_visibility?: 'full' | 'names_only' | 'none' | null;
+  live_phase?: string | null;
+  live_phase_started_at?: string | null;
+  live_reason_code?: string | null;
+  live_reason_detail?: string | null;
+  live_trace_id?: string | null;
+  live_attempt?: number | null;
+  last_progress_at?: string | null;
+  last_activity_at?: string | null;
+  stuck_since?: string | null;
+  stuck_reason?: string | null;
 }
 
 export interface WorkflowPreview {
@@ -220,4 +244,18 @@ export interface JobSchedule {
 export interface JobScheduleWithJob extends JobSchedule {
   job_title: string
   job_status: string
+}
+
+/** GET /jobs/:id/planner-pipeline — latest BRD, task split, and tool suggestion payloads */
+export interface PlannerPipelineBundle {
+  schema_version: string
+  job_id: number
+  brd_analysis: Record<string, unknown> | null
+  task_split: Record<string, unknown> | null
+  tool_suggestion: Record<string, unknown> | null
+  artifact_ids: {
+    brd_analysis?: number | null
+    task_split?: number | null
+    tool_suggestion?: number | null
+  }
 }
