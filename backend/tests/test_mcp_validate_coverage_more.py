@@ -396,3 +396,52 @@ def test_validate_smtp_gmail_oauth_probes_gmail_rest(monkeypatch):
     assert ok is True
     assert "Gmail REST" in msg
     assert calls["n"] == 1
+
+
+def test_validate_smtp_outlook_oauth_refresh_after_535(monkeypatch):
+    doc_calls: list = []
+
+    class _FakeSMTP:
+        def __init__(self, *a, **k):
+            pass
+
+        def ehlo(self):
+            pass
+
+        def starttls(self, context=None):
+            pass
+
+        def docmd(self, *a, **k):
+            doc_calls.append(a)
+            if len(doc_calls) == 1:
+                return (535, b"expired")
+            return (235, b"OK")
+
+        def quit(self):
+            pass
+
+    def fake_post(url, **kwargs):
+        r = MagicMock()
+        r.status_code = 200
+        r.json = lambda: {"access_token": "fresh-token"}
+        return r
+
+    monkeypatch.setattr(smtplib, "SMTP", _FakeSMTP)
+    monkeypatch.setattr(ssl, "create_default_context", lambda *a, **k: MagicMock())
+    monkeypatch.setattr("httpx.post", fake_post)
+    from core.config import settings
+
+    monkeypatch.setattr(settings, "MCP_OAUTH_MICROSOFT_CLIENT_ID", "cid", raising=False)
+    monkeypatch.setattr(settings, "MCP_OAUTH_MICROSOFT_CLIENT_SECRET", "sec", raising=False)
+
+    cfg = {
+        "provider": "outlook",
+        "username": "u@outlook.com",
+        "access_token": "stale",
+        "oauth_refresh_token": "rt",
+        "auth_mode": "oauth2",
+    }
+    ok, msg = validate_tool_config("smtp", cfg)
+    assert ok is True
+    assert len(doc_calls) == 2
+    assert cfg["access_token"] == "fresh-token"

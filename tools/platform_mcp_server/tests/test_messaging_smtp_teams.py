@@ -77,6 +77,37 @@ class TestExecuteSmtp:
         assert "535" in out
         assert "Error" in out or "rejected" in out.lower()
 
+    def test_validate_oauth2_refresh_microsoft_after_535(self, monkeypatch):
+        monkeypatch.setenv("MCP_OAUTH_MICROSOFT_CLIENT_ID", "cid")
+        monkeypatch.setenv("MCP_OAUTH_MICROSOFT_CLIENT_SECRET", "sec")
+        fake_smtp = MagicMock()
+        fake_smtp.ehlo = MagicMock()
+        fake_smtp.starttls = MagicMock()
+        fake_smtp.docmd = MagicMock(side_effect=[(535, b"expired"), (235, b"OK")])
+        fake_smtp.quit = MagicMock()
+        mock_http = MagicMock()
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json = MagicMock(return_value={"access_token": "new-access"})
+        mock_http.post = MagicMock(return_value=mock_resp)
+        with patch("execution_smtp.ssl.create_default_context", return_value=MagicMock()):
+            with patch("execution_smtp.smtplib.SMTP", return_value=fake_smtp):
+                with patch("execution_smtp.get_sync_http_client", return_value=mock_http):
+                    out = execute_smtp(
+                        {
+                            "provider": "outlook",
+                            "auth_mode": "oauth2",
+                            "username": "u@contoso.com",
+                            "access_token": "stale",
+                            "oauth_refresh_token": "rt1",
+                        },
+                        {"action": "validate"},
+                    )
+        data = json.loads(out)
+        assert data["status"] == "ok"
+        assert fake_smtp.docmd.call_count == 2
+        mock_http.post.assert_called_once()
+
     def test_smtp_send_requires_idempotency_key(self, monkeypatch):
         monkeypatch.delenv("PLATFORM_MCP_ALLOW_WRITES_WITHOUT_IDEMPOTENCY_KEY", raising=False)
         out = execute_smtp(

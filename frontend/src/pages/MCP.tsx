@@ -10,6 +10,37 @@ import {
 type View = 'choose' | 'connect' | 'connections' | 'configure' | 'tools'
 
 const MCP_OAUTH_RETURN_KEY = 'sandhi_mcp_oauth_return'
+/** When editing a tool, survive IdP redirect so save uses PATCH instead of POST (create). */
+const MCP_OAUTH_EDIT_TOOL_ID_KEY = 'sandhi_mcp_oauth_edit_tool_id'
+
+function stashMcpOAuthEditToolId(id: number | null | undefined) {
+  try {
+    if (id != null && id > 0) {
+      sessionStorage.setItem(MCP_OAUTH_EDIT_TOOL_ID_KEY, String(id))
+    } else {
+      sessionStorage.removeItem(MCP_OAUTH_EDIT_TOOL_ID_KEY)
+    }
+  } catch {
+    /* ignore */
+  }
+}
+
+function consumeMcpOAuthEditToolId(): number | null {
+  try {
+    const s = (sessionStorage.getItem(MCP_OAUTH_EDIT_TOOL_ID_KEY) ?? '').trim()
+    sessionStorage.removeItem(MCP_OAUTH_EDIT_TOOL_ID_KEY)
+    if (!s) return null
+    const n = parseInt(s, 10)
+    return Number.isFinite(n) && n > 0 ? n : null
+  } catch {
+    try {
+      sessionStorage.removeItem(MCP_OAUTH_EDIT_TOOL_ID_KEY)
+    } catch {
+      /* ignore */
+    }
+    return null
+  }
+}
 
 /**
  * In-memory only (not sessionStorage): survives React Strict Mode remounts in the same SPA load.
@@ -288,12 +319,17 @@ export default function MCPPage() {
           (detail ? `${detail} ` : '') +
           'Check that the redirect URI in Azure or Google exactly matches your API (e.g. http://localhost:8000/api/mcp/oauth/microsoft/callback) and the client secret matches the app registration. Use Configure platform tools below to try Connect again or paste a token manually.'
       }
+      const restoreId = consumeMcpOAuthEditToolId()
       const resume = consumeOAuthReturnAndResumeTool()
       if (resume) setOauthConfigureToolType(resume)
       setError(msg)
       if (resume) {
         setView('configure')
-        setEditTool(null)
+        if (restoreId != null) {
+          void mcpAPI.getTool(restoreId).then((full) => setEditTool(full)).catch(() => setEditTool(null))
+        } else {
+          setEditTool(null)
+        }
       } else {
         // Full-page OAuth return: session hint may be missing (new tab, storage cleared). Still land on tools.
         setView('tools')
@@ -309,8 +345,17 @@ export default function MCPPage() {
 
     let cancelled = false
     void claimMcpOAuthOnce(nonce)
-      .then((data) => {
+      .then(async (data) => {
         if (cancelled) return
+        const restoreId = consumeMcpOAuthEditToolId()
+        let nextEdit: MCPToolConfigRes | null = null
+        if (restoreId != null) {
+          try {
+            nextEdit = await mcpAPI.getTool(restoreId)
+          } catch {
+            nextEdit = null
+          }
+        }
         mcpOAuthNonceStrictModeBridge = null
         try {
           sessionStorage.removeItem(MCP_OAUTH_RETURN_KEY)
@@ -330,19 +375,24 @@ export default function MCPPage() {
         next.delete('oauth_nonce')
         setSearchParams(next, { replace: true })
         setView('configure')
-        setEditTool(null)
+        setEditTool(nextEdit)
         setError(null)
       })
       .catch((err: unknown) => {
         if (cancelled) return
         mcpOAuthNonceStrictModeBridge = null
+        const restoreId = consumeMcpOAuthEditToolId()
         const detail = (err as { response?: { data?: { detail?: string } } })?.response?.data?.detail
         const resume = consumeOAuthReturnAndResumeTool()
         if (resume) setOauthConfigureToolType(resume)
         setError(typeof detail === 'string' ? detail : 'OAuth sign-in failed')
         if (resume) {
           setView('configure')
-          setEditTool(null)
+          if (restoreId != null) {
+            void mcpAPI.getTool(restoreId).then((full) => setEditTool(full)).catch(() => setEditTool(null))
+          } else {
+            setEditTool(null)
+          }
         }
         const next = new URLSearchParams(searchParams)
         next.delete('oauth_nonce')
@@ -681,12 +731,14 @@ export default function MCPPage() {
           onBack={() => {
             setOauthConfigureToolType(null)
             setOauthClaimPayload(null)
+            stashMcpOAuthEditToolId(null)
             setView('tools')
             setEditTool(null)
           }}
           onSaved={() => {
             setOauthConfigureToolType(null)
             setOauthClaimPayload(null)
+            stashMcpOAuthEditToolId(null)
             setView('tools')
             setEditTool(null)
             loadTools()
@@ -709,6 +761,7 @@ export default function MCPPage() {
           onAdd={() => {
             setOauthConfigureToolType(null)
             setOauthClaimPayload(null)
+            stashMcpOAuthEditToolId(null)
             setEditTool(null)
             setView('configure')
             setError(null)
@@ -717,6 +770,7 @@ export default function MCPPage() {
             setError(null)
             setOauthConfigureToolType(null)
             setOauthClaimPayload(null)
+            stashMcpOAuthEditToolId(null)
             try {
               const full = await mcpAPI.getTool(tool.id)
               setEditTool(full)
@@ -1327,12 +1381,38 @@ function ConfigureFlow({
   }, [editTool, oauthResumeToolType, oauthClaimPayload])
 
   useEffect(() => {
-    if (editTool || !oauthClaimPayload) return
+    if (!oauthClaimPayload) return
     const o = oauthClaimPayload
     const purpose = o.purpose ?? ''
     const at = o.access_token ?? ''
-    const rt = o.refresh_token ?? ''
-    if (purpose === 'teams') {
+    const rt = (o.refresh_token ?? '').trim()
+    if (editTool) {
+      if (purpose === 'teams' && editTool.tool_type === 'teams') {
+        setConfig((prev) => ({ ...prev, access_token: at, oauth_refresh_token: rt || prev.oauth_refresh_token }))
+      } else if (purpose === 'smtp_outlook' && editTool.tool_type === 'smtp') {
+        setConfig((prev) => ({
+          ...prev,
+          auth_mode: 'oauth2',
+          access_token: at,
+          oauth_refresh_token: rt || prev.oauth_refresh_token,
+          username: (typeof o.username === 'string' && o.username.trim() ? o.username.trim() : prev.username) || '',
+        }))
+      } else if ((purpose === 'smtp_gmail' || o.provider === 'google') && editTool.tool_type === 'smtp') {
+        setConfig((prev) => ({
+          ...prev,
+          auth_mode: 'oauth2',
+          access_token: at,
+          oauth_refresh_token: rt || prev.oauth_refresh_token,
+          username: (typeof o.username === 'string' && o.username.trim() ? o.username.trim() : prev.username) || '',
+        }))
+      } else {
+        setConfig((prev) => ({
+          ...prev,
+          access_token: at || prev.access_token,
+          oauth_refresh_token: rt || prev.oauth_refresh_token,
+        }))
+      }
+    } else if (purpose === 'teams') {
       setToolType('teams')
       setConfig((prev) => ({ ...prev, access_token: at, oauth_refresh_token: rt || prev.oauth_refresh_token }))
     } else if (purpose === 'smtp_outlook') {
@@ -1883,6 +1963,7 @@ function ConfigureFlow({
                     try {
                       const { authorize_url } = await mcpAPI.oauthMicrosoftTeamsStart()
                       stashOAuthReturnPurpose('teams')
+                      stashMcpOAuthEditToolId(editTool?.id)
                       window.location.assign(authorize_url)
                     } catch (err: unknown) {
                       const d = (err as { response?: { data?: { detail?: string } } })?.response?.data?.detail
@@ -1900,6 +1981,7 @@ function ConfigureFlow({
                     try {
                       const { authorize_url } = await mcpAPI.oauthMicrosoftTeamsStart({ forceConsent: true })
                       stashOAuthReturnPurpose('teams')
+                      stashMcpOAuthEditToolId(editTool?.id)
                       window.location.assign(authorize_url)
                     } catch (err: unknown) {
                       const d = (err as { response?: { data?: { detail?: string } } })?.response?.data?.detail
@@ -1939,6 +2021,7 @@ function ConfigureFlow({
                     try {
                       const { authorize_url } = await mcpAPI.oauthMicrosoftSmtpStart()
                       stashOAuthReturnPurpose('smtp_outlook')
+                      stashMcpOAuthEditToolId(editTool?.id)
                       window.location.assign(authorize_url)
                     } catch (err: unknown) {
                       const d = (err as { response?: { data?: { detail?: string } } })?.response?.data?.detail
@@ -1956,6 +2039,7 @@ function ConfigureFlow({
                     try {
                       const { authorize_url } = await mcpAPI.oauthGoogleSmtpStart()
                       stashOAuthReturnPurpose('smtp_gmail')
+                      stashMcpOAuthEditToolId(editTool?.id)
                       window.location.assign(authorize_url)
                     } catch (err: unknown) {
                       const d = (err as { response?: { data?: { detail?: string } } })?.response?.data?.detail

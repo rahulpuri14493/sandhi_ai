@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import base64
 import json
+import os
 import re
 import smtplib
 import ssl
@@ -91,6 +92,95 @@ def _xoauth2_b64(username: str, access_token: str) -> str:
     return base64.b64encode(auth_string.encode("utf-8")).decode("ascii")
 
 
+def _smtp_oauth_access_token(config: Dict[str, Any]) -> str:
+    return str(config.get("access_token") or config.get("oauth2_access_token") or "").strip()
+
+
+def _smtp_oauth_refresh_token(config: Dict[str, Any]) -> str:
+    return str(config.get("oauth_refresh_token") or config.get("refresh_token") or "").strip()
+
+
+def _smtp_refresh_oauth_provider(config: Dict[str, Any]) -> str:
+    """
+    Which IdP to use for refresh_token exchange. Matches MCP OAuth env (MCP_OAUTH_*).
+    """
+    prov = str(config.get("provider") or "custom").strip().lower()
+    if prov in ("outlook", "gmail"):
+        return prov
+    host = str(config.get("smtp_host") or "").strip().lower()
+    if "office365.com" in host or host == "smtp-mail.outlook.com":
+        return "outlook"
+    if "gmail.com" in host:
+        return "gmail"
+    return ""
+
+
+def _smtp_force_refresh_access_token(config: Dict[str, Any]) -> bool:
+    """
+    Exchange oauth_refresh_token for a new access_token using MCP_OAUTH_* credentials
+    from the environment (same vars as the Sandhi backend OAuth routes).
+    Mutates config in place. Returns True if access_token was set.
+    """
+    refresh = _smtp_oauth_refresh_token(config)
+    if not refresh:
+        return False
+    prov = _smtp_refresh_oauth_provider(config)
+    client = get_sync_http_client()
+    try:
+        if prov == "outlook":
+            cid = (os.environ.get("MCP_OAUTH_MICROSOFT_CLIENT_ID") or "").strip()
+            secret = (os.environ.get("MCP_OAUTH_MICROSOFT_CLIENT_SECRET") or "").strip()
+            tenant = (os.environ.get("MCP_OAUTH_MICROSOFT_TENANT") or "common").strip() or "common"
+            if not cid or not secret:
+                return False
+            token_url = f"https://login.microsoftonline.com/{tenant}/oauth2/v2.0/token"
+            r = client.post(
+                token_url,
+                data={
+                    "client_id": cid,
+                    "client_secret": secret,
+                    "grant_type": "refresh_token",
+                    "refresh_token": refresh,
+                },
+                timeout=30.0,
+            )
+        elif prov == "gmail":
+            cid = (os.environ.get("MCP_OAUTH_GOOGLE_CLIENT_ID") or "").strip()
+            secret = (os.environ.get("MCP_OAUTH_GOOGLE_CLIENT_SECRET") or "").strip()
+            if not cid or not secret:
+                return False
+            r = client.post(
+                "https://oauth2.googleapis.com/token",
+                data={
+                    "client_id": cid,
+                    "client_secret": secret,
+                    "grant_type": "refresh_token",
+                    "refresh_token": refresh,
+                },
+                timeout=30.0,
+            )
+        else:
+            return False
+    except Exception:
+        return False
+    if r.status_code != 200:
+        return False
+    try:
+        data = r.json()
+    except Exception:
+        return False
+    if not isinstance(data, dict):
+        return False
+    at = str(data.get("access_token") or "").strip()
+    if not at:
+        return False
+    config["access_token"] = at
+    new_rt = str(data.get("refresh_token") or "").strip()
+    if new_rt:
+        config["oauth_refresh_token"] = new_rt
+    return True
+
+
 def _resolve_endpoint(config: Dict[str, Any]) -> Tuple[str, int, bool, bool]:
     provider = str(config.get("provider") or "custom").strip().lower()
     if provider in _PRESETS:
@@ -128,16 +218,36 @@ def _auth_smtp(client: smtplib.SMTP, config: Dict[str, Any]) -> Tuple[bool, str]
     auth_mode = str(config.get("auth_mode") or "").strip().lower()
     username = str(config.get("username") or config.get("from_address") or "").strip()
     password = str(config.get("password") or "").strip()
-    access_token = str(config.get("access_token") or config.get("oauth2_access_token") or "").strip()
+    access_token = _smtp_oauth_access_token(config)
     if not auth_mode:
-        auth_mode = "oauth2" if access_token else "password"
+        auth_mode = (
+            "oauth2"
+            if (access_token or _smtp_oauth_refresh_token(config))
+            else "password"
+        )
     if auth_mode == "oauth2":
-        if not username or not access_token:
-            return False, "username and access_token (OAuth2) are required for auth_mode=oauth2"
+        if not username:
+            return False, "username (mailbox) is required for auth_mode=oauth2"
+        if not access_token and _smtp_oauth_refresh_token(config):
+            _smtp_force_refresh_access_token(config)
+            access_token = _smtp_oauth_access_token(config)
+        if not access_token:
+            return False, (
+                "username and access_token (OAuth2) are required for auth_mode=oauth2; "
+                "or store oauth_refresh_token and set MCP_OAUTH_MICROSOFT_* / MCP_OAUTH_GOOGLE_* on the platform MCP server "
+                "so expired access tokens can be refreshed."
+            )
         try:
             code, resp = client.docmd("AUTH", "XOAUTH2 " + _xoauth2_b64(username, access_token))
         except smtplib.SMTPException as e:
             return False, f"SMTP OAuth2 auth failed ({type(e).__name__})"
+        if code != 235 and _smtp_oauth_refresh_token(config):
+            if _smtp_force_refresh_access_token(config):
+                access_token = _smtp_oauth_access_token(config)
+                try:
+                    code, resp = client.docmd("AUTH", "XOAUTH2 " + _xoauth2_b64(username, access_token))
+                except smtplib.SMTPException as e:
+                    return False, f"SMTP OAuth2 auth failed after token refresh ({type(e).__name__})"
         if code != 235:
             detail = resp.decode(errors="replace") if isinstance(resp, bytes) else str(resp)
             msg = f"SMTP OAuth2 rejected ({code}): {detail.strip()[:400]}"
@@ -145,7 +255,9 @@ def _auth_smtp(client: smtplib.SMTP, config: Dict[str, Any]) -> Tuple[bool, str]
                 msg += (
                     " Hint: Microsoft SMTP (smtp.office365.com) expects token aud https://outlook.office.com — use OAuth scope "
                     "https://outlook.office.com/SMTP.Send when connecting, not Graph-only SMTP.Send. Turn on Authenticated SMTP "
-                    "for the mailbox; consumer @outlook.com may not support app SMTP OAuth."
+                    "for the mailbox; consumer @outlook.com may not support app SMTP OAuth. "
+                    "If this worked earlier and now fails with 535, the access token may have expired — ensure oauth_refresh_token "
+                    "is saved and platform MCP has MCP_OAUTH_MICROSOFT_CLIENT_ID/SECRET (same app as Connect Microsoft)."
                 )
             return False, msg
         return True, ""
@@ -159,7 +271,12 @@ def _auth_smtp(client: smtplib.SMTP, config: Dict[str, Any]) -> Tuple[bool, str]
 
 
 def _gmail_oauth_token(config: Dict[str, Any]) -> str:
-    return str(config.get("access_token") or config.get("oauth2_access_token") or "").strip()
+    t = _smtp_oauth_access_token(config)
+    if t:
+        return t
+    if _smtp_oauth_refresh_token(config) and _smtp_force_refresh_access_token(config):
+        return _smtp_oauth_access_token(config)
+    return ""
 
 
 def _gmail_api_only_error() -> str:
@@ -222,9 +339,11 @@ def _smtp_gmail_list_mail(config: Dict[str, Any], arguments: Dict[str, Any]) -> 
     if q:
         params["q"] = q
     url = "https://gmail.googleapis.com/gmail/v1/users/me/messages"
-    r = get_sync_http_client().get(
-        url, headers={"Authorization": f"Bearer {token}"}, params=params, timeout=30.0
-    )
+    client = get_sync_http_client()
+    r = client.get(url, headers={"Authorization": f"Bearer {token}"}, params=params, timeout=30.0)
+    if r.status_code == 401 and _smtp_force_refresh_access_token(config):
+        token = _gmail_oauth_token(config)
+        r = client.get(url, headers={"Authorization": f"Bearer {token}"}, params=params, timeout=30.0)
     if r.status_code >= 400:
         return _gmail_api_error_response(r)
     data = r.json()
@@ -259,12 +378,21 @@ def _smtp_gmail_get_mail(config: Dict[str, Any], arguments: Dict[str, Any]) -> s
     if not token:
         return "Error: access_token is required for Gmail get_mail_message"
     url = f"https://gmail.googleapis.com/gmail/v1/users/me/messages/{urllib.parse.quote(mid)}"
-    r = get_sync_http_client().get(
+    client = get_sync_http_client()
+    r = client.get(
         url,
         headers={"Authorization": f"Bearer {token}"},
         params={"format": "full"},
         timeout=45.0,
     )
+    if r.status_code == 401 and _smtp_force_refresh_access_token(config):
+        token = _gmail_oauth_token(config)
+        r = client.get(
+            url,
+            headers={"Authorization": f"Bearer {token}"},
+            params={"format": "full"},
+            timeout=45.0,
+        )
     if r.status_code >= 400:
         return _gmail_api_error_response(r)
     data = r.json()
@@ -314,9 +442,11 @@ def _smtp_gmail_get_attachment(config: Dict[str, Any], arguments: Dict[str, Any]
         f"https://gmail.googleapis.com/gmail/v1/users/me/messages/"
         f"{urllib.parse.quote(mid)}/attachments/{urllib.parse.quote(aid)}"
     )
-    r = get_sync_http_client().get(
-        url, headers={"Authorization": f"Bearer {token}"}, timeout=45.0
-    )
+    client = get_sync_http_client()
+    r = client.get(url, headers={"Authorization": f"Bearer {token}"}, timeout=45.0)
+    if r.status_code == 401 and _smtp_force_refresh_access_token(config):
+        token = _gmail_oauth_token(config)
+        r = client.get(url, headers={"Authorization": f"Bearer {token}"}, timeout=45.0)
     if r.status_code >= 400:
         return _gmail_api_error_response(r)
     data = r.json()

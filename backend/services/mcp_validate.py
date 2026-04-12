@@ -681,6 +681,85 @@ def _gmail_read_api_probe(access_token: str) -> str:
         return " Warning: could not reach Gmail REST API; check network if you need inbox read."
 
 
+def _smtp_validate_oauth_provider_for_refresh(config: dict) -> str:
+    prov = str(config.get("provider") or "custom").strip().lower()
+    if prov in ("outlook", "gmail"):
+        return prov
+    host = str(config.get("smtp_host") or "").strip().lower()
+    if "office365.com" in host or host == "smtp-mail.outlook.com":
+        return "outlook"
+    if "gmail.com" in host:
+        return "gmail"
+    return ""
+
+
+def _smtp_validate_refresh_access_token(config: dict) -> bool:
+    """
+    Refresh OAuth access_token using stored refresh token and MCP_OAUTH_* settings.
+    Mutates config in place. Used so validation matches platform MCP after access tokens expire.
+    """
+    refresh = str(config.get("oauth_refresh_token") or config.get("refresh_token") or "").strip()
+    if not refresh:
+        return False
+    prov = _smtp_validate_oauth_provider_for_refresh(config)
+    try:
+        from core.config import settings
+        import httpx
+    except Exception:
+        return False
+    try:
+        if prov == "outlook":
+            cid = (getattr(settings, "MCP_OAUTH_MICROSOFT_CLIENT_ID", "") or "").strip()
+            secret = (getattr(settings, "MCP_OAUTH_MICROSOFT_CLIENT_SECRET", "") or "").strip()
+            tenant = (getattr(settings, "MCP_OAUTH_MICROSOFT_TENANT", "") or "common").strip() or "common"
+            if not cid or not secret:
+                return False
+            token_url = f"https://login.microsoftonline.com/{tenant}/oauth2/v2.0/token"
+            data = {
+                "client_id": cid,
+                "client_secret": secret,
+                "grant_type": "refresh_token",
+                "refresh_token": refresh,
+            }
+            r = httpx.post(token_url, data=data, timeout=30.0)
+        elif prov == "gmail":
+            cid = (getattr(settings, "MCP_OAUTH_GOOGLE_CLIENT_ID", "") or "").strip()
+            secret = (getattr(settings, "MCP_OAUTH_GOOGLE_CLIENT_SECRET", "") or "").strip()
+            if not cid or not secret:
+                return False
+            r = httpx.post(
+                "https://oauth2.googleapis.com/token",
+                data={
+                    "client_id": cid,
+                    "client_secret": secret,
+                    "grant_type": "refresh_token",
+                    "refresh_token": refresh,
+                },
+                timeout=30.0,
+            )
+        else:
+            return False
+    except Exception:
+        logger.exception("SMTP OAuth token refresh failed during validation")
+        return False
+    if r.status_code != 200:
+        return False
+    try:
+        body = r.json()
+    except Exception:
+        return False
+    if not isinstance(body, dict):
+        return False
+    at = str(body.get("access_token") or "").strip()
+    if not at:
+        return False
+    config["access_token"] = at
+    new_rt = str(body.get("refresh_token") or "").strip()
+    if new_rt:
+        config["oauth_refresh_token"] = new_rt
+    return True
+
+
 def _validate_teams(config: dict) -> Tuple[bool, str]:
     token = (config.get("access_token") or config.get("oauth2_access_token") or "").strip()
     if not token:
@@ -730,8 +809,9 @@ def _validate_smtp(config: dict) -> Tuple[bool, str]:
     username = str(config.get("username") or config.get("from_address") or "").strip()
     password = str(config.get("password") or "").strip()
     access_token = str(config.get("access_token") or config.get("oauth2_access_token") or "").strip()
+    refresh_tok = str(config.get("oauth_refresh_token") or config.get("refresh_token") or "").strip()
     if not auth_mode:
-        auth_mode = "oauth2" if access_token else "password"
+        auth_mode = "oauth2" if (access_token or refresh_tok) else "password"
     ctx = ssl.create_default_context()
     timeout = 25.0
     try:
@@ -745,20 +825,36 @@ def _validate_smtp(config: dict) -> Tuple[bool, str]:
                 client.ehlo()
         try:
             if auth_mode == "oauth2":
-                if not username or not access_token:
-                    return False, "username and access_token are required for OAuth2 SMTP"
+                if not username:
+                    return False, "username (mailbox) is required for OAuth2 SMTP"
+                if not access_token and refresh_tok:
+                    _smtp_validate_refresh_access_token(config)
+                    access_token = str(config.get("access_token") or config.get("oauth2_access_token") or "").strip()
+                if not access_token:
+                    return False, (
+                        "username and access_token are required for OAuth2 SMTP, or oauth_refresh_token plus "
+                        "MCP_OAUTH_MICROSOFT_* / MCP_OAUTH_GOOGLE_* in backend settings to refresh expired tokens."
+                    )
                 import base64
 
                 auth_string = f"user={username}\x01auth=Bearer {access_token}\x01\x01"
                 b64 = base64.b64encode(auth_string.encode("utf-8")).decode("ascii")
                 code, resp = client.docmd("AUTH", "XOAUTH2 " + b64)
+                if code != 235 and refresh_tok:
+                    if _smtp_validate_refresh_access_token(config):
+                        access_token = str(config.get("access_token") or config.get("oauth2_access_token") or "").strip()
+                        auth_string = f"user={username}\x01auth=Bearer {access_token}\x01\x01"
+                        b64 = base64.b64encode(auth_string.encode("utf-8")).decode("ascii")
+                        code, resp = client.docmd("AUTH", "XOAUTH2 " + b64)
                 if code != 235:
                     detail = resp.decode(errors="replace") if isinstance(resp, bytes) else str(resp)
                     msg = f"SMTP OAuth2 rejected ({code}): {detail.strip()[:400]}"
                     if code == 535:
                         msg += (
                             " Hint: use OAuth scope https://outlook.office.com/SMTP.Send (not Graph-only) for "
-                            "smtp.office365.com; enable Authenticated SMTP on the mailbox."
+                            "smtp.office365.com; enable Authenticated SMTP on the mailbox. "
+                            "If this worked earlier, the access token may have expired — save oauth_refresh_token and "
+                            "ensure backend has the same OAuth app credentials used for Connect Microsoft."
                         )
                     return False, msg
             else:
