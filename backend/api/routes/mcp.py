@@ -227,7 +227,11 @@ async def _invoke_platform_tool_call(
     except MCPGuardrailError as ge:
         raise _http_exception_from_mcp_guardrail_error(ge) from ge
     except Exception as e:
-        logger.exception("call_platform_tool failed tool_name=%s", body.tool_name)
+        logger.error(
+            "call_platform_tool failed tool_name=%s err_type=%s",
+            body.tool_name,
+            type(e).__name__,
+        )
         raise HTTPException(
             status_code=502,
             detail=f"Platform tool call failed ({type(e).__name__})",
@@ -302,7 +306,11 @@ def _run_platform_write_operation(operation_id: str, user_id: int) -> None:
         op.completed_at = datetime.utcnow()
         db.commit()
     except Exception as e:
-        logger.exception("Async platform write operation failed operation_id=%s", operation_id)
+        logger.error(
+            "Async platform write operation failed operation_id=%s err_type=%s",
+            operation_id,
+            type(e).__name__,
+        )
         try:
             op = db.query(MCPWriteOperation).filter(
                 MCPWriteOperation.operation_id == operation_id,
@@ -479,7 +487,11 @@ async def certify_connection_for_production(
         checks.append({"name": "initialize", "passed": False, "error": ge.code})
         return {"certified": False, "checks": checks, "recommended_policy": "fix_connection"}
     except Exception as e:
-        logger.exception("MCP certify: initialize failed")
+        logger.error(
+            "MCP certify: initialize failed connection_id=%s err_type=%s",
+            conn.id,
+            type(e).__name__,
+        )
         checks.append({"name": "initialize", "passed": False, "error": type(e).__name__})
         return {"certified": False, "checks": checks, "recommended_policy": "fix_connection"}
 
@@ -500,7 +512,11 @@ async def certify_connection_for_production(
         checks.append({"name": "tools_list", "passed": False, "error": ge.code})
         return {"certified": False, "checks": checks, "recommended_policy": "fix_tools_list"}
     except Exception as e:
-        logger.exception("MCP certify: tools/list failed")
+        logger.error(
+            "MCP certify: tools/list failed connection_id=%s err_type=%s",
+            conn.id,
+            type(e).__name__,
+        )
         checks.append({"name": "tools_list", "passed": False, "error": type(e).__name__})
         return {"certified": False, "checks": checks, "recommended_policy": "fix_tools_list"}
 
