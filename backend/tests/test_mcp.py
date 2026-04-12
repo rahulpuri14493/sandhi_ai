@@ -267,6 +267,8 @@ class TestMCPSchemaRefresh:
         types_and_configs = [
             ("s3", {"bucket": "b", "region": "us-east-1"}),
             ("slack", {"token": "xoxb-x"}),
+            ("teams", {"access_token": "fake-graph-token"}),
+            ("smtp", {"provider": "gmail", "username": "a@b.com", "password": "x"}),
             ("github", {"token": "ghp-x"}),
             ("notion", {"api_key": "secret-x"}),
             ("elasticsearch", {"url": "http://localhost:9200"}),

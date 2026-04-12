@@ -1,7 +1,11 @@
 """Additional branch coverage for services.mcp_validate (no real external I/O)."""
 
+import smtplib
+import socket
+import ssl
 import sys
 import types
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -144,7 +148,11 @@ def test_validate_notion_import_error(monkeypatch):
 
 
 def test_validate_rest_api_ok(monkeypatch):
-    monkeypatch.setattr(mv, "_http_reachable", lambda url, headers=None: (True, "ok"))
+    monkeypatch.setattr(mv, "_http_reachable", lambda url, headers=None, **kwargs: (True, "ok"))
+    monkeypatch.setattr(
+        "services.http_url_guard.socket.getaddrinfo",
+        lambda *a, **k: [(socket.AF_INET, socket.SOCK_STREAM, 0, "", ("8.8.8.8", 0))],
+    )
     ok, _ = validate_tool_config("rest_api", {"url": "https://api.example.com"})
     assert ok is True
 
@@ -243,11 +251,15 @@ def test_github_host_helper_api_github_com():
 def test_validate_elasticsearch_uses_trailing_slash(monkeypatch):
     seen = {}
 
-    def capture(url, headers=None):
+    def capture(url, headers=None, **kwargs):
         seen["url"] = url
         return True, "ok"
 
     monkeypatch.setattr(mv, "_http_reachable", capture)
+    monkeypatch.setattr(
+        "services.http_url_guard.socket.getaddrinfo",
+        lambda *a, **k: [(socket.AF_INET, socket.SOCK_STREAM, 0, "", ("8.8.8.8", 0))],
+    )
     validate_tool_config("elasticsearch", {"url": "https://es.test:9200"})
     assert seen["url"].endswith("/")
 
@@ -340,3 +352,47 @@ def test_validate_postgres_connection_refused_localhost_message(monkeypatch):
     )
     assert ok is False
     assert "host.docker.internal" in msg or "docker" in msg.lower()
+
+
+def test_validate_smtp_gmail_oauth_probes_gmail_rest(monkeypatch):
+    """After SMTP 235, Gmail REST is probed so users see whether inbox read will work."""
+    calls = {"n": 0}
+
+    class _FakeSMTP:
+        def __init__(self, *a, **k):
+            pass
+
+        def ehlo(self):
+            pass
+
+        def starttls(self, context=None):
+            pass
+
+        def docmd(self, *a, **k):
+            return (235, b"OK")
+
+        def quit(self):
+            pass
+
+    def fake_httpx_get(url, **kwargs):
+        calls["n"] += 1
+        r = MagicMock()
+        r.status_code = 200
+        return r
+
+    monkeypatch.setattr(smtplib, "SMTP", _FakeSMTP)
+    monkeypatch.setattr(ssl, "create_default_context", lambda *a, **k: MagicMock())
+    monkeypatch.setattr("httpx.get", fake_httpx_get)
+
+    ok, msg = validate_tool_config(
+        "smtp",
+        {
+            "provider": "gmail",
+            "username": "a@gmail.com",
+            "access_token": "ya29.unit-test",
+            "auth_mode": "oauth2",
+        },
+    )
+    assert ok is True
+    assert "Gmail REST" in msg
+    assert calls["n"] == 1

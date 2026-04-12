@@ -877,7 +877,12 @@ class TestRestApi:
             {"method": "GET", "path": "/get"},
         )
         assert isinstance(out, str)
-        assert "REST API error" in out or "Error:" in out or "status" in out
+        assert (
+            "REST API error" in out
+            or "Error:" in out
+            or "status" in out
+            or '"error"' in out
+        )
 
 
 class TestStubTools:
@@ -898,6 +903,14 @@ class TestStubTools:
     def test_notion_invalid_key_returns_error(self):
         out = execute_platform_tool("notion", {"api_key": "secret_invalid"}, {"action": "search", "query": "test"})
         assert "Error:" in out
+
+    def test_smtp_custom_missing_host_returns_error(self):
+        out = execute_platform_tool("smtp", {"provider": "custom"}, {"action": "validate"})
+        assert "smtp_host" in out.lower() or "Error" in out
+
+    def test_teams_missing_token_returns_error(self):
+        out = execute_platform_tool("teams", {}, {"action": "list_joined_teams"})
+        assert "access_token" in out.lower() or "Error" in out
 
 
 class TestUnknownTool:

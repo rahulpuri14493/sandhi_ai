@@ -31,6 +31,7 @@ from schemas.mcp import (
 from core.security import get_current_business_user
 from core.encryption import encrypt_json, decrypt_json
 from db.database import SessionLocal
+from services.http_url_guard import safe_url_host_for_logs
 from services.mcp_platform_naming import platform_tool_id_from_mcp_function_name
 from services.mcp_guardrails import (
     MCPGuardrailError,
@@ -40,8 +41,10 @@ from services.mcp_guardrails import (
     infer_mcp_tool_operation_class,
     resolve_mcp_tenant_tier,
 )
+from api.routes import mcp_oauth as _mcp_oauth
 
 router = APIRouter(prefix="/api/mcp", tags=["mcp"])
+router.include_router(_mcp_oauth.router)
 logger = logging.getLogger(__name__)
 
 
@@ -592,15 +595,34 @@ def list_tools(
 def validate_tool_config(
     body: ValidateToolConfigRequest,
     current_user: User = Depends(get_current_business_user),
+    db: Session = Depends(get_db),
 ):
     """Validate tool config (test connection) before save. Does not store anything."""
     from services.mcp_validate import validate_tool_config as do_validate
     tool_type_str = (body.tool_type or "").strip().lower()
     try:
-        MCPToolType(tool_type_str)
+        expected_type = MCPToolType(tool_type_str)
     except ValueError:
         raise HTTPException(status_code=400, detail="Invalid tool_type")
-    valid, message = do_validate(tool_type_str, body.config)
+    cfg_in = body.config if isinstance(body.config, dict) else {}
+    merged: dict = dict(cfg_in)
+    if body.tool_id is not None:
+        t = db.query(MCPToolConfig).filter(
+            MCPToolConfig.id == int(body.tool_id),
+            MCPToolConfig.user_id == current_user.id,
+        ).first()
+        if not t:
+            raise HTTPException(status_code=404, detail="Tool config not found")
+        if t.tool_type != expected_type:
+            raise HTTPException(status_code=400, detail="tool_type does not match this tool_id")
+        if t.encrypted_config:
+            try:
+                stored = decrypt_json(t.encrypted_config)
+                if isinstance(stored, dict):
+                    merged = {**stored, **cfg_in}
+            except Exception:
+                pass
+    valid, message = do_validate(tool_type_str, merged)
     return {"valid": valid, "message": message}
 
 
@@ -619,7 +641,7 @@ def create_tool(
             detail=(
                 "tool_type must be one of: vector_db, pinecone, weaviate, qdrant, chroma, "
                 "postgres, mysql, sqlserver, snowflake, databricks, bigquery, elasticsearch, pageindex, "
-                "filesystem, s3, minio, ceph, azure_blob, gcs, slack, github, notion, rest_api"
+                "filesystem, s3, minio, ceph, azure_blob, gcs, slack, teams, smtp, github, notion, rest_api"
             ),
         )
     encrypted = encrypt_json(body.config)
@@ -1001,7 +1023,13 @@ async def get_registry(
             )
             error_msg = f"Failed to list tools ({ge.code})."
         except Exception as e:
-            logging.getLogger(__name__).warning("Failed to list tools for connection %s (%s): %s", c.name, base_url, e)
+            logger.warning(
+                "Failed to list tools for connection id=%s name=%s host=%s (%s)",
+                c.id,
+                c.name,
+                safe_url_host_for_logs(base_url),
+                type(e).__name__,
+            )
             error_msg = "Failed to list tools for this connection."
         connection_tools.append({
             "connection_id": c.id,
@@ -1085,7 +1113,9 @@ def _registry_description(tool_type: str, name: str) -> str:
         "ceph": "Ceph",
         "azure_blob": "Azure Blob",
         "gcs": "Google Cloud Storage",
-        "slack": "Slack",
+        "slack": "Slack (read + write)",
+        "teams": "Microsoft Teams / Graph (read + write)",
+        "smtp": "SMTP email (read + write)",
         "github": "GitHub",
         "notion": "Notion",
         "rest_api": "REST API",

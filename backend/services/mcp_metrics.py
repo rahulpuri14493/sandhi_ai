@@ -116,6 +116,8 @@ def infer_mcp_tool_family(tool_name: Optional[str]) -> str:
         "elasticsearch",
         "pageindex",
         "slack",
+        "teams",
+        "smtp",
         "github",
         "notion",
         "rest_api",

@@ -425,6 +425,38 @@ export const mcpAPI = {
   deleteTool(id: number) {
     return api.delete('/mcp/tools/' + id)
   },
+  /** OAuth2: open authorize_url in the browser; after redirect, MCP page claims tokens via oauth_nonce. */
+  oauthMicrosoftTeamsStart(opts?: { forceConsent?: boolean }) {
+    return api
+      .post<{ authorize_url: string }>('/mcp/oauth/microsoft/start', {
+        purpose: 'teams',
+        ...(opts?.forceConsent ? { force_consent: true } : {}),
+      })
+      .then((res) => res.data)
+  },
+  oauthMicrosoftSmtpStart() {
+    return api
+      .post<{ authorize_url: string }>('/mcp/oauth/microsoft/start', { purpose: 'smtp_outlook' })
+      .then((res) => res.data)
+  },
+  oauthGoogleSmtpStart() {
+    return api
+      .post<{ authorize_url: string }>('/mcp/oauth/google/start', { purpose: 'smtp_gmail' })
+      .then((res) => res.data)
+  },
+  oauthClaim(nonce: string) {
+    return api
+      .get<{
+        provider?: string
+        purpose?: string
+        access_token: string
+        refresh_token?: string
+        expires_in?: number
+        /** SMTP XOAUTH2 mailbox; set for Outlook/Gmail OAuth when derivable from token JWT. */
+        username?: string
+      }>('/mcp/oauth/claim', { params: { nonce } })
+      .then((res) => res.data)
+  },
   proxy(connectionId: number, method: string, params?: Record<string, unknown>) {
     return api.post('/mcp/proxy', { connection_id: connectionId, method, params }).then((res) => res.data)
   },
@@ -457,8 +489,14 @@ export const mcpAPI = {
       platform_tool_count: number
     }>('/mcp/registry').then((res) => res.data)
   },
-  validateToolConfig(tool_type: string, config: Record<string, unknown>) {
-    return api.post<{ valid: boolean; message: string }>('/mcp/tools/validate', { tool_type, config }).then((res) => res.data)
+  validateToolConfig(tool_type: string, config: Record<string, unknown>, toolId?: number) {
+    return api
+      .post<{ valid: boolean; message: string }>('/mcp/tools/validate', {
+        tool_type,
+        config,
+        ...(toolId != null ? { tool_id: toolId } : {}),
+      })
+      .then((res) => res.data)
   },
   getTool(toolId: number) {
     return api.get<MCPToolConfigRes>('/mcp/tools/' + toolId).then((res) => res.data)

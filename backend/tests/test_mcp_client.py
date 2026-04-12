@@ -58,8 +58,10 @@ async def test_call_mcp_server_json_response():
     mock_response.json.return_value = {"jsonrpc": "2.0", "id": 1, "result": {"serverInfo": {"name": "test"}}}
     mock_response.raise_for_status = MagicMock()
 
-    with patch("services.mcp_client.httpx.AsyncClient") as mock_client:
-        mock_client.return_value.__aenter__.return_value.post = AsyncMock(return_value=mock_response)
+    mock_http = MagicMock()
+    mock_http.post = AsyncMock(return_value=mock_response)
+    mock_get = AsyncMock(return_value=mock_http)
+    with patch("services.mcp_client._get_async_http_client", mock_get):
         result = await call_mcp_server(
             base_url="https://mcp.example.com",
             method="initialize",
@@ -81,8 +83,10 @@ async def test_call_mcp_server_sse_response():
     mock_response.headers = {"content-type": "text/event-stream"}
     mock_response.raise_for_status = MagicMock()
 
-    with patch("services.mcp_client.httpx.AsyncClient") as mock_client:
-        mock_client.return_value.__aenter__.return_value.post = AsyncMock(return_value=mock_response)
+    mock_http = MagicMock()
+    mock_http.post = AsyncMock(return_value=mock_response)
+    mock_get = AsyncMock(return_value=mock_http)
+    with patch("services.mcp_client._get_async_http_client", mock_get):
         result = await call_mcp_server(
             base_url="https://api.pageindex.ai",
             method="initialize",
@@ -109,8 +113,10 @@ async def test_call_mcp_server_sends_accept_and_protocol_version():
         post_called_with["kwargs"] = kwargs
         return mock_response
 
-    with patch("services.mcp_client.httpx.AsyncClient") as mock_client:
-        mock_client.return_value.__aenter__.return_value.post = AsyncMock(side_effect=capture_post)
+    mock_http = MagicMock()
+    mock_http.post = AsyncMock(side_effect=capture_post)
+    mock_get = AsyncMock(return_value=mock_http)
+    with patch("services.mcp_client._get_async_http_client", mock_get):
         await call_mcp_server(base_url="https://mcp.example.com", method="initialize", params={})
 
     headers = post_called_with["kwargs"]["headers"]
@@ -128,9 +134,11 @@ async def test_call_mcp_server_base_url_includes_path_no_double_slash():
     mock_response.json.return_value = {"jsonrpc": "2.0", "id": 1, "result": {}}
     mock_response.raise_for_status = MagicMock()
 
-    with patch("services.mcp_client.httpx.AsyncClient") as mock_client:
-        post_mock = AsyncMock(return_value=mock_response)
-        mock_client.return_value.__aenter__.return_value.post = post_mock
+    mock_http = MagicMock()
+    post_mock = AsyncMock(return_value=mock_response)
+    mock_http.post = post_mock
+    mock_get = AsyncMock(return_value=mock_http)
+    with patch("services.mcp_client._get_async_http_client", mock_get):
         await call_mcp_server(
             base_url="https://api.pageindex.ai/mcp",
             method="initialize",
@@ -162,10 +170,10 @@ def _capture_post(capture_dict):
 async def test_call_mcp_server_api_key_auth_sent_as_bearer():
     """API key auth: sent as Authorization Bearer, value trimmed."""
     captured = {}
-    with patch("services.mcp_client.httpx.AsyncClient") as mock_client:
-        mock_client.return_value.__aenter__.return_value.post = AsyncMock(
-            side_effect=_capture_post(captured)
-        )
+    mock_http = MagicMock()
+    mock_http.post = AsyncMock(side_effect=_capture_post(captured))
+    mock_get = AsyncMock(return_value=mock_http)
+    with patch("services.mcp_client._get_async_http_client", mock_get):
         await call_mcp_server(
             base_url="https://mcp.example.com",
             method="initialize",
@@ -181,10 +189,10 @@ async def test_call_mcp_server_basic_auth():
     """Basic auth: username:password base64-encoded, trimmed."""
     import base64
     captured = {}
-    with patch("services.mcp_client.httpx.AsyncClient") as mock_client:
-        mock_client.return_value.__aenter__.return_value.post = AsyncMock(
-            side_effect=_capture_post(captured)
-        )
+    mock_http = MagicMock()
+    mock_http.post = AsyncMock(side_effect=_capture_post(captured))
+    mock_get = AsyncMock(return_value=mock_http)
+    with patch("services.mcp_client._get_async_http_client", mock_get):
         await call_mcp_server(
             base_url="https://mcp.example.com",
             method="initialize",
@@ -202,10 +210,10 @@ async def test_call_mcp_server_basic_auth():
 async def test_call_mcp_server_basic_empty_credentials_no_header():
     """Basic auth with both username and password empty: no Authorization header set."""
     captured = {}
-    with patch("services.mcp_client.httpx.AsyncClient") as mock_client:
-        mock_client.return_value.__aenter__.return_value.post = AsyncMock(
-            side_effect=_capture_post(captured)
-        )
+    mock_http = MagicMock()
+    mock_http.post = AsyncMock(side_effect=_capture_post(captured))
+    mock_get = AsyncMock(return_value=mock_http)
+    with patch("services.mcp_client._get_async_http_client", mock_get):
         await call_mcp_server(
             base_url="https://mcp.example.com",
             method="initialize",

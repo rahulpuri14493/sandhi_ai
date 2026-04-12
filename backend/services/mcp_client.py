@@ -9,9 +9,11 @@ Compatible with:
 
 Platform uses this to forward requests to user's MCP server with their stored credentials.
 """
+import asyncio
 import json
+from typing import Any, Dict, Optional
+
 import httpx
-from typing import Optional, Dict, Any
 
 # MCP uses JSON-RPC 2.0 over HTTP
 JSONRPC_VERSION = "2.0"
@@ -62,6 +64,44 @@ def _normalize_path(path: str) -> str:
     if not path.startswith("/"):
         path = "/" + path
     return path.rstrip("/") or "/"
+
+
+# One pooled AsyncClient per running event loop (avoids TLS churn under heavy platform load;
+# also avoids "different loop" errors in pytest-asyncio when reusing a global client).
+_loop_async_clients: Dict[int, httpx.AsyncClient] = {}
+_async_client_init_lock = asyncio.Lock()
+
+
+async def _get_async_http_client() -> httpx.AsyncClient:
+    loop = asyncio.get_running_loop()
+    key = id(loop)
+    async with _async_client_init_lock:
+        existing = _loop_async_clients.get(key)
+        if existing is not None:
+            closed = getattr(existing, "is_closed", False)
+            if not closed:
+                return existing
+        client = httpx.AsyncClient(
+            limits=httpx.Limits(max_keepalive_connections=64, max_connections=256),
+            follow_redirects=True,
+        )
+        _loop_async_clients[key] = client
+        return client
+
+
+async def shutdown_shared_mcp_http_clients() -> None:
+    """
+    Close pooled MCP HTTP clients. Call from FastAPI lifespan shutdown so workers
+    release connections cleanly (security hygiene + avoids warnings on reload).
+    """
+    global _loop_async_clients
+    async with _async_client_init_lock:
+        for _key, client in list(_loop_async_clients.items()):
+            try:
+                await client.aclose()
+            except Exception:
+                pass
+        _loop_async_clients.clear()
 
 
 async def call_mcp_server(
@@ -116,39 +156,39 @@ async def call_mcp_server(
 
     body = build_jsonrpc_body(method, params)
 
-    async with httpx.AsyncClient(timeout=timeout) as client:
-        response = await client.post(post_url, json=body, headers=headers)
-        response.raise_for_status()
-        raw = response.text
-        if not raw or not raw.strip():
-            raise RuntimeError(
-                "MCP server returned an empty response. "
-                "The server may require a different endpoint or transport."
-            )
-        content_type = (response.headers.get("content-type") or "").split(";")[0].strip().lower()
-        try:
-            if content_type == "text/event-stream":
-                data = _parse_sse_to_json(raw)
-            else:
-                data = response.json()
-        except ValueError as e:
-            raise RuntimeError(
-                f"MCP server returned non-JSON (Content-Type: {content_type or 'unknown'}). "
-                f"Response body starts with: {raw[:200]!r}"
-            ) from e
-        if "error" in data:
-            err = data.get("error") if isinstance(data, dict) else None
-            if isinstance(err, dict):
-                msg = str(err.get("message") or "MCP JSON-RPC error")
-                code = err.get("code")
-                try:
-                    code_int = int(code) if code is not None else None
-                except (TypeError, ValueError):
-                    code_int = None
-                rpc_data = err.get("data") if isinstance(err.get("data"), dict) else {}
-                raise MCPJSONRPCError(msg, rpc_code=code_int, rpc_data=rpc_data)
-            raise RuntimeError(str(err))
-        return data
+    client = await _get_async_http_client()
+    response = await client.post(post_url, json=body, headers=headers, timeout=timeout)
+    response.raise_for_status()
+    raw = response.text
+    if not raw or not raw.strip():
+        raise RuntimeError(
+            "MCP server returned an empty response. "
+            "The server may require a different endpoint or transport."
+        )
+    content_type = (response.headers.get("content-type") or "").split(";")[0].strip().lower()
+    try:
+        if content_type == "text/event-stream":
+            data = _parse_sse_to_json(raw)
+        else:
+            data = response.json()
+    except ValueError as e:
+        raise RuntimeError(
+            f"MCP server returned non-JSON (Content-Type: {content_type or 'unknown'}). "
+            f"Response body starts with: {raw[:200]!r}"
+        ) from e
+    if "error" in data:
+        err = data.get("error") if isinstance(data, dict) else None
+        if isinstance(err, dict):
+            msg = str(err.get("message") or "MCP JSON-RPC error")
+            code = err.get("code")
+            try:
+                code_int = int(code) if code is not None else None
+            except (TypeError, ValueError):
+                code_int = None
+            rpc_data = err.get("data") if isinstance(err.get("data"), dict) else {}
+            raise MCPJSONRPCError(msg, rpc_code=code_int, rpc_data=rpc_data)
+        raise RuntimeError(str(err))
+    return data
 
 
 async def list_tools(

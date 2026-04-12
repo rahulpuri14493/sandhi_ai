@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react'
-import { Link, useNavigate } from 'react-router-dom'
+import { Link, useNavigate, useSearchParams } from 'react-router-dom'
 import { useAuthStore } from '../lib/store'
 import {
   mcpAPI,
@@ -9,9 +9,177 @@ import {
 
 type View = 'choose' | 'connect' | 'connections' | 'configure' | 'tools'
 
+const MCP_OAUTH_RETURN_KEY = 'sandhi_mcp_oauth_return'
+/** If `?oauth_nonce=` is gone before `user` is loaded (navigation, router timing), we still claim using this. */
+const MCP_PENDING_OAUTH_NONCE_KEY = 'sandhi_mcp_oauth_nonce_pending'
+
+/** Router search can lag behind `window.location` with basename; read both. */
+function getOAuthQueryParam(searchParams: URLSearchParams, key: string): string {
+  const fromRouter = searchParams.get(key)
+  if (fromRouter) return fromRouter
+  if (typeof window === 'undefined') return ''
+  try {
+    return new URLSearchParams(window.location.search).get(key) ?? ''
+  } catch {
+    return ''
+  }
+}
+
+/** One HTTP /claim per nonce: Strict Mode runs effects twice; parallel claims race Redis and the second returns 404 — tokens never reach state. */
+const oauthClaimPromiseByNonce = new Map<
+  string,
+  Promise<{
+    provider?: string
+    purpose?: string
+    access_token: string
+    refresh_token?: string
+    expires_in?: number
+    username?: string
+  }>
+>()
+
+function claimMcpOAuthOnce(nonce: string) {
+  let p = oauthClaimPromiseByNonce.get(nonce)
+  if (!p) {
+    p = mcpAPI.oauthClaim(nonce)
+    oauthClaimPromiseByNonce.set(nonce, p)
+    void p.finally(() => {
+      window.setTimeout(() => oauthClaimPromiseByNonce.delete(nonce), 120_000)
+    })
+  }
+  return p
+}
+
+type OAuthReturnPurpose = 'teams' | 'smtp_outlook' | 'smtp_gmail'
+
+/** Passed from parent so React Strict Mode cannot “consume” it before the second mount (sessionStorage bug). */
+type OAuthClaimPayload = {
+  access_token: string
+  refresh_token?: string
+  purpose?: string
+  provider?: string
+  expires_in?: number
+  /** Mailbox for SMTP XOAUTH2 (from OAuth claim when available). */
+  username?: string
+}
+
+function purposeToResumeToolType(purpose: string): 'teams' | 'smtp' | null {
+  if (purpose === 'teams') return 'teams'
+  if (purpose === 'smtp_outlook' || purpose === 'smtp_gmail') return 'smtp'
+  return null
+}
+
+function stashOAuthReturnPurpose(purpose: OAuthReturnPurpose) {
+  try {
+    sessionStorage.setItem(MCP_OAUTH_RETURN_KEY, JSON.stringify({ purpose }))
+  } catch {
+    /* ignore quota / private mode */
+  }
+}
+
+function consumeOAuthReturnAndResumeTool(): 'teams' | 'smtp' | null {
+  try {
+    const raw = sessionStorage.getItem(MCP_OAUTH_RETURN_KEY)
+    sessionStorage.removeItem(MCP_OAUTH_RETURN_KEY)
+    if (!raw) return null
+    const o = JSON.parse(raw) as { purpose?: string }
+    return purposeToResumeToolType(o.purpose ?? '')
+  } catch {
+    try {
+      sessionStorage.removeItem(MCP_OAUTH_RETURN_KEY)
+    } catch {
+      /* ignore */
+    }
+    return null
+  }
+}
+
+/** SMTP/Teams field defaults from OAuth /claim — used in lazy useState so the form is correct on first paint (avoids Strict Mode reset + effect ordering). */
+function configFromOAuthClaimPayload(o: OAuthClaimPayload): Record<string, string> {
+  const purpose = o.purpose ?? ''
+  const at = o.access_token ?? ''
+  const rt = (o.refresh_token ?? '').trim()
+  if (purpose === 'teams') {
+    const row: Record<string, string> = { access_token: at }
+    if (rt) row.oauth_refresh_token = rt
+    return row
+  }
+  if (purpose === 'smtp_outlook') {
+    const row: Record<string, string> = {
+      provider: 'outlook',
+      auth_mode: 'oauth2',
+      access_token: at,
+      use_tls: 'true',
+    }
+    if (rt) row.oauth_refresh_token = rt
+    const u = (o.username ?? '').trim()
+    if (u) row.username = u
+    return row
+  }
+  if (purpose === 'smtp_gmail' || o.provider === 'google') {
+    const row: Record<string, string> = {
+      provider: 'gmail',
+      auth_mode: 'oauth2',
+      access_token: at,
+      use_tls: 'true',
+    }
+    if (rt) row.oauth_refresh_token = rt
+    const u = (o.username ?? '').trim()
+    if (u) row.username = u
+    return row
+  }
+  const row: Record<string, string> = {}
+  if (at) row.access_token = at
+  if (rt) row.oauth_refresh_token = rt
+  return row
+}
+
+function buildEditToolConfigSnapshot(editTool: MCPToolConfigRes | null): Record<string, string> {
+  if (!editTool) return {}
+  const init: Record<string, string> = {}
+  if (editTool.tool_type === 'chroma' && editTool.chroma_url_preview?.trim()) {
+    init.url = editTool.chroma_url_preview.trim()
+  }
+  if (editTool.tool_type === 'weaviate') {
+    if (editTool.weaviate_cluster_preview?.trim()) {
+      init.weaviate_cluster_name = editTool.weaviate_cluster_preview.trim()
+    }
+    if (editTool.weaviate_class_preview?.trim()) {
+      init.index_name = editTool.weaviate_class_preview.trim()
+    }
+  }
+  return init
+}
+
+function initialConfigureToolType(
+  editTool: MCPToolConfigRes | null,
+  oauthClaimPayload: OAuthClaimPayload | null,
+  oauthResumeToolType: 'teams' | 'smtp' | null,
+): string {
+  if (editTool?.tool_type) return editTool.tool_type
+  if (oauthClaimPayload) {
+    const p = oauthClaimPayload.purpose ?? ''
+    if (p === 'teams') return 'teams'
+    if (p === 'smtp_outlook' || p === 'smtp_gmail') return 'smtp'
+  }
+  if (oauthResumeToolType === 'teams') return 'teams'
+  if (oauthResumeToolType === 'smtp') return 'smtp'
+  return 'vector_db'
+}
+
+function initialConfigureConfig(
+  editTool: MCPToolConfigRes | null,
+  oauthClaimPayload: OAuthClaimPayload | null,
+): Record<string, string> {
+  if (editTool) return buildEditToolConfigSnapshot(editTool)
+  if (oauthClaimPayload) return configFromOAuthClaimPayload(oauthClaimPayload)
+  return {}
+}
+
 export default function MCPPage() {
   const { user, loadUser } = useAuthStore()
   const navigate = useNavigate()
+  const [searchParams, setSearchParams] = useSearchParams()
   const [view, setView] = useState<View>('choose')
   const [connections, setConnections] = useState<MCPServerConnectionRes[]>([])
   const [tools, setTools] = useState<MCPToolConfigRes[]>([])
@@ -22,6 +190,10 @@ export default function MCPPage() {
   const [error, setError] = useState<string | null>(null)
   const [editTool, setEditTool] = useState<MCPToolConfigRes | null>(null)
   const [editConnection, setEditConnection] = useState<MCPServerConnectionRes | null>(null)
+  /** Survives React Strict Mode remounts (sessionStorage alone does not). Set on OAuth error/claim failure; cleared when leaving configure or starting a fresh add. */
+  const [oauthConfigureToolType, setOauthConfigureToolType] = useState<'teams' | 'smtp' | null>(null)
+  /** Successful /claim response; parent-held so Strict Mode double-mount does not lose Teams/SMTP apply. */
+  const [oauthClaimPayload, setOauthClaimPayload] = useState<OAuthClaimPayload | null>(null)
 
   useEffect(() => {
     if (!user) {
@@ -42,6 +214,109 @@ export default function MCPPage() {
       navigate('/dashboard')
     }
   }, [loading, user, navigate])
+
+  useEffect(() => {
+    const oauthErrRaw = getOAuthQueryParam(searchParams, 'oauth_error')
+    let nonce = getOAuthQueryParam(searchParams, 'oauth_nonce').trim()
+    if (!nonce) {
+      try {
+        nonce = (sessionStorage.getItem(MCP_PENDING_OAUTH_NONCE_KEY) ?? '').trim()
+      } catch {
+        nonce = ''
+      }
+    }
+    if (nonce) {
+      try {
+        sessionStorage.setItem(MCP_PENDING_OAUTH_NONCE_KEY, nonce)
+      } catch {
+        /* ignore */
+      }
+    }
+
+    if (!user) return
+
+    if (oauthErrRaw) {
+      try {
+        sessionStorage.removeItem(MCP_PENDING_OAUTH_NONCE_KEY)
+      } catch {
+        /* ignore */
+      }
+      let msg = decodeURIComponent(oauthErrRaw.replace(/\+/g, ' '))
+      if (msg.toLowerCase().includes('token_exchange')) {
+        const detail = msg.replace(/^token_exchange\s*/i, '').trim()
+        msg =
+          'Sign-in failed at token exchange. ' +
+          (detail ? `${detail} ` : '') +
+          'Check that the redirect URI in Azure or Google exactly matches your API (e.g. http://localhost:8000/api/mcp/oauth/microsoft/callback) and the client secret matches the app registration. Use Configure platform tools below to try Connect again or paste a token manually.'
+      }
+      const resume = consumeOAuthReturnAndResumeTool()
+      if (resume) setOauthConfigureToolType(resume)
+      setError(msg)
+      if (resume) {
+        setView('configure')
+        setEditTool(null)
+      } else {
+        // Full-page OAuth return: session hint may be missing (new tab, storage cleared). Still land on tools.
+        setView('tools')
+        setEditTool(null)
+      }
+      const next = new URLSearchParams(searchParams)
+      next.delete('oauth_error')
+      setSearchParams(next, { replace: true })
+      return
+    }
+
+    if (!nonce) return
+
+    let cancelled = false
+    void claimMcpOAuthOnce(nonce)
+      .then((data) => {
+        if (cancelled) return
+        try {
+          sessionStorage.removeItem(MCP_OAUTH_RETURN_KEY)
+          sessionStorage.removeItem(MCP_PENDING_OAUTH_NONCE_KEY)
+        } catch {
+          /* ignore */
+        }
+        setOauthConfigureToolType(null)
+        setOauthClaimPayload({
+          access_token: data.access_token,
+          refresh_token: data.refresh_token,
+          purpose: data.purpose,
+          provider: data.provider,
+          expires_in: data.expires_in,
+          username: data.username,
+        })
+        const next = new URLSearchParams(searchParams)
+        next.delete('oauth_nonce')
+        setSearchParams(next, { replace: true })
+        setView('configure')
+        setEditTool(null)
+        setError(null)
+      })
+      .catch((err: unknown) => {
+        if (cancelled) return
+        try {
+          sessionStorage.removeItem(MCP_PENDING_OAUTH_NONCE_KEY)
+        } catch {
+          /* ignore */
+        }
+        const detail = (err as { response?: { data?: { detail?: string } } })?.response?.data?.detail
+        const resume = consumeOAuthReturnAndResumeTool()
+        if (resume) setOauthConfigureToolType(resume)
+        setError(typeof detail === 'string' ? detail : 'OAuth sign-in failed')
+        if (resume) {
+          setView('configure')
+          setEditTool(null)
+        }
+        const next = new URLSearchParams(searchParams)
+        next.delete('oauth_nonce')
+        setSearchParams(next, { replace: true })
+      })
+    return () => {
+      cancelled = true
+    }
+  }, [user, searchParams, setSearchParams])
 
   const loadConnections = () => {
     setError(null)
@@ -366,8 +641,22 @@ export default function MCPPage() {
       {view === 'configure' && (
         <ConfigureFlow
           editTool={editTool}
-          onBack={() => { setView('tools'); setEditTool(null); }}
-          onSaved={() => { setView('tools'); setEditTool(null); loadTools(); setError(null); }}
+          oauthResumeToolType={oauthConfigureToolType}
+          oauthClaimPayload={oauthClaimPayload}
+          onBack={() => {
+            setOauthConfigureToolType(null)
+            setOauthClaimPayload(null)
+            setView('tools')
+            setEditTool(null)
+          }}
+          onSaved={() => {
+            setOauthConfigureToolType(null)
+            setOauthClaimPayload(null)
+            setView('tools')
+            setEditTool(null)
+            loadTools()
+            setError(null)
+          }}
           onError={setError}
           onSchemaRefreshed={async (id) => {
             const list = await mcpAPI.listTools()
@@ -382,9 +671,17 @@ export default function MCPPage() {
         <ToolsList
           tools={tools}
           onBack={() => setView('choose')}
-          onAdd={() => { setEditTool(null); setView('configure'); setError(null); }}
+          onAdd={() => {
+            setOauthConfigureToolType(null)
+            setOauthClaimPayload(null)
+            setEditTool(null)
+            setView('configure')
+            setError(null)
+          }}
           onEdit={async (tool) => {
             setError(null)
+            setOauthConfigureToolType(null)
+            setOauthClaimPayload(null)
             try {
               const full = await mcpAPI.getTool(tool.id)
               setEditTool(full)
@@ -775,6 +1072,8 @@ const TOOL_LABELS: Record<string, string> = {
   azure_blob: 'Azure Blob Storage',
   gcs: 'Google Cloud Storage',
   slack: 'Slack',
+  teams: 'Microsoft Teams (Graph)',
+  smtp: 'SMTP email',
   github: 'GitHub',
   notion: 'Notion',
   rest_api: 'REST API',
@@ -796,6 +1095,83 @@ function resolvePlatformRegistryAccessMode(t: {
   const tt = (t.tool_type || '').toLowerCase()
   if (READ_ONLY_PLATFORM_TOOL_TYPES.has(tt)) return 'read_only'
   return 'read_write'
+}
+
+/** Extra line shown under Validate result when the message matches known patterns (latency to fix). */
+function validationFollowUpHint(message: string): string | null {
+  const m = message.toLowerCase()
+  if (m.includes('gmail rest') && (m.includes('403') || m.includes('warning')))
+    return 'Reconnect Google on this SMTP tool and accept updated permissions (gmail.readonly) if you need inbox read via list_mail_messages.'
+  if (m.includes('535') || m.includes('smtp oauth2 rejected'))
+    return 'Outlook: token must target smtp.office365.com (outlook.office.com/SMTP.Send scope); enable Authenticated SMTP on the mailbox.'
+  if (m.includes('graph api') && m.includes('401'))
+    return 'Microsoft token missing or expired: use Connect Microsoft or paste a fresh Graph access token, then Save.'
+  if (m.includes('graph api') && (m.includes('403') || m.includes('denied')))
+    return 'Re-authorize Microsoft after Entra changes. Common scopes: Team.ReadBasic.All, ChannelMessage.Read.All, Mail.Read, ChannelMessage.Send.'
+  if (
+    m.includes('private') ||
+    m.includes('loopback') ||
+    m.includes('link-local') ||
+    m.includes('169.254')
+  ) {
+    if (m.includes('blocked') || m.includes('not allowed') || m.includes('ssrf'))
+      return 'For a local API base URL, set MCP_HTTP_ALLOW_PRIVATE_URLS=true on the Sandhi backend and the platform MCP server, then restart both.'
+  }
+  if (m.includes('could not resolve host'))
+    return 'Check the REST API base URL is reachable from the server (DNS and TLS).'
+  if (
+    /\b30[123789]\b/.test(m) ||
+    (m.includes('redirect') &&
+      (m.includes('blocked') ||
+        m.includes('location') ||
+        m.includes('too many') ||
+        m.includes('host does not match')))
+  ) {
+    return 'REST/Elasticsearch validate only follows redirects on the same host; each Location URL is re-checked (SSRF). The REST tool with MCP_REST_API_FOLLOW_REDIRECTS=true still allows only same-host redirects on the platform server.'
+  }
+  return null
+}
+
+/** In-form guidance for messaging tools (read vs write, agent-friendly). */
+const MESSAGING_CONFIGURE_HINTS: Record<string, { title: string; lines: string[] }> = {
+  slack: {
+    title: 'Slack — how agents use this tool',
+    lines: [
+      'Read: list_channels returns each channel id and name—pass id into list_messages (and optional limit, cursor).',
+      'Write: action send with channel and message. Use idempotency_key on send so retries do not double-post.',
+      'Store the bot token here; invite the bot to channels it must post in.',
+    ],
+  },
+  teams: {
+    title: 'Microsoft Teams — how agents use this tool',
+    lines: [
+      'Delegated scopes (Connect / Re-authorize): User.Read, Team.ReadBasic.All, Channel.ReadBasic.All, ChannelMessage.Send, ChannelMessage.Read.All, Mail.Read (as configured in your Entra app).',
+      'Read: list_joined_teams → list_channels → list_channel_messages / get_channel_message. Outlook: list_mail_messages, get_mail_message, get_mail_attachment (same Graph token).',
+      'Write: send_message (team_id + channel_id + body) or reply_message (+ message_id). Use idempotency_key on writes.',
+      'Use Connect Microsoft to sign in, or paste a Graph access token. Backend needs MCP_OAUTH_ENABLED and Redis for Connect.',
+      'Re-authorize after Entra permission changes. Work/school accounts for joined teams; consumer mailboxes may differ.',
+    ],
+  },
+  smtp: {
+    title: 'SMTP email — how agents use this tool',
+    lines: [
+      'Google OAuth scopes: https://mail.google.com/ (send/SMTP) and gmail.readonly (inbox read via Gmail API when provider=gmail).',
+      'Outlook OAuth: https://outlook.office.com/SMTP.Send (send only to smtp.office365.com); inbox read uses the Teams (Graph) tool, not SMTP.',
+      'Read-like: validate checks SMTP auth. Gmail + OAuth: list_mail_messages, get_mail_message, get_mail_attachment (re-connect Google after scope changes).',
+      'Write: send with to, subject, body/html_body, optional attachments. idempotency_key on send.',
+      'Username must match the mailbox for OAuth2 XOAUTH2.',
+    ],
+  },
+}
+
+const REST_API_CONFIGURE_HINTS = {
+  title: 'REST API tool — security and usage',
+  lines: [
+    'Use base_url such as https://api.vendor.com and a relative path only (no leading slash, no second host in path).',
+    'Private, loopback, and cloud-metadata hosts are blocked by default (SSRF protection). For local APIs set MCP_HTTP_ALLOW_PRIVATE_URLS=true on the backend and platform MCP server.',
+    'HTTP redirects are off by default. With MCP_REST_API_FOLLOW_REDIRECTS=true, the platform follows redirects only within the same registrable domain as the first request (e.g. api.vendor.com → cdn.vendor.com) and re-checks each Location URL (SSRF).',
+    'Optional API key is sent as Authorization: Bearer …',
+  ],
 }
 
 const TOOL_OPTIONS_GROUPS: { label: string; options: { value: string; label: string }[] }[] = [
@@ -828,6 +1204,8 @@ const TOOL_OPTIONS_GROUPS: { label: string; options: { value: string; label: str
   ]},
   { label: 'Integrations', options: [
     { value: 'slack', label: 'Slack' },
+    { value: 'teams', label: 'Microsoft Teams (Graph)' },
+    { value: 'smtp', label: 'SMTP email' },
     { value: 'github', label: 'GitHub' },
     { value: 'notion', label: 'Notion' },
     { value: 'rest_api', label: 'REST API' },
@@ -850,21 +1228,31 @@ function isChromaTrycloudUrl(raw: string | undefined): boolean {
 
 function ConfigureFlow({
   editTool,
+  oauthResumeToolType,
+  oauthClaimPayload,
   onBack,
   onSaved,
   onError,
   onSchemaRefreshed,
 }: {
   editTool: MCPToolConfigRes | null
+  /** When set (e.g. after OAuth error), new-tool form opens as Teams or SMTP instead of default vector DB. */
+  oauthResumeToolType: 'teams' | 'smtp' | null
+  /** Successful OAuth claim from parent (survives Strict Mode); applied to tool type + config once per open. */
+  oauthClaimPayload: OAuthClaimPayload | null
   onBack: () => void
   onSaved: () => void
   onError: (e: string | null) => void
   onSchemaRefreshed?: (toolId: number) => Promise<void>
 }) {
-  const [toolType, setToolType] = useState(editTool?.tool_type ?? 'vector_db')
+  const [toolType, setToolType] = useState(() =>
+    initialConfigureToolType(editTool, oauthClaimPayload, oauthResumeToolType),
+  )
   const [name, setName] = useState(editTool?.name ?? '')
   const [businessDescription, setBusinessDescription] = useState(editTool?.business_description ?? '')
-  const [config, setConfig] = useState<Record<string, string>>({})
+  const [config, setConfig] = useState<Record<string, string>>(() =>
+    initialConfigureConfig(editTool, oauthClaimPayload),
+  )
   const [submitting, setSubmitting] = useState(false)
   const [validating, setValidating] = useState(false)
   const [refreshingSchema, setRefreshingSchema] = useState(false)
@@ -890,27 +1278,57 @@ function ConfigureFlow({
       setName(editTool.name)
       setToolType(editTool.tool_type)
       setBusinessDescription(editTool.business_description ?? '')
-      const init: Record<string, string> = {}
-      if (editTool.tool_type === 'chroma' && editTool.chroma_url_preview?.trim()) {
-        init.url = editTool.chroma_url_preview.trim()
-      }
-      if (editTool.tool_type === 'weaviate') {
-        if (editTool.weaviate_cluster_preview?.trim()) {
-          init.weaviate_cluster_name = editTool.weaviate_cluster_preview.trim()
-        }
-        if (editTool.weaviate_class_preview?.trim()) {
-          init.index_name = editTool.weaviate_class_preview.trim()
-        }
-      }
-      setConfig(init)
-    } else {
+      setConfig(buildEditToolConfigSnapshot(editTool))
+    } else if (!oauthClaimPayload) {
       setName('')
       setBusinessDescription('')
-      setToolType('vector_db')
+      const fromOauth =
+        oauthResumeToolType === 'teams' || oauthResumeToolType === 'smtp' ? oauthResumeToolType : null
+      setToolType(fromOauth ?? 'vector_db')
       setConfig({})
     }
     setValidateMessage(null)
-  }, [editTool])
+  }, [editTool, oauthResumeToolType, oauthClaimPayload])
+
+  useEffect(() => {
+    if (editTool || !oauthClaimPayload) return
+    const o = oauthClaimPayload
+    const purpose = o.purpose ?? ''
+    const at = o.access_token ?? ''
+    const rt = o.refresh_token ?? ''
+    if (purpose === 'teams') {
+      setToolType('teams')
+      setConfig((prev) => ({ ...prev, access_token: at, oauth_refresh_token: rt || prev.oauth_refresh_token }))
+    } else if (purpose === 'smtp_outlook') {
+      setToolType('smtp')
+      setConfig((prev) => ({
+        ...prev,
+        provider: 'outlook',
+        auth_mode: 'oauth2',
+        access_token: at,
+        oauth_refresh_token: rt || prev.oauth_refresh_token,
+        username: (typeof o.username === 'string' && o.username.trim() ? o.username.trim() : prev.username) || '',
+        use_tls: prev.use_tls?.trim() || 'true',
+      }))
+    } else if (purpose === 'smtp_gmail' || o.provider === 'google') {
+      setToolType('smtp')
+      setConfig((prev) => ({
+        ...prev,
+        provider: 'gmail',
+        auth_mode: 'oauth2',
+        access_token: at,
+        oauth_refresh_token: rt || prev.oauth_refresh_token,
+        username: (typeof o.username === 'string' && o.username.trim() ? o.username.trim() : prev.username) || '',
+        use_tls: prev.use_tls?.trim() || 'true',
+      }))
+    } else {
+      setConfig((prev) => ({ ...prev, access_token: at || prev.access_token, oauth_refresh_token: rt || prev.oauth_refresh_token }))
+    }
+    setValidateMessage({
+      success: true,
+      text: 'Signed in with OAuth. Review fields and save the tool to store tokens encrypted.',
+    })
+  }, [editTool, oauthClaimPayload])
 
   const configFields: Record<string, { key: string; label: string; placeholder: string; secret?: boolean }[]> = {
     vector_db: [
@@ -1113,6 +1531,45 @@ function ConfigureFlow({
       { key: 'bot_token', label: 'Bot token (xoxb-...)', placeholder: '', secret: true },
       { key: 'default_channel', label: 'Default channel ID (optional)', placeholder: 'C01234...' },
     ],
+    teams: [
+      {
+        key: 'access_token',
+        label: 'Microsoft Graph access token',
+        placeholder: 'From Connect Microsoft or paste bearer token',
+        secret: true,
+      },
+      {
+        key: 'oauth_refresh_token',
+        label: 'OAuth refresh token (optional)',
+        placeholder: 'Stored when provider returns it; future token refresh may use this',
+        secret: true,
+      },
+      {
+        key: 'graph_base_url',
+        label: 'Graph base URL (optional)',
+        placeholder: 'https://graph.microsoft.com/v1.0',
+        secret: false,
+      },
+    ],
+    smtp: [
+      { key: 'provider', label: 'Provider preset', placeholder: 'gmail | outlook | yahoo | custom', secret: false },
+      { key: 'smtp_host', label: 'SMTP host (custom only)', placeholder: 'smtp.example.com', secret: false },
+      { key: 'smtp_port', label: 'SMTP port (optional)', placeholder: '587', secret: false },
+      { key: 'use_tls', label: 'STARTTLS (optional)', placeholder: 'true — set false only if server forbids TLS upgrade', secret: false },
+      { key: 'use_ssl', label: 'Implicit SSL / port 465 (optional)', placeholder: 'true', secret: false },
+      { key: 'auth_mode', label: 'Auth mode', placeholder: 'password | oauth2 (omit to auto-detect)', secret: false },
+      { key: 'username', label: 'Username / mailbox', placeholder: 'user@domain.com', secret: false },
+      { key: 'password', label: 'Password (password auth)', placeholder: '', secret: true },
+      { key: 'access_token', label: 'OAuth2 access token (XOAUTH2)', placeholder: 'From Connect buttons or paste', secret: true },
+      {
+        key: 'oauth_refresh_token',
+        label: 'OAuth refresh token (optional)',
+        placeholder: 'Stored when Google/Microsoft returns it',
+        secret: true,
+      },
+      { key: 'from_address', label: 'Default From address (optional)', placeholder: 'same as username if omitted', secret: false },
+      { key: 'from_name', label: 'Display name (optional)', placeholder: 'Support Bot', secret: false },
+    ],
     github: [
       { key: 'api_key', label: 'Personal access token', placeholder: 'ghp_...', secret: true },
       { key: 'base_url', label: 'GitHub API URL (optional)', placeholder: 'https://api.github.com' },
@@ -1150,17 +1607,13 @@ function ConfigureFlow({
     onError(null)
     setValidateMessage(null)
     const configPayload = buildConfigPayload()
-    if (editTool && Object.keys(configPayload).length === 0) {
-      setValidateMessage({ success: false, text: 'Enter connection details to validate, or leave blank when editing to keep existing.' })
-      return
-    }
     if (!editTool && Object.keys(configPayload).length === 0) {
       setValidateMessage({ success: false, text: 'Enter connection details to validate.' })
       return
     }
     setValidating(true)
     try {
-      const res = await mcpAPI.validateToolConfig(toolType, configPayload)
+      const res = await mcpAPI.validateToolConfig(toolType, configPayload, editTool?.id)
       setValidateMessage({ success: res.valid, text: res.message })
     } catch (err: unknown) {
       setValidateMessage({ success: false, text: (err as { response?: { data?: { detail?: string } } })?.response?.data?.detail ?? 'Validation request failed' })
@@ -1217,6 +1670,35 @@ function ConfigureFlow({
       if (toolType === 'gcs' && (!config.project_id?.trim() || !config.bucket?.trim())) {
         setValidateMessage({ success: false, text: 'Google Cloud Storage requires project ID and bucket.' })
         return
+      }
+      if (toolType === 'teams' && !config.access_token?.trim()) {
+        setValidateMessage({ success: false, text: 'Teams requires a Microsoft Graph access token.' })
+        return
+      }
+      if (toolType === 'smtp') {
+        const prov = (config.provider || 'custom').trim().toLowerCase()
+        if (prov === 'custom' && !config.smtp_host?.trim()) {
+          setValidateMessage({ success: false, text: 'SMTP custom provider requires smtp_host.' })
+          return
+        }
+        const mode = (config.auth_mode || '').trim().toLowerCase()
+        const hasPw = Boolean(config.password?.trim())
+        const hasOAuth = Boolean(config.access_token?.trim())
+        if (mode === 'oauth2' && (!config.username?.trim() || !hasOAuth)) {
+          setValidateMessage({ success: false, text: 'SMTP OAuth2 requires username and access_token.' })
+          return
+        }
+        if (mode === 'password' && (!config.username?.trim() || !hasPw)) {
+          setValidateMessage({ success: false, text: 'SMTP password auth requires username and password.' })
+          return
+        }
+        if (!mode && !((config.username?.trim() && hasPw) || (config.username?.trim() && hasOAuth))) {
+          setValidateMessage({
+            success: false,
+            text: 'SMTP requires username with password, or username with OAuth2 access_token.',
+          })
+          return
+        }
       }
     }
     const configPayload = buildConfigPayload()
@@ -1333,6 +1815,119 @@ function ConfigureFlow({
             />
             <p className="mt-1 text-xs text-white/50">Short context for the agent (e.g. what tables mean). Shown with schema so the agent can write correct queries.</p>
           </div>
+          {MESSAGING_CONFIGURE_HINTS[toolType] && (
+            <div className="p-4 rounded-xl bg-primary-500/10 border border-primary-500/25 text-sm">
+              <h3 className="font-semibold text-primary-300 mb-2">{MESSAGING_CONFIGURE_HINTS[toolType].title}</h3>
+              <ul className="list-disc pl-5 space-y-1.5 text-white/80">
+                {MESSAGING_CONFIGURE_HINTS[toolType].lines.map((line, idx) => (
+                  <li key={idx}>{line}</li>
+                ))}
+              </ul>
+            </div>
+          )}
+          {toolType === 'rest_api' && (
+            <div className="p-4 rounded-xl bg-amber-500/10 border border-amber-500/25 text-sm">
+              <h3 className="font-semibold text-amber-200 mb-2">{REST_API_CONFIGURE_HINTS.title}</h3>
+              <ul className="list-disc pl-5 space-y-1.5 text-white/80">
+                {REST_API_CONFIGURE_HINTS.lines.map((line, idx) => (
+                  <li key={idx}>{line}</li>
+                ))}
+              </ul>
+            </div>
+          )}
+          {toolType === 'teams' && (
+            <div className="p-4 rounded-xl bg-dark-50 border border-dark-200 space-y-2">
+              <p className="text-sm text-white/85 font-medium">Sign in with Microsoft</p>
+              <div className="flex flex-wrap gap-2">
+                <button
+                  type="button"
+                  className="px-4 py-2.5 rounded-xl bg-[#0078d4] text-white text-sm font-semibold hover:opacity-90"
+                  onClick={async () => {
+                    onError(null)
+                    try {
+                      const { authorize_url } = await mcpAPI.oauthMicrosoftTeamsStart()
+                      stashOAuthReturnPurpose('teams')
+                      window.location.assign(authorize_url)
+                    } catch (err: unknown) {
+                      const d = (err as { response?: { data?: { detail?: string } } })?.response?.data?.detail
+                      onError(typeof d === 'string' ? d : 'Could not start Microsoft sign-in (check MCP_OAUTH_ENABLED and Redis).')
+                    }
+                  }}
+                >
+                  Connect Microsoft (Teams)
+                </button>
+                <button
+                  type="button"
+                  className="px-4 py-2.5 rounded-xl bg-dark-200 text-white text-sm font-semibold border border-dark-200 hover:bg-dark-200/80"
+                  onClick={async () => {
+                    onError(null)
+                    try {
+                      const { authorize_url } = await mcpAPI.oauthMicrosoftTeamsStart({ forceConsent: true })
+                      stashOAuthReturnPurpose('teams')
+                      window.location.assign(authorize_url)
+                    } catch (err: unknown) {
+                      const d = (err as { response?: { data?: { detail?: string } } })?.response?.data?.detail
+                      onError(typeof d === 'string' ? d : 'Could not start Microsoft sign-in (check MCP_OAUTH_ENABLED and Redis).')
+                    }
+                  }}
+                >
+                  Re-authorize (refresh scopes)
+                </button>
+              </div>
+              <p className="text-xs text-white/45">
+                Teams listing needs a <span className="text-white/60">work or school</span> account; personal Outlook.com is not
+                supported by Graph for joined teams. Use Re-authorize after changing API permissions in Entra.
+              </p>
+              <p className="text-xs text-white/45">
+                Callback URL (register in Azure):{' '}
+                <code className="bg-dark-200/60 px-1 rounded break-all">/api/mcp/oauth/microsoft/callback</code> on your API base.
+              </p>
+            </div>
+          )}
+          {!editTool && toolType === 'smtp' && (
+            <div className="p-4 rounded-xl bg-dark-50 border border-dark-200 space-y-3">
+              <p className="text-sm text-white/85 font-medium">Sign in with OAuth (optional)</p>
+              <div className="flex flex-wrap gap-2">
+                <button
+                  type="button"
+                  className="px-4 py-2.5 rounded-xl bg-[#0078d4] text-white text-sm font-semibold hover:opacity-90"
+                  onClick={async () => {
+                    onError(null)
+                    try {
+                      const { authorize_url } = await mcpAPI.oauthMicrosoftSmtpStart()
+                      stashOAuthReturnPurpose('smtp_outlook')
+                      window.location.assign(authorize_url)
+                    } catch (err: unknown) {
+                      const d = (err as { response?: { data?: { detail?: string } } })?.response?.data?.detail
+                      onError(typeof d === 'string' ? d : 'Could not start Microsoft sign-in.')
+                    }
+                  }}
+                >
+                  Connect Microsoft (Outlook SMTP)
+                </button>
+                <button
+                  type="button"
+                  className="px-4 py-2.5 rounded-xl bg-white text-gray-900 text-sm font-semibold border border-white/20 hover:bg-white/90"
+                  onClick={async () => {
+                    onError(null)
+                    try {
+                      const { authorize_url } = await mcpAPI.oauthGoogleSmtpStart()
+                      stashOAuthReturnPurpose('smtp_gmail')
+                      window.location.assign(authorize_url)
+                    } catch (err: unknown) {
+                      const d = (err as { response?: { data?: { detail?: string } } })?.response?.data?.detail
+                      onError(typeof d === 'string' ? d : 'Could not start Google sign-in.')
+                    }
+                  }}
+                >
+                  Connect Google (Gmail SMTP)
+                </button>
+              </div>
+              <p className="text-xs text-white/45">
+                Also register <code className="bg-dark-200/60 px-1 rounded">/api/mcp/oauth/google/callback</code> in Google Cloud Console.
+              </p>
+            </div>
+          )}
           {visibleFields.map((f) => (
             <div key={f.key}>
               <label className="block text-sm font-medium text-white/80 mb-1">{f.label}</label>
@@ -1368,11 +1963,19 @@ function ConfigureFlow({
               )}
             </div>
           ))}
-          {validateMessage && (
-            <div className={`p-3 rounded-xl text-sm ${validateMessage.success ? 'bg-green-500/20 border border-green-500/50 text-green-200' : 'bg-amber-500/20 border border-amber-500/50 text-amber-200'}`}>
-              {validateMessage.text}
-            </div>
-          )}
+          {validateMessage && (() => {
+            const followUp = validationFollowUpHint(validateMessage.text)
+            return (
+              <div
+                className={`p-3 rounded-xl text-sm space-y-2 ${validateMessage.success ? 'bg-green-500/20 border border-green-500/50 text-green-200' : 'bg-amber-500/20 border border-amber-500/50 text-amber-200'}`}
+              >
+                <div className="whitespace-pre-wrap break-words">{validateMessage.text}</div>
+                {followUp && (
+                  <p className="text-xs text-white/75 border-t border-white/15 pt-2 mt-1 leading-relaxed">{followUp}</p>
+                )}
+              </div>
+            )
+          })()}
           {(editTool && (toolType === 'postgres' || toolType === 'mysql' || toolType === 'sqlserver')) && (
             <div className="p-3 rounded-xl bg-dark-50 border border-dark-200">
               <p className="text-sm text-white/80 mb-2">Load database schema so the agent can write correct SQL. Refresh after changing the connection.</p>

@@ -23,7 +23,7 @@ export function getToolAccessBadge(toolType: string | undefined | null): ToolAcc
   ])
   const sql = new Set(['postgres', 'mysql', 'sqlserver', 'snowflake', 'databricks', 'bigquery'])
   const object = new Set(['s3', 'minio', 'ceph', 'azure_blob', 'gcs', 'filesystem'])
-  const messaging = new Set(['slack'])
+  const messaging = new Set(['slack', 'teams', 'smtp'])
   const integration = new Set(['github', 'notion'])
 
   if (search.has(t)) {
@@ -50,8 +50,9 @@ export function getToolAccessBadge(toolType: string | undefined | null): ToolAcc
   if (messaging.has(t)) {
     return {
       short: 'messaging',
-      label: 'Messaging',
-      hint: 'Side effects — assign only where needed.',
+      label: 'Messaging (read + write)',
+      hint:
+        'Read-like: list channels/teams, SMTP validate. Write-like: send/post. Classify by action; scope per step.',
     }
   }
   if (integration.has(t)) {

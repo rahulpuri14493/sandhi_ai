@@ -1,5 +1,6 @@
 """Extended unit tests for services.mcp_validate helpers and branches."""
 
+import socket
 import sys
 import types
 
@@ -27,7 +28,7 @@ def test_http_reachable_success(monkeypatch):
 
     monkeypatch.setattr(
         "httpx.get",
-        lambda url, headers=None, timeout=None: R(),
+        lambda url, headers=None, timeout=None, follow_redirects=True: R(),
     )
     ok, msg = mv._http_reachable("https://x.test/")
     assert ok is True
@@ -54,6 +55,97 @@ def test_http_reachable_exception(monkeypatch):
     assert "reach" in msg.lower()
 
 
+def test_http_reachable_restricted_follows_same_host(monkeypatch):
+    calls: list = []
+
+    def fake_get(url, headers=None, timeout=None, follow_redirects=True):
+        calls.append((url, follow_redirects))
+        if len(calls) == 1:
+
+            class R302:
+                status_code = 302
+                headers = {"location": "/b"}
+
+            return R302()
+
+        class R200:
+            status_code = 200
+            headers = {}
+
+        return R200()
+
+    monkeypatch.setattr("httpx.get", fake_get)
+    monkeypatch.setattr(
+        "services.http_url_guard.socket.getaddrinfo",
+        lambda *a, **k: [(socket.AF_INET, socket.SOCK_STREAM, 0, "", ("8.8.8.8", 0))],
+    )
+    ok, msg = mv._http_reachable("https://x.test/a", restrict_same_host_redirects=True)
+    assert ok is True
+    assert "200" in msg
+    assert calls[0][1] is False and calls[1][1] is False
+    assert calls[1][0] == "https://x.test/b"
+
+
+def test_http_reachable_restricted_allows_subdomain_redirect(monkeypatch):
+    calls: list = []
+
+    def fake_get(url, headers=None, timeout=None, follow_redirects=True):
+        calls.append(url)
+        if len(calls) == 1:
+
+            class R302:
+                status_code = 302
+                headers = {"location": "https://cdn.example.com/b"}
+
+            return R302()
+
+        class R200:
+            status_code = 200
+            headers = {}
+
+        return R200()
+
+    monkeypatch.setattr("httpx.get", fake_get)
+    monkeypatch.setattr(
+        "services.http_url_guard.socket.getaddrinfo",
+        lambda *a, **k: [(socket.AF_INET, socket.SOCK_STREAM, 0, "", ("8.8.8.8", 0))],
+    )
+    ok, msg = mv._http_reachable("https://api.example.com/a", restrict_same_host_redirects=True)
+    assert ok is True
+    assert "200" in msg
+    assert calls[-1] == "https://cdn.example.com/b"
+
+
+def test_http_reachable_restricted_blocks_cross_host(monkeypatch):
+    class R302:
+        status_code = 302
+        headers = {"location": "https://evil.example/other"}
+
+    monkeypatch.setattr("httpx.get", lambda *a, **kw: R302())
+    monkeypatch.setattr(
+        "services.http_url_guard.socket.getaddrinfo",
+        lambda *a, **k: [(socket.AF_INET, socket.SOCK_STREAM, 0, "", ("8.8.8.8", 0))],
+    )
+    ok, msg = mv._http_reachable("https://x.test/start", restrict_same_host_redirects=True)
+    assert ok is False
+    assert "host" in msg.lower()
+
+
+def test_http_reachable_restricted_no_location(monkeypatch):
+    class R302:
+        status_code = 302
+        headers = {}
+
+    monkeypatch.setattr("httpx.get", lambda *a, **kw: R302())
+    monkeypatch.setattr(
+        "services.http_url_guard.socket.getaddrinfo",
+        lambda *a, **k: [(socket.AF_INET, socket.SOCK_STREAM, 0, "", ("8.8.8.8", 0))],
+    )
+    ok, msg = mv._http_reachable("https://x.test/", restrict_same_host_redirects=True)
+    assert ok is False
+    assert "location" in msg.lower()
+
+
 def test_validate_tool_config_unsupported_type():
     ok, msg = validate_tool_config("unknown_tool_xyz", {})
     assert ok is False
@@ -73,19 +165,23 @@ def test_vector_db_invalid_host():
 
 
 def test_weaviate_success(monkeypatch):
-    monkeypatch.setattr("services.mcp_validate._http_reachable", lambda url, headers=None: (True, "ok"))
+    monkeypatch.setattr(
+        "services.mcp_validate._http_reachable", lambda url, headers=None, **kwargs: (True, "ok")
+    )
     ok, msg = validate_tool_config("weaviate", {"url": "https://w.test", "api_key": "k"})
     assert ok is True
 
 
 def test_qdrant_with_api_key(monkeypatch):
-    monkeypatch.setattr("services.mcp_validate._http_reachable", lambda url, headers=None: (True, "ok"))
+    monkeypatch.setattr(
+        "services.mcp_validate._http_reachable", lambda url, headers=None, **kwargs: (True, "ok")
+    )
     ok, _ = validate_tool_config("qdrant", {"url": "https://q.test", "api_key": "abc"})
     assert ok is True
 
 
 def test_chroma_v2_heartbeat_used_when_v1_fails(monkeypatch):
-    def fake(url, headers=None, timeout=None):
+    def fake(url, headers=None, timeout=None, **kwargs):
         if "/api/v1/heartbeat" in url:
             return False, "v1 down"
         if "/api/v2/heartbeat" in url:
@@ -99,7 +195,13 @@ def test_chroma_v2_heartbeat_used_when_v1_fails(monkeypatch):
 
 
 def test_elasticsearch_reachable(monkeypatch):
-    monkeypatch.setattr("services.mcp_validate._http_reachable", lambda url, headers=None: (True, "ok"))
+    monkeypatch.setattr(
+        "services.mcp_validate._http_reachable", lambda url, headers=None, **kwargs: (True, "ok")
+    )
+    monkeypatch.setattr(
+        "services.http_url_guard.socket.getaddrinfo",
+        lambda *a, **k: [(socket.AF_INET, socket.SOCK_STREAM, 0, "", ("8.8.8.8", 0))],
+    )
     ok, _ = validate_tool_config("elasticsearch", {"url": "https://es.test:9200"})
     assert ok is True
 

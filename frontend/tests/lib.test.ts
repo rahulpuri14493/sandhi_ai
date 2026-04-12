@@ -27,8 +27,13 @@ describe('getToolAccessBadge', () => {
     expect(getToolAccessBadge('minio').short).toBe('object')
   })
 
-  it('returns messaging for slack', () => {
-    expect(getToolAccessBadge('slack').short).toBe('messaging')
+  it('returns messaging read+write for slack, teams, smtp', () => {
+    for (const tt of ['slack', 'teams', 'smtp']) {
+      const b = getToolAccessBadge(tt)
+      expect(b.short).toBe('messaging')
+      expect(b.label).toContain('read')
+      expect(b.label).toContain('write')
+    }
   })
 
   it('returns integration for github', () => {

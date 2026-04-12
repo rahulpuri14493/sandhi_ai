@@ -57,6 +57,8 @@ class MCPToolConfigUpdate(BaseModel):
 class ValidateToolConfigRequest(BaseModel):
     tool_type: str
     config: dict
+    # When set, merge `config` over the stored encrypted config so secret fields left blank in the UI still validate.
+    tool_id: Optional[int] = None
 
 
 class MCPToolConfigResponse(BaseModel):

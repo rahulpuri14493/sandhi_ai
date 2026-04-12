@@ -762,6 +762,19 @@ def test_infer_mcp_tool_operation_class_matches_platform_and_byo_naming():
     assert infer_mcp_tool_operation_class("platform_9_snowflake", {"query": "SELECT 1"}) == "read_like"
     assert infer_mcp_tool_operation_class("platform_9_snowflake", {"operation_type": "insert"}) == "write_like"
     assert infer_mcp_tool_operation_class("byo_1_write_record", {}) == "write_like"
+    assert infer_mcp_tool_operation_class("platform_1_slack", {"action": "list_channels"}) == "read_like"
+    assert infer_mcp_tool_operation_class("platform_1_slack", {"action": "list_messages"}) == "read_like"
+    assert infer_mcp_tool_operation_class("platform_1_slack", {"action": "send"}) == "write_like"
+    assert infer_mcp_tool_operation_class("platform_1_teams", {"action": "list_joined_teams"}) == "read_like"
+    assert infer_mcp_tool_operation_class("platform_1_teams", {"action": "list_mail_messages"}) == "read_like"
+    assert infer_mcp_tool_operation_class("platform_1_teams", {"action": "get_mail_message"}) == "read_like"
+    assert infer_mcp_tool_operation_class("platform_1_teams", {"action": "send_message"}) == "write_like"
+    assert infer_mcp_tool_operation_class("platform_1_smtp", {"action": "validate"}) == "read_like"
+    assert infer_mcp_tool_operation_class("platform_1_smtp", {"action": "list_mail_messages"}) == "read_like"
+    assert infer_mcp_tool_operation_class("platform_1_smtp", {"action": "send"}) == "write_like"
+    assert infer_mcp_tool_operation_class("platform_1_rest", {"method": "GET", "path": "/x"}) == "read_like"
+    assert infer_mcp_tool_operation_class("platform_1_rest", {"method": "POST", "path": "/x"}) == "write_like"
+    assert infer_mcp_tool_operation_class("platform_1_slack", {"channel": "C1", "message": "hi"}) == "write_like"
 
 
 def test_classify_mcp_failure_public_alias_matches_transport_errors():

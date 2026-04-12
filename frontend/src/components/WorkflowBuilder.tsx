@@ -510,7 +510,7 @@ export function WorkflowBuilder({ jobId, onWorkflowCreated, initialSelectedAgent
     'vector_db', 'pinecone', 'weaviate', 'qdrant', 'chroma',
     'elasticsearch', 'pageindex',
     'filesystem', 's3', 'minio', 'ceph', 'azure_blob', 'gcs',
-    'slack', 'github', 'notion', 'rest_api',
+    'slack', 'teams', 'smtp', 'github', 'notion', 'rest_api',
   ])
   const hasWriteCapablePlatformTools = platformTools.some((tool) => {
     const t = String(tool.tool_type || '').toLowerCase()

@@ -2372,10 +2372,23 @@ END DOCUMENT {i+1}: {doc_name}
             "ceph": "Ceph object storage",
             "azure_blob": "Azure Blob storage",
             "gcs": "Google Cloud Storage",
-            "slack": "Slack integration",
+            "slack": (
+                "Slack (read + write). Read: list_channels returns channel id+name (use id for list_messages); "
+                "list_messages needs channel (prefer id). Write: send with channel + message; idempotency_key on send."
+            ),
+            "teams": (
+                "Microsoft Teams / Graph (read + write). Read: list_joined_teams, list_channels, list_channel_messages, "
+                "get_channel_message; Outlook mailbox: list_mail_messages, get_mail_message, get_mail_attachment (Graph token). "
+                "Write: send_message, reply_message. Re-authorize Microsoft after scope changes (Mail.Read, ChannelMessage.Read)."
+            ),
+            "smtp": (
+                "SMTP email + Gmail inbox read. validate checks SMTP auth; send for outbound. "
+                "Gmail only (provider=gmail + OAuth): list_mail_messages, get_mail_message, get_mail_attachment. "
+                "Outlook inbox read uses the Teams tool (Graph), not SMTP. idempotency_key on send."
+            ),
             "github": "GitHub API",
             "notion": "Notion API",
-            "rest_api": "REST API client",
+            "rest_api": "REST API client (relative path + base_url; private hosts blocked unless MCP_HTTP_ALLOW_PRIVATE_URLS=true; redirects off by default; MCP_REST_API_FOLLOW_REDIRECTS=true enables same-registrable-domain redirects only, with per-hop SSRF checks)",
         }
         tools = []
         platform_query = self.db.query(MCPToolConfig).filter(
