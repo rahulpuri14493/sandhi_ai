@@ -39,6 +39,11 @@ export const authAPI = {
   getCurrentUser(): Promise<User | null> {
     return api.get<User>('/auth/me').then((res) => res.data).catch(() => null)
   },
+  /** Use after login; propagates axios errors so the UI can show `/auth/me` failures. */
+  async fetchCurrentUser(): Promise<User> {
+    const { data } = await api.get<User>('/auth/me')
+    return data
+  },
   logout() {
     localStorage.removeItem(TOKEN_KEY)
   },

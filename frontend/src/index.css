@@ -162,3 +162,55 @@ input[type="time"]::-webkit-calendar-picker-indicator {
 input[type="time"]::-webkit-datetime-edit {
   color: inherit;
 }
+
+/*
+ * New Job form: page uses light text on dark bg (body). Native inputs/textareas can still get
+ * "dark widget" styling (light glyphs) while we force a white box → invisible text.
+ * Scope + high specificity + color-scheme fixes that.
+ */
+form.create-job-form input#title,
+form.create-job-form textarea#new-job-description,
+form.create-job-form textarea.new-job-description-textarea {
+  color: #ffffff !important;
+  -webkit-text-fill-color: #501010 !important;
+  background-color: #ffffff!important;
+  color-scheme: light !important;
+  caret-color: #7c3aed;
+  opacity: 1 !important;
+}
+form.create-job-form input#title::placeholder,
+form.create-job-form textarea#new-job-description::placeholder {
+  color: #6b7280 !important;
+  -webkit-text-fill-color: #6b7280 !important;
+  opacity: 1 !important;
+}
+form.create-job-form input#title:focus,
+form.create-job-form textarea#new-job-description:focus {
+  color: #111827 !important;
+  -webkit-text-fill-color: #111827 !important;
+}
+
+/* Chrome + Windows/macOS dark mode */
+@media (prefers-color-scheme: dark) {
+  form.create-job-form .create-job-desc-surface {
+    color-scheme: light !important;
+    forced-color-adjust: none;
+    color: #111827;
+  }
+  form.create-job-form textarea#new-job-description,
+  form.create-job-form textarea.new-job-description-textarea,
+  form.create-job-form input#title {
+    color-scheme: light !important;
+    forced-color-adjust: none;
+    color: #111827 !important;
+    -webkit-text-fill-color: #111827 !important;
+    background-color: #ffffff !important;
+    caret-color: #7c3aed;
+  }
+  form.create-job-form textarea#new-job-description::placeholder,
+  form.create-job-form input#title::placeholder {
+    color: #6b7280 !important;
+    -webkit-text-fill-color: #6b7280 !important;
+    opacity: 1 !important;
+  }
+}

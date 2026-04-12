@@ -3,6 +3,9 @@ import { useNavigate } from 'react-router-dom'
 import { jobsAPI, agentsAPI, mcpAPI } from '../lib/api'
 import type { Agent } from '../lib/types'
 import type { MCPToolConfigRes, MCPServerConnectionRes } from '../lib/api'
+import { useJobDescriptionEnhancer } from '../hooks/useJobDescriptionEnhancer'
+import { AIEnhanceButton } from '../components/AIEnhanceButton'
+import { JobDescriptionEnhanceModal } from '../components/JobDescriptionEnhanceModal'
 
 export default function NewJobPage() {
   const [title, setTitle] = useState('')
@@ -17,6 +20,24 @@ export default function NewJobPage() {
   const [selectedFiles, setSelectedFiles] = useState<File[]>([])
   const [isLoading, setIsLoading] = useState(false)
   const [error, setError] = useState('')
+  const [modalOpen, setModalOpen] = useState(false)
+const { loading: aiLoading, error: aiError, result, enhance, reset } = useJobDescriptionEnhancer()
+
+const handleEnhanceClick = () => {
+  setModalOpen(true)
+  enhance(description)
+}
+
+const handleApply = (enhancedText: string) => {
+  setDescription(enhancedText)
+  setModalOpen(false)
+  reset()
+}
+
+const handleCancel = () => {
+  setModalOpen(false)
+  reset()
+}
   const navigate = useNavigate()
 
   useEffect(() => {
@@ -145,7 +166,10 @@ export default function NewJobPage() {
             {error}
           </div>
         )}
-        <form onSubmit={handleSubmit} className="bg-dark-100/50 backdrop-blur-xl rounded-2xl shadow-2xl p-10 border border-dark-200/50">
+        <form
+          onSubmit={handleSubmit}
+          className="create-job-form bg-dark-100/50 backdrop-blur-xl rounded-2xl shadow-2xl p-10 border border-dark-200/50"
+        >
           <div className="mb-8">
             <label className="block text-white font-bold mb-3 text-lg" htmlFor="title">
               Job Title
@@ -160,8 +184,8 @@ export default function NewJobPage() {
               required
             />
           </div>
-          <div className="mb-8">
-            <label className="block text-white font-bold mb-3 text-lg" htmlFor="description">
+          {/* <div className="mb-8"> 
+             <label className="block text-white font-bold mb-3 text-lg" htmlFor="description"> 
               Description
             </label>
             <textarea
@@ -172,7 +196,46 @@ export default function NewJobPage() {
               className="w-full px-5 py-4 bg-white border-2 border-gray-300 rounded-xl text-gray-900 placeholder-gray-500 focus:outline-none focus:ring-2 focus:ring-primary-500 focus:border-primary-500 text-lg font-medium resize-none"
               placeholder="Describe what you need..."
             />
+          </div>*/}
+          <div className="mb-8">
+            <label className="block text-white font-bold mb-3 text-lg" htmlFor="new-job-description">
+              Description
+            </label>
+            {/* Light surface: explicit text color on wrapper + textarea (body is light-on-dark; avoid ring-inset inside overflow — Chrome paint issues). */}
+            <div
+              className="create-job-desc-surface flex flex-col rounded-xl border-2 border-gray-300 bg-white shadow-sm text-gray-900"
+              style={{ colorScheme: "light" }}
+            >
+              <div className="flex justify-end items-center gap-2 px-3 py-2 border-b border-gray-200 bg-white">
+                <AIEnhanceButton
+                  layout="inline"
+                  onClick={handleEnhanceClick}
+                  loading={aiLoading && modalOpen}
+                  disabled={!description.trim()}
+                />
+              </div>
+              <textarea
+                id="new-job-description"
+                name="new-job-description"
+                value={description}
+                onChange={(e) => setDescription(e.target.value)}
+                rows={6}
+                spellCheck
+                placeholder="Describe what you need..."
+                className="new-job-description-textarea w-full min-h-[168px] resize-y rounded-b-[10px] border-0 bg-white px-5 py-4 text-lg font-medium leading-relaxed text-gray-900 caret-purple-600 shadow-none outline-none focus:outline focus:outline-2 focus:outline-offset-0 focus:outline-primary-500"
+              />
+            </div>
           </div>
+
+<JobDescriptionEnhanceModal
+  isOpen={modalOpen}
+  original={description}
+  result={result}
+  error={aiError}
+  loading={aiLoading}
+  onApply={handleApply}
+  onCancel={handleCancel}
+/>
           <div className="mb-8">
             <label className="block text-white font-bold mb-2 text-lg">Tool visibility (optional)</label>
             <p className="text-sm text-white/50 mb-2 font-medium">Control how much tool info agents see. Credentials are never shared.</p>

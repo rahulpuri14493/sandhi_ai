@@ -17,10 +17,7 @@ export const useAuthStore = create<AuthState>((set) => ({
     set({ isLoading: true });
     try {
       await authAPI.login(email, password);
-      const user = await authAPI.getCurrentUser();
-      if (!user) {
-        throw new Error('Failed to get user after login');
-      }
+      const user = await authAPI.fetchCurrentUser();
       set({ user, isLoading: false });
     } catch (error) {
       set({ isLoading: false });
