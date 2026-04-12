@@ -1569,7 +1569,17 @@ class AgentExecutor:
                     )
                 except Exception:
                     pass
-                
+                try:
+                    from services.job_completion_notify_email import maybe_notify_job_completed_email
+
+                    maybe_notify_job_completed_email(
+                        job_id=int(job.id),
+                        business_id=int(job.business_id),
+                        title=str(job.title or f"Job {job.id}"),
+                    )
+                except Exception:
+                    pass
+
                 # Distribute earnings
                 self.payment_processor.distribute_earnings(job_id)
                 
@@ -2374,17 +2384,21 @@ END DOCUMENT {i+1}: {doc_name}
             "gcs": "Google Cloud Storage",
             "slack": (
                 "Slack (read + write). Read: list_channels returns channel id+name (use id for list_messages); "
-                "list_messages needs channel (prefer id). Write: send with channel + message; idempotency_key on send."
+                "list_messages needs channel (prefer id). Write: send requires idempotency_key (stable per logical message) "
+                "unless PLATFORM_MCP_ALLOW_WRITES_WITHOUT_IDEMPOTENCY_KEY=true."
             ),
             "teams": (
                 "Microsoft Teams / Graph (read + write). Read: list_joined_teams, list_channels, list_channel_messages, "
                 "get_channel_message; Outlook mailbox: list_mail_messages, get_mail_message, get_mail_attachment (Graph token). "
-                "Write: send_message, reply_message. Re-authorize Microsoft after scope changes (Mail.Read, ChannelMessage.Read)."
+                "Write: send_message and reply_message require idempotency_key unless PLATFORM_MCP_ALLOW_WRITES_WITHOUT_IDEMPOTENCY_KEY=true. "
+                "Graph base URL must be https://graph.microsoft.com/v1.0 (not Graph Explorer). "
+                "Re-authorize Microsoft after scope changes (Mail.Read, ChannelMessage.Read)."
             ),
             "smtp": (
-                "SMTP email + Gmail inbox read. validate checks SMTP auth; send for outbound. "
+                "SMTP email + Gmail inbox read. validate checks SMTP auth; send for outbound (idempotency_key required on send "
+                "unless PLATFORM_MCP_ALLOW_WRITES_WITHOUT_IDEMPOTENCY_KEY=true). "
                 "Gmail only (provider=gmail + OAuth): list_mail_messages, get_mail_message, get_mail_attachment. "
-                "Outlook inbox read uses the Teams tool (Graph), not SMTP. idempotency_key on send."
+                "Outlook inbox read uses the Teams tool (Graph), not SMTP."
             ),
             "github": "GitHub API",
             "notion": "Notion API",

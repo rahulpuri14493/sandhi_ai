@@ -176,14 +176,26 @@ export default function EditJobPage() {
     setIsLoading(true)
     setError('')
     try {
+      const catalogPlatformIds = new Set(platformTools.map((t) => t.id))
+      const catalogConnectionIds = new Set(connections.map((c) => c.id))
+      // Drop ids deleted from MCP (e.g. tool recreated with a new row) so we never send stale ids.
+      const platformIdsForSave =
+        platformTools.length > 0
+          ? selectedPlatformToolIds.filter((tid) => catalogPlatformIds.has(tid))
+          : selectedPlatformToolIds
+      const connectionIdsForSave =
+        connections.length > 0
+          ? selectedConnectionIds.filter((cid) => catalogConnectionIds.has(cid))
+          : selectedConnectionIds
+
       await jobsAPI.update(
         parseInt(id),
         {
           ...formData,
           // Same contract as create job: always send both arrays (possibly empty) so the API
           // stores explicit scope and Build workflow → Tools per agent lists stay in sync.
-          allowed_platform_tool_ids: selectedPlatformToolIds,
-          allowed_connection_ids: selectedConnectionIds,
+          allowed_platform_tool_ids: platformIdsForSave,
+          allowed_connection_ids: connectionIdsForSave,
           tool_visibility: toolVisibility,
         },
         selectedFiles.length > 0 ? selectedFiles : undefined

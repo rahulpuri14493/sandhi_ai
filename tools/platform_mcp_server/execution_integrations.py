@@ -9,6 +9,15 @@ from typing import Any, Dict, Tuple
 from urllib.parse import urljoin, urlparse
 
 from execution_common import safe_tool_error
+from execution_contract import (
+    ERROR_AUTH_FAILED,
+    ERROR_CONFIGURATION_ERROR,
+    ERROR_UPSTREAM_ERROR,
+    ERROR_VALIDATION_FAILED,
+    maybe_validate_messaging_output,
+    tool_error_json,
+    write_blocked_without_idempotency,
+)
 from execution_http import get_sync_http_client
 from execution_idempotency import cached_tool_json
 from execution_read_cache import get_cached_or_run
@@ -65,10 +74,10 @@ def execute_slack(config: Dict[str, Any], arguments: Dict[str, Any]) -> str:
         from slack_sdk import WebClient
         from slack_sdk.errors import SlackApiError
     except ImportError:
-        return "Error: slack_sdk is not installed"
+        return tool_error_json(ERROR_CONFIGURATION_ERROR, "slack_sdk is not installed")
     token = (config.get("bot_token") or config.get("token") or "").strip()
     if not token:
-        return "Error: bot_token not configured"
+        return tool_error_json(ERROR_VALIDATION_FAILED, "bot_token not configured")
     action = (arguments.get("action") or "send").strip().lower()
     client = WebClient(token=token)
     try:
@@ -94,7 +103,7 @@ def execute_slack(config: Dict[str, Any], arguments: Dict[str, Any]) -> str:
                             "is_private": bool(c.get("is_private")),
                         }
                     )
-                return json.dumps(
+                raw = json.dumps(
                     {
                         "channels": detailed,
                         "note": (
@@ -103,13 +112,14 @@ def execute_slack(config: Dict[str, Any], arguments: Dict[str, Any]) -> str:
                     },
                     indent=2,
                 )
+                return maybe_validate_messaging_output("slack", "list_channels", raw)
 
             ck = "slack:list_channels:" + hashlib.sha256(token.encode()).hexdigest()[:40]
             return get_cached_or_run(ck, _produce_channels)
         if action == "list_messages":
             channel = (arguments.get("channel") or config.get("default_channel") or "").strip()
             if not channel:
-                return "Error: channel is required for list_messages"
+                return tool_error_json(ERROR_VALIDATION_FAILED, "channel is required for list_messages")
             try:
                 lim = int(arguments.get("limit") or 50)
             except (TypeError, ValueError):
@@ -141,11 +151,15 @@ def execute_slack(config: Dict[str, Any], arguments: Dict[str, Any]) -> str:
             out: Dict[str, Any] = {"messages": slim, "has_more": bool(meta.get("next_cursor"))}
             if meta.get("next_cursor"):
                 out["next_cursor"] = meta.get("next_cursor")
-            return json.dumps(out, indent=2)
+            raw = json.dumps(out, indent=2)
+            return maybe_validate_messaging_output("slack", "list_messages", raw)
         channel = (arguments.get("channel") or config.get("default_channel") or "").strip()
         message = (arguments.get("message") or "").strip()
         if not channel or not message:
-            return "Error: channel and message are required for send"
+            return tool_error_json(ERROR_VALIDATION_FAILED, "channel and message are required for send")
+        blocked = write_blocked_without_idempotency(arguments, operation="slack send")
+        if blocked:
+            return blocked
         idem = str(arguments.get("idempotency_key") or "").strip()
 
         def _post() -> str:
@@ -154,8 +168,27 @@ def execute_slack(config: Dict[str, Any], arguments: Dict[str, Any]) -> str:
 
         return cached_tool_json("slack_send", idem, _post, cache_success_only=True)
     except SlackApiError as e:
-        code = (e.response or {}).get("error") or "slack_api_error"
-        return f"Error: Slack API ({code})"
+        resp = e.response or {}
+        slack_err = str(resp.get("error") or "slack_api_error")
+        if slack_err in (
+            "not_authed",
+            "invalid_auth",
+            "token_revoked",
+            "account_inactive",
+            "invalid_token",
+        ):
+            return tool_error_json(
+                ERROR_AUTH_FAILED,
+                f"Slack rejected credentials ({slack_err})",
+                provider="slack",
+                upstream_code=slack_err,
+            )
+        return tool_error_json(
+            ERROR_UPSTREAM_ERROR,
+            f"Slack API error: {slack_err}",
+            provider="slack",
+            upstream_code=slack_err,
+        )
     except Exception as e:
         return safe_tool_error("Slack error", e)
 

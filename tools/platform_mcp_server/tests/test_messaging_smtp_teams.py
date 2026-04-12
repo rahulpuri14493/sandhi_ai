@@ -77,10 +77,25 @@ class TestExecuteSmtp:
         assert "535" in out
         assert "Error" in out or "rejected" in out.lower()
 
+    def test_smtp_send_requires_idempotency_key(self, monkeypatch):
+        monkeypatch.delenv("PLATFORM_MCP_ALLOW_WRITES_WITHOUT_IDEMPOTENCY_KEY", raising=False)
+        out = execute_smtp(
+            {"provider": "gmail", "username": "a@b.com", "password": "p"},
+            {"action": "send", "to": "b@b.com", "subject": "S", "body": "B", "from_address": "a@b.com"},
+        )
+        data = json.loads(out)
+        assert data.get("error") == "idempotency_required"
+
     def test_send_requires_recipients(self):
         out = execute_smtp(
             {"provider": "gmail", "username": "a@b.com", "password": "p"},
-            {"action": "send", "subject": "S", "body": "B", "from_address": "a@b.com"},
+            {
+                "action": "send",
+                "subject": "S",
+                "body": "B",
+                "from_address": "a@b.com",
+                "idempotency_key": "unit-smtp-send-no-recipients",
+            },
         )
         assert "to" in out.lower()
 
@@ -102,6 +117,20 @@ class TestExecuteSmtp:
 
 
 class TestExecuteTeams:
+    def test_send_message_requires_idempotency_key(self, monkeypatch):
+        monkeypatch.delenv("PLATFORM_MCP_ALLOW_WRITES_WITHOUT_IDEMPOTENCY_KEY", raising=False)
+        out = execute_teams(
+            {"access_token": "tok"},
+            {
+                "action": "send_message",
+                "team_id": "t1",
+                "channel_id": "c1",
+                "body": "hi",
+            },
+        )
+        data = json.loads(out)
+        assert data.get("error") == "idempotency_required"
+
     def test_missing_token_list(self):
         out = execute_teams({}, {"action": "list_joined_teams"})
         assert "access_token" in out.lower()
@@ -117,9 +146,57 @@ class TestExecuteTeams:
         data = json.loads(out)
         assert any(t.get("displayName") == "Team A" for t in data.get("teams", []))
 
+    def test_graph_explorer_base_url_normalized_to_v1(self):
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = {"value": []}
+        mock_http = MagicMock()
+        mock_http.request.return_value = mock_resp
+        bad_base = "https://developer.microsoft.com/en-us/graph/graph-explorer/me"
+        with patch("execution_teams.get_sync_http_client", return_value=mock_http):
+            execute_teams(
+                {"access_token": "tok-graph-explorer-url", "graph_base_url": bad_base},
+                {"action": "list_joined_teams"},
+            )
+        url = mock_http.request.call_args[0][1]
+        assert url == "https://graph.microsoft.com/v1.0/me/joinedTeams"
+
+    def test_graph_base_trailing_me_stripped_for_graph_host(self):
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = {"value": []}
+        mock_http = MagicMock()
+        mock_http.request.return_value = mock_resp
+        with patch("execution_teams.get_sync_http_client", return_value=mock_http):
+            execute_teams(
+                {"access_token": "tok-trailing-me", "graph_base_url": "https://graph.microsoft.com/v1.0/me"},
+                {"action": "list_joined_teams"},
+            )
+        url = mock_http.request.call_args[0][1]
+        assert url == "https://graph.microsoft.com/v1.0/me/joinedTeams"
+
+    def test_login_host_base_url_reset_to_v1(self):
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = {"value": []}
+        mock_http = MagicMock()
+        mock_http.request.return_value = mock_resp
+        with patch("execution_teams.get_sync_http_client", return_value=mock_http):
+            execute_teams(
+                {
+                    "access_token": "tok-login-host",
+                    "graph_base_url": "https://login.microsoftonline.com/common/oauth2/v2.0/token",
+                },
+                {"action": "list_joined_teams"},
+            )
+        url = mock_http.request.call_args[0][1]
+        assert url == "https://graph.microsoft.com/v1.0/me/joinedTeams"
+
     def test_list_channels_requires_team_id(self):
         out = execute_teams({"access_token": "tok"}, {"action": "list_channels"})
-        assert "team_id" in out.lower()
+        data = json.loads(out)
+        assert data.get("error") == "validation_failed"
+        assert "team_id" in (data.get("message") or "").lower()
 
     def test_graph_error_json(self):
         mock_resp = MagicMock()
@@ -131,11 +208,36 @@ class TestExecuteTeams:
         with patch("execution_teams.get_sync_http_client", return_value=mock_http):
             out = execute_teams({"access_token": "bad"}, {"action": "list_joined_teams"})
         data = json.loads(out)
-        assert data.get("error") == "graph_api_error"
+        assert data.get("error") == "auth_failed"
+
+    def test_graph_error_403_no_authorization_info_hint(self):
+        mock_resp = MagicMock()
+        mock_resp.status_code = 403
+        mock_resp.reason_phrase = "Forbidden"
+        mock_resp.json.return_value = {
+            "error": {
+                "code": "Forbidden",
+                "message": "No authorization information present on the request.",
+            }
+        }
+        mock_http = MagicMock()
+        mock_http.request.return_value = mock_resp
+        with patch("execution_teams.get_sync_http_client", return_value=mock_http):
+            out = execute_teams(
+                {"access_token": "tok-403-noauth-msg"},
+                {"action": "list_joined_teams"},
+            )
+        data = json.loads(out)
+        assert data.get("error") == "permission_denied"
+        assert data.get("status") == 403
+        hint = (data.get("hint") or "").lower()
+        assert "msa" in hint or "personal microsoft" in hint
+        assert "jwt.ms" in hint
 
     def test_list_channel_messages_requires_ids(self):
         out = execute_teams({"access_token": "tok"}, {"action": "list_channel_messages"})
-        assert "team_id" in out.lower()
+        data = json.loads(out)
+        assert data.get("error") == "validation_failed"
 
     def test_list_channel_messages_ok(self):
         mock_resp = MagicMock()

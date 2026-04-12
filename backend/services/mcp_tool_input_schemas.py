@@ -430,7 +430,10 @@ def input_schema_for_platform_tool_type(tool_type: str) -> Dict[str, Any]:
                 },
                 "idempotency_key": {
                     "type": "string",
-                    "description": "Optional; when set, identical send requests return the same outcome without double-posting (in-process TTL).",
+                    "description": (
+                        "Required for action send unless PLATFORM_MCP_ALLOW_WRITES_WITHOUT_IDEMPOTENCY_KEY=true. "
+                        "Stable unique key per logical post; identical key+payload returns cached success within TTL (Redis when configured)."
+                    ),
                 },
             },
         },
@@ -501,7 +504,10 @@ def input_schema_for_platform_tool_type(tool_type: str) -> Dict[str, Any]:
                 },
                 "idempotency_key": {
                     "type": "string",
-                    "description": "Recommended for send; dedupes successful sends (Redis when configured, else in-process on MCP server).",
+                    "description": (
+                        "Required for action send unless PLATFORM_MCP_ALLOW_WRITES_WITHOUT_IDEMPOTENCY_KEY=true. "
+                        "Dedupes successful sends within TTL (Redis when configured, else in-process on MCP server)."
+                    ),
                 },
             },
         },
@@ -559,7 +565,10 @@ def input_schema_for_platform_tool_type(tool_type: str) -> Dict[str, Any]:
                 "content_type": {"type": "string", "enum": ["text", "html"], "default": "text"},
                 "idempotency_key": {
                     "type": "string",
-                    "description": "Recommended for send_message and reply_message; dedupes successful posts within TTL.",
+                    "description": (
+                        "Required for send_message and reply_message unless PLATFORM_MCP_ALLOW_WRITES_WITHOUT_IDEMPOTENCY_KEY=true. "
+                        "Dedupes successful Graph posts within TTL."
+                    ),
                 },
             },
         },

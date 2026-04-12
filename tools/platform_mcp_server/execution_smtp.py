@@ -15,6 +15,7 @@ from email.utils import formataddr
 from typing import Any, Dict, List, Optional, Tuple
 
 from execution_common import safe_tool_error
+from execution_contract import write_blocked_without_idempotency
 from execution_http import get_sync_http_client
 from execution_idempotency import cached_tool_json
 
@@ -388,6 +389,9 @@ def _smtp_validate(config: Dict[str, Any]) -> str:
 
 
 def _smtp_send(config: Dict[str, Any], arguments: Dict[str, Any]) -> str:
+    blocked = write_blocked_without_idempotency(arguments, operation="smtp send")
+    if blocked:
+        return blocked
     idem = str(arguments.get("idempotency_key") or "").strip()
 
     def _do_send() -> str:

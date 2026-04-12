@@ -4,23 +4,67 @@ from __future__ import annotations
 import hashlib
 import json
 from typing import Any, Dict, Optional
-from urllib.parse import quote
+from urllib.parse import quote, urlparse
 
 import httpx
 
 from execution_common import safe_tool_error
+from execution_contract import (
+    ERROR_AUTH_FAILED,
+    ERROR_PERMISSION_DENIED,
+    ERROR_UNKNOWN_ACTION,
+    ERROR_UPSTREAM_ERROR,
+    ERROR_UPSTREAM_UNAVAILABLE,
+    ERROR_VALIDATION_FAILED,
+    maybe_validate_messaging_output,
+    tool_error_json,
+    write_blocked_without_idempotency,
+)
 from execution_http import get_sync_http_client
-from execution_read_cache import get_cached_or_run
 from execution_idempotency import cached_tool_json
+from execution_read_cache import get_cached_or_run
 
 _MAX_BODY_CHARS = 32_000
 _MAX_CHANNEL_MSG_BODY_PREVIEW = 8_000
 _MAX_MAIL_BODY_CHARS = 64_000
 _MAX_GRAPH_ATTACHMENT_BYTES = 4 * 1024 * 1024
 
+_DEFAULT_GRAPH_BASE = "https://graph.microsoft.com/v1.0"
+
+
+def _normalize_graph_base_url(raw: Any) -> str:
+    """Resolve graph_base_url to a real Microsoft Graph API root.
+
+    Operators sometimes paste the Graph Explorer page URL or a base ending in ``/me``;
+    both break requests such as ``me/joinedTeams``.
+    """
+    s = "" if raw is None else str(raw).strip()
+    if not s:
+        return _DEFAULT_GRAPH_BASE
+    low = s.lower()
+    if "developer.microsoft.com" in low or "graph-explorer" in low:
+        return _DEFAULT_GRAPH_BASE
+    if not low.startswith(("http://", "https://")):
+        s = "https://" + s
+        low = s.lower()
+    try:
+        p = urlparse(s)
+        host = (p.hostname or "").lower()
+    except ValueError:
+        return _DEFAULT_GRAPH_BASE
+    if host == "login.microsoftonline.com":
+        return _DEFAULT_GRAPH_BASE
+    base = s.rstrip("/")
+    lowb = base.lower()
+    if host.endswith("graph.microsoft.com"):
+        while lowb.endswith("/me"):
+            base = base[:-3].rstrip("/")
+            lowb = base.lower()
+    return base or _DEFAULT_GRAPH_BASE
+
 
 def _graph_base(config: Dict[str, Any]) -> str:
-    return str(config.get("graph_base_url") or "https://graph.microsoft.com/v1.0").rstrip("/")
+    return _normalize_graph_base_url(config.get("graph_base_url"))
 
 
 def _token(config: Dict[str, Any]) -> str:
@@ -78,9 +122,9 @@ def execute_teams(config: Dict[str, Any], arguments: Dict[str, Any]) -> str:
             return _get_mail_message(config, arguments)
         if action == "get_mail_attachment":
             return _get_mail_attachment(config, arguments)
-        return json.dumps({"error": "unknown_action", "action": action})
+        return tool_error_json(ERROR_UNKNOWN_ACTION, f"Unknown action: {action}", action=action)
     except ValueError as e:
-        return f"Error: {e}"
+        return tool_error_json(ERROR_VALIDATION_FAILED, str(e))
     except Exception as e:
         return safe_tool_error("Microsoft Teams error", e)
 
@@ -93,7 +137,8 @@ def _list_joined_teams(config: Dict[str, Any]) -> str:
         data = r.json()
         teams = data.get("value") or []
         slim = [{"id": t.get("id"), "displayName": t.get("displayName")} for t in teams if isinstance(t, dict)]
-        return json.dumps({"teams": slim}, indent=2)
+        raw = json.dumps({"teams": slim}, indent=2)
+        return maybe_validate_messaging_output("teams", "list_joined_teams", raw)
 
     ck = _graph_read_cache_key("joined", config)
     if not ck:
@@ -104,7 +149,7 @@ def _list_joined_teams(config: Dict[str, Any]) -> str:
 def _list_channels(config: Dict[str, Any], arguments: Dict[str, Any]) -> str:
     team_id = str(arguments.get("team_id") or "").strip()
     if not team_id:
-        return "Error: team_id is required for list_channels"
+        return tool_error_json(ERROR_VALIDATION_FAILED, "team_id is required for list_channels")
 
     def _produce() -> str:
         r = _request(config, "GET", f"teams/{team_id}/channels")
@@ -117,7 +162,8 @@ def _list_channels(config: Dict[str, Any], arguments: Dict[str, Any]) -> str:
             for c in chans
             if isinstance(c, dict)
         ]
-        return json.dumps({"channels": slim}, indent=2)
+        raw = json.dumps({"channels": slim}, indent=2)
+        return maybe_validate_messaging_output("teams", "list_channels", raw)
 
     ck = _graph_read_cache_key("channels", config, team_id)
     if not ck:
@@ -137,6 +183,9 @@ def _normalize_body(arguments: Dict[str, Any]) -> tuple[str, str]:
 
 
 def _send_message(config: Dict[str, Any], arguments: Dict[str, Any]) -> str:
+    blocked = write_blocked_without_idempotency(arguments, operation="teams send_message")
+    if blocked:
+        return blocked
     idem = str(arguments.get("idempotency_key") or "").strip()
 
     def _do() -> str:
@@ -149,10 +198,10 @@ def _send_message_impl(config: Dict[str, Any], arguments: Dict[str, Any]) -> str
     team_id = str(arguments.get("team_id") or "").strip()
     channel_id = str(arguments.get("channel_id") or "").strip()
     if not team_id or not channel_id:
-        return "Error: team_id and channel_id are required for send_message"
+        return tool_error_json(ERROR_VALIDATION_FAILED, "team_id and channel_id are required for send_message")
     text, graph_type = _normalize_body(arguments)
     if not text:
-        return "Error: body (message text) is required for send_message"
+        return tool_error_json(ERROR_VALIDATION_FAILED, "body (message text) is required for send_message")
     payload = {"body": {"content": text, "contentType": graph_type}}
     r = _request(
         config,
@@ -170,6 +219,9 @@ def _send_message_impl(config: Dict[str, Any], arguments: Dict[str, Any]) -> str
 
 
 def _reply_message(config: Dict[str, Any], arguments: Dict[str, Any]) -> str:
+    blocked = write_blocked_without_idempotency(arguments, operation="teams reply_message")
+    if blocked:
+        return blocked
     idem = str(arguments.get("idempotency_key") or "").strip()
 
     def _do() -> str:
@@ -183,10 +235,13 @@ def _reply_message_impl(config: Dict[str, Any], arguments: Dict[str, Any]) -> st
     channel_id = str(arguments.get("channel_id") or "").strip()
     message_id = str(arguments.get("message_id") or "").strip()
     if not team_id or not channel_id or not message_id:
-        return "Error: team_id, channel_id, and message_id are required for reply_message"
+        return tool_error_json(
+            ERROR_VALIDATION_FAILED,
+            "team_id, channel_id, and message_id are required for reply_message",
+        )
     text, graph_type = _normalize_body(arguments)
     if not text:
-        return "Error: body (message text) is required for reply_message"
+        return tool_error_json(ERROR_VALIDATION_FAILED, "body (message text) is required for reply_message")
     payload = {"body": {"content": text, "contentType": graph_type}}
     r = _request(
         config,
@@ -225,7 +280,7 @@ def _list_channel_messages(config: Dict[str, Any], arguments: Dict[str, Any]) ->
     team_id = str(arguments.get("team_id") or "").strip()
     channel_id = str(arguments.get("channel_id") or "").strip()
     if not team_id or not channel_id:
-        return "Error: team_id and channel_id are required for list_channel_messages"
+        return tool_error_json(ERROR_VALIDATION_FAILED, "team_id and channel_id are required for list_channel_messages")
     top = _int_arg(arguments, "top", 25, min_v=1, max_v=50)
     path = f"teams/{_seg(team_id)}/channels/{_seg(channel_id)}/messages?$top={top}"
     r = _request(config, "GET", path)
@@ -259,7 +314,10 @@ def _get_channel_message(config: Dict[str, Any], arguments: Dict[str, Any]) -> s
     channel_id = str(arguments.get("channel_id") or "").strip()
     message_id = str(arguments.get("message_id") or "").strip()
     if not team_id or not channel_id or not message_id:
-        return "Error: team_id, channel_id, and message_id are required for get_channel_message"
+        return tool_error_json(
+            ERROR_VALIDATION_FAILED,
+            "team_id, channel_id, and message_id are required for get_channel_message",
+        )
     r = _request(
         config,
         "GET",
@@ -320,7 +378,7 @@ def _list_mail_messages(config: Dict[str, Any], arguments: Dict[str, Any]) -> st
 def _get_mail_message(config: Dict[str, Any], arguments: Dict[str, Any]) -> str:
     message_id = str(arguments.get("message_id") or "").strip()
     if not message_id:
-        return "Error: message_id is required for get_mail_message"
+        return tool_error_json(ERROR_VALIDATION_FAILED, "message_id is required for get_mail_message")
     include_full = bool(arguments.get("include_full_body") or arguments.get("full_body"))
     select = (
         "id,subject,body,bodyPreview,hasAttachments,receivedDateTime,from,toRecipients,ccRecipients"
@@ -356,7 +414,10 @@ def _get_mail_attachment(config: Dict[str, Any], arguments: Dict[str, Any]) -> s
     message_id = str(arguments.get("message_id") or "").strip()
     attachment_id = str(arguments.get("attachment_id") or "").strip()
     if not message_id or not attachment_id:
-        return "Error: message_id and attachment_id are required for get_mail_attachment"
+        return tool_error_json(
+            ERROR_VALIDATION_FAILED,
+            "message_id and attachment_id are required for get_mail_attachment",
+        )
     r = _request(
         config,
         "GET",
@@ -420,13 +481,25 @@ def _graph_error_response(r: httpx.Response) -> str:
         )
     elif r.status_code == 403:
         lowmsg = (msg or "").lower()
-        hint = (
-            "HTTP 403 from Graph often means missing delegated permissions, a consumer/personal account limitation, "
-            "or guest restrictions. For Teams listing: work/school account + Team.ReadBasic.All. "
-            "For channel message read: ChannelMessage.Read.All. For mailbox read: Mail.Read. "
-            "Add them in Entra, then Re-authorize (prompt=consent) and verify scp at jwt.ms. "
-            "Guests may be blocked; use a member account where required."
-        )
+        # Graph uses this wording for several cases; for /me/joinedTeams it often means the user principal
+        # cannot use that API (e.g. personal Microsoft account) or the token is not a Graph access token.
+        if "no authorization information present" in lowmsg:
+            hint = (
+                "Despite the wording, this 403 usually does not mean the HTTP client omitted Authorization. "
+                "For /me/joinedTeams, Microsoft requires a work or school (Entra) user — personal Microsoft "
+                "accounts (MSA / @outlook.com consumer) are not supported for this API. "
+                "Also verify at jwt.ms that this is a Graph access token: aud should be https://graph.microsoft.com "
+                "(or a regional equivalent), and delegated scp should include Team.ReadBasic.All (and User.Read) after "
+                "Entra admin consent if needed. Re-authorize the Teams tool with prompt=consent after fixing the app registration."
+            )
+        else:
+            hint = (
+                "HTTP 403 from Graph often means missing delegated permissions, a consumer/personal account limitation, "
+                "or guest restrictions. For Teams listing: work/school account + Team.ReadBasic.All. "
+                "For channel message read: ChannelMessage.Read.All. For mailbox read: Mail.Read. "
+                "Add them in Entra, then Re-authorize (prompt=consent) and verify scp at jwt.ms. "
+                "Guests may be blocked; use a member account where required."
+            )
         if "mail" in lowmsg or "mailbox" in lowmsg:
             hint = (
                 "Mail read was denied. Ensure the Entra app has delegated Mail.Read (admin consent if required), "
@@ -437,11 +510,25 @@ def _graph_error_response(r: httpx.Response) -> str:
                 "Channel messages read was denied. Ensure delegated ChannelMessage.Read.All is granted, "
                 "then Re-authorize. The bot/app must be allowed to read that team's channel content."
             )
+    sc = r.status_code
+    if sc == 401:
+        unified = ERROR_AUTH_FAILED
+    elif sc == 403:
+        unified = ERROR_PERMISSION_DENIED
+    elif sc in (502, 503, 504, 429):
+        unified = ERROR_UPSTREAM_UNAVAILABLE
+    elif sc >= 500:
+        unified = ERROR_UPSTREAM_UNAVAILABLE
+    elif sc >= 400:
+        unified = ERROR_UPSTREAM_ERROR
+    else:
+        unified = ERROR_UPSTREAM_ERROR
     payload = {
-        "error": "graph_api_error",
-        "status": r.status_code,
-        "code": code,
+        "error": unified,
         "message": msg or r.reason_phrase,
+        "provider": "graph",
+        "status": sc,
+        "upstream_code": code,
     }
     if hint:
         payload["hint"] = hint

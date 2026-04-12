@@ -6,6 +6,7 @@ Tools are resolved per business (tenant) via the Sandhi AI backend internal API.
 Implements Vector DB, PostgreSQL, and File system tools using tenant-stored config.
 """
 try:
+    from execution_contract import CONTRACT_ERROR_CODES
     from execution_common import safe_tool_error
     from execution import (
         execute_artifact_write,
@@ -35,6 +36,7 @@ except ModuleNotFoundError:
     _here = _os.path.dirname(_os.path.abspath(__file__))
     if _here not in _sys.path:
         _sys.path.insert(0, _here)
+    from execution_contract import CONTRACT_ERROR_CODES
     from execution_common import safe_tool_error
     from execution import (
         execute_artifact_write,
@@ -184,7 +186,7 @@ def _fetch_tool_config(business_id: int, tool_id: int) -> Dict[str, Any]:
 
 
 def _tool_result_is_error(result_text: Optional[str]) -> bool:
-    """True when tool output should surface as MCP isError (plain errors or Graph API failures)."""
+    """True when tool output should surface as MCP isError (plain errors or contract/provider failures)."""
     if not result_text:
         return False
     s = str(result_text).strip()
@@ -192,8 +194,12 @@ def _tool_result_is_error(result_text: Optional[str]) -> bool:
         return True
     try:
         obj = json.loads(s)
-        if isinstance(obj, dict) and obj.get("error") == "graph_api_error":
-            return True
+        if isinstance(obj, dict):
+            err = obj.get("error")
+            if err in CONTRACT_ERROR_CODES:
+                return True
+            if err and isinstance(err, str) and err != "ok":
+                return True
     except (json.JSONDecodeError, TypeError):
         pass
     return False

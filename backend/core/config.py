@@ -279,6 +279,18 @@ class Settings(BaseSettings):
     BUSINESS_JOB_ALERTS_ENABLED: bool = False
     BUSINESS_JOB_ALERT_WEBHOOK_URL: str = ""
     BUSINESS_JOB_ALERT_COOLDOWN_SECONDS: int = 180
+    # Optional: email the business user (User.email) when a job completes (platform SMTP, not MCP).
+    JOB_COMPLETION_EMAIL_ENABLED: bool = False
+    JOB_COMPLETION_SMTP_HOST: str = ""
+    JOB_COMPLETION_SMTP_PORT: int = 587
+    JOB_COMPLETION_SMTP_USER: str = ""
+    JOB_COMPLETION_SMTP_PASSWORD: str = ""
+    JOB_COMPLETION_SMTP_USE_TLS: bool = True
+    JOB_COMPLETION_SMTP_USE_SSL: bool = False
+    JOB_COMPLETION_EMAIL_FROM: str = ""
+    JOB_COMPLETION_EMAIL_SUBJECT_PREFIX: str = "[Sandhi AI]"
+    # SPA base for "Open the job" link (e.g. http://localhost:3000/sandhi_ai). Empty = no link in email.
+    JOB_COMPLETION_EMAIL_LINK_BASE_URL: str = ""
     BUSINESS_KPI_ALERTS_ENABLED: bool = False
     BUSINESS_KPI_ALERT_WEBHOOK_URL: str = ""
     BUSINESS_KPI_ALERT_COOLDOWN_SECONDS: int = 900

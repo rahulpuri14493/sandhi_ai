@@ -383,6 +383,8 @@ export interface MCPToolConfigRes {
   weaviate_cluster_preview?: string | null
   /** Weaviate class/collection name; GET /tools/{id} only */
   weaviate_class_preview?: string | null
+  /** GET /tools/{id} only — non-secret config fields to repopulate the edit form */
+  config_preview?: Record<string, string> | null
   created_at: string
   updated_at: string
 }
@@ -400,7 +402,15 @@ export const mcpAPI = {
   deleteConnection(id: number) {
     return api.delete('/mcp/connections/' + id)
   },
-  validateConnection(data: { name: string; base_url: string; endpoint_path?: string; auth_type?: string; credentials?: Record<string, string> }) {
+  validateConnection(data: {
+    name: string
+    base_url: string
+    endpoint_path?: string
+    auth_type?: string
+    credentials?: Record<string, string>
+    /** When editing, send so blank credential fields reuse stored secrets during validate. */
+    connection_id?: number
+  }) {
     return api.post<{ valid: boolean; message: string }>('/mcp/connections/validate', data).then((res) => res.data)
   },
   certifyConnection(connectionId: number) {

@@ -894,7 +894,7 @@ class TestStubTools:
 
     def test_slack_invalid_token_returns_error(self):
         out = execute_platform_tool("slack", {"bot_token": "xoxb-invalid"}, {"action": "list_channels"})
-        assert "Error:" in out
+        assert "Error:" in out or '"error"' in out
 
     def test_github_invalid_token_returns_error(self):
         out = execute_platform_tool("github", {"api_key": "ghp_invalid"}, {"repo": "a/b", "path": "README.md", "action": "get_file"})

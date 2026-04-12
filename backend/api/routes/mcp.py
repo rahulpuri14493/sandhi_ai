@@ -7,9 +7,10 @@ import logging
 import uuid
 from datetime import datetime
 from fastapi import APIRouter, Depends, HTTPException, status, BackgroundTasks
+from sqlalchemy import func
 from sqlalchemy.orm import Session
 from sqlalchemy.exc import IntegrityError
-from typing import List
+from typing import List, Optional
 
 from db.database import get_db
 from models.user import User
@@ -17,6 +18,7 @@ from models.audit_log import AuditLog
 from models.mcp_server import MCPServerConnection, MCPToolConfig, MCPToolType, MCPWriteOperation
 from schemas.mcp import (
     MCPServerConnectionCreate,
+    MCPServerConnectionValidate,
     MCPServerConnectionUpdate,
     MCPServerConnectionResponse,
     MCPToolConfigCreate,
@@ -33,6 +35,7 @@ from core.encryption import encrypt_json, decrypt_json
 from db.database import SessionLocal
 from services.http_url_guard import safe_url_host_for_logs
 from services.mcp_platform_naming import platform_tool_id_from_mcp_function_name
+from services.mcp_config_merge import merge_shallow_config, public_config_preview
 from services.mcp_guardrails import (
     MCPGuardrailError,
     get_mcp_guardrails,
@@ -46,6 +49,26 @@ from api.routes import mcp_oauth as _mcp_oauth
 router = APIRouter(prefix="/api/mcp", tags=["mcp"])
 router.include_router(_mcp_oauth.router)
 logger = logging.getLogger(__name__)
+
+
+def _platform_tool_name_taken(
+    db: Session,
+    user_id: int,
+    name: str,
+    *,
+    exclude_tool_id: Optional[int] = None,
+) -> bool:
+    """True if this business user already has a platform tool with the same name (trimmed, case-insensitive)."""
+    norm = (name or "").strip()
+    if not norm:
+        return False
+    q = db.query(MCPToolConfig.id).filter(
+        MCPToolConfig.user_id == user_id,
+        func.lower(MCPToolConfig.name) == norm.lower(),
+    )
+    if exclude_tool_id is not None:
+        q = q.filter(MCPToolConfig.id != exclude_tool_id)
+    return q.first() is not None
 
 
 def _require_platform_tool_for_user(db: Session, user_id: int, tool_name: str) -> None:
@@ -342,8 +365,9 @@ def _tool_to_response(t: MCPToolConfig) -> MCPToolConfigResponse:
 
 @router.post("/connections/validate")
 async def validate_connection(
-    body: MCPServerConnectionCreate,
+    body: MCPServerConnectionValidate,
     current_user: User = Depends(get_current_business_user),
+    db: Session = Depends(get_db),
 ):
     """
     Test MCP server connectivity (JSON-RPC initialize) without saving.
@@ -357,6 +381,22 @@ async def validate_connection(
         endpoint_path = "/" + endpoint_path
     auth_type = body.auth_type or "none"
     credentials = body.credentials
+    if body.connection_id is not None:
+        conn = db.query(MCPServerConnection).filter(
+            MCPServerConnection.id == int(body.connection_id),
+            MCPServerConnection.user_id == current_user.id,
+        ).first()
+        if not conn:
+            return {"valid": False, "message": "Connection not found"}
+        stored_cred: dict = {}
+        if conn.encrypted_credentials:
+            try:
+                raw = decrypt_json(conn.encrypted_credentials)
+                if isinstance(raw, dict):
+                    stored_cred = raw
+            except Exception:
+                pass
+        credentials = merge_shallow_config(stored_cred, body.credentials or {})
     try:
         await guarded_mcp_jsonrpc(
             business_id=int(current_user.id),
@@ -552,7 +592,15 @@ def update_connection(
     if body.auth_type is not None:
         conn.auth_type = body.auth_type
     if body.credentials is not None:
-        conn.encrypted_credentials = encrypt_json(body.credentials)
+        prev: dict = {}
+        if conn.encrypted_credentials:
+            try:
+                d = decrypt_json(conn.encrypted_credentials)
+                if isinstance(d, dict):
+                    prev = d
+            except Exception:
+                pass
+        conn.encrypted_credentials = encrypt_json(merge_shallow_config(prev, body.credentials))
     if body.is_active is not None:
         conn.is_active = body.is_active
     db.commit()
@@ -615,13 +663,15 @@ def validate_tool_config(
             raise HTTPException(status_code=404, detail="Tool config not found")
         if t.tool_type != expected_type:
             raise HTTPException(status_code=400, detail="tool_type does not match this tool_id")
+        stored: dict = {}
         if t.encrypted_config:
             try:
-                stored = decrypt_json(t.encrypted_config)
-                if isinstance(stored, dict):
-                    merged = {**stored, **cfg_in}
+                raw = decrypt_json(t.encrypted_config)
+                if isinstance(raw, dict):
+                    stored = raw
             except Exception:
                 pass
+        merged = merge_shallow_config(stored, cfg_in)
     valid, message = do_validate(tool_type_str, merged)
     return {"valid": valid, "message": message}
 
@@ -648,10 +698,18 @@ def create_tool(
     business_description = (body.business_description or "").strip() or None
     if business_description and len(business_description) > 2000:
         business_description = business_description[:2000]
+    display_name = (body.name or "").strip()
+    if not display_name:
+        raise HTTPException(status_code=400, detail="Tool name is required")
+    if _platform_tool_name_taken(db, int(current_user.id), display_name):
+        raise HTTPException(
+            status_code=400,
+            detail="A platform tool with this name already exists. Choose a different name.",
+        )
     tool = MCPToolConfig(
         user_id=current_user.id,
         tool_type=tool_type,
-        name=body.name,
+        name=display_name,
         encrypted_config=encrypted,
         business_description=business_description,
     )
@@ -683,6 +741,9 @@ def get_tool(
     if not isinstance(cfg, dict):
         return base
     updates: dict = {}
+    preview = public_config_preview(cfg)
+    if preview:
+        updates["config_preview"] = preview
     if t.tool_type == MCPToolType.CHROMA:
         url = cfg.get("url")
         if isinstance(url, str) and url.strip():
@@ -713,14 +774,22 @@ def update_tool(
     if not t:
         raise HTTPException(status_code=404, detail="Tool config not found")
     if body.name is not None:
-        t.name = body.name
+        display_name = (body.name or "").strip()
+        if not display_name:
+            raise HTTPException(status_code=400, detail="Tool name cannot be empty")
+        if _platform_tool_name_taken(db, int(current_user.id), display_name, exclude_tool_id=tool_id):
+            raise HTTPException(
+                status_code=400,
+                detail="A platform tool with this name already exists. Choose a different name.",
+            )
+        t.name = display_name
     if body.config is not None:
         # Merge partial updates so omitted keys (e.g. secret fields left blank in UI)
         # are preserved instead of being dropped.
         current_cfg = decrypt_json(t.encrypted_config) if t.encrypted_config else {}
         if not isinstance(current_cfg, dict):
             current_cfg = {}
-        merged_cfg = {**current_cfg, **body.config}
+        merged_cfg = merge_shallow_config(current_cfg, body.config)
         t.encrypted_config = encrypt_json(merged_cfg)
     if body.business_description is not None:
         bd = (body.business_description or "").strip() or None

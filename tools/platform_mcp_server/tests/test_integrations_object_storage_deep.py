@@ -89,12 +89,19 @@ class TestExecuteSlack:
     def test_missing_token(self, monkeypatch):
         _ensure_fake_slack_sdk(monkeypatch)
         out = execute_slack({}, {"action": "send", "channel": "c", "message": "m"})
-        assert "bot_token" in out.lower()
+        data = json.loads(out)
+        assert data.get("error") == "validation_failed"
+        assert "bot_token" in (data.get("message") or "").lower()
 
     def test_send_missing_channel(self, monkeypatch):
         _ensure_fake_slack_sdk(monkeypatch)
-        out = execute_slack({"bot_token": "mock-slack-bot-token-unit-test"}, {"action": "send", "message": "hi"})
-        assert "channel" in out.lower()
+        out = execute_slack(
+            {"bot_token": "mock-slack-bot-token-unit-test"},
+            {"action": "send", "message": "hi", "idempotency_key": "unit-slack-missing-channel"},
+        )
+        data = json.loads(out)
+        assert data.get("error") == "validation_failed"
+        assert "channel" in (data.get("message") or "").lower()
 
     def test_list_channels(self, monkeypatch):
         _ensure_fake_slack_sdk(monkeypatch)
@@ -170,9 +177,16 @@ class TestExecuteSlack:
         monkeypatch.setattr(slack_sdk, "WebClient", lambda token: inst)
         out = execute_slack(
             {"bot_token": "mock-slack-bot-token-unit-test"},
-            {"action": "send", "channel": "#x", "message": "m"},
+            {
+                "action": "send",
+                "channel": "#x",
+                "message": "m",
+                "idempotency_key": "unit-slack-api-err-1",
+            },
         )
-        assert "channel_not_found" in out or "Error" in out
+        data = json.loads(out)
+        assert data.get("error") == "upstream_error"
+        assert data.get("upstream_code") == "channel_not_found"
 
     def test_slack_import_error_surfaces_not_installed(self, monkeypatch):
         real = builtins.__import__
@@ -184,7 +198,8 @@ class TestExecuteSlack:
 
         monkeypatch.setattr(builtins, "__import__", _guard)
         out = execute_slack({}, {})
-        assert "not installed" in out.lower()
+        data = json.loads(out)
+        assert data.get("error") == "configuration_error"
 
     def test_slack_generic_exception_maps_safe_error(self, monkeypatch):
         _ensure_fake_slack_sdk(monkeypatch)
@@ -195,9 +210,29 @@ class TestExecuteSlack:
         monkeypatch.setattr(slack_sdk, "WebClient", lambda token: inst)
         out = execute_slack(
             {"bot_token": "mock-slack-bot-token-unit-test"},
-            {"action": "send", "channel": "#x", "message": "m"},
+            {
+                "action": "send",
+                "channel": "#x",
+                "message": "m",
+                "idempotency_key": "unit-slack-runtime-err",
+            },
         )
         assert "Error" in out
+
+    def test_send_requires_idempotency_key_by_default(self, monkeypatch):
+        _ensure_fake_slack_sdk(monkeypatch)
+        monkeypatch.delenv("PLATFORM_MCP_ALLOW_WRITES_WITHOUT_IDEMPOTENCY_KEY", raising=False)
+        inst = MagicMock()
+        import slack_sdk
+
+        monkeypatch.setattr(slack_sdk, "WebClient", lambda token: inst)
+        out = execute_slack(
+            {"bot_token": "mock-slack-bot-token-unit-test"},
+            {"action": "send", "channel": "#x", "message": "m"},
+        )
+        data = json.loads(out)
+        assert data.get("error") == "idempotency_required"
+        inst.chat_postMessage.assert_not_called()
 
 
 class TestExecuteGithub:

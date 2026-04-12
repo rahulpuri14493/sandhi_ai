@@ -137,6 +137,12 @@ function configFromOAuthClaimPayload(o: OAuthClaimPayload): Record<string, strin
 function buildEditToolConfigSnapshot(editTool: MCPToolConfigRes | null): Record<string, string> {
   if (!editTool) return {}
   const init: Record<string, string> = {}
+  const cp = editTool.config_preview
+  if (cp && typeof cp === 'object') {
+    for (const [k, v] of Object.entries(cp)) {
+      if (v != null && String(v).trim() !== '') init[k] = String(v)
+    }
+  }
   if (editTool.tool_type === 'chroma' && editTool.chroma_url_preview?.trim()) {
     init.url = editTool.chroma_url_preview.trim()
   }
@@ -760,6 +766,7 @@ function ConnectFlow({
         endpoint_path: endpointPath || '/mcp',
         auth_type: authType,
         credentials: getCredentials(),
+        ...(connection?.id != null ? { connection_id: connection.id } : {}),
       })
       setValidateMessage({ success: res.valid, text: res.message })
     } catch (err: unknown) {
@@ -1884,9 +1891,16 @@ function ConfigureFlow({
               </p>
             </div>
           )}
-          {!editTool && toolType === 'smtp' && (
+          {toolType === 'smtp' && (
             <div className="p-4 rounded-xl bg-dark-50 border border-dark-200 space-y-3">
-              <p className="text-sm text-white/85 font-medium">Sign in with OAuth (optional)</p>
+              <p className="text-sm text-white/85 font-medium">
+                {editTool ? 'Re-authenticate or switch mailbox (OAuth)' : 'Sign in with OAuth (optional)'}
+              </p>
+              {editTool && (
+                <p className="text-xs text-white/50">
+                  Use Connect below to refresh tokens or change the signed-in account; secret fields above can stay blank to keep existing credentials until you save.
+                </p>
+              )}
               <div className="flex flex-wrap gap-2">
                 <button
                   type="button"
