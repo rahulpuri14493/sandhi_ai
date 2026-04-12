@@ -384,6 +384,29 @@ class TestMCPSchemaRefresh:
         assert cfg["query"] == "SELECT now();"
         assert cfg["connection_string"] == "postgresql://u:p@localhost/db"
 
+    def test_update_tool_fails_when_decrypt_raises(self, client_mcp: TestClient, business_user, monkeypatch):
+        import api.routes.mcp as mcp_routes
+
+        cr = client_mcp.post(
+            "/api/mcp/tools",
+            headers=business_user["headers"],
+            json={"tool_type": "slack", "name": "S1", "config": {"bot_token": "x"}},
+        )
+        assert cr.status_code == 201
+        tid = cr.json()["id"]
+
+        def _boom(_blob):
+            raise ValueError("bad cipher")
+
+        monkeypatch.setattr(mcp_routes, "decrypt_json", _boom)
+        r = client_mcp.patch(
+            f"/api/mcp/tools/{tid}",
+            headers=business_user["headers"],
+            json={"config": {"bot_token": "new"}},
+        )
+        assert r.status_code == 500
+        assert "decrypt" in str(r.json().get("detail", "")).lower()
+
     def test_delete_tool(self, client_mcp: TestClient, business_user):
         cr = client_mcp.post(
             "/api/mcp/tools",

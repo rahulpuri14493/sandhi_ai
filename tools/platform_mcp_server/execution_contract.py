@@ -43,6 +43,8 @@ def allow_writes_without_idempotency_key() -> bool:
 
 def write_blocked_without_idempotency(arguments: Dict[str, Any], *, operation: str) -> Optional[str]:
     """Return JSON error body if write must be blocked; else None."""
+    if not isinstance(arguments, dict):
+        arguments = {}
     if allow_writes_without_idempotency_key():
         return None
     if str(arguments.get("idempotency_key") or "").strip():

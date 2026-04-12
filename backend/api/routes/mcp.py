@@ -802,9 +802,24 @@ def update_tool(
     if body.config is not None:
         # Merge partial updates so omitted keys (e.g. secret fields left blank in UI)
         # are preserved instead of being dropped.
-        current_cfg = decrypt_json(t.encrypted_config) if t.encrypted_config else {}
-        if not isinstance(current_cfg, dict):
-            current_cfg = {}
+        current_cfg: dict = {}
+        if t.encrypted_config:
+            try:
+                raw = decrypt_json(t.encrypted_config)
+            except Exception:
+                raise HTTPException(
+                    status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                    detail=(
+                        "Stored tool configuration could not be decrypted. "
+                        "Check MCP_ENCRYPTION_KEY matches the key used when the tool was created, or re-create the tool."
+                    ),
+                )
+            if not isinstance(raw, dict):
+                raise HTTPException(
+                    status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                    detail="Stored tool configuration is invalid. Re-create the tool.",
+                )
+            current_cfg = raw
         merged_cfg = merge_shallow_config(current_cfg, body.config)
         t.encrypted_config = encrypt_json(merged_cfg)
     if body.business_description is not None:
